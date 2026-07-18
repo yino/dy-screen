@@ -1,0 +1,24 @@
+schema: spec-driven
+
+# 项目上下文会在创建 OpenSpec 产物时提供给 AI。
+context: |
+  项目是面向 Tauri 2.0 的抖音多直播间录制客户端验证工程。
+  核心使用 Rust、Tokio、FFmpeg 和 FFprobe。
+  当前阶段只验证公开直播间的直播流解析、并发录制、音视频保存和可恢复分片。
+  所有面向人的 OpenSpec 文档使用中文；机器字段、代码标识符、命令和 OpenSpec 结构关键字保持原样。
+  不实现或描述登录、验证码、DRM、付费内容或私有直播间的访问控制绕过。
+
+# 各类产物的补充规则。
+rules:
+  proposal:
+    - 使用中文说明变更动机、能力和影响。
+    - 明确当前阶段的非目标。
+  design:
+    - 使用中文记录技术决策、替代方案、风险和迁移路径。
+    - 保持 Rust 核心可复用于 Tauri 2.0。
+  specs:
+    - 需求与场景正文使用中文。
+    - 保留 Requirement、Scenario、WHEN、THEN、SHALL 和 MUST 等规范结构关键字。
+  tasks:
+    - 使用中文描述可验证任务。
+    - 保留 OpenSpec 可解析的复选框格式。
