@@ -1,6 +1,8 @@
 use dy_screen::error::RecorderError;
 use dy_screen::model::{Protocol, RoomStreams};
-use dy_screen::resolver::{parse_room_page, validate_room_url};
+use dy_screen::resolver::{
+    RoomInspection, parse_room_inspection, parse_room_page, validate_room_url,
+};
 
 const LIVE_PAGE: &str = include_str!("fixtures/live_room.html");
 const OFFLINE_PAGE: &str = include_str!("fixtures/offline_room.html");
@@ -35,6 +37,17 @@ fn reports_offline_room_without_exposing_payload_data() {
     let error = parse_room_page(OFFLINE_PAGE).unwrap_err();
     assert!(matches!(error, RecorderError::RoomUnavailable));
     assert!(!error.to_string().contains("auth_key"));
+}
+
+#[test]
+fn inspects_canonical_identity_for_offline_room() {
+    let inspection = parse_room_inspection(OFFLINE_PAGE).expect("offline room identity");
+    assert_eq!(
+        inspection,
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned()
+        }
+    );
 }
 
 #[test]

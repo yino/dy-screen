@@ -23,8 +23,9 @@ struct CapturingSink {
 }
 
 impl EventSink for CapturingSink {
-    fn emit(&self, event: JobEvent) {
+    fn emit(&self, event: JobEvent) -> bool {
         self.events.lock().expect("event lock").push(event);
+        true
     }
 }
 

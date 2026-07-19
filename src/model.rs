@@ -257,6 +257,9 @@ pub enum JobEvent {
         room_url: String,
         room_id: String,
         path: PathBuf,
+        started_at: Option<String>,
+        ended_at: Option<String>,
+        duration_seconds: Option<i64>,
         audio_present: Option<bool>,
     },
     Finished {
@@ -265,14 +268,16 @@ pub enum JobEvent {
 }
 
 pub trait EventSink: Send + Sync {
-    fn emit(&self, event: JobEvent);
+    fn emit(&self, event: JobEvent) -> bool;
 }
 
 #[derive(Default)]
 pub struct NoopEventSink;
 
 impl EventSink for NoopEventSink {
-    fn emit(&self, _event: JobEvent) {}
+    fn emit(&self, _event: JobEvent) -> bool {
+        true
+    }
 }
 
 pub fn noop_event_sink() -> Arc<dyn EventSink> {

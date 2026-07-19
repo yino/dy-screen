@@ -1,64 +1,100 @@
-# dy-screen
+# 直播管家（dy-screen）
 
-面向 Tauri 2.0 的抖音多直播间录制可行性 Demo。它从公开直播页解析当前有效的 FLV/HLS 直播源，并通过 FFmpeg 同时保存多个直播间的原始视频和声音。
+直播管家是一个基于 Tauri 2.0、React、TypeScript、Rust 和 SQLite 的本地桌面客户端，用于同时监听多个公开抖音直播间，并在主播开播后自动保存包含视频和声音的 MKV 分片。
 
-当前阶段只验证录制链路。ASR、NLP、高光识别和自动切片将在录制稳定后单独设计。
+当前版本优先验证并交付“可靠录制”能力。AI 剪辑页面已经预留，但 ASR、NLP、高光识别和自动切片尚未实现。
 
-## 当前结论
+## 已实现功能
 
-录制方案已经通过真实直播间验证：
+- 添加监控主播：输入主播名称和公开抖音直播间链接；
+- 规范化直播间链接、真实访问公开页面、提取房间标识并阻止重复添加；
+- 使用 SQLite 保存主播、监听状态、设置、录制会话和视频分片；
+- 应用启动后自动恢复之前开启的监听任务；
+- 未开播时每 30 秒检查一次，错误时按 30、60、120、300 秒退避；
+- 检测到开播后自动启动 FFmpeg，直播结束后关闭本次录制会话；
+- FFmpeg 退出后重新确认房间状态；仍在直播时在同一逻辑会话中最多续录 3 次，只有明确未开播才结束会话；
+- 默认最多同时录制 4 个直播间，可在设置页修改；
+- 录像默认保存到 `~/Downloads/dy-screen/`，允许指定其他目录；
+- 录制期间增量监听完成清单，MKV 分片一旦正确关闭就立即登记，不等待整场直播结束；
+- 展示直播状态、监听状态、本次视频数量和历史视频数量；
+- 提供本次监听视频和历史视频库，历史视频按录制会话分组；
+- 使用系统默认播放器打开 MKV，或在 Finder/文件管理器中定位；
+- 支持删除单个视频或整个已结束会话；删除失败时恢复数据库状态并显示错误；
+- 关闭主窗口后驻留系统托盘，监听和录制继续运行；
+- 托盘提供打开窗口、暂停全部、恢复全部和退出；
+- 提供 FFmpeg/FFprobe 环境诊断、系统通知、日志目录和可选开机启动；
+- 磁盘低于 10 GB 时警告，低于 2 GB 时不启动新录制，低于 1 GB 时安全停止活动录制；
+- AI 剪辑页面只展示未来流程，不读取视频，也不创建 AI 任务；
+- 所有主播、设置、视频元数据均保存在本机，不包含云同步和遥测。
 
-- 能解析公开 `live.douyin.com` 页面中的 React Flight 初始化数据；
-- 能识别 FLV/HLS 和 `FULL_HD1`、`HD1`、`SD1`、`SD2` 等清晰度；
-- 能同时启动多个相互隔离的录制任务；
-- 使用 FFmpeg `-c copy` 保存源视频和可选音频，不进行转码；
-- 使用 MKV 分片降低网络中断或进程异常造成的文件损坏风险；
-- 能通过 FFprobe 检查完成分片是否包含音频；
-- 所有状态、错误和 JSON 输出都会移除签名 URL 的查询参数。
+## 录制方式
 
-2026-07-18 对 `https://live.douyin.com/452086788686` 的实测结果：
+本项目采用“直播源直录”，不是桌面截图式录屏。Rust 后端解析公开直播页中的 FLV/HLS 地址，再通过 FFmpeg 使用 `-c copy` 保存原始视频和音频。
 
-- FLV/HLS 各解析出 4 档清晰度；
-- `HD1 + FLV` 直接命中，无协议或清晰度回退；
-- 录制文件为 H.264 视频，分辨率 `720×1280`；
-- 音频为 AAC、`48 kHz`、双声道；
-- 人工停止后，已完成 MKV 分片均可继续播放和处理。
+这种方式具有以下特点：
 
-> 直播间随时可能下播。如果示例地址失效，请通过 `ROOM_URL` 或 `ROOM_URLS` 换成正在直播的公开房间。
-
-## 录制的是什么
-
-本 Demo 采用“直播源直录”，不是桌面或浏览器画面截图录屏。这种方式通常具有以下优势：
-
-- 不需要保持浏览器窗口可见；
-- 不会录入鼠标、通知或其他桌面内容；
+- 不需要让浏览器窗口保持可见；
+- 不会录入鼠标、桌面通知或其他窗口；
 - 不进行视频转码时 CPU 占用较低；
-- 保存的是直播源本身的视频和声音。
+- 保存直播源本身的视频和声音；
+- 不包含弹幕、礼物动画和网页控件。
 
-因此，它不会录制弹幕、礼物动画、浏览器控件或其他页面 UI。如果产品必须保留这些画面，需要另行实现系统级屏幕捕获方案。
+如果产品必须保留直播页面 UI、弹幕或礼物动画，需要另外实现系统级屏幕捕获方案。
+
+## 技术结构
+
+```text
+dy-screen/
+├── src/                         Rust 直播解析、FFmpeg 录制和多任务核心
+├── tests/                       录制核心测试与页面 fixture
+├── ui/                          React + TypeScript + Vite 客户端界面
+│   └── src/
+│       ├── App.tsx              监控中心、视频库、设置和 AI 占位页
+│       ├── api.ts               Tauri command 与浏览器演示适配
+│       └── styles.css           参考图风格和响应式主题
+├── src-tauri/                   Tauri 2.0 桌面后端
+│   ├── src/database.rs          SQLite migration 和 repository
+│   ├── src/supervisor.rs        监听 worker、自动录制、重试和磁盘保护
+│   ├── src/app.rs               command、事件、托盘和桌面生命周期
+│   └── tests/                   数据库与状态机测试
+├── openspec/                    中文 OpenSpec 规格和变更
+├── Makefile                     开发、构建、测试和 CLI 命令
+└── README.md                    本文档
+```
+
+前端不直接执行 SQL。所有数据读写、文件操作和录制控制都通过类型化 Tauri command 进入 Rust 后端。
 
 ## 环境要求
 
-- macOS 或 Linux；
+当前优先支持 macOS，代码结构保留 Windows 和 Linux 迁移空间。
+
+- Node.js 20 或更高版本；
+- npm；
 - Rust stable 和 Cargo；
 - FFmpeg，同时需要 FFprobe；
-- GNU Make 或兼容的 `make`。
+- GNU Make 或兼容的 `make`；
+- macOS 构建 Tauri 时需要 Xcode Command Line Tools。
 
-macOS/Homebrew 安装示例：
+macOS 使用 Homebrew 安装示例：
 
 ```bash
-brew install rustup ffmpeg
+xcode-select --install
+brew install node rustup ffmpeg
 rustup toolchain install stable --profile minimal
 rustup default stable
 ```
 
-如果终端找不到 Cargo，可将 Rustup 路径加入环境变量：
+如果终端找不到 Cargo：
 
 ```bash
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 ```
 
-Windows 开发阶段建议使用 WSL 或 Git Bash。正式客户端应由 Tauri 2.0 打包对应平台的 FFmpeg/FFprobe sidecar。
+Makefile 会自动尝试 `$HOME/.cargo/bin/cargo` 和 Homebrew Rustup 路径，也可以显式指定：
+
+```bash
+make doctor CARGO="$HOME/.cargo/bin/cargo"
+```
 
 ## 快速开始
 
@@ -68,268 +104,281 @@ Windows 开发阶段建议使用 WSL 或 Git Bash。正式客户端应由 Tauri 
 cd /opt/yino/python/douyin
 ```
 
-检查依赖：
+检查环境：
 
 ```bash
 make doctor
 ```
 
-构建发布版本：
+安装前端依赖：
 
 ```bash
-make release
+make install
 ```
 
-解析默认直播间：
+启动 Tauri 桌面客户端：
 
 ```bash
-make resolve
+make app-dev
 ```
 
-开始录制：
+首次启动后：
+
+1. 点击“添加主播”；
+2. 输入便于识别的主播名称；
+3. 输入公开直播间链接，例如 `https://live.douyin.com/452086788686`；
+4. 保持“添加后立即监听”开启；
+5. 保存后，后台会立即检查一次直播状态；
+6. 主播开播时自动录制，下播时自动结束会话。
+
+直播间可能随时下播，示例地址只用于展示格式。
+
+## 仅预览界面
+
+如果只想查看 React 页面，不启动 Tauri 后端：
 
 ```bash
-make record
+make web-dev
 ```
 
-按 `Ctrl-C` 停止。程序会先请求 FFmpeg 优雅退出，等待完成分片收尾，超过限定时间才会强制终止。当前 CLI 将人工取消视为非成功结束，因此 shell 可能看到退出码 `1`，但已经完成的 MKV 分片仍会保留。
+然后打开：
 
-## 使用 Makefile
+```text
+http://localhost:1420/
+```
 
-查看全部命令和参数：
+浏览器预览使用 `localStorage` 模拟主播和设置，不能解析真实直播状态，也不能启动 FFmpeg。真实监听和录制必须使用 `make app-dev`。
+
+## 构建桌面应用
+
+构建 macOS `.app`：
+
+```bash
+make app-build
+```
+
+默认产物位于：
+
+```text
+src-tauri/target/release/bundle/macos/直播管家.app
+```
+
+第一版继续依赖本机安装的 FFmpeg/FFprobe。正式分发前还需要单独确定 sidecar 来源、签名、许可证和多平台打包策略。
+
+## 自动监听与录制逻辑
+
+每个启用监听的主播最多拥有一个长期 worker：
+
+```text
+启动/恢复监听
+    ↓
+立即检查直播页
+    ├── 未开播：等待 30 秒后再次检查
+    ├── 检查失败：30/60/120/300 秒退避
+    └── 正在直播
+            ↓
+       等待全局录制许可
+            ↓
+       再次解析最新签名地址
+            ↓
+       检查磁盘并创建逻辑会话
+            ↓
+       FFmpeg 录制 MKV 分片
+            ├── FFmpeg 退出且房间仍在线：同一会话内继续录制
+            ├── 再次解析明确未开播：关闭会话，等待下一次开播
+            ├── 用户暂停/退出：安全停止并保留完成分片
+            └── 异常断流：重新解析并最多续录 3 次
+```
+
+直播状态和监听状态分开保存：
+
+- 直播状态：检查中、未开播、直播中、检查失败；
+- 监听状态：已暂停、等待开播、等待资源、录制中、正在重试、录制异常。
+
+因此，“主播未开播”和“应用没有监听”不会被混为同一个状态。
+
+## 本地数据位置
+
+### 录像目录
+
+默认：
+
+```text
+~/Downloads/dy-screen/
+```
+
+可以在设置页修改。修改只影响后续新会话，历史文件不会自动搬迁。
+
+录制核心的目录结构类似：
+
+```text
+~/Downloads/dy-screen/
+└── <room-id>/
+    └── <recording-session>/
+        ├── 20260718-180000.mkv
+        ├── 20260718-181500.mkv
+        └── segments.csv
+```
+
+FFmpeg 只能在合适的关键帧处切分，因此实际时长可能略大于设置的分片秒数。
+
+### SQLite
+
+macOS 默认位于 Tauri 应用数据目录：
+
+```text
+~/Library/Application Support/com.yino.dyscreen/dy-screen.sqlite3
+```
+
+主要表：
+
+- `streamers`：主播、链接、监听开关、直播状态和监听状态；
+- `recording_sessions`：每次直播周期的逻辑会话；
+- `videos`：完成 MKV 分片的路径、大小、音频和文件状态；
+- `settings`：录像目录、质量、协议、并发、FFmpeg 和桌面设置；
+- `schema_migrations`：数据库迁移版本。
+
+### 日志
+
+macOS 默认日志目录：
+
+```text
+~/Library/Logs/com.yino.dyscreen/
+```
+
+设置页可以直接打开日志目录。应用启动时只清理超过 14 天的普通日志文件，不会删除录像或数据库。
+
+## 关闭窗口和退出
+
+- 点击主窗口关闭按钮只会隐藏窗口；
+- 后台 worker、直播检查和活动录制继续运行；
+- 点击托盘“打开主窗口”可以恢复并聚焦窗口；
+- 托盘支持暂停全部和恢复全部监听；
+- 显式退出且存在活动录制时，主窗口会要求确认；
+- 确认后，后端先取消活动录制并等待完成分片收尾，超时后才会结束任务；
+- 所有 worker 共享一个全局 10 秒退出期限，超时任务会终止并执行 SQLite 会话对账，退出耗时不会随主播数量线性增加。
+
+## MKV 如何打开
+
+客户端视频列表提供两种操作：
+
+- “打开”：调用系统默认播放器；
+- “定位”：在 Finder 或文件管理器中显示文件。
+
+macOS 可以使用 IINA 或 VLC：
+
+```bash
+brew install --cask iina
+```
+
+也可以直接使用 FFplay：
+
+```bash
+ffplay '/完整路径/视频.mkv'
+```
+
+MKV 适合直播录制，因为进程异常时通常比 MP4 更容易保留已经完成的内容。后续如需 MP4，可在录制结束后重封装，不必重新编码：
+
+```bash
+ffmpeg -i input.mkv -c copy output.mp4
+```
+
+## Makefile 命令
+
+查看帮助：
 
 ```bash
 make help
 ```
 
-常用目标：
-
-| 目标 | 用途 |
+| 命令 | 用途 |
 | --- | --- |
-| `make doctor` | 检查 Cargo、FFmpeg 和 FFprobe |
-| `make build` | 构建调试版本 |
-| `make release` | 构建发布版本 |
-| `make resolve` | 解析一个直播间及可用清晰度 |
-| `make record` | 录制一个直播间 |
-| `make record-multi` | 同时录制多个直播间 |
-| `make fmt` | 格式化 Rust 代码 |
-| `make fmt-check` | 检查 Rust 代码格式 |
-| `make lint` | 执行 Clippy 严格检查 |
-| `make test` | 执行全部 Rust 测试 |
-| `make check` | 依次执行格式检查、Clippy 和测试 |
-| `make clean` | 清理 Cargo 构建产物，不删除录像 |
+| `make doctor` | 检查 Node、npm、Cargo、FFmpeg 和 FFprobe |
+| `make install` | 安装前端依赖 |
+| `make web-dev` | 启动浏览器界面预览 |
+| `make typecheck` | 执行 React/TypeScript 类型检查 |
+| `make frontend-build` | 类型检查并构建 React 前端 |
+| `make app-dev` | 启动 Tauri 桌面开发客户端 |
+| `make app-build` | 构建桌面应用 |
+| `make fmt` | 格式化根 crate 和 Tauri crate |
+| `make fmt-check` | 检查 Rust 格式 |
+| `make lint` | 对两个 Rust crate 执行 Clippy 严格检查 |
+| `make test-frontend` | 执行 React 组件测试 |
+| `make test-core` | 执行录制核心测试 |
+| `make test-app` | 执行 SQLite 和 supervisor 测试 |
+| `make test` | 执行全部测试 |
+| `make check` | 执行格式、Clippy、全部测试和前端构建 |
+| `make spec-validate` | 严格校验全部 OpenSpec 主规格和活动变更 |
+| `make verify` | 执行全量检查、OpenSpec 校验和桌面应用构建 |
+| `make resolve` | 使用原 CLI 解析直播间 |
+| `make record` | 使用原 CLI 录制单个直播间 |
+| `make record-multi` | 使用原 CLI 同时录制多个直播间 |
 
-可覆盖参数：
+## 原 CLI 录制方式
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `ROOM_URL` | `https://live.douyin.com/452086788686` | 单个直播间地址 |
-| `ROOM_URLS` | `ROOM_URL` 的值 | 空格分隔的多个直播间地址 |
-| `QUALITY` | `HD1` | `FULL_HD1`、`HD1`、`SD1` 或 `SD2` |
-| `PROTOCOL` | `flv` | `flv` 或 `hls` |
-| `OUTPUT` | `recordings` | 录像根目录 |
-| `SEGMENT_SECONDS` | `900` | 每个 MKV 分片的目标时长，单位为秒 |
-| `PROBE_TIMEOUT_SECONDS` | `3` | FFprobe 音频检查超时，单位为秒 |
-| `FFMPEG` | `ffmpeg` | FFmpeg 命令或绝对路径 |
-| `FFPROBE` | `ffprobe` | FFprobe 命令或绝对路径 |
-| `CARGO` | 自动发现 Rustup Cargo | Cargo 命令或绝对路径 |
-| `JSON` | `0` | 设为 `1` 输出 JSON 或 JSON-lines |
-
-### 解析指定直播间
-
-```bash
-make resolve \
-  ROOM_URL='https://live.douyin.com/452086788686' \
-  QUALITY=FULL_HD1 \
-  PROTOCOL=flv \
-  JSON=1
-```
-
-解析命令只输出房间状态、清晰度、协议和脱敏后的 CDN 地址，不会输出签名查询参数。
-
-### 录制一个直播间
-
-```bash
-make record \
-  ROOM_URL='https://live.douyin.com/452086788686' \
-  QUALITY=HD1 \
-  PROTOCOL=flv \
-  SEGMENT_SECONDS=900 \
-  OUTPUT=recordings
-```
-
-如果 FFmpeg 不在 `PATH` 中，可以传入绝对路径：
-
-```bash
-make record \
-  FFMPEG=/opt/homebrew/bin/ffmpeg \
-  FFPROBE=/opt/homebrew/bin/ffprobe
-```
-
-### 同时录制多个直播间
-
-```bash
-make record-multi \
-  ROOM_URLS='https://live.douyin.com/ROOM_A https://live.douyin.com/ROOM_B https://live.douyin.com/ROOM_C' \
-  QUALITY=HD1 \
-  OUTPUT=recordings
-```
-
-每个直播间对应独立 Tokio 任务和 FFmpeg 子进程。某个房间离线、解析失败或 FFmpeg 异常时，其他房间会继续录制；命令最终会逐房间报告结果，并在任一任务失败时返回非零退出码。
-
-## 不使用 Makefile
-
-Makefile 只是命令封装，也可以直接使用发布二进制。
-
-构建：
-
-```bash
-cargo build --release
-```
+桌面客户端之外，原 Rust CLI 仍可独立使用。
 
 解析直播间：
 
 ```bash
-./target/release/dy-screen resolve \
-  'https://live.douyin.com/452086788686' \
-  --quality HD1 \
-  --protocol flv \
-  --json
+make resolve \
+  ROOM_URL='https://live.douyin.com/452086788686' \
+  QUALITY=HD1 \
+  PROTOCOL=flv
 ```
 
-录制直播间：
+录制单个直播间：
 
 ```bash
-./target/release/dy-screen record \
-  'https://live.douyin.com/452086788686' \
-  --quality HD1 \
-  --protocol flv \
-  --ffmpeg /opt/homebrew/bin/ffmpeg \
-  --ffprobe /opt/homebrew/bin/ffprobe \
-  --probe-timeout-seconds 3 \
-  --segment-seconds 900 \
-  --output recordings
+make record \
+  ROOM_URL='https://live.douyin.com/452086788686' \
+  OUTPUT=recordings \
+  SEGMENT_SECONDS=900
 ```
 
-多个房间只需在 `record` 后继续追加直播间 URL。
-
-开发检查：
+同时录制多个直播间：
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+make record-multi \
+  ROOM_URLS='https://live.douyin.com/ROOM_A https://live.douyin.com/ROOM_B'
+```
+
+按 `Ctrl-C` 后程序会先请求 FFmpeg 优雅退出，已经完成的 MKV 分片仍会保留。
+
+## 开发与验证
+
+执行全量检查：
+
+```bash
+make check
+```
+
+也可以分别执行：
+
+```bash
+npm test
+npm run typecheck
+npm run build
 cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+openspec validate --all --strict
 ```
 
-## 输出结构
+## 当前限制
 
-```text
-recordings/
-  <room-id>/
-    <session-id>/
-      20260718-180000.mkv
-      20260718-181500.mkv
-      segments.csv
-```
-
-- 每次启动录制都会创建独立 session 目录；
-- MKV 文件名使用分片开始时间；
-- `segments.csv` 由 FFmpeg 在分片正确关闭后写入；
-- 核心层只把清单中的文件放入 `segments`；
-- 异常退出时未进入清单的 MKV 会放入 `partial_segments`，不会直接投递给后续 ASR；
-- FFprobe 会为完成分片报告 `audio_present`。
-
-FFmpeg 只能在合适的关键帧处切分，因此实际分片时长可能略大于 `SEGMENT_SECONDS`。
-
-## JSON 事件
-
-设置 `JSON=1` 后，录制过程会输出适合前端或任务系统消费的 JSON-lines 事件：
-
-- `queued`
-- `resolving`
-- `resolved`
-- `recording_started`
-- `segment_finalized`
-- `finished`
-
-这些模型已经支持 Serde 序列化，后续可以直接映射为 Tauri event。
-
-## Rust 模块
-
-核心代码位于 Rust library，CLI 只是适配层：
-
-- `resolver`：直播页请求、React Flight 解析、清晰度和协议选择；
-- `recorder`：FFmpeg 参数、子进程监督、取消、分片清单和 FFprobe；
-- `manager`：多房间并发和单房间故障隔离；
-- `model`：请求、结果和生命周期事件；
-- `error`：不会泄漏签名参数的类型化错误；
-- `main.rs`：命令行参数和文本/JSON 输出。
-
-## Tauri 2.0 接入建议
-
-下一阶段可以让 Tauri managed state 持有 `RecordingManager<LiveJobRunner>`：
-
-1. 前端调用 `start_recordings` command，传入直播间 URL、清晰度和输出策略；
-2. Rust 后端为该批任务创建共享 `CancellationToken`；
-3. manager 为每个房间启动独立任务和 FFmpeg sidecar；
-4. 将核心产生的生命周期事件通过 `AppHandle::emit` 转发给前端；
-5. `stop_recording` command 只触发 cancellation，不直接操作 FFmpeg PID；
-6. 完成的 MKV 分片进入独立 ASR 队列，避免内容分析阻塞录制生命周期。
-
-生产分发前需要确定各平台 FFmpeg/FFprobe sidecar 的来源、许可证、包体积和更新策略。
-
-## 后续 ASR 与高光流程
-
-每个完成的 MKV 分片可以作为后续处理边界：
-
-1. 提取音频并提交 ASR；
-2. 保存带时间戳的转写文本；
-3. 通过 NLP/LLM 计算候选高光区间；
-4. 将文本时间轴映射回原始视频；
-5. 使用 FFmpeg 无损重封装或转码输出短视频。
-
-本阶段没有实现以上流程，只保留分片、音频检测和生命周期事件接口。
-
-## 已知限制
-
-- 抖音修改页面或 React Flight 数据结构后，解析 fixture 和解析器可能需要更新；
-- 签名流地址会过期，当前只在启动 FFmpeg 前解析一次；
-- 断流后的自动重新解析、重试和无缝续录尚未实现；
-- 暂无并发数量限制、磁盘空间配额、定时任务和崩溃恢复；
-- 不支持登录自动化、验证码、DRM、付费直播、私有直播间或其他访问控制绕过；
-- 不录制弹幕、礼物动画和浏览器 UI；
-- 当前尚未创建 Tauri 前端和生产 sidecar 打包配置。
-
-## 常见问题
-
-### 提示找不到 Cargo
-
-确认 Rust stable 已安装并将 Cargo 加入 `PATH`，或者临时指定：
-
-```bash
-make check CARGO=/absolute/path/to/cargo
-```
-
-### 提示找不到 FFmpeg
-
-```bash
-make doctor \
-  FFMPEG=/absolute/path/to/ffmpeg \
-  FFPROBE=/absolute/path/to/ffprobe
-```
-
-### 提示直播间已下播或没有可用流
-
-先在浏览器确认房间仍在直播，再替换地址：
-
-```bash
-make resolve ROOM_URL='https://live.douyin.com/新的房间号'
-```
-
-### 为什么停止后命令返回非零状态
-
-当前 Demo 将用户取消视为未自然完成，因此可能返回退出码 `1`。只要日志已经出现 `segment_finalized`，且文件列在 `segments.csv` 中，该分片就是已完成文件。
+- 第一版优先在 macOS 上开发和验证；
+- FFmpeg/FFprobe 尚未作为 Tauri sidecar 打包，运行机器必须自行安装；
+- 抖音修改页面或 React Flight 数据结构后，解析器和 fixture 可能需要更新；
+- 仅支持无需登录即可访问的公开直播间；
+- 不支持验证码、Cookie 自动化、DRM、付费或私有直播间绕过；
+- 不录制弹幕、礼物动画或网页 UI；
+- 不提供应用内播放器、分片合并和自动转码；
+- AI 剪辑、ASR、NLP 和高光切片尚未实现；
+- Windows/Linux 的托盘、开机启动、通知和文件管理器行为仍需在对应平台验证；
+- 生产发布前仍需完成 FFmpeg sidecar、应用签名、公证和安装包策略。
 
 ## 合规说明
 
-仅应录制你有权保存和处理的内容，并遵守平台规则、版权要求、隐私要求及适用法律。本项目不提供访问控制绕过能力。
+仅应录制你有权保存和处理的内容，并遵守平台规则、版权要求、隐私要求及适用法律。本项目不会绕过登录、权限控制、付费限制或 DRM。

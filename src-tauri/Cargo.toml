@@ -1,0 +1,37 @@
+[package]
+name = "dy-screen-app"
+version = "0.2.0"
+description = "Tauri 2.0 抖音主播监听客户端"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "dy_screen_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "dy-screen-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+dy-screen = { path = ".." }
+fs2 = "0.4"
+rusqlite = { version = "0.40.1", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-notification = "2.3.3"
+tauri-plugin-opener = "2.5.4"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"

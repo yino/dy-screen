@@ -110,13 +110,13 @@ struct CliEventSink {
 }
 
 impl EventSink for CliEventSink {
-    fn emit(&self, event: JobEvent) {
+    fn emit(&self, event: JobEvent) -> bool {
         if self.json {
             println!(
                 "{}",
                 serde_json::to_string(&event).expect("job event is serializable")
             );
-            return;
+            return true;
         }
         match event {
             JobEvent::Queued { room_url } => println!("queued {room_url}"),
@@ -135,12 +135,14 @@ impl EventSink for CliEventSink {
             JobEvent::SegmentFinalized {
                 room_id,
                 path,
+                duration_seconds,
                 audio_present,
                 ..
             } => println!(
-                "segment room={} path={} audio_present={:?}",
+                "segment room={} path={} duration_seconds={:?} audio_present={:?}",
                 room_id,
                 path.display(),
+                duration_seconds,
                 audio_present
             ),
             JobEvent::Finished { result } if result.success => println!(
@@ -157,6 +159,7 @@ impl EventSink for CliEventSink {
                 result.partial_segments.len()
             ),
         }
+        true
     }
 }
 

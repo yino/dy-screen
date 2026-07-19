@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -14,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{RecorderError, Result};
 use crate::model::{EventSink, JobEvent, JobResult, SelectedStream, noop_event_sink};
 use crate::resolver::DEFAULT_USER_AGENT;
+
+const MANIFEST_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct FfmpegConfig {
@@ -260,31 +263,76 @@ impl FfmpegRecorder {
                 message: error.to_string(),
             })?;
 
-        events.emit(JobEvent::RecordingStarted {
+        let _ = events.emit(JobEvent::RecordingStarted {
             room_url: room_url.to_owned(),
             room_id: room_id.to_owned(),
             output_dir: output_dir.clone(),
         });
 
         let mut child_stdin = child.stdin.take();
+        let recording_started_at = Utc::now();
+        let mut emitted_segments = HashSet::new();
+        let mut manifest_interval = tokio::time::interval(MANIFEST_POLL_INTERVAL);
+        manifest_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let (status, cancelled) = tokio::select! {
-            status = child.wait() => (status?, false),
-            _ = cancellation.cancelled() => {
-                if let Some(mut stdin) = child_stdin.take() {
-                    let _ = stdin.write_all(b"q\n").await;
-                    let _ = stdin.flush().await;
-                }
-                let status = match timeout(self.config.shutdown_timeout, child.wait()).await {
-                    Ok(status) => status?,
-                    Err(_) => {
-                        let _ = child.start_kill();
-                        child.wait().await?
+        let (status, cancelled) = loop {
+            enum RecorderProgress {
+                Exited(std::process::ExitStatus),
+                Cancelled,
+                ManifestTick,
+            }
+
+            let progress = tokio::select! {
+                status = child.wait() => RecorderProgress::Exited(status?),
+                _ = cancellation.cancelled() => RecorderProgress::Cancelled,
+                _ = manifest_interval.tick() => RecorderProgress::ManifestTick,
+            };
+
+            match progress {
+                RecorderProgress::Exited(status) => break (status, false),
+                RecorderProgress::Cancelled => {
+                    if let Some(mut stdin) = child_stdin.take() {
+                        let _ = stdin.write_all(b"q\n").await;
+                        let _ = stdin.flush().await;
                     }
-                };
-                (status, true)
+                    let status = match timeout(self.config.shutdown_timeout, child.wait()).await {
+                        Ok(status) => status?,
+                        Err(_) => {
+                            let _ = child.start_kill();
+                            child.wait().await?
+                        }
+                    };
+                    break (status, true);
+                }
+                RecorderProgress::ManifestTick => {
+                    emit_new_segments(
+                        room_url,
+                        room_id,
+                        &plan.segment_list,
+                        &output_dir,
+                        &recording_started_at,
+                        &self.config.ffprobe_executable,
+                        self.config.probe_timeout,
+                        &events,
+                        &mut emitted_segments,
+                    )
+                    .await;
+                }
             }
         };
+
+        emit_new_segments(
+            room_url,
+            room_id,
+            &plan.segment_list,
+            &output_dir,
+            &recording_started_at,
+            &self.config.ffprobe_executable,
+            self.config.probe_timeout,
+            &events,
+            &mut emitted_segments,
+        )
+        .await;
 
         let (segments, partial_segments) =
             collect_segments(&output_dir, &plan.segment_list).await?;
@@ -298,14 +346,6 @@ impl FfmpegRecorder {
             .unwrap_or(None),
             None => None,
         };
-        for path in &segments {
-            events.emit(JobEvent::SegmentFinalized {
-                room_url: room_url.to_owned(),
-                room_id: room_id.to_owned(),
-                path: path.clone(),
-                audio_present,
-            });
-        }
         if cancelled {
             return Ok(RecordingOutcome {
                 output_dir,
@@ -377,26 +417,10 @@ async fn collect_segments(
     output_dir: &Path,
     segment_list: &Path,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let manifest = tokio::fs::read_to_string(segment_list)
+    let mut completed = read_manifest_entries(output_dir, segment_list)
         .await
-        .unwrap_or_default();
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .flexible(true)
-        .from_reader(manifest.as_bytes());
-    let mut completed = reader
-        .records()
-        .filter_map(std::result::Result::ok)
-        .filter_map(|record| record.get(0).map(str::to_owned))
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let path = PathBuf::from(&value);
-            if path.is_absolute() || path.starts_with(output_dir) {
-                path
-            } else {
-                output_dir.join(path)
-            }
-        })
+        .into_iter()
+        .map(|entry| entry.path)
         .filter(|path| path.exists())
         .collect::<Vec<_>>();
     completed.sort();
@@ -414,6 +438,100 @@ async fn collect_segments(
     }
     partial.sort();
     Ok((completed, partial))
+}
+
+#[derive(Debug)]
+struct ManifestEntry {
+    path: PathBuf,
+    started_offset_seconds: Option<f64>,
+    ended_offset_seconds: Option<f64>,
+}
+
+async fn read_manifest_entries(output_dir: &Path, segment_list: &Path) -> Vec<ManifestEntry> {
+    let manifest = tokio::fs::read_to_string(segment_list)
+        .await
+        .unwrap_or_default();
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(manifest.as_bytes());
+    reader
+        .records()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|record| {
+            let value = record.get(0)?.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let path = PathBuf::from(value);
+            Some(ManifestEntry {
+                path: if path.is_absolute() || path.starts_with(output_dir) {
+                    path
+                } else {
+                    output_dir.join(path)
+                },
+                started_offset_seconds: record.get(1).and_then(parse_manifest_seconds),
+                ended_offset_seconds: record.get(2).and_then(parse_manifest_seconds),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_new_segments(
+    room_url: &str,
+    room_id: &str,
+    segment_list: &Path,
+    output_dir: &Path,
+    recording_started_at: &DateTime<Utc>,
+    ffprobe_executable: &Path,
+    probe_timeout: Duration,
+    events: &Arc<dyn EventSink>,
+    emitted_segments: &mut HashSet<PathBuf>,
+) {
+    for entry in read_manifest_entries(output_dir, segment_list).await {
+        if emitted_segments.contains(&entry.path) || !entry.path.exists() {
+            continue;
+        }
+        let audio_present = probe_audio(ffprobe_executable, &entry.path, probe_timeout)
+            .await
+            .unwrap_or(None);
+        let duration_seconds = entry
+            .started_offset_seconds
+            .zip(entry.ended_offset_seconds)
+            .and_then(|(started, ended)| {
+                let duration = ended - started;
+                (duration >= 0.0 && duration <= i64::MAX as f64).then_some(duration.round() as i64)
+            });
+        let accepted = events.emit(JobEvent::SegmentFinalized {
+            room_url: room_url.to_owned(),
+            room_id: room_id.to_owned(),
+            path: entry.path.clone(),
+            started_at: absolute_manifest_time(recording_started_at, entry.started_offset_seconds),
+            ended_at: absolute_manifest_time(recording_started_at, entry.ended_offset_seconds),
+            duration_seconds,
+            audio_present,
+        });
+        if accepted {
+            emitted_segments.insert(entry.path);
+        }
+    }
+}
+
+fn parse_manifest_seconds(value: &str) -> Option<f64> {
+    value.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn absolute_manifest_time(
+    started_at: &DateTime<Utc>,
+    offset_seconds: Option<f64>,
+) -> Option<String> {
+    let milliseconds = (offset_seconds? * 1_000.0).round();
+    if !(i64::MIN as f64..=i64::MAX as f64).contains(&milliseconds) {
+        return None;
+    }
+    let offset = chrono::Duration::try_milliseconds(milliseconds as i64)?;
+    Some((*started_at + offset).to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 async fn probe_audio(

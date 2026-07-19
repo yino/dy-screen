@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,9 +29,29 @@ struct CapturingSink {
     events: Mutex<Vec<JobEvent>>,
 }
 
+#[derive(Default)]
+struct RejectFirstSegmentSink {
+    attempts: AtomicUsize,
+    accepted: Mutex<Vec<JobEvent>>,
+}
+
+impl EventSink for RejectFirstSegmentSink {
+    fn emit(&self, event: JobEvent) -> bool {
+        if matches!(event, JobEvent::SegmentFinalized { .. }) {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return false;
+            }
+            self.accepted.lock().expect("event lock").push(event);
+        }
+        true
+    }
+}
+
 impl EventSink for CapturingSink {
-    fn emit(&self, event: JobEvent) {
+    fn emit(&self, event: JobEvent) -> bool {
         self.events.lock().expect("event lock").push(event);
+        true
     }
 }
 
@@ -329,6 +350,141 @@ async fn emits_recording_and_finalized_segment_events_from_core() {
             .iter()
             .any(|event| matches!(event, JobEvent::SegmentFinalized { .. }))
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn emits_completed_segment_before_long_running_ffmpeg_exits() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fake_ffmpeg = temp.path().join("fake-ffmpeg");
+    write_fake_ffmpeg(&fake_ffmpeg, true);
+    let recorder = FfmpegRecorder::new(RecordingConfig {
+        ffmpeg: FfmpegConfig {
+            executable: fake_ffmpeg,
+            segment_seconds: 60,
+            user_agent: "dy-screen-test".to_owned(),
+        },
+        ffprobe_executable: fake_ffprobe(temp.path(), true),
+        probe_timeout: Duration::from_millis(500),
+        output_root: temp.path().join("recordings"),
+        shutdown_timeout: Duration::from_secs(1),
+    });
+    let sink = Arc::new(CapturingSink::default());
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let sink = sink.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            recorder
+                .record_selected_with_event_sink(
+                    "https://live.douyin.com/room".to_owned(),
+                    "room".to_owned(),
+                    selected_stream(),
+                    cancellation,
+                    sink,
+                )
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let finalized = sink
+                .events
+                .lock()
+                .expect("event lock")
+                .iter()
+                .any(|event| matches!(event, JobEvent::SegmentFinalized { .. }));
+            if finalized {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("completed segment should be emitted while FFmpeg is still running");
+
+    assert!(!task.is_finished());
+    {
+        let events = sink.events.lock().expect("event lock");
+        let finalized = events
+            .iter()
+            .find_map(|event| match event {
+                JobEvent::SegmentFinalized {
+                    started_at,
+                    ended_at,
+                    duration_seconds,
+                    ..
+                } => Some((started_at, ended_at, duration_seconds)),
+                _ => None,
+            })
+            .expect("finalized segment event");
+        assert!(finalized.0.is_some());
+        assert!(finalized.1.is_some());
+        assert_eq!(*finalized.2, Some(6));
+    }
+    cancellation.cancel();
+    let _ = task.await.expect("recording task");
+    let finalized_count = sink
+        .events
+        .lock()
+        .expect("event lock")
+        .iter()
+        .filter(|event| matches!(event, JobEvent::SegmentFinalized { .. }))
+        .count();
+    assert_eq!(finalized_count, 1, "final scan must not emit duplicates");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retries_finalized_segment_until_event_sink_accepts_it() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fake_ffmpeg = temp.path().join("fake-ffmpeg");
+    write_fake_ffmpeg(&fake_ffmpeg, true);
+    let recorder = FfmpegRecorder::new(RecordingConfig {
+        ffmpeg: FfmpegConfig {
+            executable: fake_ffmpeg,
+            segment_seconds: 60,
+            user_agent: "dy-screen-test".to_owned(),
+        },
+        ffprobe_executable: fake_ffprobe(temp.path(), true),
+        probe_timeout: Duration::from_millis(200),
+        output_root: temp.path().join("recordings"),
+        shutdown_timeout: Duration::from_secs(1),
+    });
+    let sink = Arc::new(RejectFirstSegmentSink::default());
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let sink = sink.clone();
+        let cancellation = cancellation.clone();
+        async move {
+            recorder
+                .record_selected_with_event_sink(
+                    "https://live.douyin.com/room".to_owned(),
+                    "room".to_owned(),
+                    selected_stream(),
+                    cancellation,
+                    sink,
+                )
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !sink.accepted.lock().expect("event lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("rejected segment should be retried");
+
+    assert!(sink.attempts.load(Ordering::SeqCst) >= 2);
+    assert!(!task.is_finished());
+    cancellation.cancel();
+    let _ = task.await.expect("recording task");
 }
 
 #[cfg(unix)]

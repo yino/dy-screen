@@ -14,6 +14,21 @@ pub struct StreamResolver {
     client: reqwest::Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomInspection {
+    Live(RoomStreams),
+    Offline { room_id: String },
+}
+
+impl RoomInspection {
+    pub fn room_id(&self) -> &str {
+        match self {
+            Self::Live(room) => &room.room_id,
+            Self::Offline { room_id } => room_id,
+        }
+    }
+}
+
 impl StreamResolver {
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -25,6 +40,13 @@ impl StreamResolver {
     }
 
     pub async fn resolve(&self, room_url: &str) -> Result<RoomStreams> {
+        match self.inspect(room_url).await? {
+            RoomInspection::Live(room) => Ok(room),
+            RoomInspection::Offline { .. } => Err(RecorderError::RoomUnavailable),
+        }
+    }
+
+    pub async fn inspect(&self, room_url: &str) -> Result<RoomInspection> {
         let url = validate_room_url(room_url)?;
         let page = self
             .client
@@ -35,7 +57,7 @@ impl StreamResolver {
             .error_for_status()?
             .text()
             .await?;
-        parse_room_page(&page)
+        parse_room_inspection(&page)
     }
 }
 
@@ -57,9 +79,16 @@ pub fn validate_room_url(input: &str) -> Result<Url> {
 }
 
 pub fn parse_room_page(page: &str) -> Result<RoomStreams> {
+    match parse_room_inspection(page)? {
+        RoomInspection::Live(room) => Ok(room),
+        RoomInspection::Offline { .. } => Err(RecorderError::RoomUnavailable),
+    }
+}
+
+pub fn parse_room_inspection(page: &str) -> Result<RoomInspection> {
     let document = Html::parse_document(page);
     let selector = Selector::parse("script").expect("static script selector");
-    let mut saw_room_without_stream = false;
+    let mut offline_room_id = None;
 
     for script in document.select(&selector) {
         let text = script.text().collect::<String>();
@@ -71,15 +100,17 @@ pub fn parse_room_page(page: &str) -> Result<RoomStreams> {
         };
 
         if let Some(room) = find_room_object(&payload, true) {
-            return normalize_room(room);
+            return normalize_room(room).map(RoomInspection::Live);
         }
-        if find_room_object(&payload, false).is_some() {
-            saw_room_without_stream = true;
+        if let Some(room) = find_room_object(&payload, false)
+            && let Some(room_id) = room.get("id_str").and_then(Value::as_str)
+        {
+            offline_room_id = Some(room_id.to_owned());
         }
     }
 
-    if saw_room_without_stream {
-        Err(RecorderError::RoomUnavailable)
+    if let Some(room_id) = offline_room_id {
+        Ok(RoomInspection::Offline { room_id })
     } else {
         Err(RecorderError::UnsupportedPageLayout)
     }
