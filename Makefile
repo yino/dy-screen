@@ -31,7 +31,7 @@ ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
 
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
-	resolve record record-multi clean
+	preview-doctor test-preview test-preview-integration resolve record record-multi clean
 
 help:
 	@printf '%s\n' \
@@ -47,6 +47,9 @@ help:
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端' \
 		'  make app-build       构建 macOS .app 安装产物' \
+		'  make preview-doctor  检查视频预览所需 FFmpeg 编码能力' \
+		'  make test-preview    执行预览服务和播放器组件测试' \
+		'  make test-preview-integration 使用真实 FFmpeg 样本验证预览转换' \
 		'  make check           执行格式、Clippy、测试和前端构建' \
 		'  make spec-validate   严格校验当前 OpenSpec 变更' \
 		'  make verify          执行 check、OpenSpec 校验和桌面应用构建' \
@@ -73,6 +76,10 @@ doctor:
 	@command -v "$(FFMPEG)" >/dev/null 2>&1 || { printf '%s\n' '错误：找不到 FFmpeg，请安装或通过 FFMPEG=/path/to/ffmpeg 指定。' >&2; exit 1; }
 	@command -v "$(FFPROBE)" >/dev/null 2>&1 || { printf '%s\n' '错误：找不到 FFprobe，请安装或通过 FFPROBE=/path/to/ffprobe 指定。' >&2; exit 1; }
 	@printf '%s\n' '环境检查通过。'
+
+preview-doctor: doctor
+	@"$(FFMPEG)" -hide_banner -encoders 2>/dev/null | grep -Eq 'h264_videotoolbox|libx264|h264_mf' || { printf '%s\n' '错误：当前 FFmpeg 没有可用的 H.264 预览编码器。' >&2; exit 1; }
+	@printf '%s\n' '视频预览环境检查通过。'
 
 install:
 	"$(NPM)" install
@@ -120,6 +127,14 @@ test-core:
 
 test-app:
 	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --all-targets
+
+test-preview:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test preview
+	"$(NPM)" test -- --run ui/src/App.test.tsx
+
+test-preview-integration: preview-doctor
+	FFMPEG="$(FFMPEG)" FFPROBE="$(FFPROBE)" "$(CARGO)" test --manifest-path src-tauri/Cargo.toml \
+		--test preview real_ffmpeg_handles_remux_transcode_and_video_without_audio -- --ignored --nocapture
 
 test: test-frontend test-core test-app
 

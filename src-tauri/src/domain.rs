@@ -105,6 +105,8 @@ pub struct Video {
     pub size_bytes: i64,
     pub audio_present: Option<bool>,
     pub status: String,
+    #[serde(default)]
+    pub has_preview_cache: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -47,6 +47,7 @@ export interface Video {
   sizeBytes: number;
   audioPresent: boolean | null;
   status: string;
+  hasPreviewCache?: boolean;
 }
 
 export interface VideoPage {
@@ -85,6 +86,33 @@ export interface MonitorEvent {
   streamerId: number | null;
 }
 
+export type PreviewState =
+  | "queued"
+  | "probing"
+  | "remuxing"
+  | "transcoding"
+  | "ready"
+  | "failed";
+
+export interface PreviewMedia {
+  path: string;
+  mimeType: string;
+  cacheHit: boolean;
+  generated: boolean;
+  sourceMissing: boolean;
+}
+
+export interface PreviewSnapshot {
+  requestId: string;
+  videoId: number;
+  state: PreviewState;
+  progressPercent: number | null;
+  message: string;
+  media: PreviewMedia | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
 export interface ClientApi {
   getDashboard(): Promise<Dashboard>;
   createStreamer(input: CreateStreamerInput): Promise<Streamer>;
@@ -97,6 +125,11 @@ export interface ClientApi {
   listCurrentVideos(streamerId: number): Promise<VideoPage>;
   getSettings(): Promise<AppSettings>;
   saveSettings(settings: AppSettings): Promise<void>;
+  requestVideoPreview(id: number): Promise<PreviewSnapshot>;
+  retryVideoPreview(id: number): Promise<PreviewSnapshot>;
+  getVideoPreview(requestId: string): Promise<PreviewSnapshot>;
+  retainVideoPreview(requestId: string): Promise<void>;
+  releaseVideoPreview(requestId: string): Promise<void>;
   openVideo(id: number): Promise<void>;
   revealVideo(id: number): Promise<void>;
   deleteVideo(id: number): Promise<void>;
@@ -105,4 +138,5 @@ export interface ClientApi {
   diagnoseEnvironment(): Promise<EnvironmentStatus>;
   requestExit(force: boolean): Promise<void>;
   subscribe(listener: (event: MonitorEvent) => void): Promise<() => void>;
+  subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
 }

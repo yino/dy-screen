@@ -20,6 +20,9 @@ use crate::domain::{
     AppSettings, CreateStreamerRequest, Dashboard, EnvironmentStatus, MonitorEvent, NewStreamer,
     Streamer, VideoFilter, VideoPage,
 };
+use crate::preview::{
+    PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
+};
 use crate::supervisor::{MonitorPublisher, Supervisor};
 
 type TrayStatus = Arc<Mutex<Option<MenuItem<tauri::Wry>>>>;
@@ -27,6 +30,7 @@ type TrayStatus = Arc<Mutex<Option<MenuItem<tauri::Wry>>>>;
 struct AppState {
     database: Database,
     supervisor: Supervisor,
+    preview: PreviewService,
     log_dir: PathBuf,
     quitting: Arc<AtomicBool>,
 }
@@ -65,6 +69,18 @@ impl MonitorPublisher for DesktopPublisher {
                 .body(body)
                 .show();
         }
+    }
+}
+
+#[derive(Clone)]
+struct DesktopPreviewPublisher {
+    app: AppHandle,
+}
+
+impl PreviewPublisher for DesktopPreviewPublisher {
+    fn publish(&self, snapshot: &PreviewSnapshot) {
+        authorize_preview_media(&self.app, snapshot);
+        let _ = self.app.emit("video-preview-event", snapshot);
     }
 }
 
@@ -212,15 +228,16 @@ fn list_videos(
     filter: Option<VideoFilter>,
     state: State<'_, AppState>,
 ) -> Result<VideoPage, String> {
-    state
+    let page = state
         .database
         .query_videos(streamer_id, page, page_size, &filter.unwrap_or_default())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    attach_preview_cache_availability(page, &state.preview)
 }
 
 #[tauri::command]
 fn list_current_videos(streamer_id: i64, state: State<'_, AppState>) -> Result<VideoPage, String> {
-    state
+    let page = state
         .database
         .query_videos(
             Some(streamer_id),
@@ -231,7 +248,19 @@ fn list_current_videos(streamer_id: i64, state: State<'_, AppState>) -> Result<V
                 ..VideoFilter::default()
             },
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    attach_preview_cache_availability(page, &state.preview)
+}
+
+fn attach_preview_cache_availability(
+    mut page: VideoPage,
+    preview: &PreviewService,
+) -> Result<VideoPage, String> {
+    let cached_video_ids = preview.cached_video_ids().map_err(|error| error.message)?;
+    for video in &mut page.items {
+        video.has_preview_cache = cached_video_ids.contains(&video.id);
+    }
+    Ok(page)
 }
 
 #[tauri::command]
@@ -271,6 +300,52 @@ fn save_settings(
         .supervisor
         .set_max_concurrent(normalized.max_concurrent_recordings);
     Ok(())
+}
+
+#[tauri::command]
+async fn request_video_preview(
+    id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PreviewSnapshot, PreviewFailure> {
+    let snapshot = state.preview.request(preview_request(id, &state)?).await?;
+    authorize_preview_media(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn retry_video_preview(
+    id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PreviewSnapshot, PreviewFailure> {
+    let snapshot = state.preview.retry(preview_request(id, &state)?).await?;
+    authorize_preview_media(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn get_video_preview(
+    request_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PreviewSnapshot, PreviewFailure> {
+    let snapshot = state
+        .preview
+        .get(&request_id)
+        .ok_or_else(|| PreviewFailure::new("preview_not_found", "找不到视频预览任务"))?;
+    authorize_preview_media(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn retain_video_preview(request_id: String, state: State<'_, AppState>) {
+    state.preview.retain_playback(&request_id);
+}
+
+#[tauri::command]
+fn release_video_preview(request_id: String, state: State<'_, AppState>) {
+    state.preview.release_playback(&request_id);
 }
 
 #[tauri::command]
@@ -320,12 +395,30 @@ fn delete_video(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     state
         .database
         .delete_video_record(id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    state
+        .preview
+        .evict_video(id)
+        .map_err(|error| format!("视频已删除，但预览缓存清理失败：{}", error.message))
 }
 
 #[tauri::command]
 fn delete_session(session_id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    delete_recording_session(&state.database, session_id)
+    let video_ids = state
+        .database
+        .list_session_videos(session_id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|video| video.id)
+        .collect::<Vec<_>>();
+    delete_recording_session(&state.database, session_id)?;
+    for video_id in video_ids {
+        state
+            .preview
+            .evict_video(video_id)
+            .map_err(|error| format!("录制会话已删除，但预览缓存清理失败：{}", error.message))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -359,7 +452,12 @@ fn request_exit(force: bool, app: AppHandle, state: State<'_, AppState>) -> Resu
     if active_recordings > 0 && !force {
         return Err("当前仍有活动录制，需要确认后才能退出".to_owned());
     }
-    begin_shutdown(&app, state.supervisor.clone(), state.quitting.clone());
+    begin_shutdown(
+        &app,
+        state.supervisor.clone(),
+        state.preview.clone(),
+        state.quitting.clone(),
+    );
     Ok(())
 }
 
@@ -383,6 +481,11 @@ pub fn run() {
             list_current_videos,
             get_settings,
             save_settings,
+            request_video_preview,
+            retry_video_preview,
+            get_video_preview,
+            retain_video_preview,
+            release_video_preview,
             open_video,
             reveal_video,
             delete_video,
@@ -393,8 +496,10 @@ pub fn run() {
         ])
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
+            let app_cache_dir = app.path().app_cache_dir()?;
             let log_dir = app.path().app_log_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
+            std::fs::create_dir_all(&app_cache_dir)?;
             std::fs::create_dir_all(&log_dir)?;
             cleanup_old_logs(&log_dir, 14);
 
@@ -414,11 +519,24 @@ pub fn run() {
             let max_concurrent = database.get_settings()?.max_concurrent_recordings;
             let supervisor = Supervisor::new(database.clone(), publisher, max_concurrent)
                 .map_err(std::io::Error::other)?;
+            let preview_cache_dir = app_cache_dir.join("video-preview");
+            std::fs::create_dir_all(&preview_cache_dir)?;
+            app.asset_protocol_scope()
+                .allow_directory(&preview_cache_dir, true)?;
+            let preview = PreviewService::with_executor_and_publisher(
+                PreviewCache::new(preview_cache_dir),
+                Arc::new(crate::preview::FfmpegPreviewExecutor),
+                Arc::new(DesktopPreviewPublisher {
+                    app: app.handle().clone(),
+                }),
+            )
+            .map_err(std::io::Error::other)?;
             let quitting = Arc::new(AtomicBool::new(false));
 
             app.manage(AppState {
                 database,
                 supervisor: supervisor.clone(),
+                preview,
                 log_dir,
                 quitting,
             });
@@ -477,7 +595,12 @@ pub fn run() {
                         },
                     );
                 } else {
-                    begin_shutdown(app, state.supervisor.clone(), state.quitting.clone());
+                    begin_shutdown(
+                        app,
+                        state.supervisor.clone(),
+                        state.preview.clone(),
+                        state.quitting.clone(),
+                    );
                 }
             }
         }
@@ -522,7 +645,12 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
                     },
                 );
             } else {
-                begin_shutdown(app, state.supervisor.clone(), state.quitting.clone());
+                begin_shutdown(
+                    app,
+                    state.supervisor.clone(),
+                    state.preview.clone(),
+                    state.quitting.clone(),
+                );
             }
         }
         _ => {}
@@ -536,15 +664,49 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn begin_shutdown(app: &AppHandle, supervisor: Supervisor, quitting: Arc<AtomicBool>) {
+fn begin_shutdown(
+    app: &AppHandle,
+    supervisor: Supervisor,
+    preview: PreviewService,
+    quitting: Arc<AtomicBool>,
+) {
     if quitting.swap(true, Ordering::SeqCst) {
         return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        preview.shutdown().await;
         supervisor.shutdown().await;
         app.exit(0);
     });
+}
+
+fn preview_request(id: i64, state: &State<'_, AppState>) -> Result<PreviewRequest, PreviewFailure> {
+    let mut video = state
+        .database
+        .get_video(id)
+        .map_err(|_| PreviewFailure::new("video_not_found", "找不到视频记录"))?;
+    if !Path::new(&video.path).is_file() {
+        let _ = state.database.mark_video_status(id, "missing");
+        video.status = "missing".to_owned();
+    }
+    let settings = state
+        .database
+        .get_settings()
+        .map_err(|_| PreviewFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    Ok(PreviewRequest {
+        video_id: video.id,
+        source_path: video.path,
+        source_status: video.status,
+        ffmpeg_path: settings.ffmpeg_path,
+        ffprobe_path: settings.ffprobe_path,
+    })
+}
+
+fn authorize_preview_media(app: &AppHandle, snapshot: &PreviewSnapshot) {
+    if let Some(media) = &snapshot.media {
+        let _ = app.asset_protocol_scope().allow_file(&media.path);
+    }
 }
 
 fn expand_home(path: &str) -> PathBuf {

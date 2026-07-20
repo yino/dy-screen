@@ -7,6 +7,7 @@ import type {
   Dashboard,
   EnvironmentStatus,
   MonitorEvent,
+  PreviewSnapshot,
   Streamer,
   VideoPage,
 } from "./types";
@@ -42,6 +43,11 @@ const tauriApi: ClientApi = {
     invoke<VideoPage>("list_current_videos", { streamerId }),
   getSettings: () => invoke<AppSettings>("get_settings"),
   saveSettings: (settings) => invoke<void>("save_settings", { settings }),
+  requestVideoPreview: (id) => invoke<PreviewSnapshot>("request_video_preview", { id }),
+  retryVideoPreview: (id) => invoke<PreviewSnapshot>("retry_video_preview", { id }),
+  getVideoPreview: (requestId) => invoke<PreviewSnapshot>("get_video_preview", { requestId }),
+  retainVideoPreview: (requestId) => invoke<void>("retain_video_preview", { requestId }),
+  releaseVideoPreview: (requestId) => invoke<void>("release_video_preview", { requestId }),
   openVideo: (id) => invoke<void>("open_video", { id }),
   revealVideo: (id) => invoke<void>("reveal_video", { id }),
   deleteVideo: (id) => invoke<void>("delete_video", { id }),
@@ -51,6 +57,12 @@ const tauriApi: ClientApi = {
   requestExit: (force) => invoke<void>("request_exit", { force }),
   subscribe: async (listener) => {
     const unlisten = await listen<MonitorEvent>("monitor-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
+  subscribePreview: async (listener) => {
+    const unlisten = await listen<PreviewSnapshot>("video-preview-event", (event) => {
       listener(event.payload);
     });
     return unlisten;
@@ -167,6 +179,31 @@ function createBrowserApi(): ClientApi {
       settings = nextSettings;
       localStorage.setItem("dy-screen-settings", JSON.stringify(settings));
     },
+    requestVideoPreview: async (id): Promise<PreviewSnapshot> => ({
+      requestId: `browser-preview-${id}`,
+      videoId: id,
+      state: "failed",
+      progressPercent: null,
+      message: "浏览器演示模式不能读取本地视频",
+      media: null,
+      errorCode: "browser_preview_unavailable",
+      errorMessage: "请在 Tauri 桌面客户端中使用内置视频预览",
+    }),
+    retryVideoPreview: async (id): Promise<PreviewSnapshot> => ({
+      requestId: `browser-preview-${id}`,
+      videoId: id,
+      state: "failed",
+      progressPercent: null,
+      message: "浏览器演示模式不能读取本地视频",
+      media: null,
+      errorCode: "browser_preview_unavailable",
+      errorMessage: "请在 Tauri 桌面客户端中使用内置视频预览",
+    }),
+    getVideoPreview: async () => {
+      throw new Error("浏览器演示模式没有预览任务");
+    },
+    retainVideoPreview: async () => undefined,
+    releaseVideoPreview: async () => undefined,
     openVideo: async () => undefined,
     revealVideo: async () => undefined,
     deleteVideo: async () => undefined,
@@ -178,6 +215,7 @@ function createBrowserApi(): ClientApi {
     }),
     requestExit: async () => undefined,
     subscribe: async () => () => undefined,
+    subscribePreview: async () => () => undefined,
   };
 }
 

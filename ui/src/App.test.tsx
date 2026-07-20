@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -17,6 +17,20 @@ const streamer: Streamer = {
   lastError: null,
   currentVideoCount: 0,
   historyVideoCount: 3,
+};
+
+const completedVideo: Video = {
+  id: 31,
+  sessionId: 8,
+  streamerId: streamer.id,
+  streamerName: streamer.name,
+  path: "/tmp/preview-source.mkv",
+  startedAt: "2026-07-18T20:00:00Z",
+  endedAt: "2026-07-18T20:01:00Z",
+  durationSeconds: 60,
+  sizeBytes: 1024,
+  audioPresent: true,
+  status: "complete",
 };
 
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
@@ -49,6 +63,11 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       autostartEnabled: false,
     }),
     saveSettings: vi.fn().mockResolvedValue(undefined),
+    requestVideoPreview: vi.fn().mockRejectedValue("测试未配置视频预览"),
+    retryVideoPreview: vi.fn().mockRejectedValue("测试未配置视频预览重试"),
+    getVideoPreview: vi.fn().mockRejectedValue("测试未配置视频预览查询"),
+    retainVideoPreview: vi.fn().mockResolvedValue(undefined),
+    releaseVideoPreview: vi.fn().mockResolvedValue(undefined),
     openVideo: vi.fn().mockResolvedValue(undefined),
     revealVideo: vi.fn().mockResolvedValue(undefined),
     deleteVideo: vi.fn().mockResolvedValue(undefined),
@@ -57,6 +76,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     diagnoseEnvironment: vi.fn().mockResolvedValue({ ffmpeg: true, ffprobe: true }),
     requestExit: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue(() => undefined),
+    subscribePreview: vi.fn().mockResolvedValue(() => undefined),
   };
 }
 
@@ -233,5 +253,327 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "保存并监听" }));
 
     expect(await screen.findByText("该直播间已经存在")).toBeInTheDocument();
+  });
+
+  it("从本次监听视频打开内置播放器", async () => {
+    const user = userEvent.setup();
+    const requestVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "preview-31",
+      videoId: 31,
+      state: "ready",
+      progressPercent: 100,
+      message: "视频可以播放",
+      media: {
+        path: "/tmp/cache/preview-31.mp4",
+        mimeType: "video/mp4",
+        cacheHit: false,
+        generated: true,
+        sourceMissing: false,
+      },
+      errorCode: null,
+      errorMessage: null,
+    });
+    const api = {
+      ...createApi([streamer], [completedVideo]),
+      requestVideoPreview,
+      getVideoPreview: vi.fn(),
+      retryVideoPreview: vi.fn(),
+      retainVideoPreview: vi.fn().mockResolvedValue(undefined),
+      releaseVideoPreview: vi.fn().mockResolvedValue(undefined),
+      subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+    } as ClientApi;
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+
+    expect(requestVideoPreview).toHaveBeenCalledWith(31);
+    expect(screen.getByRole("dialog", { name: "视频预览" })).toBeInTheDocument();
+    expect(screen.getByLabelText("视频播放器")).toBeInTheDocument();
+  });
+
+  it("视频库与本次监听视频使用相同预览入口", async () => {
+    const user = userEvent.setup();
+    const requestVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "preview-31",
+      videoId: 31,
+      state: "queued",
+      progressPercent: null,
+      message: "预览任务已进入队列",
+      media: null,
+      errorCode: null,
+      errorMessage: null,
+    });
+    const api = {
+      ...createApi([streamer], [completedVideo]),
+      requestVideoPreview,
+      getVideoPreview: vi.fn(),
+      retryVideoPreview: vi.fn(),
+      retainVideoPreview: vi.fn().mockResolvedValue(undefined),
+      releaseVideoPreview: vi.fn().mockResolvedValue(undefined),
+      subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+    } as ClientApi;
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "预览 preview-source.mkv" }));
+
+    expect(requestVideoPreview).toHaveBeenCalledWith(31);
+    expect(screen.getAllByText("预览任务已进入队列").length).toBeGreaterThan(0);
+  });
+
+  it("预览失败时提供重试和系统播放器打开", async () => {
+    const user = userEvent.setup();
+    const retryVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "retry-31",
+      videoId: 31,
+      state: "queued",
+      progressPercent: null,
+      message: "预览任务已进入队列",
+      media: null,
+      errorCode: null,
+      errorMessage: null,
+    });
+    const api = {
+      ...createApi([streamer], [completedVideo]),
+      requestVideoPreview: vi.fn().mockResolvedValue({
+        requestId: "preview-31",
+        videoId: 31,
+        state: "failed",
+        progressPercent: null,
+        message: "视频预览准备失败",
+        media: null,
+        errorCode: "ffmpeg_missing",
+        errorMessage: "无法启动 FFmpeg，请检查应用设置中的路径",
+      }),
+      getVideoPreview: vi.fn(),
+      retryVideoPreview,
+      retainVideoPreview: vi.fn().mockResolvedValue(undefined),
+      releaseVideoPreview: vi.fn().mockResolvedValue(undefined),
+      subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+    } as ClientApi;
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+    expect(await screen.findByText("无法启动 FFmpeg，请检查应用设置中的路径")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试预览" }));
+    expect(retryVideoPreview).toHaveBeenCalledWith(31);
+    expect(screen.getByRole("button", { name: "使用系统播放器打开" })).toBeInTheDocument();
+  });
+
+  it("通过后端事件把排队状态恢复为可播放状态", async () => {
+    const user = userEvent.setup();
+    let previewListener: ((snapshot: any) => void) | undefined;
+    const api = {
+      ...createApi([streamer], [completedVideo]),
+      requestVideoPreview: vi.fn().mockResolvedValue({
+        requestId: "preview-event-31",
+        videoId: 31,
+        state: "queued",
+        progressPercent: null,
+        message: "预览任务已进入队列",
+        media: null,
+        errorCode: null,
+        errorMessage: null,
+      }),
+      subscribePreview: vi.fn().mockImplementation(async (listener) => {
+        previewListener = listener;
+        return () => undefined;
+      }),
+    } as ClientApi;
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+    await act(async () => {
+      previewListener?.({
+        requestId: "preview-event-31",
+        videoId: 31,
+        state: "ready",
+        progressPercent: 100,
+        message: "视频可以播放",
+        media: {
+          path: "/tmp/cache/preview-event-31.mp4",
+          mimeType: "video/mp4",
+          cacheHit: true,
+          generated: true,
+          sourceMissing: false,
+        },
+        errorCode: null,
+        errorMessage: null,
+      });
+    });
+
+    expect(screen.getByLabelText("视频播放器")).toBeInTheDocument();
+    expect(screen.getByText("已使用预览缓存")).toBeInTheDocument();
+  });
+
+  it("关闭播放器时释放缓存播放引用", async () => {
+    const user = userEvent.setup();
+    const retainVideoPreview = vi.fn().mockResolvedValue(undefined);
+    const releaseVideoPreview = vi.fn().mockResolvedValue(undefined);
+    const api = {
+      ...createApi([streamer], [completedVideo]),
+      requestVideoPreview: vi.fn().mockResolvedValue({
+        requestId: "preview-release-31",
+        videoId: 31,
+        state: "ready",
+        progressPercent: 100,
+        message: "视频可以播放",
+        media: {
+          path: "/tmp/cache/preview-release-31.mp4",
+          mimeType: "video/mp4",
+          cacheHit: false,
+          generated: true,
+          sourceMissing: false,
+        },
+        errorCode: null,
+        errorMessage: null,
+      }),
+      retainVideoPreview,
+      releaseVideoPreview,
+    } as ClientApi;
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+    await waitFor(() => expect(retainVideoPreview).toHaveBeenCalledWith("preview-release-31"));
+    await user.click(screen.getByRole("button", { name: "关闭视频预览" }));
+
+    await waitFor(() => expect(releaseVideoPreview).toHaveBeenCalledWith("preview-release-31"));
+  });
+
+  it("源文件缺失且没有缓存时禁用预览入口", async () => {
+    const missing = {
+      ...completedVideo,
+      status: "missing",
+      hasPreviewCache: false,
+    } as Video & { hasPreviewCache: boolean };
+
+    render(<App api={createApi([streamer], [missing])} />);
+
+    expect(await screen.findByRole("button", { name: "预览视频" })).toBeDisabled();
+  });
+
+  it("源文件缺失但缓存有效时仍允许内置预览", async () => {
+    const user = userEvent.setup();
+    const missing = {
+      ...completedVideo,
+      status: "missing",
+      hasPreviewCache: true,
+    } as Video & { hasPreviewCache: boolean };
+    const api = createApi([streamer], [missing]);
+    api.requestVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "cached-missing-31",
+      videoId: 31,
+      state: "ready",
+      progressPercent: 100,
+      message: "预览缓存已准备完成",
+      media: {
+        path: "/tmp/cache/cached-missing-31.mp4",
+        mimeType: "video/mp4",
+        cacheHit: true,
+        generated: true,
+        sourceMissing: true,
+      },
+      errorCode: null,
+      errorMessage: null,
+    });
+
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+
+    expect(api.requestVideoPreview).toHaveBeenCalledWith(31);
+    expect(await screen.findByText("原文件缺失，仅播放缓存")).toBeInTheDocument();
+  });
+
+  it("忽略同一视频旧请求发出的迟到预览事件", async () => {
+    const user = userEvent.setup();
+    let previewListener: ((snapshot: any) => void) | undefined;
+    const api = createApi([streamer], [completedVideo]);
+    api.requestVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "current-request-31",
+      videoId: 31,
+      state: "queued",
+      progressPercent: null,
+      message: "当前请求仍在排队",
+      media: null,
+      errorCode: null,
+      errorMessage: null,
+    });
+    api.subscribePreview = vi.fn().mockImplementation(async (listener) => {
+      previewListener = listener;
+      return () => undefined;
+    });
+
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+    expect(await screen.findAllByText("当前请求仍在排队")).not.toHaveLength(0);
+
+    await act(async () => {
+      previewListener?.({
+        requestId: "old-request-31",
+        videoId: 31,
+        state: "ready",
+        progressPercent: 100,
+        message: "旧请求完成",
+        media: {
+          path: "/tmp/cache/old-request-31.mp4",
+          mimeType: "video/mp4",
+          cacheHit: true,
+          generated: true,
+          sourceMissing: false,
+        },
+        errorCode: null,
+        errorMessage: null,
+      });
+    });
+
+    expect(screen.queryByLabelText("视频播放器")).not.toBeInTheDocument();
+    expect(screen.getAllByText("当前请求仍在排队")).not.toHaveLength(0);
+  });
+
+  it("媒体加载失败后可重新准备预览并清除旧错误", async () => {
+    const user = userEvent.setup();
+    const api = createApi([streamer], [completedVideo]);
+    api.requestVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "broken-playback-31",
+      videoId: 31,
+      state: "ready",
+      progressPercent: 100,
+      message: "视频可以播放",
+      media: {
+        path: "/tmp/cache/broken-playback-31.mp4",
+        mimeType: "video/mp4",
+        cacheHit: true,
+        generated: true,
+        sourceMissing: false,
+      },
+      errorCode: null,
+      errorMessage: null,
+    });
+    api.retryVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "repaired-playback-31",
+      videoId: 31,
+      state: "ready",
+      progressPercent: 100,
+      message: "视频可以播放",
+      media: {
+        path: "/tmp/cache/repaired-playback-31.mp4",
+        mimeType: "video/mp4",
+        cacheHit: false,
+        generated: true,
+        sourceMissing: false,
+      },
+      errorCode: null,
+      errorMessage: null,
+    });
+
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "预览视频" }));
+    fireEvent.error(await screen.findByLabelText("视频播放器"));
+    expect(await screen.findByText("WebView 无法播放该预览文件，请尝试系统播放器")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "重新准备预览" }));
+
+    await waitFor(() => expect(api.retryVideoPreview).toHaveBeenCalledWith(31));
+    expect(screen.queryByText("WebView 无法播放该预览文件，请尝试系统播放器")).not.toBeInTheDocument();
   });
 });

@@ -926,6 +926,7 @@ fn map_video(row: &rusqlite::Row<'_>) -> rusqlite::Result<Video> {
         size_bytes: row.get(8)?,
         audio_present: audio.map(|value| value != 0),
         status: row.get(10)?,
+        has_preview_cache: false,
     })
 }
 

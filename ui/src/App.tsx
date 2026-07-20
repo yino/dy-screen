@@ -13,6 +13,7 @@ import {
   HardDrive,
   LayoutDashboard,
   LoaderCircle,
+  Maximize2,
   Menu,
   MoreHorizontal,
   Pencil,
@@ -20,6 +21,7 @@ import {
   Plus,
   Radio,
   RefreshCw,
+  RotateCcw,
   Save,
   Search,
   Settings,
@@ -31,6 +33,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppSettings,
@@ -38,6 +41,7 @@ import type {
   Dashboard,
   EnvironmentStatus,
   MonitorStatus,
+  PreviewSnapshot,
   Streamer,
   Video as VideoItem,
   VideoFilters,
@@ -45,6 +49,7 @@ import type {
 
 type Page = "monitor" | "library" | "ai" | "settings";
 type HistoryFilters = { search: string; status: string; date: string };
+type ActivePreview = { video: VideoItem; snapshot: PreviewSnapshot };
 
 const emptyDashboard: Dashboard = {
   streamers: [],
@@ -121,6 +126,40 @@ function toVideoFilters(filters: HistoryFilters): VideoFilters {
   };
 }
 
+function pendingPreview(videoId: number): PreviewSnapshot {
+  return {
+    requestId: `pending-${videoId}`,
+    videoId,
+    state: "queued",
+    progressPercent: null,
+    message: "正在提交预览任务",
+    media: null,
+    errorCode: null,
+    errorMessage: null,
+  };
+}
+
+function failedPreview(videoId: number, error: unknown): PreviewSnapshot {
+  const errorCode = typeof error === "object" && error !== null && "code" in error
+    && typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : "request_failed";
+  return {
+    requestId: `failed-${videoId}`,
+    videoId,
+    state: "failed",
+    progressPercent: null,
+    message: "视频预览准备失败",
+    media: null,
+    errorCode,
+    errorMessage: errorMessage(error, "无法准备视频预览"),
+  };
+}
+
+function previewMediaUrl(path: string): string {
+  return "__TAURI_INTERNALS__" in window ? convertFileSrc(path) : path;
+}
+
 interface AppProps {
   api: ClientApi;
 }
@@ -142,6 +181,7 @@ export function App({ api }: AppProps) {
   const [addOpen, setAddOpen] = useState(false);
   const [editingStreamer, setEditingStreamer] = useState<Streamer | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [preview, setPreview] = useState<ActivePreview | null>(null);
   const selectedIdRef = useRef(selectedId);
   const pageRef = useRef(page);
   const historyPageRef = useRef(historyPage);
@@ -228,6 +268,25 @@ export function App({ api }: AppProps) {
   }, [api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
 
   useEffect(() => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void api.subscribePreview((snapshot) => {
+      setPreview((current) => current
+        && current.video.id === snapshot.videoId
+        && current.snapshot.requestId === snapshot.requestId
+        ? { ...current, snapshot }
+        : current);
+    }).then((handler) => {
+      if (disposed) handler();
+      else unsubscribe = handler;
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, [api]);
+
+  useEffect(() => {
     if (selectedId) void refreshCurrentVideos(selectedId);
     else setCurrentVideos([]);
   }, [refreshCurrentVideos, selectedId]);
@@ -271,6 +330,37 @@ export function App({ api }: AppProps) {
       setNotice(errorMessage(error, "操作失败"));
     }
   };
+
+  const openPreview = (video: VideoItem) => {
+    setPreview({ video, snapshot: pendingPreview(video.id) });
+    void api.requestVideoPreview(video.id)
+      .then((snapshot) => setPreview((current) => current?.video.id === video.id
+        ? { video, snapshot }
+        : current))
+      .catch((error) => setPreview((current) => current?.video.id === video.id
+        ? { video, snapshot: failedPreview(video.id, error) }
+        : current));
+  };
+
+  const retryPreview = () => {
+    if (!preview) return;
+    const video = preview.video;
+    setPreview({ video, snapshot: pendingPreview(video.id) });
+    void api.retryVideoPreview(video.id)
+      .then((snapshot) => setPreview((current) => current?.video.id === video.id
+        ? { video, snapshot }
+        : current))
+      .catch((error) => setPreview((current) => current?.video.id === video.id
+        ? { video, snapshot: failedPreview(video.id, error) }
+        : current));
+  };
+
+  const updatePreviewSnapshot = useCallback((snapshot: PreviewSnapshot) => {
+    setPreview((current) => current?.video.id === snapshot.videoId
+      && current.snapshot.requestId === snapshot.requestId
+      ? { ...current, snapshot }
+      : current);
+  }, []);
 
   return (
     <div className="app-shell">
@@ -330,6 +420,7 @@ export function App({ api }: AppProps) {
                 void action(() => api.archiveStreamer(id), "主播已归档");
               }
             }}
+            onPreviewVideo={openPreview}
             onOpenVideo={(id) => void action(() => api.openVideo(id))}
             onRevealVideo={(id) => void action(() => api.revealVideo(id))}
           />
@@ -353,6 +444,7 @@ export function App({ api }: AppProps) {
               void refreshHistoryVideos(historyStreamerId, 1, filters);
             }}
             onPage={(nextPage) => void refreshHistoryVideos(historyStreamerId, nextPage, historyFilters)}
+            onPreview={openPreview}
             onOpen={(id) => void action(() => api.openVideo(id))}
             onReveal={(id) => void action(() => api.revealVideo(id))}
             onDelete={(id) => {
@@ -407,6 +499,18 @@ export function App({ api }: AppProps) {
             setSelectedId(created.id);
             setNotice(editingStreamer ? "主播信息已更新" : "主播已添加，正在执行首次状态检查");
           }}
+        />
+      )}
+
+      {preview && (
+        <VideoPreviewDialog
+          api={api}
+          video={preview.video}
+          snapshot={preview.snapshot}
+          onSnapshot={updatePreviewSnapshot}
+          onRetry={retryPreview}
+          onOpenSystem={() => void action(() => api.openVideo(preview.video.id))}
+          onClose={() => setPreview(null)}
         />
       )}
     </div>
@@ -492,6 +596,7 @@ function MonitorPage({
   onEdit,
   onStop,
   onArchive,
+  onPreviewVideo,
   onOpenVideo,
   onRevealVideo,
 }: {
@@ -508,6 +613,7 @@ function MonitorPage({
   onEdit: (streamer: Streamer) => void;
   onStop: (id: number) => void;
   onArchive: (id: number) => void;
+  onPreviewVideo: (video: VideoItem) => void;
   onOpenVideo: (id: number) => void;
   onRevealVideo: (id: number) => void;
 }) {
@@ -564,6 +670,7 @@ function MonitorPage({
         <SessionPanel
           streamer={selected}
           videos={videos}
+          onPreview={onPreviewVideo}
           onOpen={onOpenVideo}
           onReveal={onRevealVideo}
         />
@@ -620,7 +727,7 @@ function StatusBadge({ children, kind }: { children: string; kind: "live" | "rec
   return <span className={"status-badge " + kind}><span />{children}</span>;
 }
 
-function SessionPanel({ streamer, videos, onOpen, onReveal }: { streamer: Streamer | null; videos: VideoItem[]; onOpen: (id: number) => void; onReveal: (id: number) => void }) {
+function SessionPanel({ streamer, videos, onPreview, onOpen, onReveal }: { streamer: Streamer | null; videos: VideoItem[]; onPreview: (video: VideoItem) => void; onOpen: (id: number) => void; onReveal: (id: number) => void }) {
   return (
     <aside className="panel session-panel">
       <div className="panel-header compact"><div><p className="section-kicker">CURRENT SESSION</p><h2>本次监听视频</h2></div>{streamer && <StatusBadge kind={streamer.monitorStatus === "recording" ? "recording" : "neutral"}>{monitorLabels[streamer.monitorStatus]}</StatusBadge>}</div>
@@ -637,7 +744,7 @@ function SessionPanel({ streamer, videos, onOpen, onReveal }: { streamer: Stream
               <article className="video-item" key={video.id}>
                 <div className="video-thumb"><Play size={17} /></div>
                 <div className="video-meta"><strong title={video.path}>{fileName(video.path)}</strong><span>{formatDate(video.startedAt)} · {formatBytes(video.sizeBytes)}</span></div>
-                <div className="video-actions"><button aria-label="播放视频" onClick={() => onOpen(video.id)}><Play size={15} /></button><button aria-label="定位视频" onClick={() => onReveal(video.id)}><FolderOpen size={15} /></button></div>
+                <div className="video-actions"><button aria-label="预览视频" disabled={video.status === "missing" && video.hasPreviewCache !== true} onClick={() => onPreview(video)}><Play size={15} /></button><button aria-label="使用系统播放器打开" disabled={video.status === "missing"} onClick={() => onOpen(video.id)}><ExternalLink size={15} /></button><button aria-label="定位视频" disabled={video.status === "missing"} onClick={() => onReveal(video.id)}><FolderOpen size={15} /></button></div>
               </article>
             ))}
           </div>
@@ -648,7 +755,7 @@ function SessionPanel({ streamer, videos, onOpen, onReveal }: { streamer: Stream
   );
 }
 
-function LibraryPage({ videos, streamers, page, total, filters, onFilter, onFilters, onPage, onOpen, onReveal, onDelete, onDeleteSession }: { videos: VideoItem[]; streamers: Streamer[]; page: number; total: number; filters: HistoryFilters; onFilter: (id?: number) => void; onFilters: (filters: HistoryFilters) => void; onPage: (page: number) => void; onOpen: (id: number) => void; onReveal: (id: number) => void; onDelete: (id: number) => void; onDeleteSession: (sessionId: number) => void }) {
+function LibraryPage({ videos, streamers, page, total, filters, onFilter, onFilters, onPage, onPreview, onOpen, onReveal, onDelete, onDeleteSession }: { videos: VideoItem[]; streamers: Streamer[]; page: number; total: number; filters: HistoryFilters; onFilter: (id?: number) => void; onFilters: (filters: HistoryFilters) => void; onPage: (page: number) => void; onPreview: (video: VideoItem) => void; onOpen: (id: number) => void; onReveal: (id: number) => void; onDelete: (id: number) => void; onDeleteSession: (sessionId: number) => void }) {
   const totalPages = Math.max(1, Math.ceil(total / 50));
   const sessions = Array.from(videos.reduce((groups, video) => {
     const current = groups.get(video.sessionId) ?? [];
@@ -658,15 +765,143 @@ function LibraryPage({ videos, streamers, page, total, filters, onFilter, onFilt
   }, new Map<number, VideoItem[]>()).entries());
   return (
     <div className="page-content">
-      <section className="library-hero"><div><p className="section-kicker">RECORDING ARCHIVE</p><h2>所有录制历史都在本机</h2><p>按主播和会话浏览完成分片，使用系统播放器打开 MKV。</p></div><div className="hero-icon"><Download size={29} /></div></section>
+      <section className="library-hero"><div><p className="section-kicker">RECORDING ARCHIVE</p><h2>所有录制历史都在本机</h2><p>按主播和会话浏览完成分片，可在应用内预览或使用系统播放器打开原文件。</p></div><div className="hero-icon"><Download size={29} /></div></section>
       <section className="panel library-panel">
         <div className="filter-bar"><label className="search-field"><Search size={17} /><input value={filters.search} onChange={(event) => onFilters({ ...filters, search: event.target.value })} placeholder="搜索主播或文件名" /></label><select aria-label="按主播筛选" defaultValue="" onChange={(event) => onFilter(event.target.value ? Number(event.target.value) : undefined)}><option value="">全部主播</option>{streamers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><select aria-label="按日期筛选" value={filters.date} onChange={(event) => onFilters({ ...filters, date: event.target.value })}><option value="all">全部日期</option><option value="today">今天</option><option value="7days">最近 7 天</option><option value="30days">最近 30 天</option></select><select aria-label="按状态筛选" value={filters.status} onChange={(event) => onFilters({ ...filters, status: event.target.value })}><option value="all">全部状态</option><option value="complete">文件正常</option><option value="missing">文件缺失</option></select><div className="result-count">共 {total} 条</div></div>
         {videos.length === 0 ? (
           <div className="empty-state spacious"><FileVideo2 size={32} /><h3>还没有历史视频</h3><p>主播开播并完成第一个分片后，视频会自动归档到这里。</p></div>
         ) : (
-          <div className="library-sessions">{sessions.map(([sessionId, items]) => <section className="library-session" key={sessionId}><header><div><span>{items[0].streamerName}</span><strong>会话 #{sessionId}</strong><small>{items.length} 个分片 · {formatBytes(items.reduce((sum, item) => sum + item.sizeBytes, 0))}</small></div><button className="danger session-delete" aria-label={`删除会话 #${sessionId}`} onClick={() => onDeleteSession(sessionId)}><Trash2 size={15} />删除整个会话</button></header><div className="library-grid">{items.map((video) => <article className="library-card" key={video.id}><div className="library-preview"><Video size={28} /><span className={video.status === "missing" ? "file-state missing" : "file-state"}>{video.status === "missing" ? "文件缺失" : "MKV"}</span></div><div className="library-card-body"><span>{video.streamerName}</span><strong title={video.path}>{fileName(video.path)}</strong><small>{formatDate(video.startedAt)} · {formatBytes(video.sizeBytes)}</small><div><button disabled={video.status === "missing"} onClick={() => onOpen(video.id)}><Play size={15} />打开</button><button onClick={() => onReveal(video.id)}><FolderOpen size={15} />定位</button><button className="danger" onClick={() => onDelete(video.id)}><Trash2 size={15} /></button></div></div></article>)}</div></section>)}</div>
+          <div className="library-sessions">{sessions.map(([sessionId, items]) => <section className="library-session" key={sessionId}><header><div><span>{items[0].streamerName}</span><strong>会话 #{sessionId}</strong><small>{items.length} 个分片 · {formatBytes(items.reduce((sum, item) => sum + item.sizeBytes, 0))}</small></div><button className="danger session-delete" aria-label={`删除会话 #${sessionId}`} onClick={() => onDeleteSession(sessionId)}><Trash2 size={15} />删除整个会话</button></header><div className="library-grid">{items.map((video) => <article className="library-card" key={video.id}><div className="library-preview"><Video size={28} /><span className={video.status === "missing" ? "file-state missing" : "file-state"}>{video.status === "missing" ? "文件缺失" : fileName(video.path).toLowerCase().endsWith(".mp4") ? "MP4" : "MKV"}</span></div><div className="library-card-body"><span>{video.streamerName}</span><strong title={video.path}>{fileName(video.path)}</strong><small>{formatDate(video.startedAt)} · {formatBytes(video.sizeBytes)}</small><div><button aria-label={`预览 ${fileName(video.path)}`} disabled={video.status === "missing" && video.hasPreviewCache !== true} onClick={() => onPreview(video)}><Play size={15} />预览</button><button disabled={video.status === "missing"} onClick={() => onOpen(video.id)}><ExternalLink size={15} />系统打开</button><button disabled={video.status === "missing"} onClick={() => onReveal(video.id)}><FolderOpen size={15} />定位</button><button className="danger" onClick={() => onDelete(video.id)}><Trash2 size={15} /></button></div></div></article>)}</div></section>)}</div>
         )}
         {total > 50 && <div className="pagination"><button disabled={page <= 1} onClick={() => onPage(page - 1)}>上一页</button><span>第 {page} / {totalPages} 页</span><button disabled={page >= totalPages} onClick={() => onPage(page + 1)}>下一页</button></div>}
+      </section>
+    </div>
+  );
+}
+
+function VideoPreviewDialog({ api, video, snapshot, onSnapshot, onRetry, onOpenSystem, onClose }: {
+  api: ClientApi;
+  video: VideoItem;
+  snapshot: PreviewSnapshot;
+  onSnapshot: (snapshot: PreviewSnapshot) => void;
+  onRetry: () => void;
+  onOpenSystem: () => void;
+  onClose: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const modalRef = useRef<HTMLElement>(null);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const mediaUrl = snapshot.state === "ready" && snapshot.media
+    ? previewMediaUrl(snapshot.media.path)
+    : null;
+  const sourceUnavailable = video.status === "missing"
+    || snapshot.media?.sourceMissing === true
+    || snapshot.errorCode === "source_missing";
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  useEffect(() => {
+    if (["ready", "failed"].includes(snapshot.state)
+      || snapshot.requestId.startsWith("pending-")
+      || snapshot.requestId.startsWith("failed-")) return;
+    let disposed = false;
+    const refresh = async () => {
+      try {
+        const latest = await api.getVideoPreview(snapshot.requestId);
+        if (!disposed && latest) onSnapshot(latest);
+      } catch {
+        // 状态事件仍会继续更新，短暂查询失败不覆盖当前状态。
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [api, onSnapshot, snapshot.requestId, snapshot.state]);
+
+  useEffect(() => {
+    setPlaybackError(null);
+    setAutoplayBlocked(false);
+  }, [mediaUrl, snapshot.requestId]);
+
+  useEffect(() => {
+    if (!mediaUrl) return;
+    void api.retainVideoPreview(snapshot.requestId);
+    return () => {
+      const player = videoRef.current;
+      player?.pause();
+      if (player) player.removeAttribute("src");
+      void api.releaseVideoPreview(snapshot.requestId);
+    };
+  }, [api, mediaUrl, snapshot.requestId]);
+
+  const tryAutoplay = () => {
+    const player = videoRef.current;
+    if (!player || !("__TAURI_INTERNALS__" in window)) return;
+    player.play()
+      .then(() => setAutoplayBlocked(false))
+      .catch(() => setAutoplayBlocked(true));
+  };
+
+  const changeRate = (rate: number) => {
+    setPlaybackRate(rate);
+    if (videoRef.current) videoRef.current.playbackRate = rate;
+  };
+
+  const enterFullscreen = () => {
+    const target = modalRef.current;
+    if (target?.requestFullscreen) void target.requestFullscreen();
+  };
+
+  const statusClass = snapshot.state === "failed" ? "failed" : snapshot.state === "ready" ? "ready" : "working";
+  return (
+    <div className="modal-backdrop preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section ref={modalRef} className="preview-modal" role="dialog" aria-modal="true" aria-label="视频预览">
+        <header className="preview-header">
+          <div><p className="section-kicker">IN-APP PREVIEW</p><h2>视频预览</h2><span title={video.path}>{fileName(video.path)}</span></div>
+          <button autoFocus className="icon-button" aria-label="关闭视频预览" onClick={onClose}><X size={20} /></button>
+        </header>
+
+        <div className="preview-stage">
+          {mediaUrl ? (
+            <>
+              <video
+                ref={videoRef}
+                aria-label="视频播放器"
+                src={mediaUrl}
+                controls
+                playsInline
+                onCanPlay={tryAutoplay}
+                onError={() => setPlaybackError("WebView 无法播放该预览文件，请尝试系统播放器")}
+              />
+              {autoplayBlocked && <button className="preview-play-overlay" onClick={() => void videoRef.current?.play().then(() => setAutoplayBlocked(false))}><Play size={24} />点击播放</button>}
+            </>
+          ) : snapshot.state === "failed" ? (
+            <div className="preview-error"><CircleOff size={37} /><h3>无法准备视频预览</h3><p>{snapshot.errorMessage || "视频预览处理失败"}</p><div><button className="primary-button" onClick={onRetry}><RotateCcw size={16} />重试预览</button><button className="secondary-button" disabled={sourceUnavailable} onClick={onOpenSystem}><ExternalLink size={16} />使用系统播放器打开</button></div></div>
+          ) : (
+            <div className="preview-preparing"><LoaderCircle className="spin" size={36} /><h3>{snapshot.message}</h3><p>{snapshot.state === "transcoding" ? "源编码与 MP4 不兼容，正在转换为 H.264 + AAC。" : "原始 MKV 会保留，预览缓存准备完成后将自动播放。"}</p>{snapshot.progressPercent !== null && <div className="preview-progress" aria-label={`转换进度 ${Math.round(snapshot.progressPercent)}%`}><span style={{ width: `${snapshot.progressPercent}%` }} /></div>}</div>
+          )}
+        </div>
+
+        <footer className="preview-footer">
+          <div className={`preview-status ${statusClass}`}><span />{snapshot.message}{snapshot.progressPercent !== null && snapshot.state !== "ready" ? ` · ${Math.round(snapshot.progressPercent)}%` : ""}</div>
+          {snapshot.media?.cacheHit && <span className="cache-badge">已使用预览缓存</span>}
+          {snapshot.media?.sourceMissing && <span className="cache-badge warning">原文件缺失，仅播放缓存</span>}
+          {mediaUrl && <label className="preview-rate">倍速<select aria-label="播放倍速" value={playbackRate} onChange={(event) => changeRate(Number(event.target.value))}><option value={0.5}>0.5×</option><option value={1}>1×</option><option value={1.25}>1.25×</option><option value={1.5}>1.5×</option><option value={2}>2×</option></select></label>}
+          {mediaUrl && <button className="secondary-button compact" onClick={enterFullscreen}><Maximize2 size={15} />全屏</button>}
+          {snapshot.state !== "failed" && <button className="secondary-button compact" disabled={sourceUnavailable} onClick={onOpenSystem}><ExternalLink size={15} />系统打开</button>}
+        </footer>
+        {playbackError && <div className="preview-playback-error" role="alert"><span>{playbackError}</span><button onClick={onRetry}>重新准备预览</button><button disabled={sourceUnavailable} onClick={onOpenSystem}>使用系统播放器打开</button></div>}
       </section>
     </div>
   );
