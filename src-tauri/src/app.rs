@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use dy_screen::resolver::StreamResolver;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
@@ -12,17 +11,16 @@ use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
-use crate::app_support::{
-    delete_recording_session, parse_room_identity, validate_room_access, validate_settings,
-};
+use crate::app_support::{delete_recording_session, validate_settings};
 use crate::database::Database;
 use crate::domain::{
-    AppSettings, CreateStreamerRequest, Dashboard, EnvironmentStatus, MonitorEvent, NewStreamer,
+    AppSettings, CommandError, CreateStreamerRequest, Dashboard, EnvironmentStatus, MonitorEvent,
     Streamer, VideoFilter, VideoPage,
 };
 use crate::preview::{
     PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
 };
+use crate::streamer_service::{PublicSourceInspector, create_streamer_with, update_streamer_with};
 use crate::supervisor::{MonitorPublisher, Supervisor};
 
 type TrayStatus = Arc<Mutex<Option<MenuItem<tauri::Wry>>>>;
@@ -96,40 +94,9 @@ fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
 async fn create_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
-) -> Result<Streamer, String> {
-    let name = input.name.trim();
-    if name.is_empty() {
-        return Err("请输入主播名称".to_owned());
-    }
-    if name.chars().count() > 80 {
-        return Err("主播名称不能超过 80 个字符".to_owned());
-    }
-    let (room_url, _) = parse_room_identity(&input.room_url)?;
-    let resolver = StreamResolver::new().map_err(|_| "无法初始化直播间访问校验".to_owned())?;
-    let room_id = validate_room_access(resolver.inspect(&room_url).await)?;
-    let existing = state
-        .database
-        .find_streamer_by_room_id(&room_id)
-        .map_err(|error| error.to_string())?;
-    if let Some(existing) = existing.as_ref().filter(|streamer| !streamer.archived) {
-        return Err(format!("该直播间已经存在，主播 ID 为 {}", existing.id));
-    }
-    let new_streamer = NewStreamer {
-        name: name.to_owned(),
-        room_url,
-        room_id,
-        monitor_enabled: input.monitor_enabled,
-    };
-    let streamer = if let Some(existing) = existing {
-        state.database.restore_streamer(existing.id, &new_streamer)
-    } else {
-        state.database.add_streamer(&new_streamer)
-    }
-    .map_err(|error| error.to_string())?;
-    if streamer.monitor_enabled {
-        state.supervisor.start(streamer.id)?;
-    }
-    Ok(streamer)
+) -> Result<Streamer, CommandError> {
+    let inspector = PublicSourceInspector::new()?;
+    create_streamer_with(&state.database, &inspector, &state.supervisor, input).await
 }
 
 #[tauri::command]
@@ -137,54 +104,9 @@ async fn update_streamer(
     id: i64,
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
-) -> Result<Streamer, String> {
-    let name = input.name.trim();
-    if name.is_empty() {
-        return Err("请输入主播名称".to_owned());
-    }
-    if name.chars().count() > 80 {
-        return Err("主播名称不能超过 80 个字符".to_owned());
-    }
-    let current = state
-        .database
-        .get_streamer(id)
-        .map_err(|error| error.to_string())?;
-    let (room_url, _) = parse_room_identity(&input.room_url)?;
-    let resolver = StreamResolver::new().map_err(|_| "无法初始化直播间访问校验".to_owned())?;
-    let room_id = validate_room_access(resolver.inspect(&room_url).await)?;
-    if let Some(existing) = state
-        .database
-        .find_streamer_by_room_id(&room_id)
-        .map_err(|error| error.to_string())?
-        && existing.id != id
-    {
-        return Err(format!("该直播间已经存在，主播 ID 为 {}", existing.id));
-    }
-    if current.monitor_enabled {
-        state.supervisor.stop(id).await?;
-    }
-    let updated = state.database.update_streamer(
-        id,
-        &NewStreamer {
-            name: name.to_owned(),
-            room_url,
-            room_id,
-            monitor_enabled: input.monitor_enabled,
-        },
-    );
-    let updated = match updated {
-        Ok(streamer) => streamer,
-        Err(error) => {
-            if current.monitor_enabled {
-                let _ = state.supervisor.resume(id).await;
-            }
-            return Err(error.to_string());
-        }
-    };
-    if updated.monitor_enabled {
-        state.supervisor.start(updated.id)?;
-    }
-    Ok(updated)
+) -> Result<Streamer, CommandError> {
+    let inspector = PublicSourceInspector::new()?;
+    update_streamer_with(&state.database, &inspector, &state.supervisor, id, input).await
 }
 
 #[tauri::command]

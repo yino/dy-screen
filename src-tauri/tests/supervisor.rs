@@ -56,12 +56,7 @@ async fn one_streamer_only_has_one_worker_and_can_be_woken_immediately() {
     let database = Database::open_in_memory().unwrap();
     database.migrate().unwrap();
     let streamer = database
-        .add_streamer(&NewStreamer {
-            name: "主播".to_owned(),
-            room_url: "https://live.douyin.com/1".to_owned(),
-            room_id: "room-1".to_owned(),
-            monitor_enabled: true,
-        })
+        .add_streamer(&NewStreamer::room("主播", "1", "room-1", true))
         .unwrap();
     let supervisor = Supervisor::new(database, Arc::new(NoopPublisher), 4).unwrap();
 

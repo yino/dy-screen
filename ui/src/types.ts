@@ -3,6 +3,12 @@ export type LiveStatus = "checking" | "offline" | "live" | "error";
 export type MonitorStatus =
   | "paused"
   | "waiting"
+  | "discovering"
+  | "waiting_first_live"
+  | "profile_error"
+  | "rediscovering"
+  | "entry_invalid"
+  | "identity_conflict"
   | "waiting_resource"
   | "recording"
   | "retrying"
@@ -11,8 +17,12 @@ export type MonitorStatus =
 export interface Streamer {
   id: number;
   name: string;
-  roomUrl: string;
-  roomId: string;
+  sourceKind: "profile" | "room";
+  sourceUrl: string;
+  profileSecUid: string | null;
+  webRid: string | null;
+  roomUrl: string | null;
+  roomId: string | null;
   monitorEnabled: boolean;
   archived: boolean;
   liveStatus: LiveStatus;
@@ -31,7 +41,7 @@ export interface Dashboard {
 
 export interface CreateStreamerInput {
   name: string;
-  roomUrl: string;
+  sourceUrl: string;
   monitorEnabled: boolean;
 }
 

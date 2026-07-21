@@ -14,6 +14,7 @@ export PATH := $(CARGO_BIN_DIR):$(PATH)
 endif
 
 ROOM_URL ?= https://live.douyin.com/452086788686
+PROFILE_URL ?= https://www.douyin.com/user/MS4wLjABAAAAdUzdkD-hjRb0rWmS8d02sHzajJrlII40rcefrLK7Oug
 ROOM_URLS ?= $(ROOM_URL)
 QUALITY ?= HD1
 PROTOCOL ?= flv
@@ -31,7 +32,8 @@ ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
 
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
-	preview-doctor test-preview test-preview-integration resolve record record-multi clean
+	preview-doctor test-preview test-preview-integration test-profile test-migration \
+	test-supervisor-profile inspect-profile resolve record record-multi clean
 
 help:
 	@printf '%s\n' \
@@ -50,6 +52,9 @@ help:
 		'  make preview-doctor  检查视频预览所需 FFmpeg 编码能力' \
 		'  make test-preview    执行预览服务和播放器组件测试' \
 		'  make test-preview-integration 使用真实 FFmpeg 样本验证预览转换' \
+		'  make test-profile    执行个人主页 fixture 与脱敏测试' \
+		'  make test-migration  执行三层身份数据库迁移测试' \
+		'  make test-supervisor-profile 执行主页/直播间双阶段状态机测试' \
 		'  make check           执行格式、Clippy、测试和前端构建' \
 		'  make spec-validate   严格校验当前 OpenSpec 变更' \
 		'  make verify          执行 check、OpenSpec 校验和桌面应用构建' \
@@ -57,12 +62,14 @@ help:
 		'原录制核心/CLI：' \
 		'  make core-build      构建 Rust CLI 调试版本' \
 		'  make release         构建 Rust CLI 发布版本' \
+		'  make inspect-profile 只读检查公开个人主页及直播入口' \
 		'  make resolve         解析单个直播间及可用清晰度' \
 		'  make record          录制单个直播间' \
 		'  make record-multi    同时录制多个直播间' \
 		'' \
 		'常用录制参数：' \
 		'  ROOM_URL=<url>               单个直播间地址' \
+		'  PROFILE_URL=<url>            公开个人主页地址' \
 		'  ROOM_URLS="<url1> <url2>"   多个直播间地址' \
 		'  QUALITY=HD1                  FULL_HD1/HD1/SD1/SD2' \
 		'  PROTOCOL=flv                 flv 或 hls' \
@@ -136,6 +143,16 @@ test-preview-integration: preview-doctor
 	FFMPEG="$(FFMPEG)" FFPROBE="$(FFPROBE)" "$(CARGO)" test --manifest-path src-tauri/Cargo.toml \
 		--test preview real_ffmpeg_handles_remux_transcode_and_video_without_audio -- --ignored --nocapture
 
+test-profile:
+	"$(CARGO)" test --test profile_resolver
+
+test-migration:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test repository legacy_migration
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test repository migrated_identity_indexes_are_partial_and_room_id_is_not_unique -- --exact
+
+test-supervisor-profile:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test supervisor_profile
+
 test: test-frontend test-core test-app
 
 check: fmt-check lint test frontend-build
@@ -147,6 +164,9 @@ verify: check spec-validate app-build
 
 resolve: release
 	"$(BINARY)" resolve "$(ROOM_URL)" $(QUALITY_ARG) $(PROTOCOL_ARG) $(JSON_ARG)
+
+inspect-profile: release
+	"$(BINARY)" inspect-profile "$(PROFILE_URL)" $(JSON_ARG)
 
 record: release
 	"$(BINARY)" record "$(ROOM_URL)" $(QUALITY_ARG) $(PROTOCOL_ARG) \

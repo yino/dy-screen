@@ -2,7 +2,8 @@ use dy_screen::error::RecorderError;
 use dy_screen::model::RoomStreams;
 use dy_screen::resolver::RoomInspection;
 use dy_screen_app_lib::app_support::{
-    delete_recording_session, parse_room_identity, validate_room_access, validate_settings,
+    NormalizedStreamerSource, delete_recording_session, parse_room_identity, parse_streamer_source,
+    validate_room_access, validate_settings,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{AppSettings, NewStreamer, NewVideo};
@@ -20,6 +21,37 @@ fn unsupported_host_is_rejected_without_exposing_query_values() {
     let error = parse_room_identity("https://example.com/1?signature=secret").unwrap_err();
     assert!(error.contains("抖音公开直播间"));
     assert!(!error.contains("secret"));
+}
+
+#[test]
+fn source_url_classification_accepts_profiles_and_rooms() {
+    let profile =
+        parse_streamer_source("https://douyin.com/user/profile-sec-uid?from=share#works").unwrap();
+    assert_eq!(
+        profile,
+        NormalizedStreamerSource::Profile {
+            source_url: "https://www.douyin.com/user/profile-sec-uid".to_owned(),
+            profile_sec_uid: "profile-sec-uid".to_owned(),
+        }
+    );
+
+    let room = parse_streamer_source("https://live.douyin.com/452086788686?anchor_id=123#fragment")
+        .unwrap();
+    assert_eq!(
+        room,
+        NormalizedStreamerSource::Room {
+            source_url: "https://live.douyin.com/452086788686".to_owned(),
+            web_rid: "452086788686".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn unsupported_source_url_is_rejected_without_exposing_tracking_values() {
+    let error =
+        parse_streamer_source("https://example.com/user/demo?token=source-secret").unwrap_err();
+    assert!(error.contains("个人主页或直播间"));
+    assert!(!error.contains("source-secret"));
 }
 
 #[test]
@@ -101,12 +133,7 @@ fn deleting_a_session_restores_earlier_files_when_a_later_file_fails() {
     let database = Database::open_in_memory().unwrap();
     database.migrate().unwrap();
     let streamer = database
-        .add_streamer(&NewStreamer {
-            name: "回滚主播".to_owned(),
-            room_url: "https://live.douyin.com/701".to_owned(),
-            room_id: "room-701".to_owned(),
-            monitor_enabled: false,
-        })
+        .add_streamer(&NewStreamer::room("回滚主播", "701", "room-701", false))
         .unwrap();
     let session = database.start_session(streamer.id, "/tmp").unwrap();
     for path in [&first_path, &invalid_second_path] {
@@ -137,12 +164,7 @@ fn session_with_video(path: &std::path::Path) -> (Database, i64) {
     let database = Database::open_in_memory().unwrap();
     database.migrate().unwrap();
     let streamer = database
-        .add_streamer(&NewStreamer {
-            name: "会话主播".to_owned(),
-            room_url: "https://live.douyin.com/700".to_owned(),
-            room_id: "room-700".to_owned(),
-            monitor_enabled: false,
-        })
+        .add_streamer(&NewStreamer::room("会话主播", "700", "room-700", false))
         .unwrap();
     let session = database.start_session(streamer.id, "/tmp").unwrap();
     database

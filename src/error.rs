@@ -1,16 +1,37 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::model::ProfileDiscoveryErrorKind;
+
 pub type Result<T> = std::result::Result<T, RecorderError>;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum RecorderError {
     #[error("invalid room URL: {reason}")]
     InvalidRoomUrl { reason: String },
 
     #[error("unsupported room URL host; expected live.douyin.com")]
     UnsupportedRoomUrl { url: String },
+
+    #[error("个人主页 URL 无效：{reason}")]
+    InvalidProfileUrl { reason: String },
+
+    #[error("仅支持公开抖音个人主页 douyin.com/user/{{profile_sec_uid}}")]
+    UnsupportedProfileUrl,
+
+    #[error("访问公开抖音个人主页失败")]
+    ProfilePageRequest {
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("公开抖音个人主页暂时无法访问（HTTP {status}）")]
+    ProfileHttpStatus { status: u16 },
+
+    #[error("公开抖音个人主页需要登录、验证码或额外访问权限")]
+    ProfileAccessRestricted,
 
     #[error("failed to fetch the Douyin room page: {0}")]
     PageRequest(#[from] reqwest::Error),
@@ -43,5 +64,25 @@ pub enum RecorderError {
 impl RecorderError {
     pub fn safe_message(&self) -> String {
         self.to_string()
+    }
+
+    pub fn profile_discovery_kind(&self) -> Option<ProfileDiscoveryErrorKind> {
+        match self {
+            Self::ProfilePageRequest { .. } | Self::ProfileHttpStatus { .. } => {
+                Some(ProfileDiscoveryErrorKind::Retryable)
+            }
+            Self::ProfileAccessRestricted => Some(ProfileDiscoveryErrorKind::AccessRestricted),
+            Self::UnsupportedPageLayout => Some(ProfileDiscoveryErrorKind::UnsupportedPageLayout),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for RecorderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("RecorderError")
+            .field(&self.safe_message())
+            .finish()
     }
 }

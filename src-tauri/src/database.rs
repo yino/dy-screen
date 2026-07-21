@@ -7,8 +7,8 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::domain::{
-    AppSettings, Dashboard, NewStreamer, NewVideo, RecordingSession, Streamer, Video, VideoFilter,
-    VideoPage,
+    AppSettings, Dashboard, DiscoveryBinding, NewStreamer, NewVideo, RecordingSession, Streamer,
+    StreamerSourceKind, Video, VideoFilter, VideoPage,
 };
 
 #[derive(Debug, Error)]
@@ -19,10 +19,16 @@ pub enum DatabaseError {
     Io(#[from] std::io::Error),
     #[error("该直播间已经存在")]
     DuplicateStreamer,
+    #[error("该个人主页已经存在")]
+    DuplicateProfile,
+    #[error("该稳定直播入口已经存在")]
+    DuplicateWebRid,
     #[error("找不到记录：{0}")]
     NotFound(&'static str),
     #[error("数据库锁已损坏")]
     Poisoned,
+    #[error("数据库迁移完整性检查失败：{0}")]
+    MigrationIntegrity(String),
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -37,7 +43,7 @@ struct SessionManifestScope {
     output_root: String,
     started_at: String,
     ended_at: Option<String>,
-    room_id: String,
+    room_id: Option<String>,
 }
 
 impl Database {
@@ -69,8 +75,7 @@ impl Database {
 
     pub fn migrate(&self) -> Result<()> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        transaction.execute_batch(
+        connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -78,7 +83,7 @@ impl Database {
             );
             "#,
         )?;
-        let applied = transaction
+        let applied = connection
             .query_row(
                 "SELECT 1 FROM schema_migrations WHERE version = 1",
                 [],
@@ -87,6 +92,7 @@ impl Database {
             .optional()?
             .is_some();
         if !applied {
+            let transaction = connection.transaction()?;
             transaction.execute_batch(
                 r#"
                 CREATE TABLE streamers (
@@ -141,8 +147,35 @@ impl Database {
                 "INSERT INTO schema_migrations(version, applied_at) VALUES(1, ?1)",
                 [Utc::now().to_rfc3339()],
             )?;
+            transaction.commit()?;
         }
-        transaction.commit()?;
+
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = 2",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            connection.pragma_update(None, "foreign_keys", "OFF")?;
+            let migration = migrate_streamers_v2(&mut connection);
+            let restore_foreign_keys = connection.pragma_update(None, "foreign_keys", "ON");
+            migration?;
+            restore_foreign_keys?;
+
+            let violations: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if violations != 0 {
+                return Err(DatabaseError::MigrationIntegrity(format!(
+                    "发现 {violations} 条外键异常"
+                )));
+            }
+        }
         drop(connection);
         self.ensure_default_settings()
     }
@@ -178,24 +211,31 @@ impl Database {
 
     pub fn add_streamer(&self, input: &NewStreamer) -> Result<Streamer> {
         let now = Utc::now().to_rfc3339();
-        let monitor_status = if input.monitor_enabled {
-            "waiting"
+        let monitor_status = initial_monitor_status(input);
+        let live_status = if input.web_rid.is_some() {
+            "checking"
         } else {
-            "paused"
+            "offline"
         };
         let connection = self.connection()?;
         let inserted = connection.execute(
             r#"
             INSERT INTO streamers(
-                name, room_url, room_id, monitor_enabled, archived,
+                name, source_kind, source_url, profile_sec_uid, web_rid,
+                room_url, room_id, monitor_enabled, archived,
                 live_status, monitor_status, created_at, updated_at
-            ) VALUES(?1, ?2, ?3, ?4, 0, 'checking', ?5, ?6, ?6)
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?11)
             "#,
             params![
                 input.name.trim(),
+                source_kind_value(input.source_kind),
+                input.source_url,
+                input.profile_sec_uid,
+                input.web_rid,
                 input.room_url,
                 input.room_id,
                 input.monitor_enabled,
+                live_status,
                 monitor_status,
                 now
             ],
@@ -207,7 +247,7 @@ impl Database {
                 self.get_streamer(id)
             }
             Err(error) if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
-                Err(DatabaseError::DuplicateStreamer)
+                Err(duplicate_identity_error(input))
             }
             Err(error) => Err(error.into()),
         }
@@ -225,8 +265,35 @@ impl Database {
         let connection = self.connection()?;
         connection
             .query_row(
-                &streamer_select("WHERE s.room_id = ?1"),
+                &streamer_select("WHERE s.room_id = ?1 ORDER BY s.id LIMIT 1"),
                 [room_id],
+                map_streamer,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn find_streamer_by_profile_sec_uid(
+        &self,
+        profile_sec_uid: &str,
+    ) -> Result<Option<Streamer>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                &streamer_select("WHERE s.profile_sec_uid = ?1"),
+                [profile_sec_uid],
+                map_streamer,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn find_streamer_by_web_rid(&self, web_rid: &str) -> Result<Option<Streamer>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                &streamer_select("WHERE s.web_rid = ?1"),
+                [web_rid],
                 map_streamer,
             )
             .optional()
@@ -260,25 +327,32 @@ impl Database {
     }
 
     pub fn update_streamer(&self, id: i64, input: &NewStreamer) -> Result<Streamer> {
-        let monitor_status = if input.monitor_enabled {
-            "waiting"
+        let monitor_status = initial_monitor_status(input);
+        let live_status = if input.web_rid.is_some() {
+            "checking"
         } else {
-            "paused"
+            "offline"
         };
         let connection = self.connection()?;
         let updated = connection.execute(
             r#"
             UPDATE streamers
-            SET name = ?1, room_url = ?2, room_id = ?3, monitor_enabled = ?4,
-                live_status = 'checking', monitor_status = ?5, last_error = NULL,
-                updated_at = ?6
-            WHERE id = ?7 AND archived = 0
+            SET name = ?1, source_kind = ?2, source_url = ?3,
+                profile_sec_uid = ?4, web_rid = ?5, room_url = ?6,
+                room_id = ?7, monitor_enabled = ?8, live_status = ?9,
+                monitor_status = ?10, last_error = NULL, updated_at = ?11
+            WHERE id = ?12 AND archived = 0
             "#,
             params![
                 input.name.trim(),
+                source_kind_value(input.source_kind),
+                input.source_url,
+                input.profile_sec_uid,
+                input.web_rid,
                 input.room_url,
                 input.room_id,
                 input.monitor_enabled,
+                live_status,
                 monitor_status,
                 Utc::now().to_rfc3339(),
                 id
@@ -291,32 +365,40 @@ impl Database {
                 self.get_streamer(id)
             }
             Err(error) if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
-                Err(DatabaseError::DuplicateStreamer)
+                Err(duplicate_identity_error(input))
             }
             Err(error) => Err(error.into()),
         }
     }
 
     pub fn restore_streamer(&self, id: i64, input: &NewStreamer) -> Result<Streamer> {
-        let monitor_status = if input.monitor_enabled {
-            "waiting"
+        let monitor_status = initial_monitor_status(input);
+        let live_status = if input.web_rid.is_some() {
+            "checking"
         } else {
-            "paused"
+            "offline"
         };
         let connection = self.connection()?;
         let changed = connection.execute(
             r#"
             UPDATE streamers
-            SET name = ?1, room_url = ?2, room_id = ?3, monitor_enabled = ?4,
-                archived = 0, live_status = 'checking', monitor_status = ?5,
-                last_checked_at = NULL, last_error = NULL, updated_at = ?6
-            WHERE id = ?7 AND archived = 1
+            SET name = ?1, source_kind = ?2, source_url = ?3,
+                profile_sec_uid = ?4, web_rid = ?5, room_url = ?6,
+                room_id = ?7, monitor_enabled = ?8, archived = 0,
+                live_status = ?9, monitor_status = ?10, last_checked_at = NULL,
+                last_error = NULL, updated_at = ?11
+            WHERE id = ?12 AND archived = 1
             "#,
             params![
                 input.name.trim(),
+                source_kind_value(input.source_kind),
+                input.source_url,
+                input.profile_sec_uid,
+                input.web_rid,
                 input.room_url,
                 input.room_id,
                 input.monitor_enabled,
+                live_status,
                 monitor_status,
                 Utc::now().to_rfc3339(),
                 id
@@ -327,6 +409,152 @@ impl Database {
         }
         drop(connection);
         self.get_streamer(id)
+    }
+
+    pub fn bind_discovered_room(
+        &self,
+        streamer_id: i64,
+        web_rid: &str,
+        room_url: &str,
+        room_id: Option<&str>,
+    ) -> Result<DiscoveryBinding> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let source = transaction
+            .query_row(
+                "SELECT source_url, profile_sec_uid, monitor_enabled FROM streamers WHERE id = ?1",
+                [streamer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotFound("主播"))?;
+        let target = transaction
+            .query_row(
+                "SELECT id, profile_sec_uid, monitor_enabled FROM streamers WHERE web_rid = ?1 AND id <> ?2",
+                params![web_rid, streamer_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((target_id, target_profile_sec_uid, target_monitor_enabled)) = target else {
+            transaction.execute(
+                r#"
+                UPDATE streamers
+                SET web_rid = ?1, room_url = ?2, room_id = ?3,
+                    live_status = 'checking', monitor_status = CASE
+                        WHEN monitor_enabled = 1 THEN 'waiting' ELSE 'paused' END,
+                    last_error = NULL, updated_at = ?4
+                WHERE id = ?5
+                "#,
+                params![
+                    web_rid,
+                    room_url,
+                    room_id,
+                    Utc::now().to_rfc3339(),
+                    streamer_id
+                ],
+            )?;
+            transaction.commit()?;
+            drop(connection);
+            return self
+                .get_streamer(streamer_id)
+                .map(Box::new)
+                .map(DiscoveryBinding::Bound);
+        };
+
+        let source_history_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM recording_sessions WHERE streamer_id = ?1",
+            [streamer_id],
+            |row| row.get(0),
+        )?;
+        let profile_is_compatible =
+            target_profile_sec_uid.is_none() || target_profile_sec_uid == source.1;
+        if source_history_count == 0 && profile_is_compatible {
+            transaction.execute("DELETE FROM streamers WHERE id = ?1", [streamer_id])?;
+            let monitor_enabled = source.2 || target_monitor_enabled;
+            transaction.execute(
+                r#"
+                UPDATE streamers
+                SET source_kind = CASE WHEN ?1 IS NULL THEN source_kind ELSE 'profile' END,
+                    source_url = CASE WHEN ?1 IS NULL THEN source_url ELSE ?2 END,
+                    profile_sec_uid = COALESCE(profile_sec_uid, ?1),
+                    web_rid = ?3, room_url = ?4, room_id = ?5,
+                    monitor_enabled = ?6, archived = 0, live_status = 'checking',
+                    monitor_status = CASE WHEN ?6 = 1 THEN 'waiting' ELSE 'paused' END,
+                    last_checked_at = NULL, last_error = NULL, updated_at = ?7
+                WHERE id = ?8
+                "#,
+                params![
+                    source.1,
+                    source.0,
+                    web_rid,
+                    room_url,
+                    room_id,
+                    monitor_enabled,
+                    Utc::now().to_rfc3339(),
+                    target_id
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(DiscoveryBinding::Merged {
+                target_streamer_id: target_id,
+                removed_streamer_id: streamer_id,
+            });
+        }
+
+        transaction.execute(
+            r#"
+            UPDATE streamers
+            SET monitor_enabled = 0, monitor_status = 'identity_conflict',
+                last_error = '发现重复稳定直播入口，已暂停监听', updated_at = ?1
+            WHERE id = ?2
+            "#,
+            params![Utc::now().to_rfc3339(), streamer_id],
+        )?;
+        transaction.commit()?;
+        Ok(DiscoveryBinding::Conflict {
+            target_streamer_id: target_id,
+        })
+    }
+
+    pub fn clear_room_binding(&self, streamer_id: i64) -> Result<()> {
+        let changed = self.connection()?.execute(
+            r#"
+            UPDATE streamers
+            SET web_rid = NULL, room_url = NULL, room_id = NULL,
+                live_status = 'offline', monitor_status = 'rediscovering',
+                last_error = NULL, updated_at = ?1
+            WHERE id = ?2 AND source_kind = 'profile'
+            "#,
+            params![Utc::now().to_rfc3339(), streamer_id],
+        )?;
+        if changed == 0 {
+            return Err(DatabaseError::NotFound("个人主页主播"));
+        }
+        Ok(())
+    }
+
+    pub fn update_current_room_id(&self, streamer_id: i64, room_id: &str) -> Result<()> {
+        let changed = self.connection()?.execute(
+            "UPDATE streamers SET room_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![room_id, Utc::now().to_rfc3339(), streamer_id],
+        )?;
+        if changed == 0 {
+            return Err(DatabaseError::NotFound("主播"));
+        }
+        Ok(())
     }
 
     pub fn update_streamer_status(
@@ -776,9 +1004,12 @@ impl Database {
     }
 
     fn reconcile_manifest_scope(&self, session: &SessionManifestScope) -> Result<()> {
+        let Some(room_id) = session.room_id.as_deref() else {
+            return Ok(());
+        };
         for path in recover_manifest_segments(
             &session.output_root,
-            &session.room_id,
+            room_id,
             &session.started_at,
             session.ended_at.as_deref(),
         ) {
@@ -815,6 +1046,132 @@ impl Database {
             current_video_count,
         })
     }
+}
+
+fn migrate_streamers_v2(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let original_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM streamers", [], |row| row.get(0))?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE streamers_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('profile', 'room')),
+            source_url TEXT NOT NULL,
+            profile_sec_uid TEXT,
+            web_rid TEXT,
+            room_url TEXT,
+            room_id TEXT,
+            monitor_enabled INTEGER NOT NULL DEFAULT 1,
+            archived INTEGER NOT NULL DEFAULT 0,
+            live_status TEXT NOT NULL DEFAULT 'checking',
+            monitor_status TEXT NOT NULL DEFAULT 'waiting',
+            last_checked_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        WITH legacy AS (
+            SELECT
+                streamers.*,
+                CASE
+                    WHEN room_url LIKE 'https://live.douyin.com/%'
+                         AND substr(room_url, 25) <> ''
+                         AND substr(room_url, 25) NOT GLOB '*[^0-9]*'
+                        THEN substr(room_url, 25)
+                    WHEN room_url LIKE 'http://live.douyin.com/%'
+                         AND substr(room_url, 24) <> ''
+                         AND substr(room_url, 24) NOT GLOB '*[^0-9]*'
+                        THEN substr(room_url, 24)
+                    ELSE NULL
+                END AS extracted_web_rid
+            FROM streamers
+        ),
+        resolved AS (
+            SELECT
+                legacy.*,
+                CASE
+                    WHEN extracted_web_rid IS NULL THEN 0
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM legacy preferred
+                        WHERE preferred.extracted_web_rid = legacy.extracted_web_rid
+                          AND (
+                              preferred.archived < legacy.archived
+                              OR (
+                                  preferred.archived = legacy.archived
+                                  AND preferred.monitor_enabled > legacy.monitor_enabled
+                              )
+                              OR (
+                                  preferred.archived = legacy.archived
+                                  AND preferred.monitor_enabled = legacy.monitor_enabled
+                                  AND preferred.id < legacy.id
+                              )
+                          )
+                    ) THEN 1
+                    ELSE 0
+                END AS identity_conflict
+            FROM legacy
+        )
+        INSERT INTO streamers_v2(
+            id, name, source_kind, source_url, profile_sec_uid, web_rid,
+            room_url, room_id, monitor_enabled, archived, live_status,
+            monitor_status, last_checked_at, last_error, created_at, updated_at
+        )
+        SELECT
+            id,
+            name,
+            'room',
+            room_url,
+            NULL,
+            CASE WHEN identity_conflict = 0 THEN extracted_web_rid ELSE NULL END,
+            room_url,
+            room_id,
+            CASE WHEN identity_conflict = 1 THEN 0 ELSE monitor_enabled END,
+            archived,
+            live_status,
+            CASE WHEN identity_conflict = 1 THEN 'paused' ELSE monitor_status END,
+            last_checked_at,
+            CASE
+                WHEN identity_conflict = 1 THEN
+                    CASE
+                        WHEN last_error IS NULL OR trim(last_error) = ''
+                            THEN '旧版主播存在稳定直播入口冲突，已暂停等待人工处理'
+                        ELSE last_error || '；旧版主播存在稳定直播入口冲突，已暂停等待人工处理'
+                    END
+                WHEN extracted_web_rid IS NOT NULL THEN last_error
+                ELSE COALESCE(last_error, '旧版直播间链接无法提取稳定直播入口')
+            END,
+            created_at,
+            updated_at
+        FROM resolved;
+        "#,
+    )?;
+    let migrated_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM streamers_v2", [], |row| row.get(0))?;
+    if original_count != migrated_count {
+        return Err(DatabaseError::MigrationIntegrity(format!(
+            "主播记录数量从 {original_count} 变为 {migrated_count}"
+        )));
+    }
+    transaction.execute_batch(
+        r#"
+        DROP TABLE streamers;
+        ALTER TABLE streamers_v2 RENAME TO streamers;
+        CREATE UNIQUE INDEX idx_streamers_profile_sec_uid
+            ON streamers(profile_sec_uid) WHERE profile_sec_uid IS NOT NULL;
+        CREATE UNIQUE INDEX idx_streamers_web_rid
+            ON streamers(web_rid) WHERE web_rid IS NOT NULL;
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn recover_manifest_segments(
@@ -877,7 +1234,8 @@ fn recover_manifest_segments(
 fn streamer_select(suffix: &str) -> String {
     format!(
         r#"
-        SELECT s.id, s.name, s.room_url, s.room_id, s.monitor_enabled, s.archived,
+        SELECT s.id, s.name, s.source_kind, s.source_url, s.profile_sec_uid,
+               s.web_rid, s.room_url, s.room_id, s.monitor_enabled, s.archived,
                s.live_status, s.monitor_status, s.last_checked_at, s.last_error,
                (
                    SELECT COUNT(*) FROM videos v
@@ -896,20 +1254,55 @@ fn streamer_select(suffix: &str) -> String {
 }
 
 fn map_streamer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Streamer> {
+    let source_kind = match row.get::<_, String>(2)?.as_str() {
+        "profile" => StreamerSourceKind::Profile,
+        _ => StreamerSourceKind::Room,
+    };
     Ok(Streamer {
         id: row.get(0)?,
         name: row.get(1)?,
-        room_url: row.get(2)?,
-        room_id: row.get(3)?,
-        monitor_enabled: row.get(4)?,
-        archived: row.get(5)?,
-        live_status: row.get(6)?,
-        monitor_status: row.get(7)?,
-        last_checked_at: row.get(8)?,
-        last_error: row.get(9)?,
-        current_video_count: row.get(10)?,
-        history_video_count: row.get(11)?,
+        source_kind,
+        source_url: row.get(3)?,
+        profile_sec_uid: row.get(4)?,
+        web_rid: row.get(5)?,
+        room_url: row.get(6)?,
+        room_id: row.get(7)?,
+        monitor_enabled: row.get(8)?,
+        archived: row.get(9)?,
+        live_status: row.get(10)?,
+        monitor_status: row.get(11)?,
+        last_checked_at: row.get(12)?,
+        last_error: row.get(13)?,
+        current_video_count: row.get(14)?,
+        history_video_count: row.get(15)?,
     })
+}
+
+fn source_kind_value(source_kind: StreamerSourceKind) -> &'static str {
+    match source_kind {
+        StreamerSourceKind::Profile => "profile",
+        StreamerSourceKind::Room => "room",
+    }
+}
+
+fn initial_monitor_status(input: &NewStreamer) -> &'static str {
+    if !input.monitor_enabled {
+        "paused"
+    } else if input.source_kind == StreamerSourceKind::Profile && input.web_rid.is_none() {
+        "waiting_first_live"
+    } else {
+        "waiting"
+    }
+}
+
+fn duplicate_identity_error(input: &NewStreamer) -> DatabaseError {
+    if input.profile_sec_uid.is_some() {
+        DatabaseError::DuplicateProfile
+    } else if input.web_rid.is_some() {
+        DatabaseError::DuplicateWebRid
+    } else {
+        DatabaseError::DuplicateStreamer
+    }
 }
 
 fn map_video(row: &rusqlite::Row<'_>) -> rusqlite::Result<Video> {

@@ -7,6 +7,10 @@ import type { ClientApi, Streamer, Video } from "./types";
 const streamer: Streamer = {
   id: 1,
   name: "小鱼直播间",
+  sourceKind: "room",
+  sourceUrl: "https://live.douyin.com/452086788686",
+  profileSecUid: null,
+  webRid: "452086788686",
   roomUrl: "https://live.douyin.com/452086788686",
   roomId: "7663779905489947411",
   monitorEnabled: true,
@@ -87,7 +91,7 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "添加主播" })).toBeInTheDocument();
   });
 
-  it("添加主播表单提交名称和链接", async () => {
+  it("添加直播间表单提交名称和统一来源链接", async () => {
     const user = userEvent.setup();
     const api = createApi();
     render(<App api={api} />);
@@ -95,16 +99,51 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "添加主播" }));
     await user.type(screen.getByLabelText("主播名称"), "小鱼直播间");
     await user.type(
-      screen.getByLabelText("直播间链接"),
+      screen.getByLabelText("个人主页或直播间链接"),
       "https://live.douyin.com/452086788686",
     );
     await user.click(screen.getByRole("button", { name: "保存并监听" }));
 
     expect(api.createStreamer).toHaveBeenCalledWith({
       name: "小鱼直播间",
-      roomUrl: "https://live.douyin.com/452086788686",
+      sourceUrl: "https://live.douyin.com/452086788686",
       monitorEnabled: true,
     });
+  });
+
+  it("个人主页允许名称为空并交给后端使用主页昵称", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    await user.type(
+      screen.getByLabelText("个人主页或直播间链接"),
+      "https://www.douyin.com/user/profile-sec-uid",
+    );
+    await user.click(screen.getByRole("button", { name: "保存并监听" }));
+
+    expect(api.createStreamer).toHaveBeenCalledWith({
+      name: "",
+      sourceUrl: "https://www.douyin.com/user/profile-sec-uid",
+      monitorEnabled: true,
+    });
+  });
+
+  it("直播间直连仍要求填写主播名称", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    await user.type(
+      screen.getByLabelText("个人主页或直播间链接"),
+      "https://live.douyin.com/452086788686",
+    );
+    await user.click(screen.getByRole("button", { name: "保存并监听" }));
+
+    expect(await screen.findByText("直播间链接必须填写主播名称")).toBeInTheDocument();
+    expect(api.createStreamer).not.toHaveBeenCalled();
   });
 
   it("将录制中的主播排在等待开播之前", async () => {
@@ -247,12 +286,133 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "添加主播" }));
     await user.type(screen.getByLabelText("主播名称"), "重复主播");
     await user.type(
-      screen.getByLabelText("直播间链接"),
+      screen.getByLabelText("个人主页或直播间链接"),
       "https://live.douyin.com/452086788686",
     );
     await user.click(screen.getByRole("button", { name: "保存并监听" }));
 
     expect(await screen.findByText("该直播间已经存在")).toBeInTheDocument();
+  });
+
+  it("展示后端结构化来源字段错误", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.createStreamer = vi.fn().mockRejectedValue({
+      code: "duplicate_profile",
+      message: "该个人主页已经存在，主播 ID 为 8",
+      field: "sourceUrl",
+      existingStreamerId: 8,
+    });
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    await user.type(
+      screen.getByLabelText("个人主页或直播间链接"),
+      "https://www.douyin.com/user/profile-duplicate",
+    );
+    await user.click(screen.getByRole("button", { name: "保存并监听" }));
+
+    expect(await screen.findByText("该个人主页已经存在，主播 ID 为 8")).toBeInTheDocument();
+  });
+
+  it("表格展示主页来源和发现阶段，未发现时禁用直播间入口", async () => {
+    const waitingProfile = {
+      ...streamer,
+      id: 9,
+      name: "等待主页主播",
+      sourceKind: "profile",
+      sourceUrl: "https://www.douyin.com/user/profile-waiting",
+      profileSecUid: "profile-waiting",
+      webRid: null,
+      roomUrl: null,
+      roomId: null,
+      monitorStatus: "waiting_first_live",
+    } as Streamer;
+
+    render(<App api={createApi([waitingProfile])} />);
+
+    const row = (await screen.findAllByTestId("streamer-row"))[0];
+    expect(row).toHaveTextContent("个人主页");
+    expect(row).toHaveTextContent("等待首次开播");
+    expect(screen.getByRole("button", { name: "直播间尚未发现" })).toBeDisabled();
+  });
+
+  it("表格覆盖正在发现、主页失败、已发现和重新发现状态", async () => {
+    const statusStreamers = [
+      ["正在发现", "discovering", null],
+      ["主页失败", "profile_error", null],
+      ["已发现", "waiting", "910"],
+      ["重新发现", "rediscovering", null],
+    ].map(([name, monitorStatus, webRid], index) => ({
+      ...streamer,
+      id: 20 + index,
+      name,
+      sourceKind: "profile",
+      sourceUrl: `https://www.douyin.com/user/profile-${index}`,
+      profileSecUid: `profile-${index}`,
+      webRid,
+      roomUrl: webRid ? `https://live.douyin.com/${webRid}` : null,
+      roomId: webRid ? `room-${webRid}` : null,
+      monitorStatus,
+    })) as Streamer[];
+
+    render(<App api={createApi(statusStreamers)} />);
+
+    expect((await screen.findAllByText("正在发现直播间")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("主页检查失败").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("等待开播").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("重新发现直播间").length).toBeGreaterThan(0);
+  });
+
+  it("已发现主页展示标准化直播间入口", async () => {
+    const discovered = {
+      ...streamer,
+      sourceKind: "profile",
+      sourceUrl: "https://www.douyin.com/user/profile-live",
+      profileSecUid: "profile-live",
+      webRid: "236150550962",
+      roomUrl: "https://live.douyin.com/236150550962",
+    } as Streamer;
+
+    render(<App api={createApi([discovered])} />);
+
+    const link = await screen.findByRole("link", { name: /打开直播间/ });
+    expect(link).toHaveAttribute("href", "https://live.douyin.com/236150550962");
+  });
+
+  it("合并事件刷新列表并定位目标主播", async () => {
+    let listener: ((event: { kind: string; streamerId: number | null }) => void) | undefined;
+    const temporary = {
+      ...streamer,
+      id: 10,
+      name: "临时主页",
+      sourceKind: "profile",
+      sourceUrl: "https://www.douyin.com/user/profile-temp",
+      profileSecUid: "profile-temp",
+      webRid: null,
+      roomUrl: null,
+      roomId: null,
+      monitorStatus: "discovering",
+    } as Streamer;
+    const target = { ...streamer, id: 11, name: "合并目标" } as Streamer;
+    const api = createApi([temporary, target]);
+    api.getDashboard = vi
+      .fn()
+      .mockResolvedValueOnce({ streamers: [temporary, target], activeRecordings: 0, currentVideoCount: 0 })
+      .mockResolvedValue({ streamers: [target], activeRecordings: 0, currentVideoCount: 0 });
+    api.subscribe = vi.fn().mockImplementation(async (callback) => {
+      listener = callback;
+      return () => undefined;
+    });
+    render(<App api={api} />);
+    expect((await screen.findAllByText("临时主页")).length).toBeGreaterThan(0);
+
+    await act(async () => {
+      listener?.({ kind: "streamer_merged", streamerId: target.id });
+    });
+
+    await waitFor(() => expect(screen.queryAllByText("临时主页")).toHaveLength(0));
+    expect(screen.getAllByText("合并目标").length).toBeGreaterThan(0);
   });
 
   it("从本次监听视频打开内置播放器", async () => {

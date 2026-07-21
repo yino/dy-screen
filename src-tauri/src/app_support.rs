@@ -1,8 +1,37 @@
 use dy_screen::error::RecorderError;
+use dy_screen::profile_resolver::validate_profile_url;
 use dy_screen::resolver::{RoomInspection, validate_room_url};
 
 use crate::database::Database;
 use crate::domain::AppSettings;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NormalizedStreamerSource {
+    Profile {
+        source_url: String,
+        profile_sec_uid: String,
+    },
+    Room {
+        source_url: String,
+        web_rid: String,
+    },
+}
+
+pub fn parse_streamer_source(input: &str) -> Result<NormalizedStreamerSource, String> {
+    if let Ok(profile) = validate_profile_url(input.trim()) {
+        return Ok(NormalizedStreamerSource::Profile {
+            source_url: profile.source_url,
+            profile_sec_uid: profile.profile_sec_uid,
+        });
+    }
+    if let Ok((source_url, web_rid)) = parse_room_identity(input) {
+        return Ok(NormalizedStreamerSource::Room {
+            source_url,
+            web_rid,
+        });
+    }
+    Err("请输入有效的个人主页或直播间链接".to_owned())
+}
 
 pub fn parse_room_identity(input: &str) -> Result<(String, String), String> {
     let mut url =

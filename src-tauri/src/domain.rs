@@ -1,29 +1,100 @@
 use serde::{Deserialize, Serialize};
 
+pub use dy_screen::model::StreamerSourceKind;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NewStreamer {
     pub name: String,
-    pub room_url: String,
-    pub room_id: String,
+    pub source_kind: StreamerSourceKind,
+    pub source_url: String,
+    pub profile_sec_uid: Option<String>,
+    pub web_rid: Option<String>,
+    pub room_url: Option<String>,
+    pub room_id: Option<String>,
     pub monitor_enabled: bool,
+}
+
+impl NewStreamer {
+    pub fn room(
+        name: impl Into<String>,
+        web_rid: impl Into<String>,
+        room_id: impl Into<String>,
+        monitor_enabled: bool,
+    ) -> Self {
+        let web_rid = web_rid.into();
+        let room_url = format!("https://live.douyin.com/{web_rid}");
+        Self {
+            name: name.into(),
+            source_kind: StreamerSourceKind::Room,
+            source_url: room_url.clone(),
+            profile_sec_uid: None,
+            web_rid: Some(web_rid),
+            room_url: Some(room_url),
+            room_id: Some(room_id.into()),
+            monitor_enabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateStreamerRequest {
     pub name: String,
-    pub room_url: String,
+    #[serde(alias = "roomUrl")]
+    pub source_url: String,
     pub monitor_enabled: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandError {
+    pub code: String,
+    pub message: String,
+    pub field: Option<String>,
+    pub existing_streamer_id: Option<i64>,
+}
+
+impl CommandError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            field: None,
+            existing_streamer_id: None,
+        }
+    }
+
+    pub fn field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+
+    pub fn existing_streamer(mut self, streamer_id: i64) -> Self {
+        self.existing_streamer_id = Some(streamer_id);
+        self
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommandError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Streamer {
     pub id: i64,
     pub name: String,
-    pub room_url: String,
-    pub room_id: String,
+    pub source_kind: StreamerSourceKind,
+    pub source_url: String,
+    pub profile_sec_uid: Option<String>,
+    pub web_rid: Option<String>,
+    pub room_url: Option<String>,
+    pub room_id: Option<String>,
     pub monitor_enabled: bool,
     pub archived: bool,
     pub live_status: String,
@@ -32,6 +103,19 @@ pub struct Streamer {
     pub last_error: Option<String>,
     pub current_video_count: i64,
     pub history_video_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscoveryBinding {
+    Bound(Box<Streamer>),
+    Merged {
+        target_streamer_id: i64,
+        removed_streamer_id: i64,
+    },
+    Conflict {
+        target_streamer_id: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

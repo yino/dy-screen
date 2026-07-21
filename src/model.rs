@@ -10,6 +10,53 @@ use crate::error::{RecorderError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum StreamerSourceKind {
+    Profile,
+    Room,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileUrl {
+    pub source_kind: StreamerSourceKind,
+    pub source_url: String,
+    pub profile_sec_uid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileIdentity {
+    pub profile_sec_uid: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileRoom {
+    pub web_rid: String,
+    pub room_url: String,
+    pub room_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProfileInspection {
+    Offline {
+        identity: ProfileIdentity,
+    },
+    Live {
+        identity: ProfileIdentity,
+        room: ProfileRoom,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileDiscoveryErrorKind {
+    Retryable,
+    AccessRestricted,
+    UnsupportedPageLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Flv,
     Hls,

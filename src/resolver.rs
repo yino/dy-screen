@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 use url::Url;
 
 use crate::error::{RecorderError, Result};
+use crate::flight::decode_pace_payload;
 use crate::model::{Protocol, RoomStreams, StreamVariant};
 
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0 Safari/537.36";
@@ -114,16 +115,6 @@ pub fn parse_room_inspection(page: &str) -> Result<RoomInspection> {
     } else {
         Err(RecorderError::UnsupportedPageLayout)
     }
-}
-
-fn decode_pace_payload(script: &str) -> Option<Value> {
-    let marker = "self.__pace_f.push(";
-    let start = script.find(marker)? + marker.len();
-    let end = script.rfind(')')?;
-    let pushed: Value = serde_json::from_str(script[start..end].trim()).ok()?;
-    let encoded = pushed.as_array()?.get(1)?.as_str()?;
-    let json_text = encoded.split_once(':').map_or(encoded, |(_, value)| value);
-    serde_json::from_str(json_text).ok()
 }
 
 fn find_room_object(value: &Value, require_stream: bool) -> Option<&Map<String, Value>> {

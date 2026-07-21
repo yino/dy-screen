@@ -1,22 +1,25 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use dy_screen::error::RecorderError;
-use dy_screen::model::{EventSink, JobEvent, Protocol, RoomStreams, SelectedStream};
+use dy_screen::model::{
+    EventSink, JobEvent, ProfileInspection, Protocol, RoomStreams, SelectedStream,
+};
+use dy_screen::profile_resolver::ProfileResolver;
 use dy_screen::recorder::{FfmpegConfig, FfmpegRecorder, RecordingConfig};
-use dy_screen::resolver::StreamResolver;
+use dy_screen::resolver::{RoomInspection, StreamResolver};
 use fs2::available_space;
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
-use crate::domain::{MonitorEvent, NewVideo, Streamer};
+use crate::domain::{DiscoveryBinding, MonitorEvent, NewVideo, Streamer, StreamerSourceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorState {
@@ -45,6 +48,10 @@ pub fn backoff_seconds(failure_count: usize) -> u64 {
         .get(failure_count)
         .copied()
         .unwrap_or(300)
+}
+
+pub fn profile_backoff_seconds(failure_count: usize) -> u64 {
+    [60, 120, 300].get(failure_count).copied().unwrap_or(300)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,11 +89,22 @@ pub fn recording_session_status(cancelled: bool, success: bool) -> &'static str 
 enum ResolveFailure {
     Offline,
     Retryable(String),
+    EntryInvalid(String),
 }
 
 fn classify_resolve_error(error: &RecorderError) -> ResolveFailure {
     match error {
         RecorderError::RoomUnavailable => ResolveFailure::Offline,
+        RecorderError::UnsupportedPageLayout
+        | RecorderError::InvalidRoomUrl { .. }
+        | RecorderError::UnsupportedRoomUrl { .. } => {
+            ResolveFailure::EntryInvalid(error.safe_message())
+        }
+        RecorderError::PageRequest(source)
+            if source.status().is_some_and(|status| status.as_u16() == 404) =>
+        {
+            ResolveFailure::EntryInvalid("直播入口已失效".to_owned())
+        }
         _ => ResolveFailure::Retryable(error.safe_message()),
     }
 }
@@ -114,8 +132,9 @@ where
 
 enum ResolveAttempt {
     Live(RoomStreams),
-    Offline,
+    Offline { room_id: Option<String> },
     Retryable(String),
+    EntryInvalid(String),
     Cancelled,
 }
 
@@ -195,7 +214,61 @@ impl MonitorPublisher for NoopPublisher {
     async fn notify(&self, _title: &str, _body: &str) {}
 }
 
+#[async_trait]
+pub trait ProfileDiscovery: Send + Sync {
+    async fn inspect(&self, source_url: &str) -> dy_screen::Result<ProfileInspection>;
+}
+
+#[async_trait]
+impl ProfileDiscovery for ProfileResolver {
+    async fn inspect(&self, source_url: &str) -> dy_screen::Result<ProfileInspection> {
+        ProfileResolver::inspect(self, source_url).await
+    }
+}
+
+#[async_trait]
+pub trait RoomDiscovery: Send + Sync {
+    async fn inspect(&self, room_url: &str) -> dy_screen::Result<RoomInspection>;
+}
+
+#[async_trait]
+impl RoomDiscovery for StreamResolver {
+    async fn inspect(&self, room_url: &str) -> dy_screen::Result<RoomInspection> {
+        StreamResolver::inspect(self, room_url).await
+    }
+}
+
+pub trait JitterSource: Send + Sync {
+    fn profile_seconds(&self) -> u64;
+}
+
+struct SystemJitter;
+
+impl JitterSource for SystemJitter {
+    fn profile_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::from(duration.subsec_nanos()) % 11)
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+pub trait DelayStrategy: Send + Sync {
+    async fn sleep(&self, duration: Duration);
+}
+
+struct TokioDelay;
+
+#[async_trait]
+impl DelayStrategy for TokioDelay {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
 struct Worker {
+    generation: u64,
     cancellation: CancellationToken,
     task: JoinHandle<()>,
     wake: mpsc::UnboundedSender<()>,
@@ -205,8 +278,12 @@ struct Worker {
 pub struct Supervisor {
     database: Database,
     publisher: Arc<dyn MonitorPublisher>,
-    resolver: StreamResolver,
+    profile_discovery: Arc<dyn ProfileDiscovery>,
+    room_discovery: Arc<dyn RoomDiscovery>,
+    jitter: Arc<dyn JitterSource>,
+    delay: Arc<dyn DelayStrategy>,
     workers: Arc<Mutex<HashMap<i64, Worker>>>,
+    worker_generation: Arc<AtomicU64>,
     recording_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
     recording_limiter: Arc<RecordingLimiter>,
     shutdown: CancellationToken,
@@ -219,18 +296,44 @@ impl Supervisor {
         publisher: Arc<dyn MonitorPublisher>,
         max_concurrent: usize,
     ) -> Result<Self, String> {
-        let resolver = StreamResolver::new().map_err(|error| error.safe_message())?;
-        let (changes, _) = broadcast::channel(128);
-        Ok(Self {
+        let profile_discovery = ProfileResolver::new().map_err(|error| error.safe_message())?;
+        let room_discovery = StreamResolver::new().map_err(|error| error.safe_message())?;
+        Ok(Self::with_dependencies(
             database,
             publisher,
-            resolver,
+            max_concurrent,
+            Arc::new(profile_discovery),
+            Arc::new(room_discovery),
+            Arc::new(SystemJitter),
+            Arc::new(TokioDelay),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_dependencies(
+        database: Database,
+        publisher: Arc<dyn MonitorPublisher>,
+        max_concurrent: usize,
+        profile_discovery: Arc<dyn ProfileDiscovery>,
+        room_discovery: Arc<dyn RoomDiscovery>,
+        jitter: Arc<dyn JitterSource>,
+        delay: Arc<dyn DelayStrategy>,
+    ) -> Self {
+        let (changes, _) = broadcast::channel(128);
+        Self {
+            database,
+            publisher,
+            profile_discovery,
+            room_discovery,
+            jitter,
+            delay,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            worker_generation: Arc::new(AtomicU64::new(0)),
             recording_tokens: Arc::new(Mutex::new(HashMap::new())),
             recording_limiter: Arc::new(RecordingLimiter::new(max_concurrent)),
             shutdown: CancellationToken::new(),
             changes,
-        })
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -259,18 +362,25 @@ impl Supervisor {
         let cancellation = self.shutdown.child_token();
         let task_cancellation = cancellation.clone();
         let (wake, wake_receiver) = mpsc::unbounded_channel();
+        let generation = self.worker_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let supervisor = self.clone();
         let task = tokio::spawn(async move {
             supervisor
                 .worker_loop(streamer_id, task_cancellation, wake_receiver)
                 .await;
             if let Ok(mut workers) = supervisor.workers.lock() {
-                workers.remove(&streamer_id);
+                let is_current = workers
+                    .get(&streamer_id)
+                    .is_some_and(|worker| worker.generation == generation);
+                if is_current {
+                    workers.remove(&streamer_id);
+                }
             }
         });
         workers.insert(
             streamer_id,
             Worker {
+                generation,
                 cancellation,
                 task,
                 wake,
@@ -411,23 +521,166 @@ impl Supervisor {
         cancellation: CancellationToken,
         mut wake_receiver: mpsc::UnboundedReceiver<()>,
     ) {
-        let mut failures = 0usize;
+        let mut room_failures = 0usize;
+        let mut profile_failures = 0usize;
+        let mut entry_invalid_count = 0usize;
         loop {
             if cancellation.is_cancelled() {
                 break;
             }
-            let streamer = match self.database.get_streamer(streamer_id) {
+            let mut streamer = match self.database.get_streamer(streamer_id) {
                 Ok(streamer) if streamer.monitor_enabled && !streamer.archived => streamer,
                 _ => break,
+            };
+
+            if streamer.source_kind == StreamerSourceKind::Profile
+                && (streamer.web_rid.is_none() || streamer.room_url.is_none())
+            {
+                let profile_status = if streamer.monitor_status == "rediscovering" {
+                    "rediscovering"
+                } else {
+                    "discovering"
+                };
+                let _ = self.database.update_streamer_status(
+                    streamer_id,
+                    "offline",
+                    profile_status,
+                    None,
+                );
+                self.emit("streamer_changed", Some(streamer_id)).await;
+                let inspection = tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    result = self.profile_discovery.inspect(&streamer.source_url) => result,
+                };
+                match inspection {
+                    Ok(ProfileInspection::Offline { .. }) => {
+                        profile_failures = 0;
+                        let _ = self.database.update_streamer_status(
+                            streamer_id,
+                            "offline",
+                            "waiting_first_live",
+                            None,
+                        );
+                        self.emit("streamer_changed", Some(streamer_id)).await;
+                        let wait = 60 + self.jitter.profile_seconds().min(10);
+                        if !self
+                            .wait_for_next(
+                                Duration::from_secs(wait),
+                                &cancellation,
+                                &mut wake_receiver,
+                            )
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(ProfileInspection::Live { room, .. }) => {
+                        profile_failures = 0;
+                        match self.database.bind_discovered_room(
+                            streamer_id,
+                            &room.web_rid,
+                            &room.room_url,
+                            room.room_id.as_deref(),
+                        ) {
+                            Ok(DiscoveryBinding::Bound(updated)) => {
+                                streamer = *updated;
+                                self.emit("streamer_changed", Some(streamer_id)).await;
+                            }
+                            Ok(DiscoveryBinding::Merged {
+                                target_streamer_id, ..
+                            }) => {
+                                self.emit("streamer_merged", Some(target_streamer_id)).await;
+                                let _ = self.start(target_streamer_id);
+                                break;
+                            }
+                            Ok(DiscoveryBinding::Conflict { target_streamer_id }) => {
+                                self.emit("streamer_changed", Some(streamer_id)).await;
+                                self.emit("streamer_conflict", Some(target_streamer_id))
+                                    .await;
+                                break;
+                            }
+                            Err(error) => {
+                                profile_failures += 1;
+                                let safe_error = error.to_string();
+                                let _ = self.database.update_streamer_status(
+                                    streamer_id,
+                                    "error",
+                                    "profile_error",
+                                    Some(&safe_error),
+                                );
+                                self.emit("streamer_changed", Some(streamer_id)).await;
+                                let wait =
+                                    profile_backoff_seconds(profile_failures.saturating_sub(1));
+                                if !self
+                                    .wait_for_next(
+                                        Duration::from_secs(wait),
+                                        &cancellation,
+                                        &mut wake_receiver,
+                                    )
+                                    .await
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        profile_failures += 1;
+                        let safe_error = error.safe_message();
+                        let _ = self.database.update_streamer_status(
+                            streamer_id,
+                            "error",
+                            "profile_error",
+                            Some(&safe_error),
+                        );
+                        self.emit("streamer_changed", Some(streamer_id)).await;
+                        let wait = profile_backoff_seconds(profile_failures.saturating_sub(1));
+                        if !self
+                            .wait_for_next(
+                                Duration::from_secs(wait),
+                                &cancellation,
+                                &mut wake_receiver,
+                            )
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let Some(room_url) = streamer.room_url.clone() else {
+                let _ = self.database.update_streamer_status(
+                    streamer_id,
+                    "error",
+                    "entry_invalid",
+                    Some("直播间来源缺少可用入口"),
+                );
+                break;
             };
             let _ = self
                 .database
                 .update_streamer_status(streamer_id, "checking", "waiting", None);
             self.emit("streamer_changed", Some(streamer_id)).await;
 
-            match self.resolve_room(&streamer.room_url, &cancellation).await {
-                ResolveAttempt::Live(_) => {
-                    failures = 0;
+            let wait_seconds = match self.resolve_room(&room_url, &cancellation).await {
+                ResolveAttempt::Live(room) => {
+                    room_failures = 0;
+                    entry_invalid_count = 0;
+                    if let Some(web_rid) = streamer.web_rid.as_deref()
+                        && let Ok(DiscoveryBinding::Bound(updated)) =
+                            self.database.bind_discovered_room(
+                                streamer_id,
+                                web_rid,
+                                &room_url,
+                                Some(&room.room_id),
+                            )
+                    {
+                        streamer = *updated;
+                    }
                     let _ = self.database.update_streamer_status(
                         streamer_id,
                         "live",
@@ -455,9 +708,21 @@ impl Supervisor {
                             self.publisher.notify("录制异常", &error).await;
                         }
                     }
+                    30
                 }
-                ResolveAttempt::Offline => {
-                    failures = 0;
+                ResolveAttempt::Offline { room_id } => {
+                    room_failures = 0;
+                    entry_invalid_count = 0;
+                    if let (Some(web_rid), Some(room_id)) =
+                        (streamer.web_rid.as_deref(), room_id.as_deref())
+                    {
+                        let _ = self.database.bind_discovered_room(
+                            streamer_id,
+                            web_rid,
+                            &room_url,
+                            Some(room_id),
+                        );
+                    }
                     let _ = self.database.update_streamer_status(
                         streamer_id,
                         "offline",
@@ -465,30 +730,66 @@ impl Supervisor {
                         None,
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
+                    30
                 }
                 ResolveAttempt::Retryable(safe_error) => {
+                    entry_invalid_count = 0;
+                    room_failures += 1;
                     let _ = self.database.update_streamer_status(
                         streamer_id,
                         "error",
                         "waiting",
                         Some(&safe_error),
                     );
-                    failures += 1;
                     self.emit("streamer_changed", Some(streamer_id)).await;
+                    backoff_seconds(room_failures.saturating_sub(1))
+                }
+                ResolveAttempt::EntryInvalid(safe_error) => {
+                    room_failures = 0;
+                    entry_invalid_count += 1;
+                    if streamer.source_kind == StreamerSourceKind::Profile
+                        && entry_invalid_count >= 3
+                        && self.database.clear_room_binding(streamer_id).is_ok()
+                    {
+                        self.emit("streamer_changed", Some(streamer_id)).await;
+                        entry_invalid_count = 0;
+                        continue;
+                    }
+                    let _ = self.database.update_streamer_status(
+                        streamer_id,
+                        "error",
+                        "entry_invalid",
+                        Some(&safe_error),
+                    );
+                    self.emit("streamer_changed", Some(streamer_id)).await;
+                    30
                 }
                 ResolveAttempt::Cancelled => break,
-            }
-
-            let wait = if failures == 0 {
-                30
-            } else {
-                backoff_seconds(failures.saturating_sub(1))
             };
-            tokio::select! {
-                _ = cancellation.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
-                _ = wake_receiver.recv() => {}
+
+            if !self
+                .wait_for_next(
+                    Duration::from_secs(wait_seconds),
+                    &cancellation,
+                    &mut wake_receiver,
+                )
+                .await
+            {
+                break;
             }
+        }
+    }
+
+    async fn wait_for_next(
+        &self,
+        duration: Duration,
+        cancellation: &CancellationToken,
+        wake_receiver: &mut mpsc::UnboundedReceiver<()>,
+    ) -> bool {
+        tokio::select! {
+            _ = cancellation.cancelled() => false,
+            _ = self.delay.sleep(duration) => true,
+            _ = wake_receiver.recv() => true,
         }
     }
 
@@ -499,11 +800,15 @@ impl Supervisor {
     ) -> ResolveAttempt {
         tokio::select! {
             _ = cancellation.cancelled() => ResolveAttempt::Cancelled,
-            result = self.resolver.resolve(room_url) => match result {
-                Ok(room) => ResolveAttempt::Live(room),
+            result = self.room_discovery.inspect(room_url) => match result {
+                Ok(RoomInspection::Live(room)) => ResolveAttempt::Live(room),
+                Ok(RoomInspection::Offline { room_id }) => ResolveAttempt::Offline {
+                    room_id: Some(room_id),
+                },
                 Err(error) => match classify_resolve_error(&error) {
-                    ResolveFailure::Offline => ResolveAttempt::Offline,
+                    ResolveFailure::Offline => ResolveAttempt::Offline { room_id: None },
                     ResolveFailure::Retryable(error) => ResolveAttempt::Retryable(error),
+                    ResolveFailure::EntryInvalid(error) => ResolveAttempt::EntryInvalid(error),
                 },
             }
         }
@@ -514,19 +819,26 @@ impl Supervisor {
         streamer: Streamer,
         worker_cancellation: CancellationToken,
     ) -> Result<SessionEnd, String> {
+        let room_url = streamer
+            .room_url
+            .clone()
+            .ok_or_else(|| "尚未发现稳定直播入口".to_owned())?;
         let permit = tokio::select! {
             permit = self.recording_limiter.acquire() => permit,
             _ = worker_cancellation.cancelled() => return Ok(SessionEnd::Cancelled),
         };
-        let room = match self
-            .resolve_room(&streamer.room_url, &worker_cancellation)
-            .await
-        {
+        let room = match self.resolve_room(&room_url, &worker_cancellation).await {
             ResolveAttempt::Live(room) => room,
-            ResolveAttempt::Offline => return Ok(SessionEnd::Completed),
-            ResolveAttempt::Retryable(error) => return Err(error),
+            ResolveAttempt::Offline { .. } => return Ok(SessionEnd::Completed),
+            ResolveAttempt::Retryable(error) | ResolveAttempt::EntryInvalid(error) => {
+                return Err(error);
+            }
             ResolveAttempt::Cancelled => return Ok(SessionEnd::Cancelled),
         };
+        let room_id = room.room_id.clone();
+        self.database
+            .update_current_room_id(streamer.id, &room_id)
+            .map_err(|error| error.to_string())?;
         let settings = self
             .database
             .get_settings()
@@ -603,8 +915,8 @@ impl Supervisor {
         let final_end = 'recording: loop {
             let result = recorder
                 .record_selected_with_event_sink(
-                    streamer.room_url.clone(),
-                    streamer.room_id.clone(),
+                    room_url.clone(),
+                    room_id.clone(),
                     current_selected,
                     token.clone(),
                     sink.clone(),
@@ -617,13 +929,15 @@ impl Supervisor {
             let mut last_error = result
                 .error
                 .unwrap_or_else(|| "直播流已结束，但直播间仍在线，准备继续录制".to_owned());
-            let mut confirmation = self.resolve_room(&streamer.room_url, &token).await;
+            let mut confirmation = self.resolve_room(&room_url, &token).await;
             loop {
                 match confirmation {
-                    ResolveAttempt::Offline => break 'recording SessionEnd::Completed,
+                    ResolveAttempt::Offline { .. } => break 'recording SessionEnd::Completed,
                     ResolveAttempt::Cancelled => break 'recording SessionEnd::Cancelled,
                     ResolveAttempt::Live(_) => {}
-                    ResolveAttempt::Retryable(error) => last_error = error,
+                    ResolveAttempt::Retryable(error) | ResolveAttempt::EntryInvalid(error) => {
+                        last_error = error
+                    }
                 }
                 if retries >= 3 {
                     break 'recording SessionEnd::Error(last_error);
@@ -642,17 +956,20 @@ impl Supervisor {
                 let Some(refreshed) = after_cancellable_delay(
                     &token,
                     Duration::from_secs(backoff_seconds(retries - 1)),
-                    self.resolve_room(&streamer.room_url, &token),
+                    self.resolve_room(&room_url, &token),
                 )
                 .await
                 else {
                     break 'recording SessionEnd::Cancelled;
                 };
                 match refreshed {
-                    ResolveAttempt::Offline => break 'recording SessionEnd::Completed,
+                    ResolveAttempt::Offline { .. } => break 'recording SessionEnd::Completed,
                     ResolveAttempt::Cancelled => break 'recording SessionEnd::Cancelled,
                     ResolveAttempt::Retryable(error) => {
                         confirmation = ResolveAttempt::Retryable(error);
+                    }
+                    ResolveAttempt::EntryInvalid(error) => {
+                        confirmation = ResolveAttempt::EntryInvalid(error);
                     }
                     ResolveAttempt::Live(room) => {
                         current_selected =
@@ -849,14 +1166,14 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_room_unavailable_ends_the_live_cycle() {
+    fn room_errors_are_classified_for_offline_retry_and_entry_recovery() {
         assert_eq!(
             classify_resolve_error(&RecorderError::RoomUnavailable),
             ResolveFailure::Offline
         );
         assert!(matches!(
             classify_resolve_error(&RecorderError::UnsupportedPageLayout),
-            ResolveFailure::Retryable(message) if !message.is_empty()
+            ResolveFailure::EntryInvalid(message) if !message.is_empty()
         ));
     }
 
@@ -883,6 +1200,7 @@ mod tests {
             .map(|_| {
                 let (wake, _) = mpsc::unbounded_channel();
                 Worker {
+                    generation: 0,
                     cancellation: CancellationToken::new(),
                     task: tokio::spawn(std::future::pending()),
                     wake,

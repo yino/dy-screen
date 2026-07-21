@@ -38,6 +38,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import type {
   AppSettings,
   ClientApi,
+  CreateStreamerInput,
   Dashboard,
   EnvironmentStatus,
   MonitorStatus,
@@ -61,9 +62,15 @@ const monitorPriority: Record<MonitorStatus, number> = {
   recording: 0,
   retrying: 1,
   waiting_resource: 2,
-  recording_error: 3,
-  waiting: 4,
-  paused: 5,
+  discovering: 3,
+  rediscovering: 3,
+  recording_error: 4,
+  profile_error: 4,
+  entry_invalid: 4,
+  identity_conflict: 4,
+  waiting_first_live: 5,
+  waiting: 6,
+  paused: 7,
 };
 
 const liveLabels = {
@@ -76,6 +83,12 @@ const liveLabels = {
 const monitorLabels = {
   paused: "已暂停",
   waiting: "等待开播",
+  discovering: "正在发现直播间",
+  waiting_first_live: "等待首次开播",
+  profile_error: "主页检查失败",
+  rediscovering: "重新发现直播间",
+  entry_invalid: "直播入口失效",
+  identity_conflict: "身份冲突已暂停",
   waiting_resource: "等待资源",
   recording: "录制中",
   retrying: "正在重试",
@@ -248,7 +261,11 @@ export function App({ api }: AppProps) {
         }
         return;
       }
-      void refreshDashboard();
+      if (event.kind === "streamer_merged" && event.streamerId) {
+        void refreshDashboard().then(() => setSelectedId(event.streamerId));
+      } else {
+        void refreshDashboard();
+      }
       if (selectedIdRef.current) void refreshCurrentVideos(selectedIdRef.current);
       if (pageRef.current === "library") {
         void refreshHistoryVideos(
@@ -618,7 +635,9 @@ function MonitorPage({
   onRevealVideo: (id: number) => void;
 }) {
   const liveCount = dashboard.streamers.filter((item) => item.liveStatus === "live").length;
-  const waitingCount = dashboard.streamers.filter((item) => item.monitorStatus === "waiting").length;
+  const waitingCount = dashboard.streamers.filter((item) =>
+    item.monitorStatus === "waiting" || item.monitorStatus === "waiting_first_live"
+  ).length;
   return (
     <div className="page-content">
       <section className="summary-grid">
@@ -640,13 +659,13 @@ function MonitorPage({
             <div className="empty-state spacious">
               <div className="empty-illustration"><Radio size={28} /><span /></div>
               <h3>还没有监控主播</h3>
-              <p>添加公开抖音直播间，应用会自动检查开播并开始录制视频与声音。</p>
+              <p>添加公开抖音个人主页或直播间，应用会自动发现开播并录制视频与声音。</p>
               <button className="primary-button" onClick={onAdd}><Plus size={18} />添加主播</button>
             </div>
           ) : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>主播</th><th>直播状态</th><th>监听状态</th><th>最近检查</th><th>视频</th><th><span className="sr-only">操作</span></th></tr></thead>
+                <thead><tr><th>主播 / 来源</th><th>直播状态</th><th>监听状态</th><th>最近检查</th><th>视频</th><th><span className="sr-only">操作</span></th></tr></thead>
                 <tbody>
                   {streamers.map((streamer) => (
                     <StreamerRow
@@ -700,11 +719,22 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
   onArchive: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const sourceLabel = streamer.sourceKind === "profile" ? "个人主页" : "直播间直连";
+  const identityLabel = streamer.webRid
+    ? `入口 ${streamer.webRid.slice(-8)}`
+    : streamer.profileSecUid
+      ? `主页 ${streamer.profileSecUid.slice(-8)}`
+      : "身份待确认";
+  const monitorKind = streamer.monitorStatus === "recording"
+    ? "recording"
+    : ["recording_error", "profile_error", "entry_invalid", "identity_conflict"].includes(streamer.monitorStatus)
+      ? "error"
+      : "neutral";
   return (
     <tr data-testid="streamer-row" className={selected ? "selected-row" : ""} onClick={onSelect}>
-      <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div><strong>{streamer.name}</strong><span>房间 {streamer.roomId.slice(-8)}</span></div></div></td>
+      <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div><strong>{streamer.name}</strong><span>{sourceLabel} · {identityLabel}</span></div></div></td>
       <td><StatusBadge kind={streamer.liveStatus === "live" ? "live" : streamer.liveStatus === "error" ? "error" : "neutral"}>{liveLabels[streamer.liveStatus]}</StatusBadge></td>
-      <td><StatusBadge kind={streamer.monitorStatus === "recording" ? "recording" : streamer.monitorStatus === "recording_error" ? "error" : "neutral"}>{monitorLabels[streamer.monitorStatus]}</StatusBadge></td>
+      <td><StatusBadge kind={monitorKind}>{monitorLabels[streamer.monitorStatus]}</StatusBadge></td>
       <td><div className="muted-cell"><span>{formatDate(streamer.lastCheckedAt)}</span>{streamer.lastError && <small title={streamer.lastError}>存在异常</small>}</div></td>
       <td><div className="video-count"><strong>{streamer.currentVideoCount}</strong><span>本次</span><i /><strong>{streamer.historyVideoCount}</strong><span>历史</span></div></td>
       <td className="actions-cell" onClick={(event) => event.stopPropagation()}>
@@ -735,7 +765,7 @@ function SessionPanel({ streamer, videos, onPreview, onOpen, onReveal }: { strea
         <div className="empty-state"><FileVideo2 size={28} /><h3>请选择主播</h3><p>选择左侧主播后查看本次会话和完成分片。</p></div>
       ) : (
         <>
-          <div className="session-streamer"><div className="streamer-avatar large">{streamer.name.slice(0, 1)}</div><div><strong>{streamer.name}</strong><a href={streamer.roomUrl} target="_blank" rel="noreferrer">打开直播间 <ExternalLink size={12} /></a></div></div>
+          <div className="session-streamer"><div className="streamer-avatar large">{streamer.name.slice(0, 1)}</div><div><strong>{streamer.name}</strong>{streamer.roomUrl ? <a href={streamer.roomUrl} target="_blank" rel="noreferrer">打开直播间 <ExternalLink size={12} /></a> : <button type="button" disabled aria-label="直播间尚未发现">直播间尚未发现</button>}</div></div>
           <div className="session-stats"><div><span>完成分片</span><strong>{videos.length}</strong></div><div><span>累计大小</span><strong>{formatBytes(videos.reduce((total, item) => total + item.sizeBytes, 0))}</strong></div></div>
           <div className="video-list">
             {videos.length === 0 ? (
@@ -932,26 +962,29 @@ function SettingsPage({ settings, environment, onOpenLogs, onDiagnose, onSave }:
   );
 }
 
-function AddStreamerModal({ initial, onClose, onSubmit }: { initial: Streamer | null; onClose: () => void; onSubmit: (input: { name: string; roomUrl: string; monitorEnabled: boolean }) => Promise<void> }) {
+function AddStreamerModal({ initial, onClose, onSubmit }: { initial: Streamer | null; onClose: () => void; onSubmit: (input: CreateStreamerInput) => Promise<void> }) {
   const [name, setName] = useState(initial?.name ?? "");
-  const [roomUrl, setRoomUrl] = useState(initial?.roomUrl ?? "");
+  const [sourceUrl, setSourceUrl] = useState(initial?.sourceUrl ?? "");
   const [monitorEnabled, setMonitorEnabled] = useState(initial?.monitorEnabled ?? true);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
-    if (!name.trim()) { setError("请输入主播名称"); return; }
-    if (!/^https:\/\/live\.douyin\.com\/\d+/.test(roomUrl.trim())) { setError("请输入有效的抖音公开直播间链接"); return; }
+    const normalizedSource = sourceUrl.trim();
+    const isProfile = /^https?:\/\/(?:www\.)?douyin\.com\/user\/[^/?#]+(?:[?#].*)?$/.test(normalizedSource);
+    const isRoom = /^https?:\/\/live\.douyin\.com\/\d+(?:[/?#].*)?$/.test(normalizedSource);
+    if (!isProfile && !isRoom) { setError("请输入有效的个人主页或直播间链接"); return; }
+    if (isRoom && !name.trim()) { setError("直播间链接必须填写主播名称"); return; }
     setSubmitting(true);
-    try { await onSubmit({ name: name.trim(), roomUrl: roomUrl.trim(), monitorEnabled }); }
+    try { await onSubmit({ name: name.trim(), sourceUrl: normalizedSource, monitorEnabled }); }
     catch (reason) { setError(errorMessage(reason, initial ? "修改主播失败" : "添加主播失败")); setSubmitting(false); }
   };
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <form className="modal" onSubmit={submit} aria-label={initial ? "编辑监控主播" : "添加监控主播"}>
         <div className="modal-header"><div className="modal-title-icon">{initial ? <Pencil size={21} /> : <Plus size={21} />}</div><div><h2>{initial ? "编辑监控主播" : "添加监控主播"}</h2><p>{initial ? "修改后会重新检查直播状态。" : "保存后会自动执行第一次直播状态检查。"}</p></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭"><X size={19} /></button></div>
-        <div className="modal-body"><label htmlFor="streamer-name">主播名称<input id="streamer-name" aria-label="主播名称" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：小鱼直播间" /></label><label htmlFor="room-url">直播间链接<input id="room-url" aria-label="直播间链接" value={roomUrl} onChange={(event) => setRoomUrl(event.target.value)} placeholder="https://live.douyin.com/452086788686" /><small>仅支持无需登录即可访问的公开直播间。</small></label><label className="switch-row boxed"><div><strong>添加后立即监听</strong><small>未开播时每 30 秒检查一次。</small></div><input type="checkbox" checked={monitorEnabled} onChange={(event) => setMonitorEnabled(event.target.checked)} /></label>{error && <div className="form-error">{error}</div>}</div>
+        <div className="modal-body"><label htmlFor="streamer-name">主播名称<input id="streamer-name" aria-label="主播名称" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="个人主页可留空，自动使用主页昵称" /><small>个人主页可留空；直播间直连必须填写。</small></label><label htmlFor="source-url">个人主页或直播间链接<input id="source-url" aria-label="个人主页或直播间链接" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} placeholder="https://www.douyin.com/user/... 或 https://live.douyin.com/..." /><small>仅访问无需登录的公开页面，不使用 Cookie、登录或验证码绕过。</small></label><label className="switch-row boxed"><div><strong>添加后立即监听</strong><small>主页未发现入口时约每 60 秒检查；发现后每 30 秒检查直播间。</small></div><input type="checkbox" checked={monitorEnabled} onChange={(event) => setMonitorEnabled(event.target.checked)} /></label>{error && <div className="form-error">{error}</div>}</div>
         <div className="modal-footer"><button type="button" className="ghost-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" size={17} /> : <Radio size={17} />}{initial ? "保存修改" : "保存并监听"}</button></div>
       </form>
     </div>

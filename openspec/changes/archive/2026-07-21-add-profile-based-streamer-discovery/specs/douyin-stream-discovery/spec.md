@@ -1,13 +1,7 @@
-# 抖音直播流发现规格
-
-## Purpose
-
-定义从公开抖音直播间页面安全、确定性地发现当前有效 FLV/HLS 直播流的行为，包括 URL 校验、页面解析、清晰度/协议选择和签名地址脱敏。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 校验支持的直播间 URL
-系统 SHALL 接受 host 为 `live.douyin.com` 的公开直播间 URL 作为直播流解析输入，并 SHALL 接受经过个人主页发现流程验证的标准化直播间 URL；任何用于 FFmpeg 的流发现请求最终 MUST 规范化为 `https://live.douyin.com/{web_rid}`。
+系统 SHALL 接受 host 为 `live.douyin.com` 的公开直播间 URL作为直播流解析输入，并 SHALL 接受经过个人主页发现流程验证的标准化直播间 URL；任何用于 FFmpeg 的流发现请求最终 MUST 规范化为 `https://live.douyin.com/{web_rid}`。
 
 #### Scenario: 有效的公开直播间 URL
 - **WHEN** 用户直接提供或个人主页发现流程返回一个 HTTPS `live.douyin.com/{web_rid}` URL
@@ -35,25 +29,3 @@
 #### Scenario: 页面结构不受支持
 - **WHEN** 页面包含初始化脚本，但无法使用受支持的载荷结构进行解码
 - **THEN** 系统返回可分类的入口结构错误，不包含任何签名直播流 token，并允许 supervisor 统计是否需要主页重新发现
-
-### Requirement: 确定性选择直播流变体
-系统 SHALL 在用户请求的清晰度可用时选择该清晰度，否则选择页面默认清晰度，否则选择已知最高的可用清晰度；在选定清晰度中，除非用户明确请求协议，否则系统 SHALL 优先选择 FLV 而不是 HLS。
-
-#### Scenario: 请求的清晰度和协议均可用
-- **WHEN** 用户请求 `HD1` 和 FLV，且两者都可用
-- **THEN** 系统选择 `HD1` FLV URL
-
-#### Scenario: 请求的清晰度不可用
-- **WHEN** 请求的清晰度不存在，但页面默认清晰度可用
-- **THEN** 系统选择页面默认清晰度并报告发生了回退
-
-#### Scenario: 选定清晰度没有 FLV
-- **WHEN** 系统优先选择 FLV，但选定清晰度只有 HLS
-- **THEN** 系统选择 HLS 变体
-
-### Requirement: 避免在常规状态输出中泄露签名 URL
-系统 MUST NOT 在普通日志、错误或结构化状态事件中包含签名 CDN URL 的查询字符串。
-
-#### Scenario: 直播流解析成功
-- **WHEN** 系统解析到包含鉴权查询参数的直播流 URL
-- **THEN** 常规输出只标识协议、清晰度和已脱敏 endpoint，不暴露查询字符串

@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn help_exposes_resolve_and_record_commands() {
+fn help_exposes_profile_resolve_and_record_commands() {
     let output = Command::new(env!("CARGO_BIN_EXE_dy-screen"))
         .arg("--help")
         .output()
@@ -9,6 +9,7 @@ fn help_exposes_resolve_and_record_commands() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("inspect-profile"));
     assert!(stdout.contains("resolve"));
     assert!(stdout.contains("record"));
 }

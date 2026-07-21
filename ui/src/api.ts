@@ -73,7 +73,16 @@ function createBrowserApi(): ClientApi {
   let streamers: Streamer[] = [];
   let settings = defaultSettings;
   try {
-    streamers = JSON.parse(localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[];
+    streamers = (JSON.parse(localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
+      .map((item) => ({
+        ...item,
+        sourceKind: item.sourceKind ?? "room",
+        sourceUrl: item.sourceUrl ?? item.roomUrl ?? "",
+        profileSecUid: item.profileSecUid ?? null,
+        webRid: item.webRid ?? item.roomUrl?.match(/live\.douyin\.com\/(\d+)/)?.[1] ?? null,
+        roomUrl: item.roomUrl ?? null,
+        roomId: item.roomId ?? null,
+      }));
     settings = JSON.parse(
       localStorage.getItem("dy-screen-settings") || JSON.stringify(defaultSettings),
     ) as AppSettings;
@@ -94,22 +103,36 @@ function createBrowserApi(): ClientApi {
   return {
     getDashboard: async () => dashboard(),
     createStreamer: async (input: CreateStreamerInput) => {
-      const roomMatch = input.roomUrl.match(/live\.douyin\.com\/(\d+)/);
-      if (!roomMatch) {
-        throw new Error("请输入有效的抖音公开直播间链接");
+      const sourceUrl = input.sourceUrl.trim();
+      const profileMatch = sourceUrl.match(/(?:www\.)?douyin\.com\/user\/([^/?#]+)/);
+      const roomMatch = sourceUrl.match(/live\.douyin\.com\/(\d+)/);
+      if (!profileMatch && !roomMatch) throw new Error("请输入有效的个人主页或直播间链接");
+      if (profileMatch && streamers.some((item) => item.profileSecUid === profileMatch[1])) {
+        throw new Error("该个人主页已经存在");
       }
-      if (streamers.some((item) => item.roomUrl === input.roomUrl)) {
-        throw new Error("该直播间已经存在");
+      if (roomMatch && streamers.some((item) => item.webRid === roomMatch[1])) {
+        throw new Error("该稳定直播入口已经存在");
       }
+      if (roomMatch && !input.name.trim()) throw new Error("直播间链接必须填写主播名称");
+      const sourceKind = profileMatch ? "profile" : "room";
+      const normalizedSourceUrl = profileMatch
+        ? `https://www.douyin.com/user/${profileMatch[1]}`
+        : `https://live.douyin.com/${roomMatch![1]}`;
       const streamer: Streamer = {
         id: Date.now(),
-        name: input.name.trim(),
-        roomUrl: input.roomUrl.trim(),
-        roomId: roomMatch[1],
+        name: input.name.trim() || "个人主页主播（演示）",
+        sourceKind,
+        sourceUrl: normalizedSourceUrl,
+        profileSecUid: profileMatch?.[1] ?? null,
+        webRid: roomMatch?.[1] ?? null,
+        roomUrl: roomMatch ? normalizedSourceUrl : null,
+        roomId: roomMatch?.[1] ?? null,
         monitorEnabled: input.monitorEnabled,
         archived: false,
-        liveStatus: "checking",
-        monitorStatus: input.monitorEnabled ? "waiting" : "paused",
+        liveStatus: profileMatch ? "offline" : "checking",
+        monitorStatus: input.monitorEnabled
+          ? profileMatch ? "waiting_first_live" : "waiting"
+          : "paused",
         lastCheckedAt: null,
         lastError: null,
         currentVideoCount: 0,
@@ -120,18 +143,31 @@ function createBrowserApi(): ClientApi {
       return streamer;
     },
     updateStreamer: async (id, input) => {
-      const roomMatch = input.roomUrl.match(/live\.douyin\.com\/(\d+)/);
-      if (!roomMatch) throw new Error("请输入有效的抖音公开直播间链接");
+      const sourceUrl = input.sourceUrl.trim();
+      const profileMatch = sourceUrl.match(/(?:www\.)?douyin\.com\/user\/([^/?#]+)/);
+      const roomMatch = sourceUrl.match(/live\.douyin\.com\/(\d+)/);
+      if (!profileMatch && !roomMatch) throw new Error("请输入有效的个人主页或直播间链接");
+      if (roomMatch && !input.name.trim()) throw new Error("直播间链接必须填写主播名称");
       const current = streamers.find((item) => item.id === id);
       if (!current) throw new Error("找不到主播");
+      const sourceKind = profileMatch ? "profile" : "room";
+      const normalizedSourceUrl = profileMatch
+        ? `https://www.douyin.com/user/${profileMatch[1]}`
+        : `https://live.douyin.com/${roomMatch![1]}`;
       const updated: Streamer = {
         ...current,
-        name: input.name.trim(),
-        roomUrl: input.roomUrl.trim(),
-        roomId: roomMatch[1],
+        name: input.name.trim() || current.name,
+        sourceKind,
+        sourceUrl: normalizedSourceUrl,
+        profileSecUid: profileMatch?.[1] ?? null,
+        webRid: roomMatch?.[1] ?? null,
+        roomUrl: roomMatch ? normalizedSourceUrl : null,
+        roomId: roomMatch?.[1] ?? null,
         monitorEnabled: input.monitorEnabled,
-        liveStatus: "checking",
-        monitorStatus: input.monitorEnabled ? "waiting" : "paused",
+        liveStatus: profileMatch ? "offline" : "checking",
+        monitorStatus: input.monitorEnabled
+          ? profileMatch ? "waiting_first_live" : "waiting"
+          : "paused",
       };
       streamers = streamers.map((item) => item.id === id ? updated : item);
       saveStreamers();

@@ -6,7 +6,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use dy_screen::error::Result;
 use dy_screen::manager::{EventSink, LiveJobRunner, RecordingManager};
-use dy_screen::model::{JobEvent, Protocol, RecordingRequest, redact_url};
+use dy_screen::model::{JobEvent, ProfileInspection, Protocol, RecordingRequest, redact_url};
+use dy_screen::profile_resolver::ProfileResolver;
 use dy_screen::recorder::{FfmpegConfig, FfmpegRecorder, RecordingConfig, check_ffmpeg};
 use dy_screen::resolver::{DEFAULT_USER_AGENT, StreamResolver};
 use serde::Serialize;
@@ -25,10 +26,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 检查公开抖音个人主页并发现稳定直播入口。
+    InspectProfile(ProfileArgs),
     /// Resolve a room and list its available stream qualities.
     Resolve(ResolveArgs),
     /// Record one or more rooms concurrently through FFmpeg.
     Record(RecordArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProfileArgs {
+    /// 公开 douyin.com/user 个人主页 URL。
+    profile_url: String,
+
+    /// 输出机器可读的 JSON。
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +118,16 @@ struct ResolveView {
     fell_back: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+struct ProfileView {
+    status: &'static str,
+    profile_sec_uid: String,
+    display_name: Option<String>,
+    web_rid: Option<String>,
+    room_url: Option<String>,
+    room_id: Option<String>,
+}
+
 struct CliEventSink {
     json: bool,
 }
@@ -177,9 +200,51 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<bool> {
     match cli.command {
+        Command::InspectProfile(args) => inspect_profile(args).await,
         Command::Resolve(args) => resolve(args).await,
         Command::Record(args) => record(args).await,
     }
+}
+
+async fn inspect_profile(args: ProfileArgs) -> Result<bool> {
+    let inspection = ProfileResolver::new()?.inspect(&args.profile_url).await?;
+    let view = match inspection {
+        ProfileInspection::Offline { identity } => ProfileView {
+            status: "offline",
+            profile_sec_uid: identity.profile_sec_uid,
+            display_name: identity.display_name,
+            web_rid: None,
+            room_url: None,
+            room_id: None,
+        },
+        ProfileInspection::Live { identity, room } => ProfileView {
+            status: "live",
+            profile_sec_uid: identity.profile_sec_uid,
+            display_name: identity.display_name,
+            web_rid: Some(room.web_rid),
+            room_url: Some(room.room_url),
+            room_id: room.room_id,
+        },
+    };
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).expect("profile view is serializable")
+        );
+    } else {
+        println!(
+            "status={} profile_sec_uid={} display_name={} web_rid={} room_id={}",
+            view.status,
+            view.profile_sec_uid,
+            view.display_name.as_deref().unwrap_or("unknown"),
+            view.web_rid.as_deref().unwrap_or("not-discovered"),
+            view.room_id.as_deref().unwrap_or("not-discovered")
+        );
+        if let Some(room_url) = view.room_url {
+            println!("room_url={room_url}");
+        }
+    }
+    Ok(true)
 }
 
 async fn resolve(args: ResolveArgs) -> Result<bool> {
