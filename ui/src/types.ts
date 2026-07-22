@@ -14,6 +14,26 @@ export type MonitorStatus =
   | "retrying"
   | "recording_error";
 
+export interface StreamerTagInput {
+  name: string;
+  promptGuidance: string | null;
+}
+
+export interface StreamerTag extends StreamerTagInput {
+  id: number;
+  sortOrder: number;
+}
+
+export interface StreamerPromptTag extends StreamerTagInput {
+  priority: number;
+}
+
+export interface StreamerPromptContext {
+  streamerId: number;
+  streamerName: string;
+  tags: StreamerPromptTag[];
+}
+
 export interface Streamer {
   id: number;
   name: string;
@@ -31,6 +51,7 @@ export interface Streamer {
   lastError: string | null;
   currentVideoCount: number;
   historyVideoCount: number;
+  tags: StreamerTag[];
 }
 
 export interface Dashboard {
@@ -43,6 +64,7 @@ export interface CreateStreamerInput {
   name: string;
   sourceUrl: string;
   monitorEnabled: boolean;
+  tags: StreamerTagInput[];
 }
 
 export interface Video {
@@ -127,6 +149,8 @@ export interface ClientApi {
   getDashboard(): Promise<Dashboard>;
   createStreamer(input: CreateStreamerInput): Promise<Streamer>;
   updateStreamer(id: number, input: CreateStreamerInput): Promise<Streamer>;
+  listStreamerTagNameSuggestions(limit?: number): Promise<string[]>;
+  getStreamerPromptContext(id: number): Promise<StreamerPromptContext>;
   setMonitorEnabled(id: number, enabled: boolean): Promise<void>;
   checkStreamerNow(id: number): Promise<void>;
   archiveStreamer(id: number): Promise<void>;

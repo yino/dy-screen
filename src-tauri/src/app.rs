@@ -15,7 +15,7 @@ use crate::app_support::{delete_recording_session, validate_settings};
 use crate::database::Database;
 use crate::domain::{
     AppSettings, CommandError, CreateStreamerRequest, Dashboard, EnvironmentStatus, MonitorEvent,
-    Streamer, VideoFilter, VideoPage,
+    Streamer, StreamerPromptContext, VideoFilter, VideoPage,
 };
 use crate::preview::{
     PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
@@ -87,6 +87,28 @@ fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
     state
         .database
         .dashboard()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_streamer_tag_name_suggestions(
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    state
+        .database
+        .list_streamer_tag_name_suggestions(limit.unwrap_or(20))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_streamer_prompt_context(
+    id: i64,
+    state: State<'_, AppState>,
+) -> Result<StreamerPromptContext, String> {
+    state
+        .database
+        .streamer_prompt_context(id)
         .map_err(|error| error.to_string())
 }
 
@@ -393,6 +415,8 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
+            list_streamer_tag_name_suggestions,
+            get_streamer_prompt_context,
             create_streamer,
             update_streamer,
             set_monitor_enabled,

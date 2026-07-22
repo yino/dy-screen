@@ -1,5 +1,7 @@
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   Archive,
   Bot,
   CheckCircle2,
@@ -27,6 +29,7 @@ import {
   Settings,
   Sparkles,
   Square,
+  Tag,
   Trash2,
   Video,
   Wifi,
@@ -44,6 +47,7 @@ import type {
   MonitorStatus,
   PreviewSnapshot,
   Streamer,
+  StreamerTagInput,
   Video as VideoItem,
   VideoFilters,
 } from "./types";
@@ -504,6 +508,7 @@ export function App({ api }: AppProps) {
 
       {addOpen && (
         <AddStreamerModal
+          api={api}
           initial={editingStreamer}
           onClose={() => { setAddOpen(false); setEditingStreamer(null); }}
           onSubmit={async (input) => {
@@ -732,7 +737,7 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
       : "neutral";
   return (
     <tr data-testid="streamer-row" className={selected ? "selected-row" : ""} onClick={onSelect}>
-      <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div><strong>{streamer.name}</strong><span>{sourceLabel} · {identityLabel}</span></div></div></td>
+      <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div className="streamer-primary"><strong>{streamer.name}</strong><span>{sourceLabel} · {identityLabel}</span>{streamer.tags.length > 0 && <div className="streamer-tag-badges" aria-label={`${streamer.name}标签`}>{streamer.tags.slice(0, 2).map((tag) => <span key={tag.id}>{tag.name}</span>)}{streamer.tags.length > 2 && <b title={`另有 ${streamer.tags.length - 2} 个标签`}>+{streamer.tags.length - 2}</b>}</div>}</div></div></td>
       <td><StatusBadge kind={streamer.liveStatus === "live" ? "live" : streamer.liveStatus === "error" ? "error" : "neutral"}>{liveLabels[streamer.liveStatus]}</StatusBadge></td>
       <td><StatusBadge kind={monitorKind}>{monitorLabels[streamer.monitorStatus]}</StatusBadge></td>
       <td><div className="muted-cell"><span>{formatDate(streamer.lastCheckedAt)}</span>{streamer.lastError && <small title={streamer.lastError}>存在异常</small>}</div></td>
@@ -766,6 +771,14 @@ function SessionPanel({ streamer, videos, onPreview, onOpen, onReveal }: { strea
       ) : (
         <>
           <div className="session-streamer"><div className="streamer-avatar large">{streamer.name.slice(0, 1)}</div><div><strong>{streamer.name}</strong>{streamer.roomUrl ? <a href={streamer.roomUrl} target="_blank" rel="noreferrer">打开直播间 <ExternalLink size={12} /></a> : <button type="button" disabled aria-label="直播间尚未发现">直播间尚未发现</button>}</div></div>
+          <section className="streamer-tag-details" aria-label="主播标签详情">
+            <header><Tag size={15} /><strong>主播标签</strong><span>未来切片上下文</span></header>
+            {streamer.tags.length === 0 ? (
+              <p className="tag-empty">尚未设置标签</p>
+            ) : (
+              <div>{streamer.tags.map((tag) => <article key={tag.id}><span>{tag.name}</span>{tag.promptGuidance && <p>{tag.promptGuidance}</p>}</article>)}</div>
+            )}
+          </section>
           <div className="session-stats"><div><span>完成分片</span><strong>{videos.length}</strong></div><div><span>累计大小</span><strong>{formatBytes(videos.reduce((total, item) => total + item.sizeBytes, 0))}</strong></div></div>
           <div className="video-list">
             {videos.length === 0 ? (
@@ -962,12 +975,98 @@ function SettingsPage({ settings, environment, onOpenLogs, onDiagnose, onSave }:
   );
 }
 
-function AddStreamerModal({ initial, onClose, onSubmit }: { initial: Streamer | null; onClose: () => void; onSubmit: (input: CreateStreamerInput) => Promise<void> }) {
+function AddStreamerModal({ api, initial, onClose, onSubmit }: { api: ClientApi; initial: Streamer | null; onClose: () => void; onSubmit: (input: CreateStreamerInput) => Promise<void> }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [sourceUrl, setSourceUrl] = useState(initial?.sourceUrl ?? "");
   const [monitorEnabled, setMonitorEnabled] = useState(initial?.monitorEnabled ?? true);
+  const [tags, setTags] = useState<StreamerTagInput[]>(
+    initial?.tags.map((tag) => ({
+      name: tag.name,
+      promptGuidance: tag.promptGuidance,
+    })) ?? [],
+  );
+  const [suggestions, setSuggestions] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void api.listStreamerTagNameSuggestions(20)
+      .then((items) => {
+        if (active) setSuggestions(items);
+      })
+      .catch(() => {
+        if (active) setSuggestions([]);
+      });
+    return () => { active = false; };
+  }, [api]);
+
+  const addTag = (tagName = "") => {
+    if (tags.length >= 10) return;
+    if (tagName && tags.some((tag) => tag.name.trim().toLocaleLowerCase() === tagName.trim().toLocaleLowerCase())) {
+      setError("同一主播不能设置重复标签");
+      return;
+    }
+    setTags([...tags, { name: tagName, promptGuidance: null }]);
+    setError(null);
+  };
+
+  const updateTag = (index: number, value: Partial<StreamerTagInput>) => {
+    setTags(tags.map((tag, tagIndex) => tagIndex === index ? { ...tag, ...value } : tag));
+    setError(null);
+  };
+
+  const removeTag = (index: number) => {
+    setTags(tags.filter((_, tagIndex) => tagIndex !== index));
+    setError(null);
+  };
+
+  const moveTag = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (target < 0 || target >= tags.length) return;
+    const reordered = [...tags];
+    [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+    setTags(reordered);
+    setError(null);
+  };
+
+  const validatedTags = (): StreamerTagInput[] | null => {
+    if (tags.length > 10) {
+      setError("每个主播最多可以设置 10 个标签");
+      return null;
+    }
+    const normalizedNames = new Set<string>();
+    const normalized: StreamerTagInput[] = [];
+    for (const tag of tags) {
+      if (/[\u0000-\u001f\u007f]/.test(tag.name) || (tag.promptGuidance && /[\u0000-\u001f\u007f]/.test(tag.promptGuidance))) {
+        setError("标签名称和指导不能包含控制字符");
+        return null;
+      }
+      const tagName = tag.name.trim();
+      const promptGuidance = tag.promptGuidance?.trim() || null;
+      if (!tagName) {
+        setError("标签名称不能为空");
+        return null;
+      }
+      if ([...tagName].length > 24) {
+        setError("标签名称不能超过 24 个字符");
+        return null;
+      }
+      if (promptGuidance && [...promptGuidance].length > 500) {
+        setError("标签指导不能超过 500 个字符");
+        return null;
+      }
+      const key = tagName.toLocaleLowerCase();
+      if (normalizedNames.has(key)) {
+        setError("同一主播不能设置重复标签");
+        return null;
+      }
+      normalizedNames.add(key);
+      normalized.push({ name: tagName, promptGuidance });
+    }
+    return normalized;
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError(null);
@@ -976,15 +1075,53 @@ function AddStreamerModal({ initial, onClose, onSubmit }: { initial: Streamer | 
     const isRoom = /^https?:\/\/live\.douyin\.com\/\d+(?:[/?#].*)?$/.test(normalizedSource);
     if (!isProfile && !isRoom) { setError("请输入有效的个人主页或直播间链接"); return; }
     if (isRoom && !name.trim()) { setError("直播间链接必须填写主播名称"); return; }
+    const normalizedTags = validatedTags();
+    if (!normalizedTags) return;
     setSubmitting(true);
-    try { await onSubmit({ name: name.trim(), sourceUrl: normalizedSource, monitorEnabled }); }
+    try { await onSubmit({ name: name.trim(), sourceUrl: normalizedSource, monitorEnabled, tags: normalizedTags }); }
     catch (reason) { setError(errorMessage(reason, initial ? "修改主播失败" : "添加主播失败")); setSubmitting(false); }
   };
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <form className="modal" onSubmit={submit} aria-label={initial ? "编辑监控主播" : "添加监控主播"}>
         <div className="modal-header"><div className="modal-title-icon">{initial ? <Pencil size={21} /> : <Plus size={21} />}</div><div><h2>{initial ? "编辑监控主播" : "添加监控主播"}</h2><p>{initial ? "修改后会重新检查直播状态。" : "保存后会自动执行第一次直播状态检查。"}</p></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭"><X size={19} /></button></div>
-        <div className="modal-body"><label htmlFor="streamer-name">主播名称<input id="streamer-name" aria-label="主播名称" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="个人主页可留空，自动使用主页昵称" /><small>个人主页可留空；直播间直连必须填写。</small></label><label htmlFor="source-url">个人主页或直播间链接<input id="source-url" aria-label="个人主页或直播间链接" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} placeholder="https://www.douyin.com/user/... 或 https://live.douyin.com/..." /><small>仅访问无需登录的公开页面，不使用 Cookie、登录或验证码绕过。</small></label><label className="switch-row boxed"><div><strong>添加后立即监听</strong><small>主页未发现入口时约每 60 秒检查；发现后每 30 秒检查直播间。</small></div><input type="checkbox" checked={monitorEnabled} onChange={(event) => setMonitorEnabled(event.target.checked)} /></label>{error && <div className="form-error">{error}</div>}</div>
+        <div className="modal-body">
+          <label htmlFor="streamer-name">主播名称<input id="streamer-name" aria-label="主播名称" autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="个人主页可留空，自动使用主页昵称" /><small>个人主页可留空；直播间直连必须填写。</small></label>
+          <label htmlFor="source-url">个人主页或直播间链接<input id="source-url" aria-label="个人主页或直播间链接" value={sourceUrl} onChange={(event) => setSourceUrl(event.target.value)} placeholder="https://www.douyin.com/user/... 或 https://live.douyin.com/..." /><small>仅访问无需登录的公开页面，不使用 Cookie、登录或验证码绕过。</small></label>
+          <section className="tag-editor" aria-label="主播标签编辑器">
+            <div className="tag-editor-heading">
+              <div><strong><Tag size={16} />主播标签</strong><small>最多 10 个；顺序代表未来切片上下文的优先级。</small></div>
+              <button type="button" className="secondary-button compact" disabled={tags.length >= 10} onClick={() => addTag()}><Plus size={15} />添加标签</button>
+            </div>
+            {suggestions.length > 0 && (
+              <div className="tag-suggestions"><span>已有名称建议</span>{suggestions.map((suggestion) => <button type="button" key={suggestion.toLocaleLowerCase()} aria-label={`使用标签建议 ${suggestion}`} disabled={tags.length >= 10} onClick={() => addTag(suggestion)}>{suggestion}</button>)}</div>
+            )}
+            {tags.length === 0 ? (
+              <p className="tag-editor-empty">暂未设置标签，可添加“带货”“搞笑”等内容类型。</p>
+            ) : (
+              <div className="tag-editor-list">
+                {tags.map((tag, index) => (
+                  <article className="tag-editor-item" key={index}>
+                    <div className="tag-priority">{index + 1}</div>
+                    <div className="tag-fields">
+                      <label>标签名称<input aria-label={`标签 ${index + 1} 名称`} value={tag.name} maxLength={24} onChange={(event) => updateTag(index, { name: event.target.value })} placeholder="例如：带货" /><small>{[...tag.name].length}/24</small></label>
+                      <label>Prompt 指导（可选）<textarea aria-label={`标签 ${index + 1} 指导`} value={tag.promptGuidance ?? ""} maxLength={500} onChange={(event) => updateTag(index, { promptGuidance: event.target.value || null })} placeholder="例如：重点提取商品卖点、价格与购买理由" /><small>{[...(tag.promptGuidance ?? "")].length}/500</small></label>
+                    </div>
+                    <div className="tag-item-actions">
+                      <button type="button" aria-label={`上移标签 ${index + 1}`} disabled={index === 0} onClick={() => moveTag(index, -1)}><ArrowUp size={15} /></button>
+                      <button type="button" aria-label={`下移标签 ${index + 1}`} disabled={index === tags.length - 1} onClick={() => moveTag(index, 1)}><ArrowDown size={15} /></button>
+                      <button type="button" className="danger" aria-label={`删除标签 ${index + 1}`} onClick={() => removeTag(index)}><Trash2 size={15} /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+            {tags.length >= 10 && <p className="tag-limit">已达到每个主播 10 个标签的上限</p>}
+            <p className="tag-reservation-note">标签仅为未来切片上下文预留，本版本不生成 Prompt、不调用 LLM。{"__TAURI_INTERNALS__" in window ? "" : " 浏览器演示模式仅保存到 localStorage，不写入 SQLite。"}</p>
+          </section>
+          <label className="switch-row boxed"><div><strong>添加后立即监听</strong><small>主页未发现入口时约每 60 秒检查；发现后每 30 秒检查直播间。</small></div><input type="checkbox" checked={monitorEnabled} onChange={(event) => setMonitorEnabled(event.target.checked)} /></label>
+          {error && <div className="form-error">{error}</div>}
+        </div>
         <div className="modal-footer"><button type="button" className="ghost-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" size={17} /> : <Radio size={17} />}{initial ? "保存修改" : "保存并监听"}</button></div>
       </form>
     </div>

@@ -8,6 +8,7 @@ use crate::app_support::{NormalizedStreamerSource, parse_streamer_source};
 use crate::database::{Database, DatabaseError};
 use crate::domain::{
     CommandError, CreateStreamerRequest, NewStreamer, Streamer, StreamerSourceKind,
+    StreamerTagValidationError, normalize_streamer_tags,
 };
 use crate::supervisor::Supervisor;
 
@@ -65,6 +66,7 @@ pub async fn create_streamer_with(
     worker: &dyn WorkerControl,
     input: CreateStreamerRequest,
 ) -> Result<Streamer, CommandError> {
+    let input = normalize_tag_request(input)?;
     let prepared = prepare_new_streamer(&input, inspector).await?;
 
     if let Some(profile_sec_uid) = prepared.profile_sec_uid.as_deref()
@@ -129,6 +131,7 @@ pub async fn update_streamer_with(
     streamer_id: i64,
     input: CreateStreamerRequest,
 ) -> Result<Streamer, CommandError> {
+    let input = normalize_tag_request(input)?;
     let current = database
         .get_streamer(streamer_id)
         .map_err(map_database_error)?;
@@ -144,10 +147,18 @@ pub async fn update_streamer_with(
     }
     let update_result =
         update_changed_source(database, inspector, worker, streamer_id, input, source).await;
-    if update_result.is_err() && current.monitor_enabled {
-        let _ = worker.start(streamer_id).await;
+    match update_result {
+        Ok(updated) => Ok(updated),
+        Err(error) => {
+            database
+                .restore_streamer_snapshot(&current)
+                .map_err(map_database_error)?;
+            if current.monitor_enabled {
+                worker.start(streamer_id).await.map_err(map_worker_error)?;
+            }
+            Err(error)
+        }
     }
-    update_result
 }
 
 async fn update_changed_source(
@@ -201,23 +212,29 @@ async fn update_without_source_change(
     if current.monitor_enabled && !input.monitor_enabled {
         worker.stop(current.id).await.map_err(map_worker_error)?;
     }
-    let updated = database
-        .update_streamer(
-            current.id,
-            &NewStreamer {
-                name,
-                source_kind: current.source_kind,
-                source_url: current.source_url,
-                profile_sec_uid: current.profile_sec_uid,
-                web_rid: current.web_rid,
-                room_url: current.room_url,
-                room_id: current.room_id,
-                monitor_enabled: input.monitor_enabled,
-            },
-        )
-        .map_err(map_database_error)?;
-    if !current.monitor_enabled && updated.monitor_enabled {
-        worker.start(updated.id).await.map_err(map_worker_error)?;
+    let stopped_original_worker = current.monitor_enabled && !input.monitor_enabled;
+    let updated = match database.update_streamer_without_source_change(
+        current.id,
+        &name,
+        input.monitor_enabled,
+        &input.tags,
+    ) {
+        Ok(updated) => updated,
+        Err(error) => {
+            if stopped_original_worker {
+                worker.start(current.id).await.map_err(map_worker_error)?;
+            }
+            return Err(map_database_error(error));
+        }
+    };
+    if !current.monitor_enabled
+        && updated.monitor_enabled
+        && let Err(message) = worker.start(updated.id).await
+    {
+        database
+            .restore_streamer_snapshot(&current)
+            .map_err(map_database_error)?;
+        return Err(map_worker_error(message));
     }
     Ok(updated)
 }
@@ -270,6 +287,7 @@ async fn prepare_normalized_streamer(
                 room_url: room.as_ref().map(|room| room.room_url.clone()),
                 room_id: room.and_then(|room| room.room_id),
                 monitor_enabled: input.monitor_enabled,
+                tags: input.tags.clone(),
             })
         }
         NormalizedStreamerSource::Room {
@@ -290,6 +308,7 @@ async fn prepare_normalized_streamer(
                 room_url: Some(source_url),
                 room_id: Some(inspection.room_id().to_owned()),
                 monitor_enabled: input.monitor_enabled,
+                tags: input.tags.clone(),
             })
         }
     }
@@ -317,6 +336,17 @@ fn normalized_name(
         return Err(CommandError::new("name_too_long", "主播名称不能超过 80 个字符").field("name"));
     }
     Ok(name.to_owned())
+}
+
+fn normalize_tag_request(
+    mut input: CreateStreamerRequest,
+) -> Result<CreateStreamerRequest, CommandError> {
+    input.tags = normalize_streamer_tags(&input.tags).map_err(map_tag_validation_error)?;
+    Ok(input)
+}
+
+fn map_tag_validation_error(error: StreamerTagValidationError) -> CommandError {
+    CommandError::new(error.code(), error.safe_message()).field(error.field())
 }
 
 fn normalized_source_url(source: &NormalizedStreamerSource) -> &str {
@@ -411,6 +441,7 @@ fn map_database_error(error: DatabaseError) -> CommandError {
         DatabaseError::NotFound(entity) => {
             CommandError::new("not_found", format!("找不到记录：{entity}"))
         }
+        DatabaseError::TagValidation(error) => map_tag_validation_error(error),
         other => CommandError::new("database_error", other.to_string()),
     }
 }

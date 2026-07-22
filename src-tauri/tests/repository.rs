@@ -675,6 +675,7 @@ fn profile_streamer_can_wait_without_room_binding_and_be_found_by_identity() {
             room_url: None,
             room_id: None,
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
 
@@ -707,6 +708,7 @@ fn stable_web_rid_is_unique_while_current_room_id_can_change() {
             room_url: Some("https://live.douyin.com/800".to_owned()),
             room_id: Some("cycle-1".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
 
@@ -741,6 +743,7 @@ fn stable_web_rid_is_unique_while_current_room_id_can_change() {
             room_url: Some("https://live.douyin.com/800".to_owned()),
             room_id: Some("another-cycle".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap_err();
     assert!(error.to_string().contains("稳定直播入口"));
@@ -760,6 +763,7 @@ fn delayed_discovery_merges_history_free_profile_into_existing_room_streamer() {
             room_url: Some("https://live.douyin.com/900".to_owned()),
             room_id: Some("room-900".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
     let session = database.start_session(target.id, "/tmp").unwrap();
@@ -776,6 +780,7 @@ fn delayed_discovery_merges_history_free_profile_into_existing_room_streamer() {
             room_url: None,
             room_id: None,
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
 
@@ -819,6 +824,7 @@ fn delayed_discovery_with_profile_history_pauses_conflict_without_deleting_recor
             room_url: Some("https://live.douyin.com/901".to_owned()),
             room_id: Some("room-901".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
     let temporary = database
@@ -831,6 +837,7 @@ fn delayed_discovery_with_profile_history_pauses_conflict_without_deleting_recor
             room_url: None,
             room_id: None,
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
     let profile_session = database.start_session(temporary.id, "/tmp").unwrap();

@@ -1,6 +1,145 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub use dy_screen::model::StreamerSourceKind;
+
+pub const MAX_STREAMER_TAGS: usize = 10;
+pub const MAX_STREAMER_TAG_NAME_CHARS: usize = 24;
+pub const MAX_STREAMER_TAG_GUIDANCE_CHARS: usize = 500;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamerTagInput {
+    pub name: String,
+    #[serde(default)]
+    pub prompt_guidance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamerTag {
+    pub id: i64,
+    pub name: String,
+    pub prompt_guidance: Option<String>,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamerPromptTag {
+    pub name: String,
+    pub prompt_guidance: Option<String>,
+    pub priority: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamerPromptContext {
+    pub streamer_id: i64,
+    pub streamer_name: String,
+    #[serde(default)]
+    pub tags: Vec<StreamerPromptTag>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamerTagValidationError {
+    TooMany,
+    NameRequired,
+    NameTooLong,
+    GuidanceTooLong,
+    ControlCharacter,
+    DuplicateName,
+}
+
+impl StreamerTagValidationError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::TooMany => "streamer_tags_too_many",
+            Self::NameRequired => "streamer_tag_name_required",
+            Self::NameTooLong => "streamer_tag_name_too_long",
+            Self::GuidanceTooLong => "streamer_tag_guidance_too_long",
+            Self::ControlCharacter => "streamer_tag_control_character",
+            Self::DuplicateName => "streamer_tag_duplicate",
+        }
+    }
+
+    pub const fn field(self) -> &'static str {
+        "tags"
+    }
+
+    pub const fn safe_message(self) -> &'static str {
+        match self {
+            Self::TooMany => "每个主播最多可以设置 10 个标签",
+            Self::NameRequired => "标签名称不能为空",
+            Self::NameTooLong => "标签名称不能超过 24 个字符",
+            Self::GuidanceTooLong => "标签指导不能超过 500 个字符",
+            Self::ControlCharacter => "标签名称和指导不能包含控制字符",
+            Self::DuplicateName => "同一主播不能设置重复标签",
+        }
+    }
+}
+
+impl std::fmt::Display for StreamerTagValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.safe_message())
+    }
+}
+
+impl std::error::Error for StreamerTagValidationError {}
+
+pub fn normalize_streamer_tags(
+    tags: &[StreamerTagInput],
+) -> Result<Vec<StreamerTagInput>, StreamerTagValidationError> {
+    if tags.len() > MAX_STREAMER_TAGS {
+        return Err(StreamerTagValidationError::TooMany);
+    }
+
+    let mut normalized_names = HashSet::with_capacity(tags.len());
+    tags.iter()
+        .map(|tag| {
+            if tag.name.chars().any(char::is_control)
+                || tag
+                    .prompt_guidance
+                    .as_deref()
+                    .is_some_and(|value| value.chars().any(char::is_control))
+            {
+                return Err(StreamerTagValidationError::ControlCharacter);
+            }
+
+            let name = tag.name.trim();
+            if name.is_empty() {
+                return Err(StreamerTagValidationError::NameRequired);
+            }
+            if name.chars().count() > MAX_STREAMER_TAG_NAME_CHARS {
+                return Err(StreamerTagValidationError::NameTooLong);
+            }
+
+            let prompt_guidance = tag
+                .prompt_guidance
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if prompt_guidance
+                .is_some_and(|value| value.chars().count() > MAX_STREAMER_TAG_GUIDANCE_CHARS)
+            {
+                return Err(StreamerTagValidationError::GuidanceTooLong);
+            }
+
+            if !normalized_names.insert(streamer_tag_name_key(name)) {
+                return Err(StreamerTagValidationError::DuplicateName);
+            }
+
+            Ok(StreamerTagInput {
+                name: name.to_owned(),
+                prompt_guidance: prompt_guidance.map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn streamer_tag_name_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -13,6 +152,8 @@ pub struct NewStreamer {
     pub room_url: Option<String>,
     pub room_id: Option<String>,
     pub monitor_enabled: bool,
+    #[serde(default)]
+    pub tags: Vec<StreamerTagInput>,
 }
 
 impl NewStreamer {
@@ -33,6 +174,7 @@ impl NewStreamer {
             room_url: Some(room_url),
             room_id: Some(room_id.into()),
             monitor_enabled,
+            tags: Vec::new(),
         }
     }
 }
@@ -44,6 +186,8 @@ pub struct CreateStreamerRequest {
     #[serde(alias = "roomUrl")]
     pub source_url: String,
     pub monitor_enabled: bool,
+    #[serde(default)]
+    pub tags: Vec<StreamerTagInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,6 +247,26 @@ pub struct Streamer {
     pub last_error: Option<String>,
     pub current_video_count: i64,
     pub history_video_count: i64,
+    #[serde(default)]
+    pub tags: Vec<StreamerTag>,
+}
+
+impl Streamer {
+    pub fn prompt_context(&self) -> StreamerPromptContext {
+        StreamerPromptContext {
+            streamer_id: self.id,
+            streamer_name: self.name.clone(),
+            tags: self
+                .tags
+                .iter()
+                .map(|tag| StreamerPromptTag {
+                    name: tag.name.clone(),
+                    prompt_guidance: tag.prompt_guidance.clone(),
+                    priority: tag.sort_order,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

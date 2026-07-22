@@ -5,10 +5,13 @@ use dy_screen::error::{RecorderError, Result as RecorderResult};
 use dy_screen::model::{ProfileIdentity, ProfileInspection, ProfileRoom, RoomStreams};
 use dy_screen::resolver::RoomInspection;
 use dy_screen_app_lib::database::Database;
-use dy_screen_app_lib::domain::{CreateStreamerRequest, NewStreamer, StreamerSourceKind};
+use dy_screen_app_lib::domain::{
+    CreateStreamerRequest, NewStreamer, StreamerSourceKind, StreamerTagInput,
+};
 use dy_screen_app_lib::streamer_service::{
     SourceInspector, WorkerControl, create_streamer_with, update_streamer_with,
 };
+use rusqlite::Connection;
 
 const PROFILE_UID: &str = "profile-service-a";
 
@@ -112,6 +115,45 @@ struct FakeWorker {
     calls: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Clone)]
+struct FailFirstStartWorker {
+    calls: Arc<Mutex<Vec<String>>>,
+    remaining_failures: Arc<Mutex<usize>>,
+}
+
+impl FailFirstStartWorker {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            remaining_failures: Arc::new(Mutex::new(1)),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkerControl for FailFirstStartWorker {
+    async fn start(&self, streamer_id: i64) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("start:{streamer_id}"));
+        let mut remaining = self.remaining_failures.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err("模拟 worker 启动失败".to_owned());
+        }
+        Ok(())
+    }
+
+    async fn stop(&self, streamer_id: i64) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("stop:{streamer_id}"));
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl WorkerControl for FakeWorker {
     async fn start(&self, streamer_id: i64) -> Result<(), String> {
@@ -136,6 +178,14 @@ fn profile_request(profile_sec_uid: &str, name: &str) -> CreateStreamerRequest {
         name: name.to_owned(),
         source_url: format!("https://www.douyin.com/user/{profile_sec_uid}"),
         monitor_enabled: true,
+        tags: Vec::new(),
+    }
+}
+
+fn tag(name: &str, prompt_guidance: Option<&str>) -> StreamerTagInput {
+    StreamerTagInput {
+        name: name.to_owned(),
+        prompt_guidance: prompt_guidance.map(str::to_owned),
     }
 }
 
@@ -199,6 +249,7 @@ async fn direct_room_still_requires_a_name() {
         name: "".to_owned(),
         source_url: "https://live.douyin.com/123".to_owned(),
         monitor_enabled: true,
+        tags: Vec::new(),
     };
 
     let error = create_streamer_with(
@@ -222,6 +273,7 @@ async fn malformed_profile_path_has_a_distinct_field_error_code() {
         name: "主页主播".to_owned(),
         source_url: "https://www.douyin.com/user/?token=profile-secret".to_owned(),
         monitor_enabled: true,
+        tags: Vec::new(),
     };
 
     let error = create_streamer_with(
@@ -258,6 +310,7 @@ async fn rename_only_preserves_identity_without_stopping_worker_or_rechecking_so
             name: "新名称".to_owned(),
             source_url: current.source_url.clone(),
             monitor_enabled: true,
+            tags: Vec::new(),
         },
     )
     .await
@@ -287,6 +340,7 @@ async fn source_conflict_restores_original_worker_and_record() {
             room_url: None,
             room_id: None,
             monitor_enabled: false,
+            tags: Vec::new(),
         })
         .unwrap();
     let inspector = FakeInspector {
@@ -396,6 +450,7 @@ async fn duplicate_profile_returns_existing_streamer_id_without_starting_second_
             room_url: None,
             room_id: None,
             monitor_enabled: false,
+            tags: Vec::new(),
         })
         .unwrap();
     let worker = FakeWorker::default();
@@ -413,4 +468,230 @@ async fn duplicate_profile_returns_existing_streamer_id_without_starting_second_
     assert_eq!(error.existing_streamer_id, Some(existing.id));
     assert!(worker.calls.lock().unwrap().is_empty());
     assert_eq!(database.list_streamers(true).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_profile_and_room_persist_normalized_ordered_tags() {
+    let profile_database = Database::open_in_memory().unwrap();
+    profile_database.migrate().unwrap();
+    let mut profile_input = profile_request(PROFILE_UID, "");
+    profile_input.tags = vec![tag("  带货  ", Some("  商品表达  ")), tag("搞笑", None)];
+    let profile = create_streamer_with(
+        &profile_database,
+        &FakeInspector::live(),
+        &FakeWorker::default(),
+        profile_input,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        profile
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        ["带货", "搞笑"]
+    );
+    assert_eq!(profile.tags[0].prompt_guidance.as_deref(), Some("商品表达"));
+
+    let room_database = Database::open_in_memory().unwrap();
+    room_database.migrate().unwrap();
+    let room = create_streamer_with(
+        &room_database,
+        &FakeInspector::live(),
+        &FakeWorker::default(),
+        CreateStreamerRequest {
+            name: "直播间主播".to_owned(),
+            source_url: "https://live.douyin.com/123".to_owned(),
+            monitor_enabled: true,
+            tags: vec![tag("知识", None)],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(room.tags[0].name, "知识");
+}
+
+#[tokio::test]
+async fn invalid_tags_fail_before_source_access_and_leave_no_partial_streamer() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let inspector = FakeInspector::live();
+    let worker = FakeWorker::default();
+    let mut request = profile_request(PROFILE_UID, "标签错误主播");
+    request.tags = vec![tag("Funny", None), tag(" funny ", None)];
+
+    let error = create_streamer_with(&database, &inspector, &worker, request)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, "streamer_tag_duplicate");
+    assert_eq!(error.field.as_deref(), Some("tags"));
+    assert!(inspector.calls.lock().unwrap().is_empty());
+    assert!(worker.calls.lock().unwrap().is_empty());
+    assert!(database.list_streamers(true).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tag_only_update_preserves_identity_and_worker_without_source_access() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let current = database
+        .add_streamer(&NewStreamer::room("标签主播", "990", "room-990", true))
+        .unwrap();
+    database
+        .update_streamer_status(current.id, "live", "recording", None)
+        .unwrap();
+    let current = database.get_streamer(current.id).unwrap();
+    let inspector = FakeInspector::unsupported("unused");
+    inspector.calls.lock().unwrap().clear();
+    let worker = FakeWorker::default();
+
+    let updated = update_streamer_with(
+        &database,
+        &inspector,
+        &worker,
+        current.id,
+        CreateStreamerRequest {
+            name: current.name.clone(),
+            source_url: current.source_url.clone(),
+            monitor_enabled: current.monitor_enabled,
+            tags: vec![tag("带货", Some("重点提取商品表达")), tag("搞笑", None)],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(updated.profile_sec_uid, current.profile_sec_uid);
+    assert_eq!(updated.web_rid, current.web_rid);
+    assert_eq!(updated.room_id, current.room_id);
+    assert_eq!(updated.monitor_status, current.monitor_status);
+    assert_eq!(updated.live_status, current.live_status);
+    assert_eq!(updated.tags.len(), 2);
+    assert!(inspector.calls.lock().unwrap().is_empty());
+    assert!(worker.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archive_and_restore_preserve_original_tags_and_order() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let mut input = NewStreamer::room("归档主播", "991", "room-991", true);
+    input.tags = vec![tag("带货", Some("商品表达")), tag("搞笑", None)];
+    let archived = database.add_streamer(&input).unwrap();
+    database.archive_streamer(archived.id).unwrap();
+
+    let restored = create_streamer_with(
+        &database,
+        &FakeInspector::live(),
+        &FakeWorker::default(),
+        CreateStreamerRequest {
+            name: "恢复主播".to_owned(),
+            source_url: "https://live.douyin.com/991".to_owned(),
+            monitor_enabled: true,
+            tags: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(restored.id, archived.id);
+    assert_eq!(
+        restored
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        ["带货", "搞笑"]
+    );
+    assert_eq!(
+        restored.tags[0].prompt_guidance.as_deref(),
+        Some("商品表达")
+    );
+}
+
+#[tokio::test]
+async fn same_source_database_failure_restores_stopped_worker_and_original_tags() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("same-source-rollback.sqlite3");
+    let database = Database::open(&path).unwrap();
+    database.migrate().unwrap();
+    let mut input = NewStreamer::room("事务主播", "992", "room-992", true);
+    input.tags = vec![tag("原标签", Some("原指导"))];
+    let current = database.add_streamer(&input).unwrap();
+    database
+        .update_streamer_status(current.id, "live", "recording", None)
+        .unwrap();
+    let current = database.get_streamer(current.id).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            r#"
+            CREATE TRIGGER fail_same_source_tag BEFORE INSERT ON streamer_tags
+            WHEN NEW.name = '触发失败'
+            BEGIN
+                SELECT RAISE(ABORT, '模拟标签写入失败');
+            END;
+            "#,
+        )
+        .unwrap();
+    let worker = FakeWorker::default();
+
+    let error = update_streamer_with(
+        &database,
+        &FakeInspector::unsupported("unused"),
+        &worker,
+        current.id,
+        CreateStreamerRequest {
+            name: current.name.clone(),
+            source_url: current.source_url.clone(),
+            monitor_enabled: false,
+            tags: vec![tag("触发失败", None)],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, "database_error");
+    assert_eq!(database.get_streamer(current.id).unwrap(), current);
+    assert_eq!(
+        worker.calls.lock().unwrap().as_slice(),
+        [
+            format!("stop:{}", current.id),
+            format!("start:{}", current.id)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn changed_source_worker_start_failure_restores_original_record_tags_and_worker() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let mut input = NewStreamer::room("原主播", "993", "room-993", true);
+    input.tags = vec![tag("原标签", Some("原指导"))];
+    let current = database.add_streamer(&input).unwrap();
+    let worker = FailFirstStartWorker::new();
+    let mut request = profile_request(PROFILE_UID, "新主页");
+    request.tags = vec![tag("新标签", None)];
+
+    let error = update_streamer_with(
+        &database,
+        &FakeInspector::offline(),
+        &worker,
+        current.id,
+        request,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, "worker_control_failed");
+    assert_eq!(database.get_streamer(current.id).unwrap(), current);
+    assert_eq!(
+        worker.calls.lock().unwrap().as_slice(),
+        [
+            format!("stop:{}", current.id),
+            format!("start:{}", current.id),
+            format!("start:{}", current.id),
+        ]
+    );
 }

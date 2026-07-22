@@ -21,6 +21,7 @@ const streamer: Streamer = {
   lastError: null,
   currentVideoCount: 0,
   historyVideoCount: 3,
+  tags: [],
 };
 
 const completedVideo: Video = {
@@ -46,6 +47,12 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     }),
     createStreamer: vi.fn().mockResolvedValue(streamer),
     updateStreamer: vi.fn().mockResolvedValue(streamer),
+    listStreamerTagNameSuggestions: vi.fn().mockResolvedValue([]),
+    getStreamerPromptContext: vi.fn().mockResolvedValue({
+      streamerId: streamer.id,
+      streamerName: streamer.name,
+      tags: [],
+    }),
     setMonitorEnabled: vi.fn().mockResolvedValue(undefined),
     checkStreamerNow: vi.fn().mockResolvedValue(undefined),
     archiveStreamer: vi.fn().mockResolvedValue(undefined),
@@ -108,6 +115,7 @@ describe("App", () => {
       name: "小鱼直播间",
       sourceUrl: "https://live.douyin.com/452086788686",
       monitorEnabled: true,
+      tags: [],
     });
   });
 
@@ -127,7 +135,117 @@ describe("App", () => {
       name: "",
       sourceUrl: "https://www.douyin.com/user/profile-sec-uid",
       monitorEnabled: true,
+      tags: [],
     });
+  });
+
+  it("添加带货和搞笑标签并按调整后的顺序提交", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    await user.type(screen.getByLabelText("主播名称"), "标签主播");
+    await user.type(
+      screen.getByLabelText("个人主页或直播间链接"),
+      "https://live.douyin.com/452086788686",
+    );
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    await user.type(screen.getByLabelText("标签 1 名称"), "带货");
+    await user.type(screen.getByLabelText("标签 1 指导"), "重点提取商品卖点");
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    await user.type(screen.getByLabelText("标签 2 名称"), "搞笑");
+    await user.click(screen.getByRole("button", { name: "上移标签 2" }));
+    await user.click(screen.getByRole("button", { name: "保存并监听" }));
+
+    expect(api.createStreamer).toHaveBeenCalledWith({
+      name: "标签主播",
+      sourceUrl: "https://live.douyin.com/452086788686",
+      monitorEnabled: true,
+      tags: [
+        { name: "搞笑", promptGuidance: null },
+        { name: "带货", promptGuidance: "重点提取商品卖点" },
+      ],
+    });
+  });
+
+  it("可以删除标签并使用已有标签名称建议", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.listStreamerTagNameSuggestions = vi.fn().mockResolvedValue(["带货", "搞笑"]);
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    await user.click(await screen.findByRole("button", { name: "使用标签建议 带货" }));
+    expect(screen.getByLabelText("标签 1 名称")).toHaveValue("带货");
+    await user.click(screen.getByRole("button", { name: "删除标签 1" }));
+    expect(screen.queryByLabelText("标签 1 名称")).not.toBeInTheDocument();
+  });
+
+  it("标签达到十个后阻止继续添加并展示数量提示", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    const addTag = screen.getByRole("button", { name: "添加标签" });
+    for (let index = 0; index < 10; index += 1) await user.click(addTag);
+
+    expect(addTag).toBeDisabled();
+    expect(screen.getByText("已达到每个主播 10 个标签的上限")).toBeInTheDocument();
+    expect(screen.getByText(/不生成 Prompt、不调用 LLM/)).toBeInTheDocument();
+    expect(screen.getByText(/浏览器演示模式仅保存到 localStorage，不写入 SQLite/)).toBeInTheDocument();
+  });
+
+  it("后端拒绝标签时保持弹窗和用户输入", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.createStreamer = vi.fn().mockRejectedValue({
+      code: "streamer_tag_duplicate",
+      message: "同一主播不能设置重复标签",
+      field: "tags",
+      existingStreamerId: null,
+    });
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "添加主播" }));
+    await user.type(screen.getByLabelText("主播名称"), "保留内容主播");
+    await user.type(
+      screen.getByLabelText("个人主页或直播间链接"),
+      "https://live.douyin.com/452086788686",
+    );
+    await user.click(screen.getByRole("button", { name: "添加标签" }));
+    await user.type(screen.getByLabelText("标签 1 名称"), "带货");
+    await user.click(screen.getByRole("button", { name: "保存并监听" }));
+
+    expect(await screen.findByText("同一主播不能设置重复标签")).toBeInTheDocument();
+    expect(screen.getByRole("form", { name: "添加监控主播" })).toBeInTheDocument();
+    expect(screen.getByLabelText("标签 1 名称")).toHaveValue("带货");
+    expect(screen.getByLabelText("主播名称")).toHaveValue("保留内容主播");
+  });
+
+  it("主播表格折叠多余标签并在详情展示完整指导", async () => {
+    const tagged: Streamer = {
+      ...streamer,
+      tags: [
+        { id: 1, name: "带货", promptGuidance: "重点提取商品卖点", sortOrder: 0 },
+        { id: 2, name: "搞笑", promptGuidance: null, sortOrder: 1 },
+        { id: 3, name: "知识", promptGuidance: "关注解释", sortOrder: 2 },
+        { id: 4, name: "生活", promptGuidance: null, sortOrder: 3 },
+      ],
+    };
+    render(<App api={createApi([tagged])} />);
+
+    const row = (await screen.findAllByTestId("streamer-row"))[0];
+    expect(row).toHaveTextContent("带货");
+    expect(row).toHaveTextContent("搞笑");
+    expect(row).toHaveTextContent("+2");
+    expect(screen.getByText("重点提取商品卖点")).toBeInTheDocument();
+    expect(screen.getByText("关注解释")).toBeInTheDocument();
+  });
+
+  it("无标签主播详情展示可操作空状态", async () => {
+    render(<App api={createApi([streamer])} />);
+    expect(await screen.findByText("尚未设置标签")).toBeInTheDocument();
   });
 
   it("直播间直连仍要求填写主播名称", async () => {
@@ -413,6 +531,45 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.queryAllByText("临时主页")).toHaveLength(0));
     expect(screen.getAllByText("合并目标").length).toBeGreaterThan(0);
+  });
+
+  it("主播事件刷新为后端返回的最新标签顺序", async () => {
+    let listener: ((event: { kind: string; streamerId: number | null }) => void) | undefined;
+    const previous: Streamer = {
+      ...streamer,
+      tags: [
+        { id: 1, name: "带货", promptGuidance: null, sortOrder: 0 },
+        { id: 2, name: "搞笑", promptGuidance: null, sortOrder: 1 },
+      ],
+    };
+    const latest: Streamer = {
+      ...previous,
+      tags: [
+        { id: 2, name: "搞笑", promptGuidance: null, sortOrder: 0 },
+        { id: 1, name: "带货", promptGuidance: null, sortOrder: 1 },
+      ],
+    };
+    const api = createApi([previous]);
+    api.getDashboard = vi
+      .fn()
+      .mockResolvedValueOnce({ streamers: [previous], activeRecordings: 0, currentVideoCount: 0 })
+      .mockResolvedValue({ streamers: [latest], activeRecordings: 0, currentVideoCount: 0 });
+    api.subscribe = vi.fn().mockImplementation(async (callback) => {
+      listener = callback;
+      return () => undefined;
+    });
+    render(<App api={api} />);
+    const row = (await screen.findAllByTestId("streamer-row"))[0];
+    expect([...row.querySelectorAll(".streamer-tag-badges span")].map((item) => item.textContent)).toEqual(["带货", "搞笑"]);
+
+    await act(async () => {
+      listener?.({ kind: "streamer_updated", streamerId: streamer.id });
+    });
+
+    await waitFor(() => {
+      const refreshedRow = screen.getAllByTestId("streamer-row")[0];
+      expect([...refreshedRow.querySelectorAll(".streamer-tag-badges span")].map((item) => item.textContent)).toEqual(["搞笑", "带货"]);
+    });
   });
 
   it("从本次监听视频打开内置播放器", async () => {

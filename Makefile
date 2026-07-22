@@ -33,7 +33,8 @@ ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor test-preview test-preview-integration test-profile test-migration \
-	test-supervisor-profile inspect-profile resolve record record-multi clean
+	test-supervisor-profile test-tags test-tag-migration test-tag-repository \
+	test-tag-service test-tag-ui inspect-profile resolve record record-multi clean
 
 help:
 	@printf '%s\n' \
@@ -55,6 +56,11 @@ help:
 		'  make test-profile    执行个人主页 fixture 与脱敏测试' \
 		'  make test-migration  执行三层身份数据库迁移测试' \
 		'  make test-supervisor-profile 执行主页/直播间双阶段状态机测试' \
+		'  make test-tags       执行主播标签后端、迁移和前端测试' \
+		'  make test-tag-migration 执行主播标签 SQLite migration 测试' \
+		'  make test-tag-repository 执行主播标签 repository 与生命周期测试' \
+		'  make test-tag-service 执行主播创建、编辑和标签校验服务测试' \
+		'  make test-tag-ui     执行标签表单、展示和浏览器演示测试' \
 		'  make check           执行格式、Clippy、测试和前端构建' \
 		'  make spec-validate   严格校验当前 OpenSpec 变更' \
 		'  make verify          执行 check、OpenSpec 校验和桌面应用构建' \
@@ -152,6 +158,22 @@ test-migration:
 
 test-supervisor-profile:
 	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test supervisor_profile
+
+test-tag-migration:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test streamer_tag_repository \
+		v2_migration_preserves_existing_data_and_adds_empty_tag_collections -- --exact
+
+test-tag-repository:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test streamer_tag_repository
+
+test-tag-service:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test streamer_tags
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test streamer_service
+
+test-tag-ui:
+	"$(NPM)" test -- --run ui/src/App.test.tsx ui/src/api.test.ts
+
+test-tags: test-tag-migration test-tag-repository test-tag-service test-tag-ui
 
 test: test-frontend test-core test-app
 

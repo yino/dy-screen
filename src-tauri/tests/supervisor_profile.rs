@@ -10,7 +10,9 @@ use dy_screen::model::{
 };
 use dy_screen::resolver::RoomInspection;
 use dy_screen_app_lib::database::Database;
-use dy_screen_app_lib::domain::{AppSettings, MonitorEvent, NewStreamer, StreamerSourceKind};
+use dy_screen_app_lib::domain::{
+    AppSettings, MonitorEvent, NewStreamer, StreamerSourceKind, StreamerTagInput,
+};
 use dy_screen_app_lib::supervisor::{
     DelayStrategy, JitterSource, MonitorPublisher, NoopPublisher, ProfileDiscovery, RoomDiscovery,
     Supervisor, profile_backoff_seconds,
@@ -237,6 +239,7 @@ fn waiting_profile(database: &Database, profile_sec_uid: &str, enabled: bool) ->
             room_url: None,
             room_id: None,
             monitor_enabled: enabled,
+            tags: Vec::new(),
         })
         .unwrap()
         .id
@@ -431,6 +434,7 @@ async fn three_entry_invalid_results_clear_binding_and_return_to_profile_discove
             room_url: Some("https://live.douyin.com/601".to_owned()),
             room_id: Some("room-601".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
     let profile = Arc::new(FakeProfileDiscovery::new([ProfileReply::Offline(
@@ -558,6 +562,7 @@ async fn retryable_room_failure_and_single_entry_invalid_do_not_clear_binding() 
             room_url: Some("https://live.douyin.com/702".to_owned()),
             room_id: Some("room-702".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
     let room = Arc::new(FakeRoomDiscovery::new([
@@ -607,7 +612,25 @@ async fn delayed_duplicate_discovery_emits_target_and_removes_temporary_worker_r
     let target = database
         .add_streamer(&NewStreamer::room("已有直播间", "803", "room-803", false))
         .unwrap();
+    database
+        .replace_streamer_tags(
+            target.id,
+            &[StreamerTagInput {
+                name: "带货".to_owned(),
+                prompt_guidance: None,
+            }],
+        )
+        .unwrap();
     let temporary_id = waiting_profile(&database, "profile-merge-worker", true);
+    database
+        .replace_streamer_tags(
+            temporary_id,
+            &[StreamerTagInput {
+                name: "搞笑".to_owned(),
+                prompt_guidance: Some("关注幽默表达".to_owned()),
+            }],
+        )
+        .unwrap();
     let profile = Arc::new(FakeProfileDiscovery::new([ProfileReply::Live {
         profile_sec_uid: "profile-merge-worker",
         web_rid: "803",
@@ -642,6 +665,14 @@ async fn delayed_duplicate_discovery_emits_target_and_removes_temporary_worker_r
     assert_eq!(
         saved_target.profile_sec_uid.as_deref(),
         Some("profile-merge-worker")
+    );
+    assert_eq!(
+        saved_target
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        ["带货", "搞笑"]
     );
     wait_until(|| supervisor.worker_count() == 1).await;
     supervisor.shutdown().await;
@@ -735,6 +766,7 @@ async fn recording_revalidation_persists_and_uses_the_latest_room_id() {
             room_url: Some("https://live.douyin.com/905".to_owned()),
             room_id: Some("room-A".to_owned()),
             monitor_enabled: true,
+            tags: Vec::new(),
         })
         .unwrap();
     let room = Arc::new(FakeRoomDiscovery::new([

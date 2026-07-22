@@ -1,14 +1,17 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
-use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params, params_from_iter};
 use thiserror::Error;
 
 use crate::domain::{
     AppSettings, Dashboard, DiscoveryBinding, NewStreamer, NewVideo, RecordingSession, Streamer,
-    StreamerSourceKind, Video, VideoFilter, VideoPage,
+    StreamerPromptContext, StreamerSourceKind, StreamerTag, StreamerTagInput,
+    StreamerTagValidationError, Video, VideoFilter, VideoPage, normalize_streamer_tags,
+    streamer_tag_name_key,
 };
 
 #[derive(Debug, Error)]
@@ -29,6 +32,8 @@ pub enum DatabaseError {
     Poisoned,
     #[error("数据库迁移完整性检查失败：{0}")]
     MigrationIntegrity(String),
+    #[error("{0}")]
+    TagValidation(#[from] StreamerTagValidationError),
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
@@ -176,6 +181,18 @@ impl Database {
                 )));
             }
         }
+
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = 3",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            migrate_streamer_tags_v3(&mut connection)?;
+        }
         drop(connection);
         self.ensure_default_settings()
     }
@@ -210,6 +227,7 @@ impl Database {
     }
 
     pub fn add_streamer(&self, input: &NewStreamer) -> Result<Streamer> {
+        let normalized_tags = normalize_streamer_tags(&input.tags)?;
         let now = Utc::now().to_rfc3339();
         let monitor_status = initial_monitor_status(input);
         let live_status = if input.web_rid.is_some() {
@@ -217,8 +235,9 @@ impl Database {
         } else {
             "offline"
         };
-        let connection = self.connection()?;
-        let inserted = connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let inserted = transaction.execute(
             r#"
             INSERT INTO streamers(
                 name, source_kind, source_url, profile_sec_uid, web_rid,
@@ -242,7 +261,9 @@ impl Database {
         );
         match inserted {
             Ok(_) => {
-                let id = connection.last_insert_rowid();
+                let id = transaction.last_insert_rowid();
+                insert_streamer_tags_in_transaction(&transaction, id, &normalized_tags)?;
+                transaction.commit()?;
                 drop(connection);
                 self.get_streamer(id)
             }
@@ -255,22 +276,27 @@ impl Database {
 
     pub fn get_streamer(&self, id: i64) -> Result<Streamer> {
         let connection = self.connection()?;
-        connection
+        let mut streamer = connection
             .query_row(&streamer_select("WHERE s.id = ?1"), [id], map_streamer)
             .optional()?
-            .ok_or(DatabaseError::NotFound("主播"))
+            .ok_or(DatabaseError::NotFound("主播"))?;
+        attach_tags_to_streamers(&connection, std::slice::from_mut(&mut streamer))?;
+        Ok(streamer)
     }
 
     pub fn find_streamer_by_room_id(&self, room_id: &str) -> Result<Option<Streamer>> {
         let connection = self.connection()?;
-        connection
+        let mut streamer = connection
             .query_row(
                 &streamer_select("WHERE s.room_id = ?1 ORDER BY s.id LIMIT 1"),
                 [room_id],
                 map_streamer,
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        if let Some(streamer) = streamer.as_mut() {
+            attach_tags_to_streamers(&connection, std::slice::from_mut(streamer))?;
+        }
+        Ok(streamer)
     }
 
     pub fn find_streamer_by_profile_sec_uid(
@@ -278,26 +304,32 @@ impl Database {
         profile_sec_uid: &str,
     ) -> Result<Option<Streamer>> {
         let connection = self.connection()?;
-        connection
+        let mut streamer = connection
             .query_row(
                 &streamer_select("WHERE s.profile_sec_uid = ?1"),
                 [profile_sec_uid],
                 map_streamer,
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        if let Some(streamer) = streamer.as_mut() {
+            attach_tags_to_streamers(&connection, std::slice::from_mut(streamer))?;
+        }
+        Ok(streamer)
     }
 
     pub fn find_streamer_by_web_rid(&self, web_rid: &str) -> Result<Option<Streamer>> {
         let connection = self.connection()?;
-        connection
+        let mut streamer = connection
             .query_row(
                 &streamer_select("WHERE s.web_rid = ?1"),
                 [web_rid],
                 map_streamer,
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        if let Some(streamer) = streamer.as_mut() {
+            attach_tags_to_streamers(&connection, std::slice::from_mut(streamer))?;
+        }
+        Ok(streamer)
     }
 
     pub fn list_streamers(&self, include_archived: bool) -> Result<Vec<Streamer>> {
@@ -310,8 +342,65 @@ impl Database {
         let sql = streamer_select(suffix);
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map([], map_streamer)?;
+        let mut streamers = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        attach_tags_to_streamers(&connection, &mut streamers)?;
+        Ok(streamers)
+    }
+
+    pub fn replace_streamer_tags(
+        &self,
+        streamer_id: i64,
+        tags: &[StreamerTagInput],
+    ) -> Result<Vec<StreamerTag>> {
+        let normalized = normalize_streamer_tags(tags)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM streamers WHERE id = ?1",
+                [streamer_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(DatabaseError::NotFound("主播"));
+        }
+        replace_streamer_tags_in_transaction(&transaction, streamer_id, &normalized)?;
+        transaction.commit()?;
+        drop(connection);
+        Ok(self.get_streamer(streamer_id)?.tags)
+    }
+
+    pub fn list_streamer_tag_name_suggestions(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT (
+                SELECT latest.name
+                FROM streamer_tags latest
+                WHERE latest.normalized_name = grouped.normalized_name
+                ORDER BY latest.updated_at DESC, latest.id DESC
+                LIMIT 1
+            )
+            FROM streamer_tags grouped
+            GROUP BY grouped.normalized_name
+            ORDER BY MAX(grouped.updated_at) DESC, grouped.normalized_name
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = statement.query_map([limit.min(100) as i64], |row| row.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn streamer_prompt_context(&self, streamer_id: i64) -> Result<StreamerPromptContext> {
+        self.get_streamer(streamer_id)
+            .map(|streamer| streamer.prompt_context())
     }
 
     pub fn set_monitor_enabled(&self, id: i64, enabled: bool) -> Result<()> {
@@ -327,14 +416,16 @@ impl Database {
     }
 
     pub fn update_streamer(&self, id: i64, input: &NewStreamer) -> Result<Streamer> {
+        let normalized_tags = normalize_streamer_tags(&input.tags)?;
         let monitor_status = initial_monitor_status(input);
         let live_status = if input.web_rid.is_some() {
             "checking"
         } else {
             "offline"
         };
-        let connection = self.connection()?;
-        let updated = connection.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let updated = transaction.execute(
             r#"
             UPDATE streamers
             SET name = ?1, source_kind = ?2, source_url = ?3,
@@ -361,6 +452,8 @@ impl Database {
         match updated {
             Ok(0) => Err(DatabaseError::NotFound("主播")),
             Ok(_) => {
+                replace_streamer_tags_in_transaction(&transaction, id, &normalized_tags)?;
+                transaction.commit()?;
                 drop(connection);
                 self.get_streamer(id)
             }
@@ -369,6 +462,116 @@ impl Database {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub fn update_streamer_without_source_change(
+        &self,
+        id: i64,
+        name: &str,
+        monitor_enabled: bool,
+        tags: &[StreamerTagInput],
+    ) -> Result<Streamer> {
+        let normalized_tags = normalize_streamer_tags(tags)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            r#"
+            UPDATE streamers
+            SET name = ?1,
+                monitor_enabled = ?2,
+                monitor_status = CASE
+                    WHEN ?2 = 0 THEN 'paused'
+                    WHEN monitor_enabled = 0 THEN CASE
+                        WHEN source_kind = 'profile' AND web_rid IS NULL
+                            THEN 'waiting_first_live'
+                        ELSE 'waiting'
+                    END
+                    ELSE monitor_status
+                END,
+                updated_at = ?3
+            WHERE id = ?4 AND archived = 0
+            "#,
+            params![name.trim(), monitor_enabled, Utc::now().to_rfc3339(), id,],
+        )?;
+        if changed == 0 {
+            return Err(DatabaseError::NotFound("主播"));
+        }
+        replace_streamer_tags_in_transaction(&transaction, id, &normalized_tags)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_streamer(id)
+    }
+
+    pub fn restore_streamer_snapshot(&self, snapshot: &Streamer) -> Result<Streamer> {
+        let snapshot_tags = snapshot
+            .tags
+            .iter()
+            .map(|tag| StreamerTagInput {
+                name: tag.name.clone(),
+                prompt_guidance: tag.prompt_guidance.clone(),
+            })
+            .collect::<Vec<_>>();
+        let normalized_tags = normalize_streamer_tags(&snapshot_tags)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            r#"
+            UPDATE streamers
+            SET name = ?1, source_kind = ?2, source_url = ?3,
+                profile_sec_uid = ?4, web_rid = ?5, room_url = ?6,
+                room_id = ?7, monitor_enabled = ?8, archived = ?9,
+                live_status = ?10, monitor_status = ?11,
+                last_checked_at = ?12, last_error = ?13, updated_at = ?14
+            WHERE id = ?15
+            "#,
+            params![
+                snapshot.name,
+                source_kind_value(snapshot.source_kind),
+                snapshot.source_url,
+                snapshot.profile_sec_uid,
+                snapshot.web_rid,
+                snapshot.room_url,
+                snapshot.room_id,
+                snapshot.monitor_enabled,
+                snapshot.archived,
+                snapshot.live_status,
+                snapshot.monitor_status,
+                snapshot.last_checked_at,
+                snapshot.last_error,
+                Utc::now().to_rfc3339(),
+                snapshot.id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(DatabaseError::NotFound("主播"));
+        }
+        transaction.execute(
+            "DELETE FROM streamer_tags WHERE streamer_id = ?1",
+            [snapshot.id],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for (snapshot_tag, normalized_tag) in snapshot.tags.iter().zip(normalized_tags) {
+            transaction.execute(
+                r#"
+                INSERT INTO streamer_tags(
+                    id, streamer_id, name, normalized_name, prompt_guidance,
+                    sort_order, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                "#,
+                params![
+                    snapshot_tag.id,
+                    snapshot.id,
+                    normalized_tag.name,
+                    streamer_tag_name_key(&normalized_tag.name),
+                    normalized_tag.prompt_guidance,
+                    snapshot_tag.sort_order,
+                    now,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.get_streamer(snapshot.id)
     }
 
     pub fn restore_streamer(&self, id: i64, input: &NewStreamer) -> Result<Streamer> {
@@ -482,6 +685,10 @@ impl Database {
         let profile_is_compatible =
             target_profile_sec_uid.is_none() || target_profile_sec_uid == source.1;
         if source_history_count == 0 && profile_is_compatible {
+            let target_tags = load_streamer_tag_inputs(&transaction, target_id)?;
+            let source_tags = load_streamer_tag_inputs(&transaction, streamer_id)?;
+            let (merged_tags, tags_truncated) = merge_streamer_tags(target_tags, source_tags);
+            replace_streamer_tags_in_transaction(&transaction, target_id, &merged_tags)?;
             transaction.execute("DELETE FROM streamers WHERE id = ?1", [streamer_id])?;
             let monitor_enabled = source.2 || target_monitor_enabled;
             transaction.execute(
@@ -508,6 +715,9 @@ impl Database {
                 ],
             )?;
             transaction.commit()?;
+            if tags_truncated {
+                eprintln!("主播标签合并超过 10 个，已按目标优先规则截断");
+            }
             return Ok(DiscoveryBinding::Merged {
                 target_streamer_id: target_id,
                 removed_streamer_id: streamer_id,
@@ -1048,6 +1258,39 @@ impl Database {
     }
 }
 
+fn migrate_streamer_tags_v3(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE streamer_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            streamer_id INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            prompt_guidance TEXT,
+            sort_order INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK(length(trim(name)) > 0),
+            CHECK(sort_order >= 0)
+        );
+
+        CREATE UNIQUE INDEX idx_streamer_tags_normalized_name
+            ON streamer_tags(streamer_id, normalized_name);
+        CREATE UNIQUE INDEX idx_streamer_tags_sort_order
+            ON streamer_tags(streamer_id, sort_order);
+        CREATE INDEX idx_streamer_tags_suggestions
+            ON streamer_tags(normalized_name, updated_at DESC, id DESC);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate_streamers_v2(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction()?;
     let original_count: i64 =
@@ -1231,6 +1474,140 @@ fn recover_manifest_segments(
     recovered
 }
 
+fn replace_streamer_tags_in_transaction(
+    transaction: &Transaction<'_>,
+    streamer_id: i64,
+    tags: &[StreamerTagInput],
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM streamer_tags WHERE streamer_id = ?1",
+        [streamer_id],
+    )?;
+    insert_streamer_tags_in_transaction(transaction, streamer_id, tags)
+}
+
+fn load_streamer_tag_inputs(
+    connection: &Connection,
+    streamer_id: i64,
+) -> Result<Vec<StreamerTagInput>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT name, prompt_guidance
+        FROM streamer_tags
+        WHERE streamer_id = ?1
+        ORDER BY sort_order, id
+        "#,
+    )?;
+    let rows = statement.query_map([streamer_id], |row| {
+        Ok(StreamerTagInput {
+            name: row.get(0)?,
+            prompt_guidance: row.get(1)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn merge_streamer_tags(
+    target_tags: Vec<StreamerTagInput>,
+    source_tags: Vec<StreamerTagInput>,
+) -> (Vec<StreamerTagInput>, bool) {
+    let mut merged = target_tags;
+    let mut positions = merged
+        .iter()
+        .enumerate()
+        .map(|(index, tag)| (streamer_tag_name_key(&tag.name), index))
+        .collect::<HashMap<_, _>>();
+    let mut truncated = false;
+
+    for source_tag in source_tags {
+        let key = streamer_tag_name_key(&source_tag.name);
+        if let Some(index) = positions.get(&key).copied() {
+            if merged[index].prompt_guidance.is_none() && source_tag.prompt_guidance.is_some() {
+                merged[index].prompt_guidance = source_tag.prompt_guidance;
+            }
+            continue;
+        }
+        if merged.len() >= crate::domain::MAX_STREAMER_TAGS {
+            truncated = true;
+            continue;
+        }
+        positions.insert(key, merged.len());
+        merged.push(source_tag);
+    }
+
+    (merged, truncated)
+}
+
+fn insert_streamer_tags_in_transaction(
+    transaction: &Transaction<'_>,
+    streamer_id: i64,
+    tags: &[StreamerTagInput],
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    for (sort_order, tag) in tags.iter().enumerate() {
+        transaction.execute(
+            r#"
+            INSERT INTO streamer_tags(
+                streamer_id, name, normalized_name, prompt_guidance,
+                sort_order, created_at, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            "#,
+            params![
+                streamer_id,
+                tag.name,
+                streamer_tag_name_key(&tag.name),
+                tag.prompt_guidance,
+                sort_order as i64,
+                now,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_tags_to_streamers(connection: &Connection, streamers: &mut [Streamer]) -> Result<()> {
+    if streamers.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", streamers.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT id, streamer_id, name, prompt_guidance, sort_order
+        FROM streamer_tags
+        WHERE streamer_id IN ({placeholders})
+        ORDER BY streamer_id, sort_order, id
+        "#
+    );
+    let streamer_ids = streamers
+        .iter()
+        .map(|streamer| streamer.id)
+        .collect::<Vec<_>>();
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(streamer_ids.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(1)?,
+            StreamerTag {
+                id: row.get(0)?,
+                name: row.get(2)?,
+                prompt_guidance: row.get(3)?,
+                sort_order: row.get(4)?,
+            },
+        ))
+    })?;
+    let mut grouped = HashMap::<i64, Vec<StreamerTag>>::new();
+    for row in rows {
+        let (streamer_id, tag) = row?;
+        grouped.entry(streamer_id).or_default().push(tag);
+    }
+    for streamer in streamers {
+        streamer.tags = grouped.remove(&streamer.id).unwrap_or_default();
+    }
+    Ok(())
+}
+
 fn streamer_select(suffix: &str) -> String {
     format!(
         r#"
@@ -1275,6 +1652,7 @@ fn map_streamer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Streamer> {
         last_error: row.get(13)?,
         current_video_count: row.get(14)?,
         history_video_count: row.get(15)?,
+        tags: Vec::new(),
     })
 }
 

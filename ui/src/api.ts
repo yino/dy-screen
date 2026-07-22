@@ -9,6 +9,9 @@ import type {
   MonitorEvent,
   PreviewSnapshot,
   Streamer,
+  StreamerPromptContext,
+  StreamerTag,
+  StreamerTagInput,
   VideoPage,
 } from "./types";
 
@@ -32,6 +35,10 @@ const tauriApi: ClientApi = {
   getDashboard: () => invoke<Dashboard>("get_dashboard"),
   createStreamer: (input) => invoke<Streamer>("create_streamer", { input }),
   updateStreamer: (id, input) => invoke<Streamer>("update_streamer", { id, input }),
+  listStreamerTagNameSuggestions: (limit = 20) =>
+    invoke<string[]>("list_streamer_tag_name_suggestions", { limit }),
+  getStreamerPromptContext: (id) =>
+    invoke<StreamerPromptContext>("get_streamer_prompt_context", { id }),
   setMonitorEnabled: (id, enabled) =>
     invoke<void>("set_monitor_enabled", { id, enabled }),
   checkStreamerNow: (id) => invoke<void>("check_streamer_now", { id }),
@@ -69,11 +76,11 @@ const tauriApi: ClientApi = {
   },
 };
 
-function createBrowserApi(): ClientApi {
+export function createBrowserApi(): ClientApi {
   let streamers: Streamer[] = [];
   let settings = defaultSettings;
   try {
-    streamers = (JSON.parse(localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
+    streamers = (JSON.parse(window.localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
       .map((item) => ({
         ...item,
         sourceKind: item.sourceKind ?? "room",
@@ -82,16 +89,24 @@ function createBrowserApi(): ClientApi {
         webRid: item.webRid ?? item.roomUrl?.match(/live\.douyin\.com\/(\d+)/)?.[1] ?? null,
         roomUrl: item.roomUrl ?? null,
         roomId: item.roomId ?? null,
+        tags: Array.isArray(item.tags)
+          ? item.tags.map((tag, index) => ({
+              id: Number.isFinite(tag.id) ? tag.id : -(index + 1),
+              name: String(tag.name ?? "").trim(),
+              promptGuidance: tag.promptGuidance?.trim() || null,
+              sortOrder: index,
+            })).filter((tag) => tag.name)
+          : [],
       }));
     settings = JSON.parse(
-      localStorage.getItem("dy-screen-settings") || JSON.stringify(defaultSettings),
+      window.localStorage.getItem("dy-screen-settings") || JSON.stringify(defaultSettings),
     ) as AppSettings;
   } catch {
     streamers = [];
   }
 
   const saveStreamers = () => {
-    localStorage.setItem("dy-screen-streamers", JSON.stringify(streamers));
+    window.localStorage.setItem("dy-screen-streamers", JSON.stringify(streamers));
   };
 
   const dashboard = (): Dashboard => ({
@@ -99,6 +114,30 @@ function createBrowserApi(): ClientApi {
     activeRecordings: streamers.filter((item) => item.monitorStatus === "recording").length,
     currentVideoCount: streamers.reduce((total, item) => total + item.currentVideoCount, 0),
   });
+
+  const normalizeTags = (tags: StreamerTagInput[]): StreamerTag[] => {
+    if (tags.length > 10) throw new Error("每个主播最多可以设置 10 个标签");
+    const names = new Set<string>();
+    return tags.map((tag, index) => {
+      if (tag.name.includes("\n") || tag.name.includes("\r") || tag.promptGuidance?.match(/[\u0000-\u001f\u007f]/)) {
+        throw new Error("标签名称和指导不能包含控制字符");
+      }
+      const name = tag.name.trim();
+      const promptGuidance = tag.promptGuidance?.trim() || null;
+      if (!name) throw new Error("标签名称不能为空");
+      if ([...name].length > 24) throw new Error("标签名称不能超过 24 个字符");
+      if (promptGuidance && [...promptGuidance].length > 500) throw new Error("标签指导不能超过 500 个字符");
+      const key = name.toLocaleLowerCase();
+      if (names.has(key)) throw new Error("同一主播不能设置重复标签");
+      names.add(key);
+      return {
+        id: -(index + 1),
+        name,
+        promptGuidance,
+        sortOrder: index,
+      };
+    });
+  };
 
   return {
     getDashboard: async () => dashboard(),
@@ -137,6 +176,7 @@ function createBrowserApi(): ClientApi {
         lastError: null,
         currentVideoCount: 0,
         historyVideoCount: 0,
+        tags: normalizeTags(input.tags),
       };
       streamers = [...streamers, streamer];
       saveStreamers();
@@ -168,10 +208,38 @@ function createBrowserApi(): ClientApi {
         monitorStatus: input.monitorEnabled
           ? profileMatch ? "waiting_first_live" : "waiting"
           : "paused",
+        tags: normalizeTags(input.tags),
       };
       streamers = streamers.map((item) => item.id === id ? updated : item);
       saveStreamers();
       return updated;
+    },
+    listStreamerTagNameSuggestions: async (limit = 20) => {
+      const seen = new Set<string>();
+      const suggestions: string[] = [];
+      for (const streamer of [...streamers].reverse()) {
+        for (const tag of streamer.tags) {
+          const key = tag.name.toLocaleLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          suggestions.push(tag.name);
+          if (suggestions.length >= Math.max(0, Math.min(limit, 100))) return suggestions;
+        }
+      }
+      return suggestions;
+    },
+    getStreamerPromptContext: async (id) => {
+      const streamer = streamers.find((item) => item.id === id);
+      if (!streamer) throw new Error("找不到主播");
+      return {
+        streamerId: streamer.id,
+        streamerName: streamer.name,
+        tags: streamer.tags.map((tag) => ({
+          name: tag.name,
+          promptGuidance: tag.promptGuidance,
+          priority: tag.sortOrder,
+        })),
+      };
     },
     setMonitorEnabled: async (id, enabled) => {
       streamers = streamers.map((item) =>
@@ -213,7 +281,7 @@ function createBrowserApi(): ClientApi {
     getSettings: async () => settings,
     saveSettings: async (nextSettings) => {
       settings = nextSettings;
-      localStorage.setItem("dy-screen-settings", JSON.stringify(settings));
+      window.localStorage.setItem("dy-screen-settings", JSON.stringify(settings));
     },
     requestVideoPreview: async (id): Promise<PreviewSnapshot> => ({
       requestId: `browser-preview-${id}`,
