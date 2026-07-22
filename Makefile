@@ -27,6 +27,8 @@ ASR_STAGE ?= resources/asr-stage
 ASR_RESOURCE_ROOT ?=
 ASR_VIDEO ?=
 ASR_TEST_VIDEO ?= $(CURDIR)/tests/fixtures/asr/short_zh.mp4
+ASR_TRANSCRIBE_VIDEO ?= $(ASR_TEST_VIDEO)
+ASR_TRANSCRIBE_OUTPUT ?= /private/tmp/dy-screen-asr-transcript.json
 ASR_PERFORMANCE_OUTPUT ?=
 ASR_TARGET_EVIDENCE ?=
 ASR_APP ?=
@@ -66,7 +68,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor test-preview test-preview-integration test-profile test-migration \
 	test-supervisor-profile asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
-	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages \
+	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
 	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
 	inspect-profile resolve record record-multi clean
 
@@ -98,6 +100,7 @@ help:
 		'  make asr-test-whisper ASR_RESOURCE_ROOT=... 运行真实识别、运行中取消和结构化输出测试' \
 		'  make asr-test-cli ASR_RESOURCE_ROOT=... [ASR_TEST_VIDEO=...] 验证 probe/audio/vad/asr 并输出完整 ASR JSON' \
 		'  make asr-test-stages ASR_RESOURCE_ROOT=... [ASR_TEST_VIDEO=...] 顺序执行全部 ASR 阶段入口' \
+		'  make asr-transcribe ASR_RESOURCE_ROOT=... [ASR_TRANSCRIBE_VIDEO=绝对路径] 将单个视频转成带时间戳 JSON' \
 		'  make asr-test-windows-target ASR_RESOURCE_ROOT=... ASR_TARGET_EVIDENCE=... 在真实 Windows x64 执行 Unicode/取消/CPU/运行库验收' \
 		'  make asr-verify-release-macos ASR_APP=/Applications/直播管家.app ASR_DMG=... ASR_VIDEO=... ASR_RELEASE_EVIDENCE=... 验证签名、公证、离线运行' \
 		'  make asr-verify-release-windows ASR_INSTALLER=... ASR_INSTALL_DIR=... ASR_VIDEO=... ASR_SIGNER_THUMBPRINT=... ASR_SMARTSCREEN_EVIDENCE=... ASR_RELEASE_EVIDENCE=... 验证安装发行' \
@@ -216,6 +219,15 @@ asr-test-cli:
 	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" run --offline -- asr "$(ASR_TEST_VIDEO)" --json
 
 asr-test-stages: asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli
+
+asr-transcribe:
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须通过 ASR_RESOURCE_ROOT 指定当前平台已经封存的 ASR 资源目录。' >&2; exit 2; }
+	@test -f "$(ASR_TRANSCRIBE_VIDEO)" || { printf '%s\n' '错误：ASR_TRANSCRIBE_VIDEO 必须指向一个可读取的本地视频。' >&2; exit 2; }
+	@test ! -L "$(ASR_TRANSCRIBE_VIDEO)" || { printf '%s\n' '错误：ASR_TRANSCRIBE_VIDEO 不能是符号链接。' >&2; exit 2; }
+	@mkdir -p "$(dir $(ASR_TRANSCRIBE_OUTPUT))"
+	@printf '正在识别：%s\n' "$(ASR_TRANSCRIBE_VIDEO)"
+	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" run --offline -- asr "$(ASR_TRANSCRIBE_VIDEO)" --json > "$(ASR_TRANSCRIBE_OUTPUT)"
+	@printf 'ASR JSON 已输出：%s\n' "$(ASR_TRANSCRIBE_OUTPUT)"
 
 asr-test-windows-target:
 	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须设置 ASR_RESOURCE_ROOT。' >&2; exit 2; }
