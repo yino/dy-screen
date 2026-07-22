@@ -1,0 +1,315 @@
+//! 暴露给 React WebView 的 Tauri command 薄适配层。
+//!
+//! 业务规则、路径授权和长任务生命周期分别由 command service 与 desktop runtime 掌握。
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
+
+use super::{
+    AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
+    AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiSessionOption,
+    AiTranscriptProjection, AiTrustedFileGrant,
+};
+
+pub struct AiDesktopState {
+    commands: AiCommandService,
+}
+
+impl AiDesktopState {
+    pub fn new(commands: AiCommandService) -> Self {
+        Self { commands }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiExportResult {
+    pub saved: bool,
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_projects(
+    state: State<'_, AiDesktopState>,
+) -> Result<Vec<AiProject>, AiCommandError> {
+    state.commands.list_projects()
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_project(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state.commands.get_project(project_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_create_project(
+    input: AiCreateProjectRequest,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProject, AiCommandError> {
+    state.commands.create_project(input)
+}
+
+#[tauri::command]
+pub(crate) fn ai_rename_project(
+    project_id: i64,
+    name: String,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProject, AiCommandError> {
+    state.commands.rename_project(project_id, &name)
+}
+
+#[tauri::command]
+pub(crate) async fn ai_delete_project(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<(), AiCommandError> {
+    state.commands.delete_project(project_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_pick_local_videos(
+    app: AppHandle,
+    state: State<'_, AiDesktopState>,
+) -> Result<Vec<AiTrustedFileGrant>, AiCommandError> {
+    let selected = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择要识别的本地视频")
+            .add_filter(
+                "视频文件",
+                &["mp4", "mkv", "mov", "avi", "webm", "m4v", "ts"],
+            )
+            .blocking_pick_files()
+    })
+    .await
+    .map_err(|_| {
+        AiCommandError::new("file_dialog_failed", "系统文件选择器异常退出，请重试", true)
+    })?;
+    let Some(selected) = selected else {
+        return Ok(Vec::new());
+    };
+    let paths = selected
+        .into_iter()
+        .filter_map(|path| path.into_path().ok())
+        .collect::<Vec<_>>();
+    state.commands.register_backend_file_selection(paths)
+}
+
+#[tauri::command]
+pub(crate) async fn ai_import_local_grants(
+    project_id: i64,
+    grant_ids: Vec<String>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiImportBatchView, AiCommandError> {
+    state
+        .commands
+        .import_local_grants(project_id, grant_ids)
+        .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_completed_sessions(
+    limit: Option<usize>,
+    state: State<'_, AiDesktopState>,
+) -> Result<Vec<AiSessionOption>, AiCommandError> {
+    state.commands.list_completed_sessions(limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub(crate) async fn ai_add_completed_session(
+    project_id: i64,
+    session_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state
+        .commands
+        .add_completed_session(project_id, session_id)
+        .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_reorder_inputs(
+    project_id: i64,
+    ordered_ids: Vec<i64>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state.commands.reorder_inputs(project_id, &ordered_ids)
+}
+
+#[tauri::command]
+pub(crate) fn ai_remove_input(
+    project_id: i64,
+    input_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state.commands.remove_input(project_id, input_id)
+}
+
+#[tauri::command]
+pub(crate) async fn ai_project_summary(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectSummary, AiCommandError> {
+    state.commands.project_summary(project_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_start_project(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProject, AiCommandError> {
+    state.commands.start_project(project_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_cancel_project(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProject, AiCommandError> {
+    state.commands.cancel_project(project_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_retry_input(
+    input_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state.commands.retry_input(input_id).await
+}
+
+#[tauri::command]
+pub(crate) fn ai_query_transcript(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiTranscriptProjection, AiCommandError> {
+    state.commands.query_transcript(project_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_copy_segment_text(
+    project_id: i64,
+    stable_segment_id: String,
+    state: State<'_, AiDesktopState>,
+) -> Result<String, AiCommandError> {
+    state
+        .commands
+        .copy_segment_text(project_id, &stable_segment_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_copy_input_text(
+    project_id: i64,
+    input_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<String, AiCommandError> {
+    state.commands.copy_input_text(project_id, input_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_copy_project_text(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<String, AiCommandError> {
+    state.commands.copy_project_text(project_id)
+}
+
+#[tauri::command]
+pub(crate) async fn ai_export_txt(
+    project_id: i64,
+    app: AppHandle,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiExportResult, AiCommandError> {
+    let content = state.commands.export_txt(project_id)?;
+    let project = state.commands.get_project(project_id)?.project;
+    save_export(
+        app,
+        export_name(&project.name, "txt"),
+        "TXT 文本",
+        "txt",
+        content,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_export_json(
+    project_id: i64,
+    app: AppHandle,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiExportResult, AiCommandError> {
+    let content = state.commands.export_json(project_id)?;
+    let project = state.commands.get_project(project_id)?.project;
+    save_export(
+        app,
+        export_name(&project.name, "json"),
+        "JSON 数据",
+        "json",
+        content,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_diagnose_environment(
+    state: State<'_, AiDesktopState>,
+) -> Result<AiEnvironmentDiagnostic, AiCommandError> {
+    state.commands.diagnose().await
+}
+
+async fn save_export(
+    app: AppHandle,
+    file_name: String,
+    filter_name: &'static str,
+    extension: &'static str,
+    content: String,
+) -> Result<AiExportResult, AiCommandError> {
+    let destination = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("导出只读转写结果")
+            .set_file_name(file_name)
+            .add_filter(filter_name, &[extension])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|_| {
+        AiCommandError::new(
+            "export_dialog_failed",
+            "系统保存对话框异常退出，请重试",
+            true,
+        )
+    })?;
+    let Some(destination) = destination.and_then(|path| path.into_path().ok()) else {
+        return Ok(AiExportResult { saved: false });
+    };
+    tokio::fs::write(destination, content)
+        .await
+        .map_err(|_| AiCommandError::new("export_write_failed", "无法写入导出文件", true))?;
+    Ok(AiExportResult { saved: true })
+}
+
+fn export_name(project_name: &str, extension: &str) -> String {
+    let safe = project_name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{}-转写.{}", safe.trim(), extension)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::export_name;
+
+    #[test]
+    fn export_file_name_does_not_allow_path_components() {
+        assert_eq!(export_name("../主播/直播", "txt"), "___主播_直播-转写.txt");
+    }
+}

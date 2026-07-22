@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "bundleVersion": "2026.07.2",
+  "engine": {
+    "id": "whisper.cpp",
+    "version": "v1.9.1",
+    "sourceCommit": "f049fff95a089aa9969deb009cdd4892b3e74916"
+  },
+  "model": {
+    "logicalId": "whisper-small-multilingual-q5_1",
+    "version": "whisper-small-q5_1@5359861c739e955e79d9a303bcbc70fb988958b1",
+    "file": "models/ggml-small-q5_1.bin",
+    "sizeBytes": 190085487,
+    "sha256": "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
+    "source": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
+    "license": "MIT（转换代码）与 OpenAI Whisper 模型许可；分发前见 THIRD_PARTY_NOTICES.md"
+  },
+  "vad": {
+    "logicalId": "silero-vad-v6.2.0",
+    "version": "silero-v6.2.0@9ffd54a1e1ee413ddf265af9913beaf518d1639b",
+    "file": "models/ggml-silero-v6.2.0.bin",
+    "sizeBytes": 885098,
+    "sha256": "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987",
+    "source": "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin",
+    "license": "MIT"
+  },
+  "normalization": {
+    "logicalId": "opencc-tscharacters",
+    "version": "OpenCC ver.1.4.1",
+    "file": "normalization/TSCharacters.txt",
+    "sizeBytes": 104516,
+    "sha256": "737c21c66f55a419dd6956cb3089476cdefc5a36877452631617696df1e5d925",
+    "source": "https://github.com/BYVoid/OpenCC/blob/ver.1.4.1/data/dictionary/TSCharacters.txt",
+    "license": "Apache-2.0"
+  },
+  "licenseFiles": [
+    "licenses/WhisperCpp-MIT.txt",
+    "licenses/OpenAI-Whisper-MIT.txt",
+    "licenses/Silero-VAD-MIT.txt",
+    "licenses/OpenCC-Apache-2.0.txt",
+    "licenses/FFmpeg-LGPL-2.1.txt"
+  ],
+  "platforms": [
+    {
+      "os": "macos",
+      "arch": "aarch64",
+      "accelerator": "metal",
+      "sidecar": "bin/macos-aarch64/whisper-cli",
+      "vadSidecar": "bin/macos-aarch64/vad-speech-segments",
+      "ffmpeg": "bin/macos-aarch64/ffmpeg",
+      "ffprobe": "bin/macos-aarch64/ffprobe",
+      "libraries": [
+        "lib/macos-aarch64/libavcodec.62.dylib",
+        "lib/macos-aarch64/libavdevice.62.dylib",
+        "lib/macos-aarch64/libavfilter.11.dylib",
+        "lib/macos-aarch64/libavformat.62.dylib",
+        "lib/macos-aarch64/libavutil.60.dylib",
+        "lib/macos-aarch64/libswresample.6.dylib",
+        "lib/macos-aarch64/libswscale.9.dylib"
+      ],
+      "resourceIntegrity": [],
+      "minimumMemoryBytes": 8589934592,
+      "minimumFreeDiskBytes": 2147483648,
+      "maximumThreads": 4
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "accelerator": "cpu",
+      "sidecar": "bin/windows-x86_64/whisper-cli.exe",
+      "vadSidecar": "bin/windows-x86_64/vad-speech-segments.exe",
+      "ffmpeg": "bin/windows-x86_64/ffmpeg.exe",
+      "ffprobe": "bin/windows-x86_64/ffprobe.exe",
+      "minimumMemoryBytes": 8589934592,
+      "minimumFreeDiskBytes": 2147483648,
+      "maximumThreads": 4,
+      "minimumCpuFeatures": ["sse4.2"],
+      "runtime": "Microsoft Visual C++ 2015-2022 Redistributable x64",
+      "runtimeFile": "runtime/windows-x86_64/vc_redist.x64.exe",
+      "resourceIntegrity": []
+    }
+  ]
+}

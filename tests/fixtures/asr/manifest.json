@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "fixtures": [
+    {
+      "id": "short_zh",
+      "path": "short_zh.mp4",
+      "sha256": "18dc146a7c967f65ce0792ec0ceea00f95c8e4c3a99969accf9b7ef9f875a1e4",
+      "durationMs": 4191,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [[0, 4191]],
+      "expectedKeywords": ["欢迎", "直播间", "九十九元"]
+    },
+    {
+      "id": "no_speech",
+      "path": "no_speech.mp4",
+      "sha256": "6bb6b1c455bf71f167ea5141c7dcf36ff0f4dd4bc6b6fe87328f44c8f511b161",
+      "durationMs": 3000,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [],
+      "expectedKeywords": []
+    },
+    {
+      "id": "music_only",
+      "path": "music_only.mp4",
+      "sha256": "86e9fc3b4af44f2764a53eefbaee6153b8c52bfab1a704a1fdda0a0ac0d5243f",
+      "durationMs": 3000,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [],
+      "expectedKeywords": []
+    },
+    {
+      "id": "video_only",
+      "path": "video_only.mp4",
+      "sha256": "547a17a3230ca96fc67b42d20c965373017f7f0b37d4acc4822a952050f372c2",
+      "durationMs": 3000,
+      "audioPresent": false,
+      "expectedSpeechRangesMs": [],
+      "expectedKeywords": []
+    },
+    {
+      "id": "mixed_zh_en",
+      "path": "mixed_zh_en.mp4",
+      "sha256": "0090c5a2f9598593b71b01c5997ccddfc1a2d8c8ff6d4d68423a719b57a8be40",
+      "durationMs": 4406,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [[0, 4406]],
+      "expectedKeywords": ["今天", "AI", "Camera", "price", "dollars"]
+    },
+    {
+      "id": "session_part_001",
+      "path": "session_part_001.mp4",
+      "sha256": "c7494ad6818a6e1a5b7a4be8c79ac44df97b7c566126f4d8a870f659c63a3d60",
+      "durationMs": 3906,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [[0, 3906]],
+      "expectedKeywords": ["第一段", "开始介绍", "这款商品"]
+    },
+    {
+      "id": "session_part_002",
+      "path": "session_part_002.mp4",
+      "sha256": "ee3e620f839ee5147143b57adb6a58753378dfb0651dead6ccd8747afde44a56",
+      "durationMs": 3811,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [[0, 3811]],
+      "expectedKeywords": ["开始介绍", "这款商品", "库存不多"],
+      "boundaryDuplicateWith": "session_part_001"
+    },
+    {
+      "id": "windows_unicode_path",
+      "path": "Windows 中文路径/测试 视频.mp4",
+      "sha256": "9d51464d2f6d1d93c6c10ebd59325c228f4096a13b4181f2721c401448b38267",
+      "durationMs": 4191,
+      "audioPresent": true,
+      "expectedSpeechRangesMs": [[0, 4191]],
+      "expectedKeywords": ["欢迎", "直播间", "九十九元"]
+    }
+  ]
+}

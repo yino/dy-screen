@@ -7,5 +7,6 @@
 /src-tauri/target/
 /src-tauri/gen/schemas/
 /.superpowers/
+/resources/asr-stage/
 *.sqlite
 *.sqlite3

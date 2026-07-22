@@ -1,6 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  AiEnvironmentDiagnostic,
+  AiExportResult,
+  AiImportBatch,
+  AiJobEvent,
+  AiProject,
+  AiProjectDetail,
+  AiProjectSummary,
+  AiSessionOption,
+  AiTranscriptProjection,
+  AiTrustedFileGrant,
   AppSettings,
   ClientApi,
   CreateStreamerInput,
@@ -54,6 +64,43 @@ const tauriApi: ClientApi = {
   deleteSession: (sessionId) => invoke<void>("delete_session", { sessionId }),
   openLogs: () => invoke<void>("open_logs"),
   diagnoseEnvironment: () => invoke<EnvironmentStatus>("diagnose_environment"),
+  listAiProjects: () => invoke<AiProject[]>("ai_list_projects"),
+  getAiProject: (projectId) => invoke<AiProjectDetail>("ai_get_project", { projectId }),
+  createAiProject: (input) => invoke<AiProject>("ai_create_project", { input }),
+  renameAiProject: (projectId, name) => invoke<AiProject>("ai_rename_project", { projectId, name }),
+  deleteAiProject: (projectId) => invoke<void>("ai_delete_project", { projectId }),
+  pickAiLocalVideos: () => invoke<AiTrustedFileGrant[]>("ai_pick_local_videos"),
+  importAiLocalGrants: (projectId, grantIds) =>
+    invoke<AiImportBatch>("ai_import_local_grants", { projectId, grantIds }),
+  listAiCompletedSessions: (limit = 100) =>
+    invoke<AiSessionOption[]>("ai_list_completed_sessions", { limit }),
+  addAiCompletedSession: (projectId, sessionId) =>
+    invoke<AiProjectDetail>("ai_add_completed_session", { projectId, sessionId }),
+  reorderAiInputs: (projectId, orderedIds) =>
+    invoke<AiProjectDetail>("ai_reorder_inputs", { projectId, orderedIds }),
+  removeAiInput: (projectId, inputId) =>
+    invoke<AiProjectDetail>("ai_remove_input", { projectId, inputId }),
+  getAiProjectSummary: (projectId) =>
+    invoke<AiProjectSummary>("ai_project_summary", { projectId }),
+  startAiProject: (projectId) => invoke<AiProject>("ai_start_project", { projectId }),
+  cancelAiProject: (projectId) => invoke<AiProject>("ai_cancel_project", { projectId }),
+  retryAiInput: (inputId) => invoke<AiProjectDetail>("ai_retry_input", { inputId }),
+  queryAiTranscript: (projectId) =>
+    invoke<AiTranscriptProjection>("ai_query_transcript", { projectId }),
+  copyAiSegmentText: (projectId, stableSegmentId) =>
+    invoke<string>("ai_copy_segment_text", { projectId, stableSegmentId }),
+  copyAiInputText: (projectId, inputId) =>
+    invoke<string>("ai_copy_input_text", { projectId, inputId }),
+  copyAiProjectText: (projectId) =>
+    invoke<string>("ai_copy_project_text", { projectId }),
+  exportAiTxt: (projectId) => invoke<AiExportResult>("ai_export_txt", { projectId }),
+  exportAiJson: (projectId) => invoke<AiExportResult>("ai_export_json", { projectId }),
+  diagnoseAiEnvironment: () =>
+    invoke<AiEnvironmentDiagnostic>("ai_diagnose_environment"),
+  requestAiInputPreview: (projectId, inputId) =>
+    invoke<PreviewSnapshot>("request_ai_input_preview", { projectId, inputId }),
+  retryAiInputPreview: (projectId, inputId) =>
+    invoke<PreviewSnapshot>("retry_ai_input_preview", { projectId, inputId }),
   requestExit: (force) => invoke<void>("request_exit", { force }),
   subscribe: async (listener) => {
     const unlisten = await listen<MonitorEvent>("monitor-event", (event) => {
@@ -63,6 +110,12 @@ const tauriApi: ClientApi = {
   },
   subscribePreview: async (listener) => {
     const unlisten = await listen<PreviewSnapshot>("video-preview-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
+  subscribeAi: async (listener) => {
+    const unlisten = await listen<AiJobEvent>("ai-job-event", (event) => {
       listener(event.payload);
     });
     return unlisten;
@@ -249,9 +302,87 @@ function createBrowserApi(): ClientApi {
       ffmpeg: false,
       ffprobe: false,
     }),
+    listAiProjects: async () => [],
+    getAiProject: async () => {
+      throw new Error("浏览器演示模式没有本地 AI 项目数据库");
+    },
+    createAiProject: async () => {
+      throw new Error("请在 Tauri 桌面客户端中创建本地 AI 项目");
+    },
+    renameAiProject: async () => {
+      throw new Error("浏览器演示模式不能修改本地 AI 项目");
+    },
+    deleteAiProject: async () => undefined,
+    pickAiLocalVideos: async () => [],
+    importAiLocalGrants: async () => ({ added: [], rejected: [] }),
+    listAiCompletedSessions: async () => [],
+    addAiCompletedSession: async () => {
+      throw new Error("浏览器演示模式不能读取录像会话");
+    },
+    reorderAiInputs: async () => {
+      throw new Error("浏览器演示模式不能修改本地 AI 项目");
+    },
+    removeAiInput: async () => {
+      throw new Error("浏览器演示模式不能修改本地 AI 项目");
+    },
+    getAiProjectSummary: async () => {
+      throw new Error("浏览器演示模式没有本地 AI 项目");
+    },
+    startAiProject: async () => {
+      throw new Error("浏览器演示模式不能执行本地 ASR");
+    },
+    cancelAiProject: async () => {
+      throw new Error("浏览器演示模式没有运行中的 ASR");
+    },
+    retryAiInput: async () => {
+      throw new Error("浏览器演示模式不能执行本地 ASR");
+    },
+    queryAiTranscript: async () => {
+      throw new Error("浏览器演示模式没有本地转写结果");
+    },
+    copyAiSegmentText: async () => "",
+    copyAiInputText: async () => "",
+    copyAiProjectText: async () => "",
+    exportAiTxt: async () => ({ saved: false }),
+    exportAiJson: async () => ({ saved: false }),
+    diagnoseAiEnvironment: async (): Promise<AiEnvironmentDiagnostic> => ({
+      ready: false,
+      platform: "browser-demo",
+      engineId: "whisper.cpp",
+      engineVersion: "v1.9.1",
+      modelId: "whisper-small-multilingual-q5_1",
+      modelVersion: "",
+      checks: [{
+        code: "desktop_required",
+        passed: false,
+        message: "浏览器演示模式不能访问随包 ASR 资源",
+      }],
+      message: "请在 Tauri 桌面客户端中使用本地语音识别",
+    }),
+    requestAiInputPreview: async (_projectId, inputId): Promise<PreviewSnapshot> => ({
+      requestId: `browser-ai-preview-${inputId}`,
+      videoId: -inputId,
+      state: "failed",
+      progressPercent: null,
+      message: "浏览器演示模式不能读取本地视频",
+      media: null,
+      errorCode: "browser_preview_unavailable",
+      errorMessage: "请在 Tauri 桌面客户端中使用播放器",
+    }),
+    retryAiInputPreview: async (_projectId, inputId): Promise<PreviewSnapshot> => ({
+      requestId: `browser-ai-preview-${inputId}`,
+      videoId: -inputId,
+      state: "failed",
+      progressPercent: null,
+      message: "浏览器演示模式不能读取本地视频",
+      media: null,
+      errorCode: "browser_preview_unavailable",
+      errorMessage: "请在 Tauri 桌面客户端中使用播放器",
+    }),
     requestExit: async () => undefined,
     subscribe: async () => () => undefined,
     subscribePreview: async () => () => undefined,
+    subscribeAi: async () => () => undefined,
   };
 }
 

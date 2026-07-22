@@ -2,7 +2,14 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { ClientApi, Streamer, Video } from "./types";
+import type {
+  AiEnvironmentDiagnostic,
+  AiProject,
+  AiProjectDetail,
+  ClientApi,
+  Streamer,
+  Video,
+} from "./types";
 
 const streamer: Streamer = {
   id: 1,
@@ -35,6 +42,45 @@ const completedVideo: Video = {
   sizeBytes: 1024,
   audioPresent: true,
   status: "complete",
+};
+
+const aiProject: AiProject = {
+  id: 101,
+  name: "直播转写项目",
+  status: "draft",
+  recognitionProfile: {
+    engineId: "whisper.cpp",
+    engineVersion: "v1.9.1",
+    modelId: "whisper-small-multilingual-q5_1",
+    modelVersion: "small-q5_1",
+    languageHint: "zh",
+    vadModelId: "silero-v6.2.0",
+    vadThresholdMillis: 500,
+    vadPaddingMs: 500,
+    timestampPolicy: "segment",
+    normalizationVersion: "OpenCC ver.1.4.1",
+    hotwords: [],
+  },
+  recognitionProfileHash: "profile-hash",
+  inputFrozen: false,
+  progressPercent: 0,
+  lastErrorCode: null,
+  lastErrorMessage: null,
+  createdAt: "2026-07-22T00:00:00Z",
+  updatedAt: "2026-07-22T00:00:00Z",
+};
+
+const emptyAiDetail: AiProjectDetail = { project: aiProject, inputs: [] };
+
+const readyAiEnvironment: AiEnvironmentDiagnostic = {
+  ready: true,
+  platform: "macos-aarch64",
+  engineId: "whisper.cpp",
+  engineVersion: "v1.9.1",
+  modelId: "whisper-small-multilingual-q5_1",
+  modelVersion: "small-q5_1",
+  checks: [{ code: "asr_model", passed: true, message: "ASR 模型完整" }],
+  message: "本地 ASR 环境就绪，识别过程不会上传视频",
 };
 
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
@@ -78,9 +124,43 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     deleteSession: vi.fn().mockResolvedValue(undefined),
     openLogs: vi.fn().mockResolvedValue(undefined),
     diagnoseEnvironment: vi.fn().mockResolvedValue({ ffmpeg: true, ffprobe: true }),
+    listAiProjects: vi.fn().mockResolvedValue([]),
+    getAiProject: vi.fn().mockResolvedValue(emptyAiDetail),
+    createAiProject: vi.fn().mockResolvedValue(aiProject),
+    renameAiProject: vi.fn().mockResolvedValue(aiProject),
+    deleteAiProject: vi.fn().mockResolvedValue(undefined),
+    pickAiLocalVideos: vi.fn().mockResolvedValue([]),
+    importAiLocalGrants: vi.fn().mockResolvedValue({ added: [], rejected: [] }),
+    listAiCompletedSessions: vi.fn().mockResolvedValue([]),
+    addAiCompletedSession: vi.fn().mockResolvedValue(emptyAiDetail),
+    reorderAiInputs: vi.fn().mockResolvedValue(emptyAiDetail),
+    removeAiInput: vi.fn().mockResolvedValue(emptyAiDetail),
+    getAiProjectSummary: vi.fn().mockResolvedValue({
+      totalInputs: 0,
+      validInputs: 0,
+      unavailableInputs: 0,
+      totalDurationMs: 0,
+      engineId: "whisper.cpp",
+      modelId: "whisper-small-multilingual-q5_1",
+      environmentReady: true,
+      environmentMessage: "本地 ASR 环境就绪",
+    }),
+    startAiProject: vi.fn().mockResolvedValue({ ...aiProject, status: "queued" }),
+    cancelAiProject: vi.fn().mockResolvedValue({ ...aiProject, status: "cancelled" }),
+    retryAiInput: vi.fn().mockResolvedValue(emptyAiDetail),
+    queryAiTranscript: vi.fn().mockResolvedValue({ project: aiProject, inputs: [] }),
+    copyAiSegmentText: vi.fn().mockResolvedValue(""),
+    copyAiInputText: vi.fn().mockResolvedValue(""),
+    copyAiProjectText: vi.fn().mockResolvedValue(""),
+    exportAiTxt: vi.fn().mockResolvedValue({ saved: true }),
+    exportAiJson: vi.fn().mockResolvedValue({ saved: true }),
+    diagnoseAiEnvironment: vi.fn().mockResolvedValue(readyAiEnvironment),
+    requestAiInputPreview: vi.fn().mockRejectedValue("测试未配置 AI 视频预览"),
+    retryAiInputPreview: vi.fn().mockRejectedValue("测试未配置 AI 视频预览重试"),
     requestExit: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue(() => undefined),
     subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+    subscribeAi: vi.fn().mockResolvedValue(() => undefined),
   };
 }
 
@@ -153,11 +233,77 @@ describe("App", () => {
     expect(rows[0]).toHaveTextContent("录制主播");
   });
 
-  it("AI 剪辑页面只显示规划中", async () => {
+  it("AI 剪辑无项目时显示本地分析空状态且不会自动读取视频", async () => {
     const user = userEvent.setup();
-    render(<App api={createApi()} />);
+    const api = createApi();
+    render(<App api={api} />);
     await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
-    expect(screen.getByText("AI 剪辑功能规划中")).toBeInTheDocument();
+    expect(await screen.findByText("还没有 AI 分析项目")).toBeInTheDocument();
+    expect(screen.getByText("视频和转写全程保留在本机")).toBeInTheDocument();
+    expect(api.pickAiLocalVideos).not.toHaveBeenCalled();
+    expect(api.requestAiInputPreview).not.toHaveBeenCalled();
+  });
+
+  it("AI 环境不可用时保留项目浏览并展示重新检测和安装修复说明", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.listAiProjects = vi.fn().mockResolvedValue([aiProject]);
+    api.diagnoseAiEnvironment = vi.fn().mockResolvedValue({
+      ...readyAiEnvironment,
+      ready: false,
+      checks: [{ code: "asr_model", passed: false, message: "ASR 模型损坏" }],
+      message: "ASR 模型损坏，请重新安装应用",
+    });
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    expect(await screen.findByText("ASR 模型损坏，请重新安装应用")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新检测" })).toBeInTheDocument();
+    expect(screen.getByText("修复方式：重新安装当前版本应用")).toBeInTheDocument();
+  });
+
+  it("AI 工作区可以创建草稿并规范化提交热词", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "创建项目" }));
+    await user.type(screen.getByLabelText("项目名称"), "  商品直播  ");
+    await user.type(screen.getByLabelText("识别热词"), "主播名, 商品名");
+    await user.click(screen.getByRole("button", { name: "创建草稿" }));
+    expect(api.createAiProject).toHaveBeenCalledWith({
+      name: "商品直播",
+      hotwords: ["主播名", "商品名"],
+    });
+  });
+
+  it("AI 草稿通过系统选择器导入多个视频并可选择已结束直播会话", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.listAiProjects = vi.fn().mockResolvedValue([aiProject]);
+    api.getAiProject = vi.fn().mockResolvedValue(emptyAiDetail);
+    api.pickAiLocalVideos = vi.fn().mockResolvedValue([
+      { grantId: "grant-a", displayName: "第一段.mp4" },
+      { grantId: "grant-b", displayName: "第二段.mkv" },
+    ]);
+    api.listAiCompletedSessions = vi.fn().mockResolvedValue([{
+      sessionId: 88,
+      streamerName: "小鱼直播间",
+      startedAt: "2026-07-21T20:00:00Z",
+      endedAt: "2026-07-21T22:00:00Z",
+      videoCount: 8,
+      totalDurationMs: 7_200_000,
+      unavailableVideoCount: 0,
+    }]);
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "添加本地视频" }));
+    await waitFor(() => expect(api.importAiLocalGrants).toHaveBeenCalledWith(
+      aiProject.id,
+      ["grant-a", "grant-b"],
+    ));
+    await user.selectOptions(screen.getByLabelText("选择已结束直播"), "88");
+    await user.click(screen.getByRole("button", { name: "添加整场直播" }));
+    expect(api.addAiCompletedSession).toHaveBeenCalledWith(aiProject.id, 88);
   });
 
   it("活动录制退出事件确认后请求安全退出", async () => {
