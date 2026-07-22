@@ -9,13 +9,11 @@ fn root() -> PathBuf {
 }
 
 fn change_root(root: &Path) -> PathBuf {
-    let active = root.join("openspec/changes/add-user-triggered-ai-asr");
-    if active.is_dir() {
-        return active;
-    }
     let archive = root.join("openspec/changes/archive");
     let mut candidates = fs::read_dir(&archive)
-        .unwrap_or_else(|error| panic!("读取 OpenSpec 归档目录失败：{error}"))
+        .ok()
+        .into_iter()
+        .flatten()
         .filter_map(|entry| entry.ok().map(|value| value.path()))
         .filter(|path| {
             path.is_dir()
@@ -26,9 +24,14 @@ fn change_root(root: &Path) -> PathBuf {
         })
         .collect::<Vec<_>>();
     candidates.sort();
-    candidates
-        .pop()
-        .expect("找不到活动或已归档的 add-user-triggered-ai-asr 变更")
+    if let Some(archived) = candidates.pop() {
+        return archived;
+    }
+    let active = root.join("openspec/changes/add-user-triggered-ai-asr");
+    if active.is_dir() {
+        return active;
+    }
+    panic!("找不到活动或已归档的 add-user-triggered-ai-asr 变更");
 }
 
 fn spec_files(root: &Path) -> [PathBuf; 3] {
