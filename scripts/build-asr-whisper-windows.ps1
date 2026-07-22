@@ -1,0 +1,136 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$SourceArchive,
+
+    [Parameter(Mandatory = $true)]
+    [string]$OutputRoot
+)
+
+$ErrorActionPreference = "Stop"
+
+# 锁定 whisper.cpp v1.9.1 源码归档。脚本必须在 VS 2022 x64 Developer PowerShell 中运行。
+$ExpectedSha256 = "d8cd961352377b1cc612224016a9ebdfe0ae508dc2b2f9ef514b341d672e3fdc"
+$ExpectedVersion = "1.9.1"
+$ExpectedCommit = "f049fff95a089aa9969deb009cdd4892b3e74916"
+
+foreach ($Tool in @("cmake.exe", "tar.exe", "dumpbin.exe")) {
+    if (-not (Get-Command $Tool -ErrorAction SilentlyContinue)) {
+        throw "缺少构建工具 $Tool；请使用 Visual Studio 2022 x64 Developer PowerShell。"
+    }
+}
+
+if (-not [Environment]::Is64BitOperatingSystem) {
+    throw "Windows x64 ASR sidecar 只能在 64 位 Windows 构建。"
+}
+if (Test-Path -LiteralPath $OutputRoot) {
+    throw "输出目录已经存在，请使用一个新的目录。"
+}
+
+$ActualSha256 = (Get-FileHash -LiteralPath $SourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($ActualSha256 -ne $ExpectedSha256) {
+    throw "whisper.cpp 源码 SHA-256 与锁定值不一致。"
+}
+
+$TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("dy-screen-whisper-" + [Guid]::NewGuid())
+$SourceRoot = Join-Path $TemporaryRoot "ggml-org-whisper.cpp-f049fff"
+$BuildRoot = Join-Path $TemporaryRoot "build"
+
+try {
+    New-Item -ItemType Directory -Path $TemporaryRoot | Out-Null
+    & tar.exe -xf $SourceArchive -C $TemporaryRoot
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt"))) {
+        throw "whisper.cpp 源码归档目录结构不符合锁定版本。"
+    }
+
+    # 关闭 native/AVX/AVX2/FMA/BMI2/F16C，使二进制最低要求与 manifest 的 SSE4.2 一致。
+    # Whisper/GGML 与 MSVC CRT 均静态链接；Windows 安装包仍携带 VC++ 运行库以覆盖主程序
+    # 和其他发行组件的兼容要求。
+    & cmake.exe -S $SourceRoot -B $BuildRoot -A x64 `
+        -DCMAKE_BUILD_TYPE=Release `
+        -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+        -DBUILD_SHARED_LIBS=OFF `
+        -DGGML_STATIC=ON `
+        -DGGML_NATIVE=OFF `
+        -DGGML_SSE42=ON `
+        -DGGML_AVX=OFF `
+        -DGGML_AVX2=OFF `
+        -DGGML_AVX_VNNI=OFF `
+        -DGGML_FMA=OFF `
+        -DGGML_F16C=OFF `
+        -DGGML_BMI2=OFF `
+        -DGGML_OPENMP=OFF `
+        -DGGML_METAL=OFF `
+        -DWHISPER_BUILD_TESTS=OFF `
+        -DWHISPER_BUILD_EXAMPLES=ON `
+        -DWHISPER_BUILD_SERVER=OFF `
+        -DWHISPER_CURL=OFF
+    if ($LASTEXITCODE -ne 0) {
+        throw "whisper.cpp CMake 配置失败。"
+    }
+
+    & cmake.exe --build $BuildRoot --config Release --parallel `
+        --target whisper-cli whisper-vad-speech-segments
+    if ($LASTEXITCODE -ne 0) {
+        throw "whisper.cpp Windows x64 构建失败。"
+    }
+
+    $WhisperCli = Get-ChildItem -LiteralPath $BuildRoot -Recurse -Filter "whisper-cli.exe" |
+        Where-Object { $_.FullName -match "[\\/]bin[\\/](Release[\\/])?whisper-cli\.exe$" } |
+        Select-Object -First 1
+    $VadSidecar = Get-ChildItem -LiteralPath $BuildRoot -Recurse -Filter "whisper-vad-speech-segments.exe" |
+        Where-Object { $_.FullName -match "[\\/]bin[\\/](Release[\\/])?whisper-vad-speech-segments\.exe$" } |
+        Select-Object -First 1
+    if (-not $WhisperCli -or -not $VadSidecar) {
+        throw "构建完成但没有找到 Windows x64 sidecar。"
+    }
+
+    $BinaryRoot = Join-Path $OutputRoot "bin\windows-x86_64"
+    $LicenseRoot = Join-Path $OutputRoot "licenses"
+    New-Item -ItemType Directory -Path $BinaryRoot, $LicenseRoot | Out-Null
+    Copy-Item -LiteralPath $WhisperCli.FullName -Destination (Join-Path $BinaryRoot "whisper-cli.exe")
+    Copy-Item -LiteralPath $VadSidecar.FullName -Destination (Join-Path $BinaryRoot "vad-speech-segments.exe")
+    Copy-Item -LiteralPath (Join-Path $SourceRoot "LICENSE") -Destination (Join-Path $LicenseRoot "WhisperCpp-MIT.txt")
+
+    foreach ($Binary in @(
+        (Join-Path $BinaryRoot "whisper-cli.exe"),
+        (Join-Path $BinaryRoot "vad-speech-segments.exe")
+    )) {
+        $Headers = (& dumpbin.exe /headers $Binary | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $Headers -notmatch "machine \(x64\)") {
+            throw "$Binary 不是 Windows x64 PE 文件。"
+        }
+        $Dependencies = (& dumpbin.exe /dependents $Binary | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "无法读取 $Binary 的 PE 依赖。"
+        }
+        if ($Dependencies -match "(?i)(libwhisper|libggml|libomp|vcomp)[^\r\n]*\.dll") {
+            throw "$Binary 仍依赖未随包声明的 Whisper/GGML/OpenMP DLL。"
+        }
+    }
+
+    $VersionOutput = & (Join-Path $BinaryRoot "whisper-cli.exe") --version | Out-String
+    if ($LASTEXITCODE -ne 0 -or $VersionOutput -notmatch [Regex]::Escape($ExpectedVersion)) {
+        throw "whisper-cli 版本与锁定版本不一致。"
+    }
+    Set-Content -LiteralPath (Join-Path $OutputRoot "whisper-version.txt") -Value $VersionOutput -Encoding utf8NoBOM
+
+    @(
+        "source=whisper.cpp-v1.9.1.tar.gz"
+        "source_sha256=$ExpectedSha256"
+        "source_commit=$ExpectedCommit"
+        "architecture=x86_64"
+        "minimum_cpu=sse4.2"
+        "avx=disabled"
+        "avx2=disabled"
+        "linkage=static-whisper-ggml-msvc-runtime"
+        "gpu=disabled"
+        "network=disabled"
+    ) | Set-Content -LiteralPath (Join-Path $OutputRoot "build-record.txt") -Encoding utf8NoBOM
+
+    Write-Host "Windows x64 whisper.cpp sidecar 已构建到：$OutputRoot"
+}
+finally {
+    if (Test-Path -LiteralPath $TemporaryRoot) {
+        Remove-Item -LiteralPath $TemporaryRoot -Recurse -Force
+    }
+}

@@ -118,6 +118,179 @@ export interface MonitorEvent {
   streamerId: number | null;
 }
 
+export type AiProjectStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "completed"
+  | "completed_with_errors"
+  | "cancelled"
+  | "failed";
+
+export type AiInputStatus =
+  | "pending"
+  | "validating"
+  | "preparing_audio"
+  | "detecting_speech"
+  | "transcribing"
+  | "completed"
+  | "skipped"
+  | "cancelled"
+  | "failed";
+
+export interface RecognitionProfile {
+  engineId: string;
+  engineVersion: string;
+  modelId: string;
+  modelVersion: string;
+  languageHint: string | null;
+  vadModelId: string;
+  vadThresholdMillis: number;
+  vadPaddingMs: number;
+  timestampPolicy: string;
+  normalizationVersion: string;
+  hotwords: string[];
+}
+
+export interface AiProject {
+  id: number;
+  name: string;
+  status: AiProjectStatus;
+  recognitionProfile: RecognitionProfile;
+  recognitionProfileHash: string;
+  inputFrozen: boolean;
+  progressPercent: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiProjectInput {
+  id: number;
+  projectId: number;
+  position: number;
+  sourceKind: "local_file" | "video_library";
+  videoId: number | null;
+  displayName: string;
+  durationMs: number | null;
+  audioPresent: boolean | null;
+  projectOffsetMs: number | null;
+  status: AiInputStatus;
+  progressPercent: number;
+  artifactId: number | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+}
+
+export interface AiProjectDetail {
+  project: AiProject;
+  inputs: AiProjectInput[];
+}
+
+export interface AiTrustedFileGrant {
+  grantId: string;
+  displayName: string;
+}
+
+export interface AiImportRejection {
+  displayName: string;
+  code: string;
+  message: string;
+}
+
+export interface AiImportBatch {
+  added: AiProjectInput[];
+  rejected: AiImportRejection[];
+}
+
+export interface AiSessionOption {
+  sessionId: number;
+  streamerName: string;
+  startedAt: string;
+  endedAt: string;
+  videoCount: number;
+  totalDurationMs: number;
+  unavailableVideoCount: number;
+}
+
+export interface AiEnvironmentCheck {
+  code: string;
+  passed: boolean;
+  message: string;
+}
+
+export interface AiEnvironmentDiagnostic {
+  ready: boolean;
+  platform: string;
+  engineId: string;
+  engineVersion: string;
+  modelId: string;
+  modelVersion: string;
+  checks: AiEnvironmentCheck[];
+  message: string;
+}
+
+export interface AiProjectSummary {
+  totalInputs: number;
+  validInputs: number;
+  unavailableInputs: number;
+  totalDurationMs: number;
+  engineId: string;
+  modelId: string;
+  environmentReady: boolean;
+  environmentMessage: string;
+}
+
+export interface AiTranscriptSegment {
+  stableSegmentId: string;
+  inputId: number;
+  videoId: number | null;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  projectStartMs: number | null;
+  projectEndMs: number | null;
+  rawText: string;
+  normalizedText: string;
+  confidence: number | null;
+}
+
+export interface AiTranscriptInput {
+  inputId: number;
+  position: number;
+  sourceKind: "local_file" | "video_library";
+  videoId: number | null;
+  displayName: string;
+  durationMs: number | null;
+  projectOffsetMs: number | null;
+  status: AiInputStatus;
+  progressPercent: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  gapDurationMs: number | null;
+  segments: AiTranscriptSegment[];
+}
+
+export interface AiTranscriptProjection {
+  project: AiProject;
+  inputs: AiTranscriptInput[];
+}
+
+export interface AiJobEvent {
+  projectId: number;
+  inputId: number;
+  projectStatus: AiProjectStatus;
+  projectProgressPercent: number;
+  inputStatus: AiInputStatus;
+  inputProgressPercent: number;
+  stage: string;
+  message: string;
+}
+
+export interface AiExportResult {
+  saved: boolean;
+}
+
 export type PreviewState =
   | "queued"
   | "probing"
@@ -170,7 +343,32 @@ export interface ClientApi {
   deleteSession(sessionId: number): Promise<void>;
   openLogs(): Promise<void>;
   diagnoseEnvironment(): Promise<EnvironmentStatus>;
+  listAiProjects(): Promise<AiProject[]>;
+  getAiProject(projectId: number): Promise<AiProjectDetail>;
+  createAiProject(input: { name: string; hotwords: string[] }): Promise<AiProject>;
+  renameAiProject(projectId: number, name: string): Promise<AiProject>;
+  deleteAiProject(projectId: number): Promise<void>;
+  pickAiLocalVideos(): Promise<AiTrustedFileGrant[]>;
+  importAiLocalGrants(projectId: number, grantIds: string[]): Promise<AiImportBatch>;
+  listAiCompletedSessions(limit?: number): Promise<AiSessionOption[]>;
+  addAiCompletedSession(projectId: number, sessionId: number): Promise<AiProjectDetail>;
+  reorderAiInputs(projectId: number, orderedIds: number[]): Promise<AiProjectDetail>;
+  removeAiInput(projectId: number, inputId: number): Promise<AiProjectDetail>;
+  getAiProjectSummary(projectId: number): Promise<AiProjectSummary>;
+  startAiProject(projectId: number): Promise<AiProject>;
+  cancelAiProject(projectId: number): Promise<AiProject>;
+  retryAiInput(inputId: number): Promise<AiProjectDetail>;
+  queryAiTranscript(projectId: number): Promise<AiTranscriptProjection>;
+  copyAiSegmentText(projectId: number, stableSegmentId: string): Promise<string>;
+  copyAiInputText(projectId: number, inputId: number): Promise<string>;
+  copyAiProjectText(projectId: number): Promise<string>;
+  exportAiTxt(projectId: number): Promise<AiExportResult>;
+  exportAiJson(projectId: number): Promise<AiExportResult>;
+  diagnoseAiEnvironment(): Promise<AiEnvironmentDiagnostic>;
+  requestAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
+  retryAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
   requestExit(force: boolean): Promise<void>;
   subscribe(listener: (event: MonitorEvent) => void): Promise<() => void>;
   subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
+  subscribeAi(listener: (event: AiJobEvent) => void): Promise<() => void>;
 }

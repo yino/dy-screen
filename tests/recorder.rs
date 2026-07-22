@@ -1,18 +1,26 @@
+#[cfg(unix)]
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use dy_screen::error::RecorderError;
+#[cfg(unix)]
 use dy_screen::manager::EventSink;
-use dy_screen::model::{JobEvent, Protocol, SelectedStream};
-use dy_screen::recorder::{
-    FfmpegConfig, FfmpegRecorder, RecordingConfig, build_ffmpeg_plan, check_ffmpeg,
-};
+#[cfg(unix)]
+use dy_screen::model::JobEvent;
+use dy_screen::model::{Protocol, SelectedStream};
+use dy_screen::recorder::{FfmpegConfig, build_ffmpeg_plan, check_ffmpeg};
+#[cfg(unix)]
+use dy_screen::recorder::{FfmpegRecorder, RecordingConfig};
+#[cfg(unix)]
 use tokio_util::sync::CancellationToken;
 
 fn selected_stream() -> SelectedStream {
@@ -25,16 +33,19 @@ fn selected_stream() -> SelectedStream {
 }
 
 #[derive(Default)]
+#[cfg(unix)]
 struct CapturingSink {
     events: Mutex<Vec<JobEvent>>,
 }
 
 #[derive(Default)]
+#[cfg(unix)]
 struct RejectFirstSegmentSink {
     attempts: AtomicUsize,
     accepted: Mutex<Vec<JobEvent>>,
 }
 
+#[cfg(unix)]
 impl EventSink for RejectFirstSegmentSink {
     fn emit(&self, event: JobEvent) -> bool {
         if matches!(event, JobEvent::SegmentFinalized { .. }) {
@@ -48,6 +59,7 @@ impl EventSink for RejectFirstSegmentSink {
     }
 }
 
+#[cfg(unix)]
 impl EventSink for CapturingSink {
     fn emit(&self, event: JobEvent) -> bool {
         self.events.lock().expect("event lock").push(event);

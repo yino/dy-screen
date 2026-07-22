@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod app_support;
 pub mod database;
 pub mod domain;

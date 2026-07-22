@@ -1,0 +1,356 @@
+//! AI 项目、输入、识别配置、产物和稳定句段的持久化领域类型。
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::repository::{AiRepositoryError, Result};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProjectStatus {
+    Draft,
+    Queued,
+    Running,
+    Completed,
+    CompletedWithErrors,
+    Cancelled,
+    Failed,
+}
+
+impl AiProjectStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::CompletedWithErrors => "completed_with_errors",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "draft" => Ok(Self::Draft),
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "completed_with_errors" => Ok(Self::CompletedWithErrors),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            _ => Err(AiRepositoryError::Integrity("项目状态无效".to_owned())),
+        }
+    }
+
+    pub(crate) fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Draft, Self::Queued)
+                | (Self::Queued, Self::Running | Self::Cancelled | Self::Failed)
+                | (
+                    Self::Running,
+                    Self::Completed | Self::CompletedWithErrors | Self::Cancelled | Self::Failed
+                )
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiInputStatus {
+    Pending,
+    Validating,
+    PreparingAudio,
+    DetectingSpeech,
+    Transcribing,
+    Completed,
+    Skipped,
+    Cancelled,
+    Failed,
+}
+
+impl AiInputStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Validating => "validating",
+            Self::PreparingAudio => "preparing_audio",
+            Self::DetectingSpeech => "detecting_speech",
+            Self::Transcribing => "transcribing",
+            Self::Completed => "completed",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "validating" => Ok(Self::Validating),
+            "preparing_audio" => Ok(Self::PreparingAudio),
+            "detecting_speech" => Ok(Self::DetectingSpeech),
+            "transcribing" => Ok(Self::Transcribing),
+            "completed" => Ok(Self::Completed),
+            "skipped" => Ok(Self::Skipped),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            _ => Err(AiRepositoryError::Integrity("输入状态无效".to_owned())),
+        }
+    }
+
+    pub(crate) fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Pending,
+                Self::Validating | Self::Cancelled | Self::Failed
+            ) | (
+                Self::Validating,
+                Self::PreparingAudio
+                    | Self::Completed
+                    | Self::Skipped
+                    | Self::Cancelled
+                    | Self::Failed
+            ) | (
+                Self::PreparingAudio,
+                Self::DetectingSpeech | Self::Cancelled | Self::Failed
+            ) | (
+                Self::DetectingSpeech,
+                Self::Transcribing | Self::Skipped | Self::Cancelled | Self::Failed
+            ) | (
+                Self::Transcribing,
+                Self::Completed | Self::Cancelled | Self::Failed
+            ) | (Self::Failed, Self::Pending)
+        )
+    }
+
+    /// 阶段对应的可恢复进度。细粒度模型进度只用于实时事件，页面重建时以此值为准。
+    pub fn progress_percent(self) -> u8 {
+        match self {
+            Self::Pending => 0,
+            Self::Validating => 10,
+            Self::PreparingAudio => 25,
+            Self::DetectingSpeech => 45,
+            Self::Transcribing => 75,
+            Self::Completed | Self::Skipped | Self::Cancelled | Self::Failed => 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiArtifactStatus {
+    Pending,
+    Published,
+    Invalidated,
+}
+
+impl AiArtifactStatus {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "published" => Ok(Self::Published),
+            "invalidated" => Ok(Self::Invalidated),
+            _ => Err(AiRepositoryError::Integrity("识别产物状态无效".to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiInputSourceKind {
+    LocalFile,
+    VideoLibrary,
+}
+
+impl AiInputSourceKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalFile => "local_file",
+            Self::VideoLibrary => "video_library",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "local_file" => Ok(Self::LocalFile),
+            "video_library" => Ok(Self::VideoLibrary),
+            _ => Err(AiRepositoryError::Integrity("输入来源无效".to_owned())),
+        }
+    }
+}
+
+/// 参与缓存指纹的完整识别配置。新增影响结果的参数时必须加入本结构。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecognitionProfile {
+    pub engine_id: String,
+    pub engine_version: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub language_hint: Option<String>,
+    pub vad_model_id: String,
+    pub vad_threshold_millis: u32,
+    pub vad_padding_ms: u64,
+    pub timestamp_policy: String,
+    pub normalization_version: String,
+    pub hotwords: Vec<String>,
+}
+
+impl RecognitionProfile {
+    /// 使用规范化 JSON 生成稳定 SHA-256，避免热词输入顺序导致无意义缓存失效。
+    pub fn fingerprint(&self) -> Result<String> {
+        let mut normalized = self.clone();
+        normalized.hotwords = normalized
+            .hotwords
+            .iter()
+            .map(|word| word.trim().to_owned())
+            .filter(|word| !word.is_empty())
+            .collect();
+        normalized.hotwords.sort();
+        normalized.hotwords.dedup();
+        let json = serde_json::to_vec(&normalized)
+            .map_err(|_| AiRepositoryError::Serialization("识别配置无法序列化".to_owned()))?;
+        Ok(hex::encode(Sha256::digest(json)))
+    }
+}
+
+/// 源指纹使用规范路径、大小、修改时间和可选视频库 ID，禁止仅按文件名复用结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFingerprint {
+    pub normalized_path: String,
+    pub size_bytes: u64,
+    pub modified_at_ms: i64,
+    pub video_id: Option<i64>,
+}
+
+impl SourceFingerprint {
+    pub fn fingerprint(&self) -> Result<String> {
+        let json = serde_json::to_vec(self)
+            .map_err(|_| AiRepositoryError::Serialization("源指纹无法序列化".to_owned()))?;
+        Ok(hex::encode(Sha256::digest(json)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProject {
+    pub id: i64,
+    pub name: String,
+    pub status: AiProjectStatus,
+    pub recognition_profile: RecognitionProfile,
+    pub recognition_profile_hash: String,
+    pub input_frozen: bool,
+    pub progress_percent: u8,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProjectInput {
+    pub id: i64,
+    pub project_id: i64,
+    pub position: i64,
+    pub source_kind: AiInputSourceKind,
+    pub video_id: Option<i64>,
+    pub display_name: String,
+    pub source_path: String,
+    pub source_fingerprint: SourceFingerprint,
+    pub source_fingerprint_hash: String,
+    pub duration_ms: Option<u64>,
+    pub audio_present: Option<bool>,
+    pub project_offset_ms: Option<u64>,
+    pub status: AiInputStatus,
+    /// 由持久化阶段稳定推导，事件丢失或页面重建后仍可恢复。
+    pub progress_percent: u8,
+    pub artifact_id: Option<i64>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProjectDetail {
+    pub project: AiProject,
+    pub inputs: Vec<AiProjectInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAiProjectInput {
+    pub position: i64,
+    pub source_kind: AiInputSourceKind,
+    pub video_id: Option<i64>,
+    pub display_name: String,
+    pub source_path: String,
+    pub source_fingerprint: SourceFingerprint,
+    pub duration_ms: Option<u64>,
+    pub audio_present: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAsrArtifact {
+    pub source_fingerprint: SourceFingerprint,
+    pub recognition_profile_hash: String,
+    pub engine_id: String,
+    pub engine_version: String,
+    pub model_id: String,
+    pub model_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrArtifact {
+    pub id: i64,
+    pub source_fingerprint: SourceFingerprint,
+    pub source_fingerprint_hash: String,
+    pub recognition_profile_hash: String,
+    pub engine_id: String,
+    pub engine_version: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub status: AiArtifactStatus,
+    pub duration_ms: Option<u64>,
+    pub language: Option<String>,
+    pub created_at: String,
+    pub published_at: Option<String>,
+    pub last_used_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSegmentDraft {
+    pub source_start_ms: u64,
+    pub source_end_ms: u64,
+    pub raw_text: String,
+    pub normalized_text: String,
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSegment {
+    pub id: String,
+    pub artifact_id: i64,
+    pub ordinal: i64,
+    pub source_start_ms: u64,
+    pub source_end_ms: u64,
+    pub raw_text: String,
+    pub normalized_text: String,
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverySummary {
+    pub projects: usize,
+    pub inputs: usize,
+    pub artifacts: usize,
+}

@@ -1,9 +1,7 @@
 import {
-  Activity,
   ArrowDown,
   ArrowUp,
   Archive,
-  Bot,
   CheckCircle2,
   ChevronRight,
   CircleOff,
@@ -34,7 +32,6 @@ import {
   Video,
   Wifi,
   X,
-  Zap,
 } from "lucide-react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -51,6 +48,7 @@ import type {
   Video as VideoItem,
   VideoFilters,
 } from "./types";
+import { AiWorkspace } from "./AiWorkspace";
 
 type Page = "monitor" | "library" | "ai" | "settings";
 type HistoryFilters = { search: string; status: string; date: string };
@@ -490,7 +488,7 @@ export function App({ api }: AppProps) {
           />
         )}
 
-        {page === "ai" && <AiPage />}
+        {page === "ai" && <AiWorkspace api={api} />}
 
         {page === "settings" && settings && (
           <SettingsPage
@@ -946,16 +944,6 @@ function VideoPreviewDialog({ api, video, snapshot, onSnapshot, onRetry, onOpenS
         </footer>
         {playbackError && <div className="preview-playback-error" role="alert"><span>{playbackError}</span><button onClick={onRetry}>重新准备预览</button><button disabled={sourceUnavailable} onClick={onOpenSystem}>使用系统播放器打开</button></div>}
       </section>
-    </div>
-  );
-}
-
-function AiPage() {
-  return (
-    <div className="page-content ai-page">
-      <section className="ai-hero"><div className="ai-orbit"><Bot size={44} /><span /><span /></div><p className="section-kicker">COMING NEXT</p><h2>AI 剪辑功能规划中</h2><p>录制链路稳定后，将基于完成分片构建 ASR、内容理解、高光时刻识别和自动切片流程。</p><div className="ai-tags"><span><Zap size={15} />语音转写</span><span><Sparkles size={15} />高光识别</span><span><Video size={15} />自动切片</span></div></section>
-      <section className="workflow-grid"><article><span>01</span><div><strong>完成分片</strong><p>只处理已正确关闭并包含音轨的 MKV。</p></div></article><article><span>02</span><div><strong>ASR 时间轴</strong><p>提取带时间戳的中文转写文本。</p></div></article><article><span>03</span><div><strong>NLP 高光判断</strong><p>识别关键信息、情绪峰值与高互动片段。</p></div></article><article><span>04</span><div><strong>导出短视频</strong><p>把文本时间轴映射回原视频并生成切片。</p></div></article></section>
-      <div className="planning-note"><Activity size={19} /><div><strong>本版本不会读取或分析视频内容</strong><p>该入口仅展示规划，不会创建 AI 任务或写入额外业务数据。</p></div></div>
     </div>
   );
 }

@@ -22,19 +22,56 @@ OUTPUT ?= recordings
 SEGMENT_SECONDS ?= 900
 PROBE_TIMEOUT_SECONDS ?= 3
 JSON ?= 0
+ASR_SOURCE ?=
+ASR_STAGE ?= resources/asr-stage
+ASR_RESOURCE_ROOT ?=
+ASR_VIDEO ?=
+ASR_TEST_VIDEO ?= $(CURDIR)/tests/fixtures/asr/short_zh.mp4
+ASR_TRANSCRIBE_VIDEO ?= $(ASR_TEST_VIDEO)
+ASR_TRANSCRIBE_OUTPUT ?= /private/tmp/dy-screen-asr-transcript.json
+ASR_PERFORMANCE_OUTPUT ?=
+ASR_TARGET_EVIDENCE ?=
+ASR_APP ?=
+ASR_DMG ?=
+ASR_RELEASE_EVIDENCE ?=
+EXECUTABLE_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
+ASR_BUNDLE_BINARY ?= target/release/asr-bundle$(EXECUTABLE_SUFFIX)
+ASR_INSTALLER ?=
+ASR_INSTALL_DIR ?=
+ASR_INSTALLED_APP_RELATIVE ?= dy-screen-app.exe
+ASR_SIGNER_THUMBPRINT ?=
+ASR_SMARTSCREEN_EVIDENCE ?=
+ASR_QUALITY_DATASET ?=
+ASR_QUALITY_RESULTS ?=
+ASR_QUALITY_JSON_REPORT ?=
+ASR_QUALITY_MARKDOWN_REPORT ?=
+ASR_COMPLETION_WINDOWS_TARGET ?=
+ASR_COMPLETION_MACOS_RELEASE ?=
+ASR_COMPLETION_WINDOWS_RELEASE ?=
+ASR_COMPLETION_MACOS_PERFORMANCE ?=
+ASR_COMPLETION_WINDOWS_PERFORMANCE ?=
+FFMPEG_SOURCE ?=
+FFMPEG_ASR_OUTPUT ?= /private/tmp/dy-screen-asr-ffmpeg
+WHISPER_SOURCE ?=
+WHISPER_ASR_OUTPUT ?= /private/tmp/dy-screen-asr-whisper
+POWERSHELL ?= powershell.exe
 
-BINARY ?= target/release/dy-screen
+BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
 
 QUALITY_ARG = $(if $(strip $(QUALITY)),--quality "$(QUALITY)",)
 PROTOCOL_ARG = $(if $(strip $(PROTOCOL)),--protocol "$(PROTOCOL)",)
 JSON_ARG = $(if $(filter 1 true yes on,$(JSON)),--json,)
 ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
+ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(ASR_RESOURCE_ROOT)",)
 
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor test-preview test-preview-integration test-profile test-migration \
-	test-supervisor-profile test-tags test-tag-migration test-tag-repository \
-	test-tag-service test-tag-ui inspect-profile resolve record record-multi clean
+	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
+	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
+	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
+	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
+	inspect-profile resolve record record-multi clean
 
 help:
 	@printf '%s\n' \
@@ -50,6 +87,29 @@ help:
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端' \
 		'  make app-build       构建 macOS .app 安装产物' \
+		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL ASR FFmpeg' \
+		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
+		'  make asr-whisper-windows WHISPER_SOURCE=C:/whisper.cpp-v1.9.1.tar.gz 构建 SSE4.2 CPU sidecar' \
+		'  make asr-stage-macos ASR_SOURCE=/可信资源目录  准备 macOS ASR 随包资源' \
+		'  make asr-build-macos ASR_SOURCE=/可信资源目录  构建含本地 ASR 的 macOS 安装包' \
+		'  make asr-stage-windows ASR_SOURCE=/可信资源目录 准备 Windows ASR 随包资源' \
+		'  make asr-build-windows ASR_SOURCE=/可信资源目录 构建 Windows NSIS 安装包' \
+		'  make asr-check-windows 交叉检查 Windows x64 根/Tauri crate 与严格 Clippy' \
+		'  make asr-test-contract 只测试中立契约、资源、错误、取消和调度边界' \
+		'  make asr-test-media 只测试 FFprobe、FFmpeg、临时音频和原视频不变' \
+		'  make asr-test-vad ASR_RESOURCE_ROOT=... 使用随包 FFmpeg/VAD 运行真实人声、静音和纯音乐测试' \
+		'  make asr-test-whisper ASR_RESOURCE_ROOT=... 运行真实识别、运行中取消和结构化输出测试' \
+		'  make asr-test-cli ASR_RESOURCE_ROOT=... [ASR_TEST_VIDEO=...] 验证 probe/audio/vad/asr 并输出完整 ASR JSON' \
+		'  make asr-test-stages ASR_RESOURCE_ROOT=... [ASR_TEST_VIDEO=...] 顺序执行全部 ASR 阶段入口' \
+		'  make asr-transcribe ASR_RESOURCE_ROOT=... [ASR_TRANSCRIBE_VIDEO=绝对路径] 将单个视频转成带时间戳 JSON' \
+		'  make asr-test-windows-target ASR_RESOURCE_ROOT=... ASR_TARGET_EVIDENCE=... 在真实 Windows x64 执行 Unicode/取消/CPU/运行库验收' \
+		'  make asr-verify-release-macos ASR_APP=/Applications/直播管家.app ASR_DMG=... ASR_VIDEO=... ASR_RELEASE_EVIDENCE=... 验证签名、公证、离线运行' \
+		'  make asr-verify-release-windows ASR_INSTALLER=... ASR_INSTALL_DIR=... ASR_VIDEO=... ASR_SIGNER_THUMBPRINT=... ASR_SMARTSCREEN_EVIDENCE=... ASR_RELEASE_EVIDENCE=... 验证安装发行' \
+		'  make asr-quality-collect ASR_QUALITY_DATASET=... ASR_QUALITY_RESULTS=... ASR_RESOURCE_ROOT=... 采集至少 10 个授权样本' \
+		'  make asr-quality-evaluate ASR_QUALITY_DATASET=... ASR_QUALITY_RESULTS=... ASR_QUALITY_JSON_REPORT=... ASR_QUALITY_MARKDOWN_REPORT=... 生成质量报告' \
+		'  make asr-performance-macos ASR_VIDEO=... ASR_RESOURCE_ROOT=... ASR_PERFORMANCE_OUTPUT=... 在 8GB Mac 采集性能' \
+		'  make asr-performance-windows ASR_VIDEO=... ASR_RESOURCE_ROOT=... ASR_PERFORMANCE_OUTPUT=... 在 8GB Windows 采集性能' \
+		'  make asr-evidence-audit ASR_COMPLETION_*=... ASR_QUALITY_*=... 汇总六个门禁并输出 readyToComplete' \
 		'  make preview-doctor  检查视频预览所需 FFmpeg 编码能力' \
 		'  make test-preview    执行预览服务和播放器组件测试' \
 		'  make test-preview-integration 使用真实 FFmpeg 样本验证预览转换' \
@@ -111,6 +171,158 @@ app-dev:
 
 app-build:
 	"$(NPM)" run tauri:build
+
+asr-ffmpeg-macos:
+	@test -n "$(FFMPEG_SOURCE)" || { printf '%s\n' '错误：必须通过 FFMPEG_SOURCE 指定 ffmpeg-8.1.2.tar.xz。' >&2; exit 2; }
+	./scripts/build-asr-ffmpeg-macos.sh "$(FFMPEG_SOURCE)" "$(FFMPEG_ASR_OUTPUT)"
+
+asr-whisper-macos:
+	@test -n "$(WHISPER_SOURCE)" || { printf '%s\n' '错误：必须通过 WHISPER_SOURCE 指定 whisper.cpp-v1.9.1.tar.gz。' >&2; exit 2; }
+	./scripts/build-asr-whisper-macos.sh "$(WHISPER_SOURCE)" "$(WHISPER_ASR_OUTPUT)"
+
+asr-whisper-windows:
+	@test -n "$(WHISPER_SOURCE)" || { printf '%s\n' '错误：必须通过 WHISPER_SOURCE 指定 whisper.cpp-v1.9.1.tar.gz。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/build-asr-whisper-windows.ps1 -SourceArchive "$(WHISPER_SOURCE)" -OutputRoot "$(WHISPER_ASR_OUTPUT)"
+
+asr-stage-macos:
+	@test -n "$(ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 ASR_SOURCE 指定已经准备好的可信资源目录。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(ASR_SOURCE)" --target "$(ASR_STAGE)" --platform macos-aarch64
+
+asr-stage-windows:
+	@test -n "$(ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 ASR_SOURCE 指定已经准备好的可信资源目录。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(ASR_SOURCE)" --target "$(ASR_STAGE)" --platform windows-x86-64
+
+asr-build-macos: asr-stage-macos
+	"$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json
+
+asr-build-windows: asr-stage-windows
+	"$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
+
+asr-check-windows:
+	"$(CARGO)" xwin check --all-targets --target x86_64-pc-windows-msvc
+	"$(CARGO)" xwin clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+	"$(CARGO)" xwin check --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc
+	"$(CARGO)" xwin clippy --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+asr-test-contract:
+	"$(CARGO)" test --offline --test asr_contract --test asr_resources --test asr_whisper_adapter --test asr_scheduler --test asr_spec_traceability -- --nocapture
+
+asr-test-media:
+	"$(CARGO)" test --offline --test asr_media -- --nocapture
+
+asr-test-vad:
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须通过 ASR_RESOURCE_ROOT 指定当前平台已经封存的 ASR 资源目录。' >&2; exit 2; }
+	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" test --offline --test asr_vad_integration -- --ignored --nocapture
+
+asr-test-whisper:
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须通过 ASR_RESOURCE_ROOT 指定当前平台已经封存的 ASR 资源目录。' >&2; exit 2; }
+	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" test --offline --test asr_whisper_integration -- --ignored --nocapture
+
+asr-test-cli:
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须通过 ASR_RESOURCE_ROOT 指定当前平台已经封存的 ASR 资源目录。' >&2; exit 2; }
+	@test -f "$(ASR_TEST_VIDEO)" || { printf '%s\n' '错误：ASR_TEST_VIDEO 必须指向一个可读取的本地视频。' >&2; exit 2; }
+	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" test --offline --test asr_cli_stages -- --ignored --nocapture
+	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" run --offline -- asr "$(ASR_TEST_VIDEO)" --json
+
+asr-test-stages: asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli
+
+asr-transcribe:
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须通过 ASR_RESOURCE_ROOT 指定当前平台已经封存的 ASR 资源目录。' >&2; exit 2; }
+	@test -f "$(ASR_TRANSCRIBE_VIDEO)" || { printf '%s\n' '错误：ASR_TRANSCRIBE_VIDEO 必须指向一个可读取的本地视频。' >&2; exit 2; }
+	@test ! -L "$(ASR_TRANSCRIBE_VIDEO)" || { printf '%s\n' '错误：ASR_TRANSCRIBE_VIDEO 不能是符号链接。' >&2; exit 2; }
+	@mkdir -p "$(dir $(ASR_TRANSCRIBE_OUTPUT))"
+	@printf '正在识别：%s\n' "$(ASR_TRANSCRIBE_VIDEO)"
+	ASR_RESOURCE_ROOT="$(ASR_RESOURCE_ROOT)" "$(CARGO)" run --offline -- asr "$(ASR_TRANSCRIBE_VIDEO)" --json > "$(ASR_TRANSCRIBE_OUTPUT)"
+	@printf 'ASR JSON 已输出：%s\n' "$(ASR_TRANSCRIBE_OUTPUT)"
+
+asr-test-windows-target:
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须设置 ASR_RESOURCE_ROOT。' >&2; exit 2; }
+	@test -n "$(ASR_TARGET_EVIDENCE)" || { printf '%s\n' '错误：必须设置 ASR_TARGET_EVIDENCE。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/test-asr-windows-target.ps1 \
+		-RepoRoot "$(CURDIR)" -ResourceRoot "$(ASR_RESOURCE_ROOT)" \
+		-Output "$(ASR_TARGET_EVIDENCE)" -Cargo "$(CARGO)"
+
+asr-verify-release-macos:
+	@test -n "$(ASR_APP)" || { printf '%s\n' '错误：必须设置 ASR_APP。' >&2; exit 2; }
+	@test -n "$(ASR_DMG)" || { printf '%s\n' '错误：必须设置 ASR_DMG。' >&2; exit 2; }
+	@test -n "$(ASR_VIDEO)" || { printf '%s\n' '错误：必须设置 ASR_VIDEO。' >&2; exit 2; }
+	@test -n "$(ASR_RELEASE_EVIDENCE)" || { printf '%s\n' '错误：必须设置 ASR_RELEASE_EVIDENCE。' >&2; exit 2; }
+	"$(CARGO)" build --offline --release --bin dy-screen --bin asr-bundle
+	./scripts/verify-asr-release-macos.sh \
+		--app "$(ASR_APP)" --dmg "$(ASR_DMG)" \
+		--asr-cli "$(BINARY)" --asr-bundle "$(ASR_BUNDLE_BINARY)" \
+		--video "$(ASR_VIDEO)" --output "$(ASR_RELEASE_EVIDENCE)" --launch-app
+
+asr-verify-release-windows:
+	@test -n "$(ASR_INSTALLER)" || { printf '%s\n' '错误：必须设置 ASR_INSTALLER。' >&2; exit 2; }
+	@test -n "$(ASR_INSTALL_DIR)" || { printf '%s\n' '错误：必须设置 ASR_INSTALL_DIR。' >&2; exit 2; }
+	@test -n "$(ASR_VIDEO)" || { printf '%s\n' '错误：必须设置 ASR_VIDEO。' >&2; exit 2; }
+	@test -n "$(ASR_SIGNER_THUMBPRINT)" || { printf '%s\n' '错误：必须设置 ASR_SIGNER_THUMBPRINT。' >&2; exit 2; }
+	@test -n "$(ASR_SMARTSCREEN_EVIDENCE)" || { printf '%s\n' '错误：必须设置 ASR_SMARTSCREEN_EVIDENCE。' >&2; exit 2; }
+	@test -n "$(ASR_RELEASE_EVIDENCE)" || { printf '%s\n' '错误：必须设置 ASR_RELEASE_EVIDENCE。' >&2; exit 2; }
+	"$(CARGO)" build --offline --release --bin dy-screen --bin asr-bundle
+	"$(POWERSHELL)" -NoProfile -File scripts/verify-asr-release-windows.ps1 \
+		-Installer "$(ASR_INSTALLER)" -InstallDirectory "$(ASR_INSTALL_DIR)" \
+		-InstalledAppRelative "$(ASR_INSTALLED_APP_RELATIVE)" \
+		-AsrCli "$(BINARY)" -AsrBundle "$(ASR_BUNDLE_BINARY)" -Video "$(ASR_VIDEO)" \
+		-ExpectedSignerThumbprint "$(ASR_SIGNER_THUMBPRINT)" \
+		-SmartScreenEvidenceId "$(ASR_SMARTSCREEN_EVIDENCE)" -Output "$(ASR_RELEASE_EVIDENCE)"
+
+asr-quality-collect: release
+	@test -n "$(ASR_QUALITY_DATASET)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_DATASET。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_RESULTS)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_RESULTS。' >&2; exit 2; }
+	"$(CARGO)" run --offline --release --bin asr-quality -- collect \
+		--dataset "$(ASR_QUALITY_DATASET)" \
+		--results "$(ASR_QUALITY_RESULTS)" \
+		--asr-binary "$(BINARY)" $(ASR_RESOURCE_ROOT_ARG) \
+		--minimum-samples 10
+
+asr-quality-evaluate:
+	@test -n "$(ASR_QUALITY_DATASET)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_DATASET。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_RESULTS)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_RESULTS。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_JSON_REPORT)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_JSON_REPORT。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_MARKDOWN_REPORT)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_MARKDOWN_REPORT。' >&2; exit 2; }
+	"$(CARGO)" run --offline --release --bin asr-quality -- evaluate \
+		--dataset "$(ASR_QUALITY_DATASET)" \
+		--results "$(ASR_QUALITY_RESULTS)" \
+		--json-report "$(ASR_QUALITY_JSON_REPORT)" \
+		--markdown-report "$(ASR_QUALITY_MARKDOWN_REPORT)" \
+		--minimum-samples 10
+
+asr-performance-macos: release
+	@test -n "$(ASR_VIDEO)" || { printf '%s\n' '错误：必须设置 ASR_VIDEO。' >&2; exit 2; }
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须设置 ASR_RESOURCE_ROOT。' >&2; exit 2; }
+	@test -n "$(ASR_PERFORMANCE_OUTPUT)" || { printf '%s\n' '错误：必须设置 ASR_PERFORMANCE_OUTPUT。' >&2; exit 2; }
+	./scripts/collect-asr-performance-macos.sh \
+		--video "$(ASR_VIDEO)" --asr-binary "$(BINARY)" \
+		--resource-root "$(ASR_RESOURCE_ROOT)" --output "$(ASR_PERFORMANCE_OUTPUT)" --require-8gb
+
+asr-performance-windows: release
+	@test -n "$(ASR_VIDEO)" || { printf '%s\n' '错误：必须设置 ASR_VIDEO。' >&2; exit 2; }
+	@test -n "$(ASR_RESOURCE_ROOT)" || { printf '%s\n' '错误：必须设置 ASR_RESOURCE_ROOT。' >&2; exit 2; }
+	@test -n "$(ASR_PERFORMANCE_OUTPUT)" || { printf '%s\n' '错误：必须设置 ASR_PERFORMANCE_OUTPUT。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/collect-asr-performance-windows.ps1 \
+		-Video "$(ASR_VIDEO)" -AsrBinary "$(BINARY)" \
+		-ResourceRoot "$(ASR_RESOURCE_ROOT)" -Output "$(ASR_PERFORMANCE_OUTPUT)" -Require8GB
+
+asr-evidence-audit:
+	@test -n "$(ASR_COMPLETION_WINDOWS_TARGET)" || { printf '%s\n' '错误：必须设置 ASR_COMPLETION_WINDOWS_TARGET。' >&2; exit 2; }
+	@test -n "$(ASR_COMPLETION_MACOS_RELEASE)" || { printf '%s\n' '错误：必须设置 ASR_COMPLETION_MACOS_RELEASE。' >&2; exit 2; }
+	@test -n "$(ASR_COMPLETION_WINDOWS_RELEASE)" || { printf '%s\n' '错误：必须设置 ASR_COMPLETION_WINDOWS_RELEASE。' >&2; exit 2; }
+	@test -n "$(ASR_COMPLETION_MACOS_PERFORMANCE)" || { printf '%s\n' '错误：必须设置 ASR_COMPLETION_MACOS_PERFORMANCE。' >&2; exit 2; }
+	@test -n "$(ASR_COMPLETION_WINDOWS_PERFORMANCE)" || { printf '%s\n' '错误：必须设置 ASR_COMPLETION_WINDOWS_PERFORMANCE。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_DATASET)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_DATASET。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_RESULTS)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_RESULTS。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_JSON_REPORT)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_JSON_REPORT。' >&2; exit 2; }
+	@test -n "$(ASR_QUALITY_MARKDOWN_REPORT)" || { printf '%s\n' '错误：必须设置 ASR_QUALITY_MARKDOWN_REPORT。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-evidence -- \
+		--windows-target "$(ASR_COMPLETION_WINDOWS_TARGET)" \
+		--macos-release "$(ASR_COMPLETION_MACOS_RELEASE)" \
+		--windows-release "$(ASR_COMPLETION_WINDOWS_RELEASE)" \
+		--macos-performance "$(ASR_COMPLETION_MACOS_PERFORMANCE)" \
+		--windows-performance "$(ASR_COMPLETION_WINDOWS_PERFORMANCE)" \
+		--quality-dataset "$(ASR_QUALITY_DATASET)" --quality-results "$(ASR_QUALITY_RESULTS)" \
+		--quality-json "$(ASR_QUALITY_JSON_REPORT)" --quality-markdown "$(ASR_QUALITY_MARKDOWN_REPORT)"
 
 build: core-build frontend-build
 

@@ -74,7 +74,7 @@ impl Database {
         })
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+    pub(crate) fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| DatabaseError::Poisoned)
     }
 
@@ -181,7 +181,6 @@ impl Database {
                 )));
             }
         }
-
         let applied = connection
             .query_row(
                 "SELECT 1 FROM schema_migrations WHERE version = 3",
@@ -193,6 +192,7 @@ impl Database {
         if !applied {
             migrate_streamer_tags_v3(&mut connection)?;
         }
+        crate::ai::migrate_ai_v4(&mut connection)?;
         drop(connection);
         self.ensure_default_settings()
     }
@@ -918,6 +918,34 @@ impl Database {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// AI 项目选择器只列出已经结束的会话，避免读取仍在写入的录像分片。
+    pub fn list_completed_sessions(&self, limit: usize) -> Result<Vec<RecordingSession>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, streamer_id, started_at, ended_at, status, retry_count, output_root, error
+            FROM recording_sessions
+            WHERE ended_at IS NOT NULL
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows =
+            statement.query_map([i64::try_from(limit.max(1)).unwrap_or(i64::MAX)], |row| {
+                Ok(RecordingSession {
+                    id: row.get(0)?,
+                    streamer_id: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    status: row.get(4)?,
+                    retry_count: row.get(5)?,
+                    output_root: row.get(6)?,
+                    error: row.get(7)?,
+                })
+            })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn update_session_retry(&self, id: i64, retry_count: i64) -> Result<()> {

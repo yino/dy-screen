@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "datasetId": "authorized-zh-livestream-2026-01",
+  "samples": [
+    {
+      "id": "livestream-01",
+      "authorizationReference": "replace-with-consent-or-license-record-01",
+      "video": "samples/livestream-01.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 3000, "endMs": 55000 }],
+      "terms": {
+        "products": [{ "label": "示例商品一", "aliases": [] }],
+        "amounts": [{ "label": "99元", "aliases": ["九十九元"] }],
+        "streamers": [{ "label": "示例主播一", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品一", "aliases": [], "startMs": 10000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-02",
+      "authorizationReference": "replace-with-consent-or-license-record-02",
+      "video": "samples/livestream-02.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 2000, "endMs": 50000 }],
+      "terms": {
+        "products": [{ "label": "示例商品二", "aliases": [] }],
+        "amounts": [{ "label": "199元", "aliases": ["一百九十九元"] }],
+        "streamers": [{ "label": "示例主播二", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品二", "aliases": [], "startMs": 12000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-03",
+      "authorizationReference": "replace-with-consent-or-license-record-03",
+      "video": "samples/livestream-03.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 5000, "endMs": 57000 }],
+      "terms": {
+        "products": [{ "label": "示例商品三", "aliases": [] }],
+        "amounts": [{ "label": "39.9元", "aliases": ["三十九块九"] }],
+        "streamers": [{ "label": "示例主播三", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品三", "aliases": [], "startMs": 9000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-04",
+      "authorizationReference": "replace-with-consent-or-license-record-04",
+      "video": "samples/livestream-04.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 1000, "endMs": 48000 }],
+      "terms": {
+        "products": [{ "label": "示例商品四", "aliases": [] }],
+        "amounts": [{ "label": "299元", "aliases": ["二百九十九元"] }],
+        "streamers": [{ "label": "示例主播四", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品四", "aliases": [], "startMs": 15000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-05",
+      "authorizationReference": "replace-with-consent-or-license-record-05",
+      "video": "samples/livestream-05.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 4000, "endMs": 52000 }],
+      "terms": {
+        "products": [{ "label": "示例商品五", "aliases": [] }],
+        "amounts": [{ "label": "59元", "aliases": ["五十九元"] }],
+        "streamers": [{ "label": "示例主播五", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品五", "aliases": [], "startMs": 11000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-06",
+      "authorizationReference": "replace-with-consent-or-license-record-06",
+      "video": "samples/livestream-06.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 3000, "endMs": 56000 }],
+      "terms": {
+        "products": [{ "label": "示例商品六", "aliases": [] }],
+        "amounts": [{ "label": "129元", "aliases": ["一百二十九元"] }],
+        "streamers": [{ "label": "示例主播六", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品六", "aliases": [], "startMs": 13000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-07",
+      "authorizationReference": "replace-with-consent-or-license-record-07",
+      "video": "samples/livestream-07.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 6000, "endMs": 54000 }],
+      "terms": {
+        "products": [{ "label": "示例商品七", "aliases": [] }],
+        "amounts": [{ "label": "79元", "aliases": ["七十九元"] }],
+        "streamers": [{ "label": "示例主播七", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品七", "aliases": [], "startMs": 16000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-08",
+      "authorizationReference": "replace-with-consent-or-license-record-08",
+      "video": "samples/livestream-08.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 2000, "endMs": 51000 }],
+      "terms": {
+        "products": [{ "label": "示例商品八", "aliases": [] }],
+        "amounts": [{ "label": "399元", "aliases": ["三百九十九元"] }],
+        "streamers": [{ "label": "示例主播八", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品八", "aliases": [], "startMs": 14000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-09",
+      "authorizationReference": "replace-with-consent-or-license-record-09",
+      "video": "samples/livestream-09.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 4000, "endMs": 58000 }],
+      "terms": {
+        "products": [{ "label": "示例商品九", "aliases": [] }],
+        "amounts": [{ "label": "49.9元", "aliases": ["四十九块九"] }],
+        "streamers": [{ "label": "示例主播九", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品九", "aliases": [], "startMs": 8000, "toleranceMs": 1500 }]
+    },
+    {
+      "id": "livestream-10",
+      "authorizationReference": "replace-with-consent-or-license-record-10",
+      "video": "samples/livestream-10.mp4",
+      "durationMs": 60000,
+      "speechRegions": [{ "startMs": 1000, "endMs": 53000 }],
+      "terms": {
+        "products": [{ "label": "示例商品十", "aliases": [] }],
+        "amounts": [{ "label": "999元", "aliases": ["九百九十九元"] }],
+        "streamers": [{ "label": "示例主播十", "aliases": [] }]
+      },
+      "anchors": [{ "label": "示例商品十", "aliases": [], "startMs": 17000, "toleranceMs": 1500 }]
+    }
+  ]
+}

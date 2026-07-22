@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use dy_screen::asr::FrozenMediaSource;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
@@ -11,6 +12,11 @@ use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::ai::tauri_commands::*;
+use crate::ai::{
+    AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService, AiRepository, LocalAsrRuntime,
+    SourceFingerprint,
+};
 use crate::app_support::{delete_recording_session, validate_settings};
 use crate::database::Database;
 use crate::domain::{
@@ -29,8 +35,20 @@ struct AppState {
     database: Database,
     supervisor: Supervisor,
     preview: PreviewService,
+    ai_runtime: Arc<LocalAsrRuntime>,
     log_dir: PathBuf,
     quitting: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct DesktopAiPublisher {
+    app: AppHandle,
+}
+
+impl AiJobPublisher for DesktopAiPublisher {
+    fn publish(&self, event: AiJobEvent) {
+        let _ = self.app.emit("ai-job-event", event);
+    }
 }
 
 #[derive(Clone)]
@@ -269,6 +287,36 @@ async fn retry_video_preview(
 }
 
 #[tauri::command]
+async fn request_ai_input_preview(
+    project_id: i64,
+    input_id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PreviewSnapshot, PreviewFailure> {
+    let snapshot = state
+        .preview
+        .request(ai_input_preview_request(project_id, input_id, &state)?)
+        .await?;
+    authorize_preview_media(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn retry_ai_input_preview(
+    project_id: i64,
+    input_id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<PreviewSnapshot, PreviewFailure> {
+    let snapshot = state
+        .preview
+        .retry(ai_input_preview_request(project_id, input_id, &state)?)
+        .await?;
+    authorize_preview_media(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
 fn get_video_preview(
     request_id: String,
     app: AppHandle,
@@ -400,6 +448,7 @@ fn request_exit(force: bool, app: AppHandle, state: State<'_, AppState>) -> Resu
         &app,
         state.supervisor.clone(),
         state.preview.clone(),
+        state.ai_runtime.clone(),
         state.quitting.clone(),
     );
     Ok(())
@@ -409,6 +458,7 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -429,6 +479,8 @@ pub fn run() {
             save_settings,
             request_video_preview,
             retry_video_preview,
+            request_ai_input_preview,
+            retry_ai_input_preview,
             get_video_preview,
             retain_video_preview,
             release_video_preview,
@@ -438,6 +490,28 @@ pub fn run() {
             delete_session,
             open_logs,
             diagnose_environment,
+            ai_list_projects,
+            ai_get_project,
+            ai_create_project,
+            ai_rename_project,
+            ai_delete_project,
+            ai_pick_local_videos,
+            ai_import_local_grants,
+            ai_list_completed_sessions,
+            ai_add_completed_session,
+            ai_reorder_inputs,
+            ai_remove_input,
+            ai_project_summary,
+            ai_start_project,
+            ai_cancel_project,
+            ai_retry_input,
+            ai_query_transcript,
+            ai_copy_segment_text,
+            ai_copy_input_text,
+            ai_copy_project_text,
+            ai_export_txt,
+            ai_export_json,
+            ai_diagnose_environment,
             request_exit
         ])
         .setup(|app| {
@@ -452,6 +526,37 @@ pub fn run() {
             let database = Database::open(&app_data_dir.join("dy-screen.sqlite3"))?;
             database.migrate()?;
             database.reconcile_startup()?;
+            let settings = database.get_settings()?;
+
+            let asr_temporary_root = app_cache_dir.join("asr-audio");
+            std::fs::create_dir_all(&asr_temporary_root)?;
+            let asr_resource_root = desktop_asr_resource_root(app.path().resource_dir()?);
+            let ai_components = tauri::async_runtime::block_on(async {
+                LocalAsrRuntime::build(
+                    database.clone(),
+                    asr_resource_root,
+                    PathBuf::from(settings.ffprobe_path.clone()),
+                    asr_temporary_root,
+                    Arc::new(DesktopAiPublisher {
+                        app: app.handle().clone(),
+                    }),
+                )
+            });
+            ai_components
+                .runtime
+                .recover_startup()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let ai_project_service = AiProjectService::new(
+                database.clone(),
+                ai_components.inspector,
+                ai_components.preflight,
+            );
+            let ai_commands = AiCommandService::new(
+                ai_project_service,
+                crate::ai::AiRepository::new(database.clone()),
+                ai_components.runtime.clone(),
+            );
+            app.manage(AiDesktopState::new(ai_commands));
 
             let tray_status_item = MenuItemBuilder::with_id("recording_status", "正在录制：0 路")
                 .enabled(false)
@@ -483,6 +588,7 @@ pub fn run() {
                 database,
                 supervisor: supervisor.clone(),
                 preview,
+                ai_runtime: ai_components.runtime,
                 log_dir,
                 quitting,
             });
@@ -545,6 +651,7 @@ pub fn run() {
                         app,
                         state.supervisor.clone(),
                         state.preview.clone(),
+                        state.ai_runtime.clone(),
                         state.quitting.clone(),
                     );
                 }
@@ -595,6 +702,7 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
                     app,
                     state.supervisor.clone(),
                     state.preview.clone(),
+                    state.ai_runtime.clone(),
                     state.quitting.clone(),
                 );
             }
@@ -614,6 +722,7 @@ fn begin_shutdown(
     app: &AppHandle,
     supervisor: Supervisor,
     preview: PreviewService,
+    ai_runtime: Arc<LocalAsrRuntime>,
     quitting: Arc<AtomicBool>,
 ) {
     if quitting.swap(true, Ordering::SeqCst) {
@@ -621,10 +730,28 @@ fn begin_shutdown(
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        preview.shutdown().await;
-        supervisor.shutdown().await;
+        let (_, _, _) = tokio::join!(
+            preview.shutdown(),
+            supervisor.shutdown(),
+            ai_runtime.shutdown()
+        );
         app.exit(0);
     });
+}
+
+fn desktop_asr_resource_root(_packaged_resource_dir: PathBuf) -> PathBuf {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(override_root) = std::env::var_os("ASR_RESOURCE_ROOT") {
+            return PathBuf::from(override_root);
+        }
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+            .join("resources/asr")
+    }
+    #[cfg(not(debug_assertions))]
+    _packaged_resource_dir.join("resources/asr")
 }
 
 fn preview_request(id: i64, state: &State<'_, AppState>) -> Result<PreviewRequest, PreviewFailure> {
@@ -644,6 +771,50 @@ fn preview_request(id: i64, state: &State<'_, AppState>) -> Result<PreviewReques
         video_id: video.id,
         source_path: video.path,
         source_status: video.status,
+        ffmpeg_path: settings.ffmpeg_path,
+        ffprobe_path: settings.ffprobe_path,
+    })
+}
+
+fn ai_input_preview_request(
+    project_id: i64,
+    input_id: i64,
+    state: &State<'_, AppState>,
+) -> Result<PreviewRequest, PreviewFailure> {
+    let input = AiRepository::new(state.database.clone())
+        .get_input(input_id)
+        .map_err(|_| PreviewFailure::new("ai_input_not_found", "找不到 AI 项目视频"))?;
+    if input.project_id != project_id {
+        return Err(PreviewFailure::new(
+            "ai_input_project_mismatch",
+            "AI 项目视频归属无效",
+        ));
+    }
+    let source = FrozenMediaSource::from_path(Path::new(&input.source_path))
+        .map_err(|error| PreviewFailure::new(error.code, error.safe_message))?;
+    let current = SourceFingerprint {
+        normalized_path: source.path.to_string_lossy().into_owned(),
+        size_bytes: source.size_bytes,
+        modified_at_ms: i64::try_from(source.modified_at_ms).map_err(|_| {
+            PreviewFailure::new("media_timestamp_unavailable", "无法读取视频修改时间")
+        })?,
+        video_id: input.video_id,
+    };
+    if current != input.source_fingerprint {
+        return Err(PreviewFailure::new(
+            "media_changed",
+            "视频文件在项目创建后发生变化，无法可靠联动时间戳",
+        ));
+    }
+    let settings = state
+        .database
+        .get_settings()
+        .map_err(|_| PreviewFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    Ok(PreviewRequest {
+        // AI 输入使用负数命名空间，避免和视频库正整数 ID 的预览缓存冲突。
+        video_id: input_id.saturating_neg(),
+        source_path: input.source_path,
+        source_status: "complete".to_owned(),
         ffmpeg_path: settings.ffmpeg_path,
         ffprobe_path: settings.ffprobe_path,
     })
