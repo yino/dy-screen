@@ -368,6 +368,10 @@ describe("AiWorkspace", () => {
     expect(screen.getAllByText(/Windows 中文目录/).length).toBeGreaterThan(0);
     expect(api.requestAiInputPreview).toHaveBeenCalledWith(project.id, completedInput.id);
     const video = await screen.findByLabelText("AI 视频播放器") as HTMLVideoElement;
+    Object.defineProperty(video, "videoWidth", { configurable: true, value: 720 });
+    Object.defineProperty(video, "videoHeight", { configurable: true, value: 1270 });
+    fireEvent.loadedMetadata(video);
+    expect(video.closest(".ai-player-stage")).toHaveClass("portrait");
     await user.click(screen.getByText("欢迎来到直播间。").closest("button")!);
     expect(video.currentTime).toBe(1);
 

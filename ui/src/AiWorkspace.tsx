@@ -158,6 +158,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
   const [currentSegmentId, setCurrentSegmentId] = useState<string | null>(null);
   const [followPlayback, setFollowPlayback] = useState(true);
   const [showSubtitles, setShowSubtitles] = useState(true);
+  const [portraitVideo, setPortraitVideo] = useState(false);
   const [segmentPage, setSegmentPage] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -271,6 +272,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
   useEffect(() => {
     setCurrentSegmentId(null);
     setShowSubtitles(true);
+    setPortraitVideo(false);
     setSegmentPage(0);
     setPreview(null);
     if (!currentInput || !["completed", "skipped"].includes(currentInput.status)) return;
@@ -299,6 +301,19 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
       void api.releaseVideoPreview(preview.requestId);
     };
   }, [api, preview?.requestId, preview?.state]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const updateOrientation = () => {
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        setPortraitVideo(video.videoHeight > video.videoWidth);
+      }
+    };
+    updateOrientation();
+    video.addEventListener("loadedmetadata", updateOrientation);
+    return () => video.removeEventListener("loadedmetadata", updateOrientation);
+  }, [preview?.media?.path]);
 
   useEffect(() => {
     if (!followPlayback || !currentSegmentId) return;
@@ -534,7 +549,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
                   <div className="ai-result-main">
                     <section className="panel ai-player-panel">
                       <header><div><p className="section-kicker">PLAYER</p><h3>{currentInput?.displayName ?? "选择视频"}</h3></div><div className="ai-player-toggles"><label><input type="checkbox" checked={followPlayback} onChange={(event) => setFollowPlayback(event.target.checked)} />跟随播放</label><label><input type="checkbox" checked={showSubtitles} disabled={!previewReady} onChange={(event) => setShowSubtitles(event.target.checked)} />显示字幕</label></div></header>
-                      <div className="ai-player-stage">
+                      <div className={`ai-player-stage ${portraitVideo ? "portrait" : ""}`}>
                         {previewReady && preview?.media ? <><video ref={videoRef} controls aria-label="AI 视频播放器" src={mediaUrl(preview.media.path)} onTimeUpdate={updateCurrentSegment} /><div className={`ai-subtitle-overlay ${showSubtitles && currentSegment ? "visible" : ""}`} aria-live="polite">{showSubtitles ? currentSegment?.normalizedText : ""}</div></> : preview?.state === "failed" ? <div className="ai-player-unavailable"><AlertTriangle size={26} /><strong>播放器联动不可用</strong><p>{preview.errorMessage}</p><button className="secondary-button" onClick={() => currentInput && void api.retryAiInputPreview(currentInput.projectId, currentInput.id).then(setPreview)}><RotateCcw size={14} />重试预览</button></div> : currentInput && ["completed", "skipped"].includes(currentInput.status) ? <div className="ai-player-unavailable"><LoaderCircle className="spin" size={25} /><strong>正在准备本地预览</strong><p>预览只服务界面播放，不参与 ASR 缓存指纹。</p></div> : <div className="ai-player-unavailable"><Video size={28} /><strong>等待当前视频处理完成</strong><p>转写和预览都不会修改原视频。</p></div>}
                       </div>
                     </section>
