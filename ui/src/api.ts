@@ -23,6 +23,9 @@ import type {
   StreamerPromptContext,
   StreamerTag,
   StreamerTagInput,
+  ThumbnailBatch,
+  ThumbnailEvent,
+  ThumbnailSnapshot,
   VideoPage,
 } from "./types";
 
@@ -66,6 +69,14 @@ const tauriApi: ClientApi = {
   getVideoPreview: (requestId) => invoke<PreviewSnapshot>("get_video_preview", { requestId }),
   retainVideoPreview: (requestId) => invoke<void>("retain_video_preview", { requestId }),
   releaseVideoPreview: (requestId) => invoke<void>("release_video_preview", { requestId }),
+  requestVideoThumbnails: (videoIds) =>
+    invoke<ThumbnailBatch>("request_video_thumbnails", { videoIds }),
+  getVideoThumbnails: (batchId) =>
+    invoke<ThumbnailBatch>("get_video_thumbnails", { batchId }),
+  releaseVideoThumbnailBatch: (batchId) =>
+    invoke<void>("release_video_thumbnail_batch", { batchId }),
+  retryVideoThumbnail: (batchId, videoId) =>
+    invoke<ThumbnailSnapshot>("retry_video_thumbnail", { batchId, videoId }),
   openVideo: (id) => invoke<void>("open_video", { id }),
   revealVideo: (id) => invoke<void>("reveal_video", { id }),
   deleteVideo: (id) => invoke<void>("delete_video", { id }),
@@ -122,6 +133,12 @@ const tauriApi: ClientApi = {
     });
     return unlisten;
   },
+  subscribeThumbnail: async (listener) => {
+    const unlisten = await listen<ThumbnailEvent>("video-thumbnail-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
   subscribeAi: async (listener) => {
     const unlisten = await listen<AiJobEvent>("ai-job-event", (event) => {
       listener(event.payload);
@@ -133,6 +150,7 @@ const tauriApi: ClientApi = {
 export function createBrowserApi(): ClientApi {
   let streamers: Streamer[] = [];
   let settings = defaultSettings;
+  const thumbnailBatches = new Map<string, ThumbnailBatch>();
   try {
     streamers = (JSON.parse(window.localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
       .map((item) => ({
@@ -380,6 +398,37 @@ export function createBrowserApi(): ClientApi {
     },
     retainVideoPreview: async () => undefined,
     releaseVideoPreview: async () => undefined,
+    requestVideoThumbnails: async (videoIds): Promise<ThumbnailBatch> => {
+      const batchId = `browser-thumbnail-${Date.now()}`;
+      const batch: ThumbnailBatch = {
+        batchId,
+        items: videoIds.map((videoId) => ({
+          batchId,
+          videoId,
+          cacheKey: null,
+          state: "unavailable",
+          media: null,
+          errorCode: "browser_thumbnail_unavailable",
+          errorMessage: "浏览器演示模式不能读取本地视频首帧",
+        })),
+      };
+      thumbnailBatches.set(batchId, batch);
+      return batch;
+    },
+    getVideoThumbnails: async (batchId) => {
+      const batch = thumbnailBatches.get(batchId);
+      if (!batch) throw new Error("找不到浏览器演示封面批次");
+      return batch;
+    },
+    releaseVideoThumbnailBatch: async (batchId) => {
+      thumbnailBatches.delete(batchId);
+    },
+    retryVideoThumbnail: async (batchId, videoId): Promise<ThumbnailSnapshot> => {
+      const batch = thumbnailBatches.get(batchId);
+      const item = batch?.items.find((candidate) => candidate.videoId === videoId);
+      if (!item) throw new Error("找不到浏览器演示封面状态");
+      return item;
+    },
     openVideo: async () => undefined,
     revealVideo: async () => undefined,
     deleteVideo: async () => undefined,
@@ -469,6 +518,7 @@ export function createBrowserApi(): ClientApi {
     requestExit: async () => undefined,
     subscribe: async () => () => undefined,
     subscribePreview: async () => () => undefined,
+    subscribeThumbnail: async () => () => undefined,
     subscribeAi: async () => () => undefined,
   };
 }

@@ -23,6 +23,7 @@
 - 录制期间增量监听完成清单，MKV 分片一旦正确关闭就立即登记，不等待整场直播结束；
 - 展示直播状态、监听状态、本次视频数量和历史视频数量；
 - 提供本次监听视频和历史视频库，历史视频按录制会话分组；
+- 视频库按当前分页异步生成第一帧 JPEG 封面，点击封面可直接使用内置播放器预览；
 - 在监控中心和视频库中使用内置播放器预览已完成分片，同时保留系统播放器打开和 Finder/文件管理器定位；
 - MKV 首次预览时按需生成 MP4 缓存：优先无损重封装，编码不兼容时自动回退为 H.264 + AAC；
 - 支持删除单个视频或整个已结束会话；删除失败时恢复数据库状态并显示错误；
@@ -68,6 +69,7 @@ dy-screen/
 │   ├── src/database.rs          SQLite migration 和 repository
 │   ├── src/supervisor.rs        监听 worker、自动录制、重试和磁盘保护
 │   ├── src/preview.rs           预览队列、FFmpeg 转换、缓存和状态模型
+│   ├── src/thumbnail.rs         首帧封面、分页批次、JPEG 缓存和生命周期
 │   ├── src/ai/                  AI 项目、命令、调度、恢复和本地 ASR 运行时
 │   ├── src/app.rs               command、事件、托盘和桌面生命周期
 │   └── tests/                   数据库与状态机测试
@@ -434,6 +436,20 @@ macOS 的预览缓存默认位于：
 
 如果 FFmpeg/FFprobe 缺失、磁盘空间不足或文件损坏，播放器会显示中文错误，并提供重试或系统播放器回退入口。
 
+### 视频库首帧封面
+
+历史视频库在当前 50 条分页完成元数据加载后异步请求首帧封面，列表会先显示固定 16:9 占位，不等待 FFmpeg。后端优先提取视频起点的第一个可解码帧；起点失败时只在第 1 秒重试一次。JPEG 保留画面方向和比例，最长边不超过 480px，卡片中使用居中裁切。本次监听视频的紧凑列表不会请求封面。
+
+封面任务全局最多并行 2 个。翻页、修改筛选或离开视频库时会释放旧批次，并取消没有其他页面引用且尚未开始的任务；已经开始的单帧提取可以完成并写入缓存。原文件缺失时只会读取已经存在且仍有效的 MP4 预览缓存，不会为了封面生成完整 MP4。
+
+macOS 的封面缓存默认位于：
+
+```text
+~/Library/Caches/com.yino.dyscreen/video-thumbnails/
+```
+
+封面 JPEG 和 JSON 清单是独立可再生缓存，不写入 SQLite，也不会修改 MKV/MP4。超过 30 天未访问的条目会被清理，并按最久未使用顺序把总容量限制在 512 MB；正在生成或当前页面正在显示的封面受保护。删除视频或整个会话会同步清理对应封面。生成失败时卡片保持稳定占位并提供重试图标，文件缺失或浏览器演示模式则显示不可用占位，已有预览、系统打开和定位操作不受封面错误影响。
+
 macOS 可以使用 IINA 或 VLC：
 
 ```bash
@@ -492,6 +508,9 @@ make help
 | `make preview-doctor` | 检查 FFmpeg/FFprobe 和可用 H.264 编码器 |
 | `make test-preview` | 执行预览 Rust 测试和播放器组件测试 |
 | `make test-preview-integration` | 使用真实 FFmpeg 样本验证重封装、回退转码和无音轨视频 |
+| `make thumbnail-doctor` | 检查 FFmpeg/FFprobe 和 JPEG 封面编码能力 |
+| `make test-thumbnail` | 执行封面缓存、批次并发、删除竞态和 React 视频库测试 |
+| `make test-thumbnail-integration` | 使用真实 FFmpeg 样本验证横屏、竖屏、无音轨与损坏媒体封面 |
 | `make asr-test-contract` | 单独验证中立 `AsrEngine` 契约、资源、错误、取消和调度边界 |
 | `make asr-test-media` | 单独验证 FFprobe、FFmpeg、临时音频和原视频不变 |
 | `make asr-test-vad ASR_RESOURCE_ROOT=...` | 使用封存资源单独运行真实人声、静音和纯音乐 VAD |

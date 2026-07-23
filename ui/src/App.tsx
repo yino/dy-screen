@@ -11,6 +11,7 @@ import {
   FileVideo2,
   FolderOpen,
   HardDrive,
+  ImageOff,
   LayoutDashboard,
   LoaderCircle,
   Maximize2,
@@ -45,6 +46,8 @@ import type {
   PreviewSnapshot,
   Streamer,
   StreamerTagInput,
+  ThumbnailBatch,
+  ThumbnailSnapshot,
   Video as VideoItem,
   VideoFilters,
 } from "./types";
@@ -179,6 +182,10 @@ function previewMediaUrl(path: string): string {
   return "__TAURI_INTERNALS__" in window ? convertFileSrc(path) : path;
 }
 
+function thumbnailMediaUrl(path: string): string {
+  return "__TAURI_INTERNALS__" in window ? convertFileSrc(path) : path;
+}
+
 interface AppProps {
   api: ClientApi;
 }
@@ -201,6 +208,7 @@ export function App({ api }: AppProps) {
   const [editingStreamer, setEditingStreamer] = useState<Streamer | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [preview, setPreview] = useState<ActivePreview | null>(null);
+  const [thumbnailBatch, setThumbnailBatch] = useState<ThumbnailBatch | null>(null);
   const selectedIdRef = useRef(selectedId);
   const pageRef = useRef(page);
   const historyPageRef = useRef(historyPage);
@@ -310,6 +318,75 @@ export function App({ api }: AppProps) {
   }, [api]);
 
   useEffect(() => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void api.subscribeThumbnail((event) => {
+      setThumbnailBatch((current) => {
+        if (!current || current.batchId !== event.batchId || event.item.batchId !== current.batchId) {
+          return current;
+        }
+        const existing = current.items.find((item) => item.videoId === event.item.videoId);
+        if (!existing) return current;
+        if (existing.cacheKey && event.item.cacheKey && existing.cacheKey !== event.item.cacheKey) {
+          return current;
+        }
+        return {
+          ...current,
+          items: current.items.map((item) => item.videoId === event.item.videoId ? event.item : item),
+        };
+      });
+    }).then((handler) => {
+      if (disposed) handler();
+      else unsubscribe = handler;
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, [api]);
+
+  useEffect(() => {
+    let disposed = false;
+    let activeBatchId: string | null = null;
+    setThumbnailBatch(null);
+    if (page !== "library" || historyVideos.length === 0) return undefined;
+    void api.requestVideoThumbnails(historyVideos.map((video) => video.id))
+      .then((batch) => {
+        activeBatchId = batch.batchId;
+        if (disposed) {
+          void api.releaseVideoThumbnailBatch(batch.batchId);
+        } else {
+          setThumbnailBatch(batch);
+        }
+      })
+      .catch((error) => {
+        if (!disposed) setNotice(errorMessage(error, "无法加载视频封面"));
+      });
+    return () => {
+      disposed = true;
+      if (activeBatchId) void api.releaseVideoThumbnailBatch(activeBatchId);
+    };
+  }, [api, historyVideos, page]);
+
+  useEffect(() => {
+    if (!thumbnailBatch?.items.some((item) => item.state === "queued")) return undefined;
+    let disposed = false;
+    const batchId = thumbnailBatch.batchId;
+    const refresh = () => {
+      void api.getVideoThumbnails(batchId)
+        .then((batch) => {
+          if (!disposed) setThumbnailBatch((current) => current?.batchId === batchId ? batch : current);
+        })
+        .catch(() => undefined);
+    };
+    const timer = window.setInterval(refresh, 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [api, thumbnailBatch]);
+
+  useEffect(() => {
     if (selectedId) void refreshCurrentVideos(selectedId);
     else setCurrentVideos([]);
   }, [refreshCurrentVideos, selectedId]);
@@ -385,6 +462,21 @@ export function App({ api }: AppProps) {
       : current);
   }, []);
 
+  const retryThumbnail = useCallback((videoId: number) => {
+    const batchId = thumbnailBatch?.batchId;
+    if (!batchId) return;
+    void api.retryVideoThumbnail(batchId, videoId)
+      .then((snapshot) => {
+        setThumbnailBatch((current) => current?.batchId === batchId
+          ? {
+              ...current,
+              items: current.items.map((item) => item.videoId === videoId ? snapshot : item),
+            }
+          : current);
+      })
+      .catch((error) => setNotice(errorMessage(error, "视频封面重试失败")));
+  }, [api, thumbnailBatch?.batchId]);
+
   return (
     <div className="app-shell">
       <Sidebar
@@ -457,6 +549,7 @@ export function App({ api }: AppProps) {
             page={historyPage}
             total={historyTotal}
             filters={historyFilters}
+            thumbnails={thumbnailBatch?.items ?? []}
             onFilter={(id) => {
               setHistoryStreamerId(id);
               setHistoryPage(1);
@@ -469,6 +562,7 @@ export function App({ api }: AppProps) {
             }}
             onPage={(nextPage) => void refreshHistoryVideos(historyStreamerId, nextPage, historyFilters)}
             onPreview={openPreview}
+            onRetryThumbnail={retryThumbnail}
             onOpen={(id) => void action(() => api.openVideo(id))}
             onReveal={(id) => void action(() => api.revealVideo(id))}
             onDelete={(id) => {
@@ -820,8 +914,9 @@ function SessionPanel({ streamer, videos, onPreview, onOpen, onReveal }: { strea
   );
 }
 
-function LibraryPage({ videos, streamers, page, total, filters, onFilter, onFilters, onPage, onPreview, onOpen, onReveal, onDelete, onDeleteSession }: { videos: VideoItem[]; streamers: Streamer[]; page: number; total: number; filters: HistoryFilters; onFilter: (id?: number) => void; onFilters: (filters: HistoryFilters) => void; onPage: (page: number) => void; onPreview: (video: VideoItem) => void; onOpen: (id: number) => void; onReveal: (id: number) => void; onDelete: (id: number) => void; onDeleteSession: (sessionId: number) => void }) {
+function LibraryPage({ videos, streamers, page, total, filters, thumbnails, onFilter, onFilters, onPage, onPreview, onRetryThumbnail, onOpen, onReveal, onDelete, onDeleteSession }: { videos: VideoItem[]; streamers: Streamer[]; page: number; total: number; filters: HistoryFilters; thumbnails: ThumbnailSnapshot[]; onFilter: (id?: number) => void; onFilters: (filters: HistoryFilters) => void; onPage: (page: number) => void; onPreview: (video: VideoItem) => void; onRetryThumbnail: (videoId: number) => void; onOpen: (id: number) => void; onReveal: (id: number) => void; onDelete: (id: number) => void; onDeleteSession: (sessionId: number) => void }) {
   const totalPages = Math.max(1, Math.ceil(total / 50));
+  const thumbnailsByVideo = new Map(thumbnails.map((item) => [item.videoId, item]));
   const sessions = Array.from(videos.reduce((groups, video) => {
     const current = groups.get(video.sessionId) ?? [];
     current.push(video);
@@ -836,12 +931,50 @@ function LibraryPage({ videos, streamers, page, total, filters, onFilter, onFilt
         {videos.length === 0 ? (
           <div className="empty-state spacious"><FileVideo2 size={32} /><h3>还没有历史视频</h3><p>主播开播并完成第一个分片后，视频会自动归档到这里。</p></div>
         ) : (
-          <div className="library-sessions">{sessions.map(([sessionId, items]) => <section className="library-session" key={sessionId}><header><div><span>{items[0].streamerName}</span><strong>会话 #{sessionId}</strong><small>{items.length} 个分片 · {formatBytes(items.reduce((sum, item) => sum + item.sizeBytes, 0))}</small></div><button className="danger session-delete" aria-label={`删除会话 #${sessionId}`} onClick={() => onDeleteSession(sessionId)}><Trash2 size={15} />删除整个会话</button></header><div className="library-grid">{items.map((video) => <article className="library-card" key={video.id}><div className="library-preview"><Video size={28} /><span className={video.status === "missing" ? "file-state missing" : "file-state"}>{video.status === "missing" ? "文件缺失" : fileName(video.path).toLowerCase().endsWith(".mp4") ? "MP4" : "MKV"}</span></div><div className="library-card-body"><span>{video.streamerName}</span><strong title={video.path}>{fileName(video.path)}</strong><small>{formatDate(video.startedAt)} · {formatBytes(video.sizeBytes)}</small><div><button aria-label={`预览 ${fileName(video.path)}`} disabled={video.status === "missing" && video.hasPreviewCache !== true} onClick={() => onPreview(video)}><Play size={15} />预览</button><button disabled={video.status === "missing"} onClick={() => onOpen(video.id)}><ExternalLink size={15} />系统打开</button><button disabled={video.status === "missing"} onClick={() => onReveal(video.id)}><FolderOpen size={15} />定位</button><button className="danger" onClick={() => onDelete(video.id)}><Trash2 size={15} /></button></div></div></article>)}</div></section>)}</div>
+          <div className="library-sessions">{sessions.map(([sessionId, items]) => <section className="library-session" key={sessionId}><header><div><span>{items[0].streamerName}</span><strong>会话 #{sessionId}</strong><small>{items.length} 个分片 · {formatBytes(items.reduce((sum, item) => sum + item.sizeBytes, 0))}</small></div><button className="danger session-delete" aria-label={`删除会话 #${sessionId}`} onClick={() => onDeleteSession(sessionId)}><Trash2 size={15} />删除整个会话</button></header><div className="library-grid">{items.map((video) => <article className="library-card" key={video.id}><LibraryThumbnail video={video} thumbnail={thumbnailsByVideo.get(video.id)} onPreview={() => onPreview(video)} onRetry={() => onRetryThumbnail(video.id)} /><div className="library-card-body"><span>{video.streamerName}</span><strong title={video.path}>{fileName(video.path)}</strong><small>{formatDate(video.startedAt)} · {formatBytes(video.sizeBytes)}</small><div><button aria-label={`预览 ${fileName(video.path)}`} disabled={video.status === "missing" && video.hasPreviewCache !== true} onClick={() => onPreview(video)}><Play size={15} />预览</button><button disabled={video.status === "missing"} onClick={() => onOpen(video.id)}><ExternalLink size={15} />系统打开</button><button disabled={video.status === "missing"} onClick={() => onReveal(video.id)}><FolderOpen size={15} />定位</button><button className="danger" onClick={() => onDelete(video.id)}><Trash2 size={15} /></button></div></div></article>)}</div></section>)}</div>
         )}
         {total > 50 && <div className="pagination"><button disabled={page <= 1} onClick={() => onPage(page - 1)}>上一页</button><span>第 {page} / {totalPages} 页</span><button disabled={page >= totalPages} onClick={() => onPage(page + 1)}>下一页</button></div>}
       </section>
     </div>
   );
+}
+
+function LibraryThumbnail({ video, thumbnail, onPreview, onRetry }: {
+  video: VideoItem;
+  thumbnail: ThumbnailSnapshot | undefined;
+  onPreview: () => void;
+  onRetry: () => void;
+}) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const mediaPath = thumbnail?.state === "ready" ? thumbnail.media?.path ?? null : null;
+  useEffect(() => setImageFailed(false), [mediaPath]);
+  const label = video.status === "missing"
+    ? "文件缺失"
+    : fileName(video.path).toLowerCase().endsWith(".mp4") ? "MP4" : "MKV";
+  const badge = <span className={video.status === "missing" ? "file-state missing" : "file-state"}>{label}</span>;
+
+  if (mediaPath && !imageFailed) {
+    return (
+      <button className="library-preview thumbnail-ready" aria-label={`预览 ${fileName(video.path)} 封面`} onClick={onPreview}>
+        <img src={thumbnailMediaUrl(mediaPath)} alt={`${fileName(video.path)} 封面`} onError={() => setImageFailed(true)} />
+        <span className="thumbnail-play"><Play size={17} /></span>
+        {badge}
+      </button>
+    );
+  }
+  if (thumbnail?.state === "failed" || imageFailed) {
+    return (
+      <div className="library-preview thumbnail-placeholder failed" title={thumbnail?.errorMessage ?? "视频封面加载失败"}>
+        <ImageOff size={27} />
+        <button className="thumbnail-retry" aria-label={`重试封面 ${fileName(video.path)}`} title="重试生成封面" onClick={onRetry}><RotateCcw size={17} /></button>
+        {badge}
+      </div>
+    );
+  }
+  if (thumbnail?.state === "unavailable") {
+    return <div className="library-preview thumbnail-placeholder unavailable" title={thumbnail.errorMessage ?? "视频封面不可用"}><ImageOff size={27} />{badge}</div>;
+  }
+  return <div className="library-preview thumbnail-placeholder queued" aria-label={`正在加载封面 ${fileName(video.path)}`}><LoaderCircle className="spin" size={25} />{badge}</div>;
 }
 
 function VideoPreviewDialog({ api, video, snapshot, onSnapshot, onRetry, onOpenSystem, onClose }: {

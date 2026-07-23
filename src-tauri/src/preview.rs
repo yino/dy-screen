@@ -758,6 +758,23 @@ impl PreviewService {
             .map_err(|_| PreviewFailure::new("cache_io", "无法读取视频预览缓存"))
     }
 
+    pub fn cached_media_for_video(&self, video_id: i64) -> Result<Option<PathBuf>, PreviewFailure> {
+        let Some(manifest) = self
+            .inner
+            .cache
+            .find_latest_for_video(video_id)
+            .map_err(|_| PreviewFailure::new("cache_io", "无法读取视频预览缓存"))?
+        else {
+            return Ok(None);
+        };
+        let manifest = self
+            .inner
+            .cache
+            .touch_manifest(&manifest.key, now_millis())
+            .map_err(|_| PreviewFailure::new("cache_io", "无法更新视频预览缓存"))?;
+        Ok(manifest.map(|manifest| PathBuf::from(manifest.media_file)))
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         loop {

@@ -2,11 +2,12 @@ use dy_screen::error::RecorderError;
 use dy_screen::model::RoomStreams;
 use dy_screen::resolver::RoomInspection;
 use dy_screen_app_lib::app_support::{
-    NormalizedStreamerSource, delete_recording_session, parse_room_identity, parse_streamer_source,
-    validate_room_access, validate_settings,
+    NormalizedStreamerSource, delete_recording_session, delete_recording_video,
+    parse_room_identity, parse_streamer_source, validate_room_access, validate_settings,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{AppSettings, NewStreamer, NewVideo};
+use rusqlite::Connection;
 
 #[test]
 fn public_douyin_url_is_normalized_and_room_key_is_extracted() {
@@ -164,8 +165,94 @@ fn deleting_a_session_restores_earlier_files_when_a_later_file_fails() {
     assert_eq!(database.list_session_videos(session.id).unwrap().len(), 2);
 }
 
+#[test]
+fn deleting_one_video_removes_file_and_database_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let video_path = directory.path().join("single.mkv");
+    std::fs::write(&video_path, b"video").unwrap();
+    let (database, session_id) = session_with_video(&video_path);
+    let video_id = database.list_session_videos(session_id).unwrap()[0].id;
+
+    delete_recording_video(&database, video_id).unwrap();
+
+    assert!(!video_path.exists());
+    assert!(database.get_video(video_id).is_err());
+}
+
+#[test]
+fn deleting_one_video_restores_status_when_target_is_not_a_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let invalid_path = directory.path().join("single.mkv");
+    std::fs::create_dir(&invalid_path).unwrap();
+    let (database, session_id) = session_with_video(&invalid_path);
+    let video_id = database.list_session_videos(session_id).unwrap()[0].id;
+
+    let error = delete_recording_video(&database, video_id).unwrap_err();
+
+    assert!(error.contains("不是普通文件"));
+    assert_eq!(database.get_video(video_id).unwrap().status, "complete");
+}
+
+#[test]
+fn deleting_one_video_restores_file_and_status_when_database_delete_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("single-rollback.sqlite3");
+    let video_path = directory.path().join("single-rollback.mkv");
+    std::fs::write(&video_path, b"video").unwrap();
+    let (database, session_id) = persistent_session_with_video(&database_path, &video_path);
+    let video_id = database.list_session_videos(session_id).unwrap()[0].id;
+    Connection::open(&database_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_video_delete BEFORE DELETE ON videos BEGIN SELECT RAISE(FAIL, 'blocked'); END;",
+        )
+        .unwrap();
+
+    let error = delete_recording_video(&database, video_id).unwrap_err();
+
+    assert!(error.contains("blocked"));
+    assert!(video_path.is_file());
+    assert_eq!(database.get_video(video_id).unwrap().status, "complete");
+}
+
+#[test]
+fn deleting_session_restores_files_and_statuses_when_database_delete_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("session-rollback.sqlite3");
+    let video_path = directory.path().join("session-rollback.mkv");
+    std::fs::write(&video_path, b"video").unwrap();
+    let (database, session_id) = persistent_session_with_video(&database_path, &video_path);
+    Connection::open(&database_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_session_delete BEFORE DELETE ON recording_sessions BEGIN SELECT RAISE(FAIL, 'blocked'); END;",
+        )
+        .unwrap();
+
+    let error = delete_recording_session(&database, session_id).unwrap_err();
+
+    assert!(error.contains("blocked"));
+    assert!(video_path.is_file());
+    assert_eq!(
+        database.list_session_videos(session_id).unwrap()[0].status,
+        "complete"
+    );
+}
+
 fn session_with_video(path: &std::path::Path) -> (Database, i64) {
     let database = Database::open_in_memory().unwrap();
+    populate_session_with_video(database, path)
+}
+
+fn persistent_session_with_video(
+    database_path: &std::path::Path,
+    video_path: &std::path::Path,
+) -> (Database, i64) {
+    let database = Database::open(database_path).unwrap();
+    populate_session_with_video(database, video_path)
+}
+
+fn populate_session_with_video(database: Database, path: &std::path::Path) -> (Database, i64) {
     database.migrate().unwrap();
     let streamer = database
         .add_streamer(&NewStreamer::room("会话主播", "700", "room-700", false))

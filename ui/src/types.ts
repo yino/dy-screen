@@ -329,6 +329,39 @@ export interface PreviewSnapshot {
   errorMessage: string | null;
 }
 
+export type ThumbnailState = "queued" | "ready" | "failed" | "unavailable";
+
+export type ThumbnailSourceKind = "original" | "preview_cache";
+
+export interface ThumbnailMedia {
+  path: string;
+  mimeType: "image/jpeg";
+  width: number;
+  height: number;
+  cacheHit: boolean;
+  sourceKind: ThumbnailSourceKind;
+}
+
+export interface ThumbnailSnapshot {
+  batchId: string;
+  videoId: number;
+  cacheKey: string | null;
+  state: ThumbnailState;
+  media: ThumbnailMedia | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export interface ThumbnailBatch {
+  batchId: string;
+  items: ThumbnailSnapshot[];
+}
+
+export interface ThumbnailEvent {
+  batchId: string;
+  item: ThumbnailSnapshot;
+}
+
 export interface ClientApi {
   getDashboard(): Promise<Dashboard>;
   createStreamer(input: CreateStreamerInput): Promise<Streamer>;
@@ -348,6 +381,10 @@ export interface ClientApi {
   getVideoPreview(requestId: string): Promise<PreviewSnapshot>;
   retainVideoPreview(requestId: string): Promise<void>;
   releaseVideoPreview(requestId: string): Promise<void>;
+  requestVideoThumbnails(videoIds: number[]): Promise<ThumbnailBatch>;
+  getVideoThumbnails(batchId: string): Promise<ThumbnailBatch>;
+  releaseVideoThumbnailBatch(batchId: string): Promise<void>;
+  retryVideoThumbnail(batchId: string, videoId: number): Promise<ThumbnailSnapshot>;
   openVideo(id: number): Promise<void>;
   revealVideo(id: number): Promise<void>;
   deleteVideo(id: number): Promise<void>;
@@ -381,5 +418,6 @@ export interface ClientApi {
   requestExit(force: boolean): Promise<void>;
   subscribe(listener: (event: MonitorEvent) => void): Promise<() => void>;
   subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
+  subscribeThumbnail(listener: (event: ThumbnailEvent) => void): Promise<() => void>;
   subscribeAi(listener: (event: AiJobEvent) => void): Promise<() => void>;
 }

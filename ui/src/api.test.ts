@@ -96,3 +96,17 @@ describe("浏览器演示标签 API", () => {
     expect((await api.getDashboard()).streamers).toEqual([]);
   });
 });
+
+describe("浏览器演示封面 API", () => {
+  it("固定返回不可用占位且释放后不再保留批次", async () => {
+    const api = createBrowserApi();
+    const batch = await api.requestVideoThumbnails([11, 12]);
+
+    expect(batch.items.map((item) => item.state)).toEqual(["unavailable", "unavailable"]);
+    expect(batch.items.every((item) => item.media === null)).toBe(true);
+    expect((await api.getVideoThumbnails(batch.batchId)).batchId).toBe(batch.batchId);
+
+    await api.releaseVideoThumbnailBatch(batch.batchId);
+    await expect(api.getVideoThumbnails(batch.batchId)).rejects.toThrow("找不到浏览器演示封面批次");
+  });
+});

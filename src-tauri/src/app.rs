@@ -17,7 +17,7 @@ use crate::ai::{
     AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService, AiRepository, LocalAsrRuntime,
     SourceFingerprint,
 };
-use crate::app_support::{delete_recording_session, validate_settings};
+use crate::app_support::{delete_recording_session, delete_recording_video, validate_settings};
 use crate::database::Database;
 use crate::domain::{
     AppSettings, CommandError, CreateStreamerRequest, Dashboard, EnvironmentStatus, MonitorEvent,
@@ -28,6 +28,11 @@ use crate::preview::{
 };
 use crate::streamer_service::{PublicSourceInspector, create_streamer_with, update_streamer_with};
 use crate::supervisor::{MonitorPublisher, Supervisor};
+use crate::thumbnail::{
+    FfmpegThumbnailExecutor, ThumbnailBatch, ThumbnailCache, ThumbnailEvent, ThumbnailFailure,
+    ThumbnailPublisher, ThumbnailRequest, ThumbnailService, ThumbnailSnapshot,
+    trusted_thumbnail_request,
+};
 
 type TrayStatus = Arc<Mutex<Option<MenuItem<tauri::Wry>>>>;
 
@@ -35,6 +40,7 @@ struct AppState {
     database: Database,
     supervisor: Supervisor,
     preview: PreviewService,
+    thumbnail: ThumbnailService,
     ai_runtime: Arc<LocalAsrRuntime>,
     log_dir: PathBuf,
     quitting: Arc<AtomicBool>,
@@ -97,6 +103,19 @@ impl PreviewPublisher for DesktopPreviewPublisher {
     fn publish(&self, snapshot: &PreviewSnapshot) {
         authorize_preview_media(&self.app, snapshot);
         let _ = self.app.emit("video-preview-event", snapshot);
+    }
+}
+
+#[derive(Clone)]
+struct DesktopThumbnailPublisher {
+    app: AppHandle,
+    cache: ThumbnailCache,
+}
+
+impl ThumbnailPublisher for DesktopThumbnailPublisher {
+    fn publish(&self, event: &ThumbnailEvent) {
+        authorize_thumbnail_item_with_cache(&self.app, &self.cache, &event.item);
+        let _ = self.app.emit("video-thumbnail-event", event);
     }
 }
 
@@ -341,6 +360,74 @@ fn release_video_preview(request_id: String, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
+async fn request_video_thumbnails(
+    video_ids: Vec<i64>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ThumbnailBatch, ThumbnailFailure> {
+    if video_ids.len() > crate::thumbnail::THUMBNAIL_MAX_BATCH_SIZE {
+        return Err(ThumbnailFailure::new(
+            "batch_too_large",
+            "单次最多请求 50 个视频封面",
+        ));
+    }
+    let settings = state
+        .database
+        .get_settings()
+        .map_err(|_| ThumbnailFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    let mut requests = Vec::with_capacity(video_ids.len());
+    for video_id in video_ids {
+        requests.push(thumbnail_request(
+            video_id,
+            &state,
+            &settings.ffmpeg_path,
+            &settings.ffprobe_path,
+        )?);
+    }
+    let batch = state.thumbnail.request_batch(requests).await?;
+    authorize_thumbnail_batch(&app, &state.thumbnail, &batch)?;
+    Ok(batch)
+}
+
+#[tauri::command]
+fn get_video_thumbnails(
+    batch_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ThumbnailBatch, ThumbnailFailure> {
+    let batch = state.thumbnail.get_batch(&batch_id)?;
+    authorize_thumbnail_batch(&app, &state.thumbnail, &batch)?;
+    Ok(batch)
+}
+
+#[tauri::command]
+fn release_video_thumbnail_batch(batch_id: String, state: State<'_, AppState>) {
+    state.thumbnail.release_batch(&batch_id);
+}
+
+#[tauri::command]
+async fn retry_video_thumbnail(
+    batch_id: String,
+    video_id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ThumbnailSnapshot, ThumbnailFailure> {
+    let settings = state
+        .database
+        .get_settings()
+        .map_err(|_| ThumbnailFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    let request = thumbnail_request(
+        video_id,
+        &state,
+        &settings.ffmpeg_path,
+        &settings.ffprobe_path,
+    )?;
+    let snapshot = state.thumbnail.retry(&batch_id, request).await?;
+    authorize_thumbnail_item(&app, &state.thumbnail, &snapshot)?;
+    Ok(snapshot)
+}
+
+#[tauri::command]
 fn open_video(id: i64, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let video = state
         .database
@@ -372,26 +459,29 @@ fn reveal_video(id: i64, app: AppHandle, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 fn delete_video(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let video = state
+    state
         .database
         .get_video(id)
         .map_err(|error| error.to_string())?;
-    state
-        .database
-        .mark_video_status(id, "pending_delete")
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = remove_video_file(Path::new(&video.path)) {
-        let _ = state.database.mark_video_status(id, &video.status);
-        return Err(format!("删除视频失败：{error}"));
+    state.thumbnail.begin_eviction(&[id]);
+    let delete_result = delete_recording_video(&state.database, id);
+    let committed = state.database.get_video(id).is_err();
+    if !committed {
+        state.thumbnail.rollback_eviction(&[id]);
+        return delete_result;
     }
-    state
-        .database
-        .delete_video_record(id)
-        .map_err(|error| error.to_string())?;
-    state
+
+    let preview_error = state
         .preview
         .evict_video(id)
-        .map_err(|error| format!("视频已删除，但预览缓存清理失败：{}", error.message))
+        .err()
+        .map(|error| format!("视频已删除，但预览缓存清理失败：{}", error.message));
+    let thumbnail_error = state
+        .thumbnail
+        .commit_eviction(&[id])
+        .err()
+        .map(|error| format!("视频已删除，但封面缓存清理失败：{}", error.message));
+    delete_result.and_then(|_| preview_error.or(thumbnail_error).map_or(Ok(()), Err))
 }
 
 #[tauri::command]
@@ -403,14 +493,30 @@ fn delete_session(session_id: i64, state: State<'_, AppState>) -> Result<(), Str
         .into_iter()
         .map(|video| video.id)
         .collect::<Vec<_>>();
-    delete_recording_session(&state.database, session_id)?;
-    for video_id in video_ids {
+    state.thumbnail.begin_eviction(&video_ids);
+    let delete_result = delete_recording_session(&state.database, session_id);
+    let committed = state.database.get_session(session_id).is_err();
+    if !committed {
+        state.thumbnail.rollback_eviction(&video_ids);
+        return delete_result;
+    }
+    let mut cache_error = None;
+    for video_id in &video_ids {
         state
             .preview
-            .evict_video(video_id)
-            .map_err(|error| format!("录制会话已删除，但预览缓存清理失败：{}", error.message))?;
+            .evict_video(*video_id)
+            .unwrap_or_else(|error| {
+                cache_error.get_or_insert_with(|| {
+                    format!("录制会话已删除，但预览缓存清理失败：{}", error.message)
+                });
+            });
     }
-    Ok(())
+    if let Err(error) = state.thumbnail.commit_eviction(&video_ids) {
+        cache_error.get_or_insert_with(|| {
+            format!("录制会话已删除，但封面缓存清理失败：{}", error.message)
+        });
+    }
+    delete_result.and_then(|_| cache_error.map_or(Ok(()), Err))
 }
 
 #[tauri::command]
@@ -448,6 +554,7 @@ fn request_exit(force: bool, app: AppHandle, state: State<'_, AppState>) -> Resu
         &app,
         state.supervisor.clone(),
         state.preview.clone(),
+        state.thumbnail.clone(),
         state.ai_runtime.clone(),
         state.quitting.clone(),
     );
@@ -484,6 +591,10 @@ pub fn run() {
             get_video_preview,
             retain_video_preview,
             release_video_preview,
+            request_video_thumbnails,
+            get_video_thumbnails,
+            release_video_thumbnail_batch,
+            retry_video_thumbnail,
             open_video,
             reveal_video,
             delete_video,
@@ -587,12 +698,23 @@ pub fn run() {
                 }),
             )
             .map_err(std::io::Error::other)?;
+            let thumbnail_cache = ThumbnailCache::new(app_cache_dir.join("video-thumbnails"));
+            let thumbnail = ThumbnailService::with_executor_and_publisher(
+                thumbnail_cache.clone(),
+                Arc::new(FfmpegThumbnailExecutor),
+                Arc::new(DesktopThumbnailPublisher {
+                    app: app.handle().clone(),
+                    cache: thumbnail_cache,
+                }),
+            )
+            .map_err(std::io::Error::other)?;
             let quitting = Arc::new(AtomicBool::new(false));
 
             app.manage(AppState {
                 database,
                 supervisor: supervisor.clone(),
                 preview,
+                thumbnail,
                 ai_runtime: ai_components.runtime,
                 log_dir,
                 quitting,
@@ -656,6 +778,7 @@ pub fn run() {
                         app,
                         state.supervisor.clone(),
                         state.preview.clone(),
+                        state.thumbnail.clone(),
                         state.ai_runtime.clone(),
                         state.quitting.clone(),
                     );
@@ -707,6 +830,7 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
                     app,
                     state.supervisor.clone(),
                     state.preview.clone(),
+                    state.thumbnail.clone(),
                     state.ai_runtime.clone(),
                     state.quitting.clone(),
                 );
@@ -727,6 +851,7 @@ fn begin_shutdown(
     app: &AppHandle,
     supervisor: Supervisor,
     preview: PreviewService,
+    thumbnail: ThumbnailService,
     ai_runtime: Arc<LocalAsrRuntime>,
     quitting: Arc<AtomicBool>,
 ) {
@@ -735,8 +860,9 @@ fn begin_shutdown(
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let (_, _, _) = tokio::join!(
+        let (_, _, _, _) = tokio::join!(
             preview.shutdown(),
+            thumbnail.shutdown(),
             supervisor.shutdown(),
             ai_runtime.shutdown()
         );
@@ -783,6 +909,28 @@ fn preview_request(id: i64, state: &State<'_, AppState>) -> Result<PreviewReques
         ffmpeg_path: settings.ffmpeg_path,
         ffprobe_path: settings.ffprobe_path,
     })
+}
+
+fn thumbnail_request(
+    id: i64,
+    state: &State<'_, AppState>,
+    ffmpeg_path: &str,
+    ffprobe_path: &str,
+) -> Result<ThumbnailRequest, ThumbnailFailure> {
+    let video = state
+        .database
+        .get_video(id)
+        .map_err(|_| ThumbnailFailure::new("video_not_found", "找不到视频记录"))?;
+    let preview_media = state
+        .preview
+        .cached_media_for_video(id)
+        .map_err(|_| ThumbnailFailure::new("preview_cache_unavailable", "无法读取视频预览缓存"))?;
+    Ok(trusted_thumbnail_request(
+        &video,
+        preview_media.as_deref(),
+        ffmpeg_path,
+        ffprobe_path,
+    ))
 }
 
 fn ai_input_preview_request(
@@ -835,6 +983,43 @@ fn authorize_preview_media(app: &AppHandle, snapshot: &PreviewSnapshot) {
     }
 }
 
+fn authorize_thumbnail_batch(
+    app: &AppHandle,
+    service: &ThumbnailService,
+    batch: &ThumbnailBatch,
+) -> Result<(), ThumbnailFailure> {
+    for item in &batch.items {
+        authorize_thumbnail_item(app, service, item)?;
+    }
+    Ok(())
+}
+
+fn authorize_thumbnail_item(
+    app: &AppHandle,
+    service: &ThumbnailService,
+    snapshot: &ThumbnailSnapshot,
+) -> Result<(), ThumbnailFailure> {
+    if let Some(media) = &snapshot.media {
+        let path = service.authorize_media(snapshot.video_id, Path::new(&media.path))?;
+        app.asset_protocol_scope()
+            .allow_file(path)
+            .map_err(|_| ThumbnailFailure::new("thumbnail_asset_denied", "无法授权视频封面资源"))?;
+    }
+    Ok(())
+}
+
+fn authorize_thumbnail_item_with_cache(
+    app: &AppHandle,
+    cache: &ThumbnailCache,
+    snapshot: &ThumbnailSnapshot,
+) {
+    if let Some(media) = &snapshot.media
+        && let Ok(path) = cache.validate_ready_media(snapshot.video_id, Path::new(&media.path))
+    {
+        let _ = app.asset_protocol_scope().allow_file(path);
+    }
+}
+
 fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
         return std::env::var_os("HOME")
@@ -870,14 +1055,6 @@ fn ensure_writable_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("录像目录不可写：{error}"))?;
     std::fs::remove_file(probe).map_err(|error| format!("录像目录写入检查失败：{error}"))?;
     Ok(())
-}
-
-fn remove_video_file(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }
 
 async fn executable_works(executable: String) -> bool {

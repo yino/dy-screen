@@ -66,7 +66,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
-	preview-doctor test-preview test-preview-integration test-profile test-migration \
+	preview-doctor test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
 	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
@@ -113,6 +113,9 @@ help:
 		'  make preview-doctor  检查视频预览所需 FFmpeg 编码能力' \
 		'  make test-preview    执行预览服务和播放器组件测试' \
 		'  make test-preview-integration 使用真实 FFmpeg 样本验证预览转换' \
+		'  make thumbnail-doctor 检查视频库封面所需 FFmpeg JPEG 编码能力' \
+		'  make test-thumbnail 执行封面缓存、批次服务和视频库卡片测试' \
+		'  make test-thumbnail-integration 使用真实 FFmpeg 样本验证横竖屏首帧封面' \
 		'  make test-profile    执行个人主页 fixture 与脱敏测试' \
 		'  make test-migration  执行三层身份数据库迁移测试' \
 		'  make test-supervisor-profile 执行主页/直播间双阶段状态机测试' \
@@ -154,6 +157,10 @@ doctor:
 preview-doctor: doctor
 	@"$(FFMPEG)" -hide_banner -encoders 2>/dev/null | grep -Eq 'h264_videotoolbox|libx264|h264_mf' || { printf '%s\n' '错误：当前 FFmpeg 没有可用的 H.264 预览编码器。' >&2; exit 1; }
 	@printf '%s\n' '视频预览环境检查通过。'
+
+thumbnail-doctor: doctor
+	@"$(FFMPEG)" -hide_banner -encoders 2>/dev/null | grep -Eq 'mjpeg' || { printf '%s\n' '错误：当前 FFmpeg 没有可用的 JPEG 封面编码器。' >&2; exit 1; }
+	@printf '%s\n' '视频库封面环境检查通过。'
 
 install:
 	"$(NPM)" install
@@ -361,6 +368,14 @@ test-preview:
 test-preview-integration: preview-doctor
 	FFMPEG="$(FFMPEG)" FFPROBE="$(FFPROBE)" "$(CARGO)" test --manifest-path src-tauri/Cargo.toml \
 		--test preview real_ffmpeg_handles_remux_transcode_and_video_without_audio -- --ignored --nocapture
+
+test-thumbnail:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test thumbnail
+	"$(NPM)" test -- --run ui/src/App.test.tsx ui/src/api.test.ts
+
+test-thumbnail-integration: thumbnail-doctor
+	FFMPEG="$(FFMPEG)" FFPROBE="$(FFPROBE)" "$(CARGO)" test --manifest-path src-tauri/Cargo.toml \
+		--test thumbnail real_ffmpeg_generates_landscape_portrait_and_video_without_audio -- --ignored --nocapture
 
 test-profile:
 	"$(CARGO)" test --test profile_resolver

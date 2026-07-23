@@ -148,6 +148,52 @@ pub fn delete_recording_session(database: &Database, session_id: i64) -> Result<
     Ok(())
 }
 
+pub fn delete_recording_video(database: &Database, video_id: i64) -> Result<(), String> {
+    let video = database
+        .get_video(video_id)
+        .map_err(|error| error.to_string())?;
+    database
+        .mark_video_status(video_id, "pending_delete")
+        .map_err(|error| error.to_string())?;
+    let original = std::path::PathBuf::from(&video.path);
+    if original.exists() && !original.is_file() {
+        let _ = database.mark_video_status(video_id, &video.status);
+        return Err("删除视频失败：目标不是普通文件".to_owned());
+    }
+    let staged = if original.exists() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let file_name = original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("video.mkv");
+        let staged =
+            original.with_file_name(format!(".{file_name}.dy-screen-delete-{video_id}-{nonce}"));
+        if let Err(error) = std::fs::rename(&original, &staged) {
+            let _ = database.mark_video_status(video_id, &video.status);
+            return Err(format!("删除视频失败：{error}"));
+        }
+        Some(staged)
+    } else {
+        None
+    };
+    if let Err(error) = database.delete_video_record(video_id) {
+        if let Some(staged) = &staged {
+            let _ = std::fs::rename(staged, &original);
+        }
+        let _ = database.mark_video_status(video_id, &video.status);
+        return Err(error.to_string());
+    }
+    if let Some(staged) = staged
+        && let Err(error) = remove_video_file(&staged)
+    {
+        return Err(format!("视频已从资料库删除，但隔离文件清理失败：{error}"));
+    }
+    Ok(())
+}
+
 fn rollback_staged_files(files: &[(std::path::PathBuf, std::path::PathBuf)]) {
     for (original, staged) in files.iter().rev() {
         if staged.exists() {

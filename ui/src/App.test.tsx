@@ -127,6 +127,21 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     getVideoPreview: vi.fn().mockRejectedValue("测试未配置视频预览查询"),
     retainVideoPreview: vi.fn().mockResolvedValue(undefined),
     releaseVideoPreview: vi.fn().mockResolvedValue(undefined),
+    requestVideoThumbnails: vi.fn().mockImplementation(async (videoIds: number[]) => ({
+      batchId: "thumbnail-test-batch",
+      items: videoIds.map((videoId) => ({
+        batchId: "thumbnail-test-batch",
+        videoId,
+        cacheKey: null,
+        state: "unavailable" as const,
+        media: null,
+        errorCode: "test_thumbnail_unavailable",
+        errorMessage: "测试未配置视频封面",
+      })),
+    })),
+    getVideoThumbnails: vi.fn().mockRejectedValue("测试未配置视频封面查询"),
+    releaseVideoThumbnailBatch: vi.fn().mockResolvedValue(undefined),
+    retryVideoThumbnail: vi.fn().mockRejectedValue("测试未配置视频封面重试"),
     openVideo: vi.fn().mockResolvedValue(undefined),
     revealVideo: vi.fn().mockResolvedValue(undefined),
     deleteVideo: vi.fn().mockResolvedValue(undefined),
@@ -174,6 +189,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     requestExit: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue(() => undefined),
     subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+    subscribeThumbnail: vi.fn().mockResolvedValue(() => undefined),
     subscribeAi: vi.fn().mockResolvedValue(() => undefined),
   };
 }
@@ -1091,5 +1107,137 @@ describe("App", () => {
 
     await waitFor(() => expect(api.retryVideoPreview).toHaveBeenCalledWith(31));
     expect(screen.queryByText("WebView 无法播放该预览文件，请尝试系统播放器")).not.toBeInTheDocument();
+  });
+
+  it("视频库渐进展示缓存封面并可点击复用现有预览", async () => {
+    const user = userEvent.setup();
+    const api = createApi([streamer], [completedVideo]);
+    api.requestVideoThumbnails = vi.fn().mockResolvedValue({
+      batchId: "cover-ready",
+      items: [{
+        batchId: "cover-ready",
+        videoId: completedVideo.id,
+        cacheKey: "a".repeat(64),
+        state: "ready",
+        media: {
+          path: "/tmp/cache/cover.jpg",
+          mimeType: "image/jpeg",
+          width: 480,
+          height: 270,
+          cacheHit: true,
+          sourceKind: "original",
+        },
+        errorCode: null,
+        errorMessage: null,
+      }],
+    });
+    api.requestVideoPreview = vi.fn().mockResolvedValue({
+      requestId: "cover-preview",
+      videoId: completedVideo.id,
+      state: "queued",
+      progressPercent: null,
+      message: "预览任务已进入队列",
+      media: null,
+      errorCode: null,
+      errorMessage: null,
+    });
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "视频库" }));
+    expect(await screen.findByAltText("preview-source.mkv 封面")).toHaveAttribute("src", "/tmp/cache/cover.jpg");
+    await user.click(screen.getByRole("button", { name: "预览 preview-source.mkv 封面" }));
+
+    expect(api.requestVideoPreview).toHaveBeenCalledWith(completedVideo.id);
+  });
+
+  it("封面事件只更新当前批次和当前源版本", async () => {
+    const user = userEvent.setup();
+    let thumbnailListener: ((event: any) => void) | undefined;
+    const api = createApi([streamer], [completedVideo]);
+    api.requestVideoThumbnails = vi.fn().mockResolvedValue({
+      batchId: "cover-current",
+      items: [{
+        batchId: "cover-current",
+        videoId: completedVideo.id,
+        cacheKey: "b".repeat(64),
+        state: "queued",
+        media: null,
+        errorCode: null,
+        errorMessage: null,
+      }],
+    });
+    api.subscribeThumbnail = vi.fn().mockImplementation(async (listener) => {
+      thumbnailListener = listener;
+      return () => undefined;
+    });
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "视频库" }));
+    expect(await screen.findByLabelText("正在加载封面 preview-source.mkv")).toBeInTheDocument();
+
+    await act(async () => {
+      thumbnailListener?.({
+        batchId: "cover-current",
+        item: {
+          batchId: "cover-current",
+          videoId: completedVideo.id,
+          cacheKey: "old-source".padEnd(64, "0"),
+          state: "ready",
+          media: { path: "/tmp/cache/old.jpg", mimeType: "image/jpeg", width: 480, height: 270, cacheHit: false, sourceKind: "original" },
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
+    });
+    expect(screen.queryByAltText("preview-source.mkv 封面")).not.toBeInTheDocument();
+
+    await act(async () => {
+      thumbnailListener?.({
+        batchId: "cover-current",
+        item: {
+          batchId: "cover-current",
+          videoId: completedVideo.id,
+          cacheKey: "b".repeat(64),
+          state: "ready",
+          media: { path: "/tmp/cache/current.jpg", mimeType: "image/jpeg", width: 480, height: 270, cacheHit: false, sourceKind: "original" },
+          errorCode: null,
+          errorMessage: null,
+        },
+      });
+    });
+    expect(await screen.findByAltText("preview-source.mkv 封面")).toHaveAttribute("src", "/tmp/cache/current.jpg");
+  });
+
+  it("封面失败可显式重试且离开视频库会释放批次", async () => {
+    const user = userEvent.setup();
+    const api = createApi([streamer], [completedVideo]);
+    api.requestVideoThumbnails = vi.fn().mockResolvedValue({
+      batchId: "cover-failed",
+      items: [{
+        batchId: "cover-failed",
+        videoId: completedVideo.id,
+        cacheKey: "c".repeat(64),
+        state: "failed",
+        media: null,
+        errorCode: "thumbnail_extract_failed",
+        errorMessage: "无法提取视频封面",
+      }],
+    });
+    api.retryVideoThumbnail = vi.fn().mockResolvedValue({
+      batchId: "cover-failed",
+      videoId: completedVideo.id,
+      cacheKey: "c".repeat(64),
+      state: "queued",
+      media: null,
+      errorCode: null,
+      errorMessage: null,
+    });
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "重试封面 preview-source.mkv" }));
+    expect(api.retryVideoThumbnail).toHaveBeenCalledWith("cover-failed", completedVideo.id);
+
+    await user.click(screen.getByRole("button", { name: "监控中心" }));
+    await waitFor(() => expect(api.releaseVideoThumbnailBatch).toHaveBeenCalledWith("cover-failed"));
   });
 });
