@@ -401,9 +401,10 @@ async fn completed_live_session_expands_and_processes_an_ordered_project_timelin
         .select_completed_session(project.id, session.id, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(selected.len(), 2);
+    assert_eq!(selected.added_count, 2);
     assert!(
         selected
+            .added
             .iter()
             .all(|input| input.source_kind == AiInputSourceKind::VideoLibrary)
     );

@@ -10,6 +10,7 @@ use dy_screen_app_lib::ai::{
     AiProjectStatus, AiRepository, PreflightReport, RecognitionProfile,
 };
 use dy_screen_app_lib::database::Database;
+use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
@@ -186,6 +187,79 @@ async fn arbitrary_grants_are_rejected_before_media_processes_and_backend_grants
         .unwrap_err();
     assert_eq!(reused.code, "untrusted_file_grant");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn completed_session_command_returns_counts_and_sanitized_project_detail() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("历史整场.mkv");
+    std::fs::write(&source, b"recorded session segment").unwrap();
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room(
+            "正在直播的主播",
+            "903",
+            "room-903",
+            true,
+        ))
+        .unwrap();
+    let history = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database
+        .add_video(&NewVideo {
+            session_id: history.id,
+            path: source.to_string_lossy().into_owned(),
+            started_at: Some("2026-07-22T01:00:00Z".to_owned()),
+            ended_at: Some("2026-07-22T01:00:04Z".to_owned()),
+            duration_seconds: Some(4),
+            size_bytes: 24,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    database
+        .finish_session(history.id, "completed", None)
+        .unwrap();
+    let _active = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    let (commands, _) = command_service(database, Arc::new(AtomicUsize::new(0)));
+    let project = commands
+        .create_project(AiCreateProjectRequest {
+            name: "整场命令".to_owned(),
+            hotwords: Vec::new(),
+        })
+        .unwrap();
+
+    let imported = commands
+        .add_completed_session(project.id, history.id)
+        .await
+        .unwrap();
+
+    assert_eq!(imported.added_count, 1);
+    assert_eq!(imported.duplicate_count, 0);
+    assert_eq!(imported.unavailable_count, 0);
+    assert_eq!(imported.detail.inputs.len(), 1);
+    assert!(imported.detail.inputs[0].video_id.is_some());
+    let serialized = serde_json::to_value(&imported).unwrap();
+    assert_eq!(serialized["addedCount"], 1);
+    assert_eq!(serialized["duplicateCount"], 0);
+    assert_eq!(serialized["unavailableCount"], 0);
+    assert!(
+        !serialized
+            .to_string()
+            .contains(source.to_string_lossy().as_ref())
+    );
+
+    let repeated = commands
+        .add_completed_session(project.id, history.id)
+        .await
+        .unwrap();
+    assert_eq!(repeated.added_count, 0);
+    assert_eq!(repeated.duplicate_count, 1);
+    assert_eq!(repeated.detail.inputs.len(), 1);
 }
 
 #[tokio::test]

@@ -218,6 +218,13 @@ export interface AiSessionOption {
   unavailableVideoCount: number;
 }
 
+export interface AiSessionImportResult {
+  detail: AiProjectDetail;
+  addedCount: number;
+  duplicateCount: number;
+  unavailableCount: number;
+}
+
 export interface AiEnvironmentCheck {
   code: string;
   passed: boolean;
@@ -355,7 +362,7 @@ export interface ClientApi {
   pickAiLocalVideos(): Promise<AiTrustedFileGrant[]>;
   importAiLocalGrants(projectId: number, grantIds: string[]): Promise<AiImportBatch>;
   listAiCompletedSessions(limit?: number): Promise<AiSessionOption[]>;
-  addAiCompletedSession(projectId: number, sessionId: number): Promise<AiProjectDetail>;
+  addAiCompletedSession(projectId: number, sessionId: number): Promise<AiSessionImportResult>;
   reorderAiInputs(projectId: number, orderedIds: number[]): Promise<AiProjectDetail>;
   removeAiInput(projectId: number, inputId: number): Promise<AiProjectDetail>;
   getAiProjectSummary(projectId: number): Promise<AiProjectSummary>;

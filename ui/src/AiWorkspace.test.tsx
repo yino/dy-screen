@@ -246,6 +246,119 @@ describe("AiWorkspace", () => {
     await waitFor(() => expect(api.startAiProject).toHaveBeenCalledWith(draftProject.id));
   });
 
+  it("主播直播中仍可一键加入历史整场并在导入后手动删除分片", async () => {
+    const user = userEvent.setup();
+    const draftProject: AiProject = {
+      ...project,
+      id: 203,
+      name: "历史整场",
+      status: "draft",
+      inputFrozen: false,
+      progressPercent: 0,
+    };
+    const session = {
+      sessionId: 88,
+      streamerName: "正在直播主播的历史回放",
+      startedAt: "2026-07-21T20:00:00Z",
+      endedAt: "2026-07-21T22:00:00Z",
+      videoCount: 3,
+      totalDurationMs: 7_200_000,
+      unavailableVideoCount: 1,
+    };
+    const sessionInputs: AiProjectDetail["inputs"] = [
+      {
+        ...completedInput,
+        id: 401,
+        projectId: draftProject.id,
+        position: 0,
+        sourceKind: "video_library",
+        videoId: 501,
+        displayName: "直播-001.mkv",
+        status: "pending",
+        progressPercent: 0,
+        artifactId: null,
+      },
+      {
+        ...completedInput,
+        id: 402,
+        projectId: draftProject.id,
+        position: 1,
+        sourceKind: "video_library",
+        videoId: 502,
+        displayName: "直播-002.mkv",
+        status: "pending",
+        progressPercent: 0,
+        artifactId: null,
+      },
+      {
+        ...completedInput,
+        id: 403,
+        projectId: draftProject.id,
+        position: 2,
+        sourceKind: "video_library",
+        videoId: 503,
+        displayName: "直播-003-缺失.mkv",
+        status: "failed",
+        progressPercent: 100,
+        artifactId: null,
+        lastErrorCode: "session_video_unavailable",
+        lastErrorMessage: "录像分片缺失或尚未完成",
+      },
+    ];
+    let currentDetail: AiProjectDetail = { project: draftProject, inputs: [] };
+    const pickAiLocalVideos = vi.fn().mockResolvedValue([]);
+    const addAiCompletedSession = vi.fn(async () => {
+      currentDetail = { project: draftProject, inputs: sessionInputs };
+      return {
+        detail: currentDetail,
+        addedCount: 3,
+        duplicateCount: 1,
+        unavailableCount: 1,
+      };
+    });
+    const removeAiInput = vi.fn(async (_projectId: number, inputId: number) => {
+      currentDetail = {
+        project: draftProject,
+        inputs: currentDetail.inputs.filter((input) => input.id !== inputId),
+      };
+      return currentDetail;
+    });
+    const api = {
+      listAiProjects: vi.fn().mockResolvedValue([draftProject]),
+      getAiProject: vi.fn(async () => currentDetail),
+      queryAiTranscript: vi.fn(async (): Promise<AiTranscriptProjection> => ({
+        project: draftProject,
+        inputs: [],
+      })),
+      diagnoseAiEnvironment: vi.fn().mockResolvedValue(environment),
+      listAiCompletedSessions: vi.fn().mockResolvedValue([session]),
+      subscribeAi: vi.fn().mockResolvedValue(() => undefined),
+      subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+      pickAiLocalVideos,
+      addAiCompletedSession,
+      removeAiInput,
+    } as unknown as ClientApi;
+    render(<AiWorkspace api={api} />);
+
+    await user.selectOptions(await screen.findByLabelText("选择已结束直播"), "88");
+    expect(screen.getByRole("option", { name: /正在直播主播的历史回放/ })).toBeInTheDocument();
+    expect(screen.getByLabelText("已选历史直播详情")).toHaveTextContent("3 个分片");
+    expect(screen.getByLabelText("已选历史直播详情")).toHaveTextContent("1 个不可用");
+
+    await user.click(screen.getByRole("button", { name: "添加整场直播" }));
+
+    expect(addAiCompletedSession).toHaveBeenCalledWith(draftProject.id, session.sessionId);
+    expect(pickAiLocalVideos).not.toHaveBeenCalled();
+    expect(await screen.findByText("新增 3 个分片，跳过 1 个重复，1 个不可用")).toBeInTheDocument();
+    expect(screen.getByText("直播-001.mkv")).toBeInTheDocument();
+    expect(screen.getByText("直播-002.mkv")).toBeInTheDocument();
+    expect(screen.getByText("直播-003-缺失.mkv")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "移除 直播-002.mkv" }));
+    expect(removeAiInput).toHaveBeenCalledWith(draftProject.id, 402);
+    await waitFor(() => expect(screen.queryByText("直播-002.mkv")).not.toBeInTheDocument());
+  });
+
   it("展示播放器与只读时间戳文本，点击句段跳转并用 WebView 元素显示临时字幕", async () => {
     const user = userEvent.setup();
     const api = createAiApi();

@@ -280,6 +280,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .ai-input-source-actions { padding: 12px 15px; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
 .ai-input-source-actions label { margin-left: auto; }
 .ai-input-source-actions select { max-width: 330px; height: 37px; padding: 0 31px 0 10px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--surface); font-size: 9px; }
+.ai-session-picker { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.ai-session-picker small { max-width: 330px; color: var(--muted); font-size: 8px; line-height: 1.4; white-space: normal; }
 .ai-input-empty, .ai-transcript-empty { min-height: 150px; padding: 30px; display: grid; place-items: center; text-align: center; color: var(--muted); font-size: 9px; }
 .ai-draft-inputs { max-height: 390px; overflow: auto; }
 .ai-draft-inputs article { min-height: 64px; padding: 10px 13px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); }

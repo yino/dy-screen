@@ -8,8 +8,8 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
-    AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiSessionOption,
-    AiTranscriptProjection, AiTrustedFileGrant,
+    AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiSessionImportView,
+    AiSessionOption, AiTranscriptProjection, AiTrustedFileGrant,
 };
 
 pub struct AiDesktopState {
@@ -122,7 +122,7 @@ pub(crate) async fn ai_add_completed_session(
     project_id: i64,
     session_id: i64,
     state: State<'_, AiDesktopState>,
-) -> Result<AiProjectDetailView, AiCommandError> {
+) -> Result<AiSessionImportView, AiCommandError> {
     state
         .commands
         .add_completed_session(project_id, session_id)

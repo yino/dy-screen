@@ -9,6 +9,7 @@ import type {
   AiProjectDetail,
   AiProjectSummary,
   AiSessionOption,
+  AiSessionImportResult,
   AiTranscriptProjection,
   AiTrustedFileGrant,
   AppSettings,
@@ -82,7 +83,7 @@ const tauriApi: ClientApi = {
   listAiCompletedSessions: (limit = 100) =>
     invoke<AiSessionOption[]>("ai_list_completed_sessions", { limit }),
   addAiCompletedSession: (projectId, sessionId) =>
-    invoke<AiProjectDetail>("ai_add_completed_session", { projectId, sessionId }),
+    invoke<AiSessionImportResult>("ai_add_completed_session", { projectId, sessionId }),
   reorderAiInputs: (projectId, orderedIds) =>
     invoke<AiProjectDetail>("ai_reorder_inputs", { projectId, orderedIds }),
   removeAiInput: (projectId, inputId) =>

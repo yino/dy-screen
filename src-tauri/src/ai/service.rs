@@ -2,6 +2,7 @@
 //!
 //! 构造、查询或打开页面不会自动读取视频或启动 ASR；只有显式开始操作会进入 preflight。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -47,6 +48,15 @@ pub struct ImportRejection {
 pub struct ImportBatchResult {
     pub added: Vec<AiProjectInput>,
     pub rejected: Vec<ImportRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionImportResult {
+    pub added: Vec<AiProjectInput>,
+    pub added_count: usize,
+    pub duplicate_count: usize,
+    pub unavailable_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,7 +196,8 @@ impl AiProjectService {
         grants: Vec<TrustedLocalFile>,
         cancellation: CancellationToken,
     ) -> Result<ImportBatchResult, ServiceError> {
-        let mut position = self.repository.get_project(project_id)?.inputs.len() as i64;
+        let detail = self.repository.get_project(project_id)?;
+        let mut position = next_input_position(&detail.inputs);
         let mut result = ImportBatchResult {
             added: Vec::new(),
             rejected: Vec::new(),
@@ -252,41 +263,77 @@ impl AiProjectService {
         project_id: i64,
         session_id: i64,
         cancellation: CancellationToken,
-    ) -> Result<Vec<AiProjectInput>, ServiceError> {
+    ) -> Result<SessionImportResult, ServiceError> {
         let session = self.database.get_session(session_id)?;
         if session.ended_at.is_none() {
             return Err(ServiceError::SessionStillRecording);
         }
         let videos = self.database.list_session_videos(session_id)?;
-        let first_position = self.repository.get_project(project_id)?.inputs.len() as i64;
-        let mut added = Vec::new();
-        for (position, video) in (first_position..).zip(videos) {
+        let existing = self.repository.get_project(project_id)?.inputs;
+        let mut position = next_input_position(&existing);
+        let mut existing_video_ids = existing
+            .iter()
+            .filter_map(|input| input.video_id)
+            .collect::<HashSet<_>>();
+        let mut existing_hashes = existing
+            .into_iter()
+            .map(|input| input.source_fingerprint_hash)
+            .collect::<HashSet<_>>();
+        let mut result = SessionImportResult {
+            added: Vec::new(),
+            added_count: 0,
+            duplicate_count: 0,
+            unavailable_count: 0,
+        };
+        for video in videos {
+            if existing_video_ids.contains(&video.id) {
+                result.duplicate_count += 1;
+                continue;
+            }
             let path = PathBuf::from(&video.path);
             let source = FrozenMediaSource::from_path(&path);
             let (fingerprint, duration_ms, audio_present, unavailable) = match source {
-                Ok(source) if video.status == "complete" => {
+                Ok(source) if video.status == "complete" && video.audio_present != Some(false) => {
                     match self
                         .inspector
                         .inspect(&source, cancellation.child_token())
                         .await
                     {
+                        Ok(inspection) if inspection.audio_present => (
+                            source_fingerprint(&source, Some(video.id))?,
+                            Some(inspection.duration_ms),
+                            Some(true),
+                            None,
+                        ),
                         Ok(inspection) => (
                             source_fingerprint(&source, Some(video.id))?,
                             Some(inspection.duration_ms),
-                            Some(inspection.audio_present),
-                            None,
+                            Some(false),
+                            Some((
+                                "session_video_no_audio".to_owned(),
+                                "录像分片没有可识别音轨".to_owned(),
+                            )),
                         ),
                         Err(error) => (
                             fallback_video_fingerprint(&video),
-                            video.duration_seconds.map(|value| value as u64 * 1_000),
+                            video_duration_ms(&video),
                             video.audio_present,
                             Some((error.code, error.safe_message)),
                         ),
                     }
                 }
+                Ok(source) if video.status == "complete" => (
+                    source_fingerprint(&source, Some(video.id))?,
+                    video_duration_ms(&video),
+                    Some(false),
+                    Some((
+                        "session_video_no_audio".to_owned(),
+                        "录像分片没有可识别音轨".to_owned(),
+                    )),
+                ),
                 _ => (
                     fallback_video_fingerprint(&video),
-                    video.duration_seconds.map(|value| value as u64 * 1_000),
+                    video_duration_ms(&video),
                     video.audio_present,
                     Some((
                         "session_video_unavailable".to_owned(),
@@ -294,7 +341,12 @@ impl AiProjectService {
                     )),
                 ),
             };
-            let input = self.repository.add_input(
+            let fingerprint_hash = fingerprint.fingerprint()?;
+            if existing_hashes.contains(&fingerprint_hash) {
+                result.duplicate_count += 1;
+                continue;
+            }
+            let input = match self.repository.add_input(
                 project_id,
                 NewAiProjectInput {
                     position,
@@ -306,21 +358,32 @@ impl AiProjectService {
                     duration_ms,
                     audio_present,
                 },
-            )?;
-            if let Some((code, message)) = unavailable {
+            ) {
+                Ok(input) => input,
+                Err(AiRepositoryError::DuplicateInput) => {
+                    result.duplicate_count += 1;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let input = if let Some((code, message)) = unavailable {
                 self.repository.transition_input(
                     input.id,
                     AiInputStatus::Failed,
                     Some((&code, &message)),
                 )?;
-                added.push(
-                    self.repository.get_project(project_id)?.inputs[position as usize].clone(),
-                );
+                result.unavailable_count += 1;
+                self.repository.get_input(input.id)?
             } else {
-                added.push(input);
-            }
+                input
+            };
+            existing_video_ids.insert(video.id);
+            existing_hashes.insert(fingerprint_hash);
+            result.added.push(input);
+            result.added_count += 1;
+            position += 1;
         }
-        Ok(added)
+        Ok(result)
     }
 
     pub fn reorder_inputs(&self, project_id: i64, ordered_ids: &[i64]) -> Result<(), ServiceError> {
@@ -419,11 +482,26 @@ fn fallback_video_fingerprint(video: &crate::domain::Video) -> SourceFingerprint
     }
 }
 
+fn video_duration_ms(video: &crate::domain::Video) -> Option<u64> {
+    video
+        .duration_seconds
+        .and_then(|value| u64::try_from(value).ok())
+        .map(|value| value.saturating_mul(1_000))
+}
+
 fn display_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("未命名视频")
         .to_owned()
+}
+
+fn next_input_position(inputs: &[AiProjectInput]) -> i64 {
+    inputs
+        .iter()
+        .map(|input| input.position)
+        .max()
+        .map_or(0, |position| position.saturating_add(1))
 }
 
 fn rejection(display_name: String, error: AsrError) -> ImportRejection {

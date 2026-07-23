@@ -84,6 +84,18 @@ function formatDuration(milliseconds: number | null): string {
     : `${minutes}:${String(rest).padStart(2, "0")}`;
 }
 
+function formatSessionTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间未知";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
 function formatTimestamp(milliseconds: number): string {
   const hours = Math.floor(milliseconds / 3_600_000);
   const minutes = Math.floor((milliseconds % 3_600_000) / 60_000);
@@ -249,6 +261,9 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
   }, [api]);
 
   const currentInput = detail?.inputs.find((input) => input.id === currentInputId) ?? null;
+  const selectedSession = sessions.find(
+    (session) => String(session.sessionId) === selectedSessionId,
+  ) ?? null;
   const currentTranscript = transcript?.inputs.find((input) => input.inputId === currentInputId) ?? null;
   const segments = currentTranscript?.segments ?? [];
   const currentSegment = segments.find((segment) => segment.stableSegmentId === currentSegmentId) ?? null;
@@ -329,10 +344,13 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
 
   const addSession = () => run(async () => {
     if (!detail || !selectedSessionId) return;
-    const next = await api.addAiCompletedSession(detail.project.id, Number(selectedSessionId));
-    setDetail(next);
-    await loadProject(detail.project.id);
-    setMessage("已把整场直播的完成分片加入项目");
+    const result = await api.addAiCompletedSession(detail.project.id, Number(selectedSessionId));
+    setDetail(result.detail);
+    setProjects((current) => current.map((project) =>
+      project.id === result.detail.project.id ? result.detail.project : project));
+    setMessage(
+      `新增 ${result.addedCount} 个分片，跳过 ${result.duplicateCount} 个重复，${result.unavailableCount} 个不可用`,
+    );
   });
 
   const reorder = (inputId: number, direction: -1 | 1) => run(async () => {
@@ -487,7 +505,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
                   <header><div><p className="section-kicker">INPUTS</p><h3>有序视频输入</h3></div><span>识别只在点击开始后执行</span></header>
                   <div className="ai-input-source-actions">
                     <button className="secondary-button" disabled={busy} onClick={addLocalVideos}><FolderPlus size={16} />添加本地视频</button>
-                    <label><span className="sr-only">选择已结束直播</span><select aria-label="选择已结束直播" value={selectedSessionId} onChange={(event) => setSelectedSessionId(event.target.value)}><option value="">选择已结束直播</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.streamerName} · {formatDuration(session.totalDurationMs)} · {session.videoCount} 段</option>)}</select></label>
+                    <label className="ai-session-picker"><span className="sr-only">选择已结束直播</span><select aria-label="选择已结束直播" value={selectedSessionId} onChange={(event) => setSelectedSessionId(event.target.value)}><option value="">选择已结束直播</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.streamerName} · {formatSessionTime(session.startedAt)}–{formatSessionTime(session.endedAt)} · {formatDuration(session.totalDurationMs)} · {session.videoCount} 段{session.unavailableVideoCount > 0 ? ` · ${session.unavailableVideoCount} 个不可用` : ""}</option>)}</select>{selectedSession && <small aria-label="已选历史直播详情">{formatSessionTime(selectedSession.startedAt)}–{formatSessionTime(selectedSession.endedAt)} · {selectedSession.videoCount} 个分片 · {formatDuration(selectedSession.totalDurationMs)}{selectedSession.unavailableVideoCount > 0 ? ` · ${selectedSession.unavailableVideoCount} 个不可用` : ""}</small>}</label>
                     <button className="secondary-button" disabled={!selectedSessionId || busy} onClick={addSession}><Video size={15} />添加整场直播</button>
                   </div>
                   {detail.inputs.length === 0 ? <div className="ai-input-empty">先添加一个或多个视频；“上传”仅表示本地导入，不会发生网络上传。</div> : (

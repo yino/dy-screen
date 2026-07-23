@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use super::{
     AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectService,
     AiProjectStatus, AiProjectSummary, AiRepository, AiSessionOption, AiTranscriptProjection,
-    ImportBatchResult, ImportRejection, RecognitionProfile, ServiceError, TrustedLocalFile,
+    ImportBatchResult, ImportRejection, RecognitionProfile, ServiceError, SessionImportResult,
+    TrustedLocalFile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,6 +91,15 @@ pub struct AiProjectInputView {
 pub struct AiImportBatchView {
     pub added: Vec<AiProjectInputView>,
     pub rejected: Vec<ImportRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSessionImportView {
+    pub detail: AiProjectDetailView,
+    pub added_count: usize,
+    pub duplicate_count: usize,
+    pub unavailable_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,8 +236,9 @@ impl AiCommandService {
         &self,
         project_id: i64,
         session_id: i64,
-    ) -> Result<AiProjectDetailView, AiCommandError> {
-        self.project_service
+    ) -> Result<AiSessionImportView, AiCommandError> {
+        let result = self
+            .project_service
             .select_completed_session(
                 project_id,
                 session_id,
@@ -235,7 +246,10 @@ impl AiCommandService {
             )
             .await
             .map_err(service_error)?;
-        self.get_project(project_id)
+        Ok(sanitize_session_import(
+            result,
+            self.get_project(project_id)?,
+        ))
     }
 
     pub fn reorder_inputs(
@@ -479,6 +493,18 @@ fn sanitize_import_batch(batch: ImportBatchResult) -> AiImportBatchView {
             .map(sanitize_project_input)
             .collect(),
         rejected: batch.rejected,
+    }
+}
+
+fn sanitize_session_import(
+    result: SessionImportResult,
+    detail: AiProjectDetailView,
+) -> AiSessionImportView {
+    AiSessionImportView {
+        detail,
+        added_count: result.added_count,
+        duplicate_count: result.duplicate_count,
+        unavailable_count: result.unavailable_count,
     }
 }
 

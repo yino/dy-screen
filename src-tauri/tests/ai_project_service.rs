@@ -114,6 +114,31 @@ fn opening_workspace_recording_completion_and_startup_do_not_create_projects() {
     assert!(service.open_workspace().unwrap().is_empty());
 }
 
+#[test]
+fn completed_session_list_keeps_history_while_the_streamer_is_live_again() {
+    let directory = tempdir().unwrap();
+    let (database, service) = service(Arc::new(MutablePreflight::new(true)));
+    let streamer = database
+        .add_streamer(&NewStreamer::room("重复开播主播", "900", "room-900", true))
+        .unwrap();
+    let history = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database
+        .finish_session(history.id, "completed", None)
+        .unwrap();
+    let active = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+
+    let options = service.list_completed_sessions(100).unwrap();
+
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0].session_id, history.id);
+    assert_eq!(options[0].streamer_name, "重复开播主播");
+    assert_ne!(options[0].session_id, active.id);
+}
+
 #[tokio::test]
 async fn trusted_multi_file_import_preserves_order_deduplicates_and_never_copies_sources() {
     let directory = tempdir().unwrap();
@@ -183,18 +208,6 @@ async fn completed_session_expands_ordered_videos_and_marks_missing_segments() {
     database
         .add_video(&NewVideo {
             session_id: active.id,
-            path: existing.to_string_lossy().into_owned(),
-            started_at: Some("2026-07-22T01:00:00Z".to_owned()),
-            ended_at: Some("2026-07-22T01:00:04Z".to_owned()),
-            duration_seconds: Some(4),
-            size_bytes: 16,
-            audio_present: Some(true),
-            status: "complete".to_owned(),
-        })
-        .unwrap();
-    database
-        .add_video(&NewVideo {
-            session_id: active.id,
             path: missing.to_string_lossy().into_owned(),
             started_at: Some("2026-07-22T01:00:04Z".to_owned()),
             ended_at: Some("2026-07-22T01:00:08Z".to_owned()),
@@ -205,19 +218,119 @@ async fn completed_session_expands_ordered_videos_and_marks_missing_segments() {
         })
         .unwrap();
     database
+        .add_video(&NewVideo {
+            session_id: active.id,
+            path: existing.to_string_lossy().into_owned(),
+            started_at: Some("2026-07-22T01:00:00Z".to_owned()),
+            ended_at: Some("2026-07-22T01:00:04Z".to_owned()),
+            duration_seconds: Some(4),
+            size_bytes: 16,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    database
         .finish_session(active.id, "completed", None)
         .unwrap();
 
-    let inputs = service
+    let result = service
         .select_completed_session(project.id, active.id, CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(inputs.len(), 2);
-    assert_eq!(inputs[0].display_name, "001.mkv");
-    assert_eq!(inputs[0].status, AiInputStatus::Pending);
-    assert_eq!(inputs[1].display_name, "002.mkv");
-    assert_eq!(inputs[1].status, AiInputStatus::Failed);
-    assert!(inputs[1].video_id.is_some());
+    assert_eq!(result.added_count, 2);
+    assert_eq!(result.duplicate_count, 0);
+    assert_eq!(result.unavailable_count, 1);
+    assert_eq!(result.added[0].display_name, "001.mkv");
+    assert_eq!(result.added[0].status, AiInputStatus::Pending);
+    assert_eq!(result.added[1].display_name, "002.mkv");
+    assert_eq!(result.added[1].status, AiInputStatus::Failed);
+    assert!(result.added.iter().all(|input| input.video_id.is_some()));
+}
+
+#[tokio::test]
+async fn whole_session_import_is_idempotent_and_keeps_unavailable_sources_untouched() {
+    let directory = tempdir().unwrap();
+    let valid = directory.path().join("001-valid.mkv");
+    let no_audio = directory.path().join("002-no-audio.mkv");
+    let missing = directory.path().join("003-missing.mkv");
+    write_video(&valid, b"valid recorded segment");
+    write_video(&no_audio, b"silent recorded segment");
+    let (database, service) = service(Arc::new(MutablePreflight::new(true)));
+    let streamer = database
+        .add_streamer(&NewStreamer::room("整场主播", "902", "room-902", false))
+        .unwrap();
+    let session = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    for (index, (path, audio_present)) in [
+        (&valid, Some(true)),
+        (&no_audio, Some(false)),
+        (&missing, Some(true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        database
+            .add_video(&NewVideo {
+                session_id: session.id,
+                path: path.to_string_lossy().into_owned(),
+                started_at: Some(format!("2026-07-22T01:00:0{index}Z")),
+                ended_at: Some(format!("2026-07-22T01:00:0{}Z", index + 1)),
+                duration_seconds: Some(4),
+                size_bytes: 16,
+                audio_present,
+                status: "complete".to_owned(),
+            })
+            .unwrap();
+    }
+    database
+        .finish_session(session.id, "completed", None)
+        .unwrap();
+    let project = service.create_draft("幂等整场", &profile()).unwrap();
+
+    let first = service
+        .select_completed_session(project.id, session.id, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(first.added_count, 3);
+    assert_eq!(first.duplicate_count, 0);
+    assert_eq!(first.unavailable_count, 2);
+    assert_eq!(
+        first
+            .added
+            .iter()
+            .filter(|input| input.status == AiInputStatus::Failed)
+            .count(),
+        2
+    );
+    let silent = first
+        .added
+        .iter()
+        .find(|input| input.display_name == "002-no-audio.mkv")
+        .unwrap();
+    assert_eq!(
+        silent.last_error_code.as_deref(),
+        Some("session_video_no_audio")
+    );
+
+    service.remove_input(project.id, silent.id).unwrap();
+    assert!(no_audio.is_file());
+    let retry = service
+        .select_completed_session(project.id, session.id, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(retry.added_count, 1);
+    assert_eq!(retry.duplicate_count, 2);
+    assert_eq!(retry.unavailable_count, 1);
+    assert!(no_audio.is_file());
+
+    let all_duplicates = service
+        .select_completed_session(project.id, session.id, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(all_duplicates.added_count, 0);
+    assert_eq!(all_duplicates.duplicate_count, 3);
+    assert_eq!(all_duplicates.unavailable_count, 0);
 }
 
 #[tokio::test]

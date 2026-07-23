@@ -16,7 +16,7 @@ pub(crate) mod tauri_commands;
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiProjectDetailView,
-    AiProjectInputView, AiTrustedFileGrant,
+    AiProjectInputView, AiSessionImportView, AiTrustedFileGrant,
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
@@ -35,7 +35,7 @@ pub use projection::{
 pub use repository::{AiRepository, AiRepositoryError, Result};
 pub use service::{
     AiPreflight, AiProjectService, AiProjectSummary, AiSessionOption, ImportBatchResult,
-    ImportRejection, PreflightReport, ServiceError, TrustedLocalFile,
+    ImportRejection, PreflightReport, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
 pub(crate) use repository::migrate_ai_v4;

@@ -141,7 +141,12 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     pickAiLocalVideos: vi.fn().mockResolvedValue([]),
     importAiLocalGrants: vi.fn().mockResolvedValue({ added: [], rejected: [] }),
     listAiCompletedSessions: vi.fn().mockResolvedValue([]),
-    addAiCompletedSession: vi.fn().mockResolvedValue(emptyAiDetail),
+    addAiCompletedSession: vi.fn().mockResolvedValue({
+      detail: emptyAiDetail,
+      addedCount: 0,
+      duplicateCount: 0,
+      unavailableCount: 0,
+    }),
     reorderAiInputs: vi.fn().mockResolvedValue(emptyAiDetail),
     removeAiInput: vi.fn().mockResolvedValue(emptyAiDetail),
     getAiProjectSummary: vi.fn().mockResolvedValue({
