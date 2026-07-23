@@ -89,6 +89,10 @@ fn room_access_accepts_live_or_offline_rooms_and_rejects_unknown_pages() {
 
     let error = validate_room_access(Err(RecorderError::UnsupportedPageLayout)).unwrap_err();
     assert!(error.contains("无法识别"));
+
+    let restricted = validate_room_access(Err(RecorderError::RoomAccessRestricted)).unwrap_err();
+    assert!(restricted.contains("验证码"));
+    assert!(restricted.contains("访问验证"));
 }
 
 #[test]

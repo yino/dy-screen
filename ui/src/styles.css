@@ -125,13 +125,17 @@ tbody tr:last-child td { border-bottom: 0; }
 .muted-cell span, .muted-cell small { display: block; white-space: nowrap; }
 .muted-cell span { color: #66736d; }
 .muted-cell small { margin-top: 3px; color: #cb6c55; font-size: 8px; }
+.diagnostic-cell { min-width: 150px; max-width: 220px; }
+.muted-cell .diagnostic-error { max-width: 220px; white-space: normal; overflow-wrap: anywhere; line-height: 1.45; }
+.muted-cell .diagnostic-meta { color: #7b8781; white-space: normal; line-height: 1.4; }
 .video-count { display: grid; grid-template-columns: auto auto 1px auto auto; gap: 4px; align-items: center; color: #7a8780; font-size: 8px; white-space: nowrap; }
 .video-count strong { color: var(--ink); font-size: 11px; }
 .video-count i { width: 1px; height: 15px; margin: 0 2px; background: var(--line); }
 .actions-cell { position: relative; width: 45px; text-align: right; }
 .action-menu { position: absolute; top: 50px; right: 12px; z-index: 15; width: 145px; padding: 6px; border-radius: 12px; background: #fff; border: 1px solid var(--line); box-shadow: 0 15px 35px rgba(26, 52, 42, 0.16); }
-.action-menu button { width: 100%; min-height: 34px; padding: 0 9px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 8px; background: transparent; font-size: 10px; cursor: pointer; }
-.action-menu button:hover { background: #f0f7f4; }
+.action-menu button, .action-menu a { width: 100%; min-height: 34px; padding: 0 9px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 8px; color: inherit; background: transparent; font-size: 10px; text-decoration: none; cursor: pointer; }
+.action-menu button:hover, .action-menu a:hover { background: #f0f7f4; }
+.action-menu button:disabled { cursor: not-allowed; opacity: .5; }
 .action-menu .danger, .danger { color: #c55454 !important; }
 
 .session-panel { min-height: 458px; overflow: hidden; }

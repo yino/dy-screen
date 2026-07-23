@@ -3,8 +3,8 @@ use std::sync::Arc;
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::NewStreamer;
 use dy_screen_app_lib::supervisor::{
-    DiskDecision, MonitorState, NoopPublisher, RecordingLimiter, Supervisor, backoff_seconds,
-    decide_disk, recording_session_status,
+    DiskDecision, MonitorLogger, MonitorState, NoopPublisher, RecordingLimiter, Supervisor,
+    backoff_seconds, decide_disk, recording_session_status,
 };
 
 #[test]
@@ -49,6 +49,43 @@ fn recording_session_outcome_distinguishes_cancel_failure_and_success() {
     assert_eq!(recording_session_status(true, false), "cancelled");
     assert_eq!(recording_session_status(false, true), "completed");
     assert_eq!(recording_session_status(false, false), "error");
+}
+
+#[test]
+fn structured_monitor_log_only_writes_allowlisted_diagnostic_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let logger = MonitorLogger::file(directory.path().to_path_buf());
+
+    logger.log_room_check(
+        42,
+        Some("703?auth_key=fixture-secret&cookie=session-secret"),
+        "layout_changed",
+        Some(200),
+        2,
+        Some("2026-07-23T01:02:03Z"),
+    );
+
+    let path = std::fs::read_dir(directory.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let log = std::fs::read_to_string(path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(value["streamerId"], 42);
+    assert_eq!(value["classification"], "layout_changed");
+    assert_eq!(value["httpStatus"], 200);
+    assert_eq!(value["failureCount"], 2);
+    assert_eq!(value["nextRetryAt"], "2026-07-23T01:02:03Z");
+    assert!(value["timestamp"].is_string());
+    assert!(value["webRid"].is_null());
+    assert!(!log.contains("fixture-secret"));
+    assert!(!log.contains("session-secret"));
+    assert!(!log.contains("auth_key"));
+    assert!(!log.contains("cookie"));
+    assert!(!log.contains("roomUrl"));
+    assert!(!log.contains("error"));
 }
 
 #[tokio::test]

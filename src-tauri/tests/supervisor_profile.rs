@@ -87,6 +87,8 @@ enum RoomReply {
     Live(&'static str),
     Offline(&'static str),
     EntryInvalid,
+    AccessRestricted,
+    LayoutChanged,
     Retryable,
 }
 
@@ -150,9 +152,38 @@ impl RoomDiscovery for FakeRoomDiscovery {
             RoomReply::Offline(room_id) => Ok(RoomInspection::Offline {
                 room_id: room_id.to_owned(),
             }),
-            RoomReply::EntryInvalid => Err(RecorderError::UnsupportedPageLayout),
-            RoomReply::Retryable => Err(RecorderError::ProfileHttpStatus { status: 503 }),
+            RoomReply::EntryInvalid => Err(RecorderError::RoomHttpStatus { status: 404 }),
+            RoomReply::AccessRestricted => Err(RecorderError::RoomAccessRestricted),
+            RoomReply::LayoutChanged => Err(RecorderError::UnsupportedPageLayout),
+            RoomReply::Retryable => Err(RecorderError::RoomHttpStatus { status: 503 }),
         }
+    }
+}
+
+#[derive(Clone)]
+struct BlockingRoomDiscovery {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl Default for BlockingRoomDiscovery {
+    fn default() -> Self {
+        Self {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl RoomDiscovery for BlockingRoomDiscovery {
+    async fn inspect(&self, _room_url: &str) -> RecorderResult<RoomInspection> {
+        self.entered.add_permits(1);
+        let permit = self.release.acquire().await.unwrap();
+        permit.forget();
+        Ok(RoomInspection::Offline {
+            room_id: "serialized-room".to_owned(),
+        })
     }
 }
 
@@ -261,6 +292,52 @@ fn profile_retry_backoff_uses_sixty_one_twenty_and_three_hundred_seconds() {
     assert_eq!(profile_backoff_seconds(1), 120);
     assert_eq!(profile_backoff_seconds(2), 300);
     assert_eq!(profile_backoff_seconds(20), 300);
+}
+
+#[tokio::test]
+async fn public_page_checks_are_serialized_across_streamers() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let first = database
+        .add_streamer(&NewStreamer::room("主播一", "4101", "room-4101", true))
+        .unwrap();
+    let second = database
+        .add_streamer(&NewStreamer::room("主播二", "4102", "room-4102", true))
+        .unwrap();
+    let room = Arc::new(BlockingRoomDiscovery::default());
+    let delay = Arc::new(ControlledDelay::default());
+    let supervisor = Supervisor::with_dependencies(
+        database,
+        Arc::new(NoopPublisher),
+        4,
+        Arc::new(FakeProfileDiscovery::new([])),
+        room.clone(),
+        Arc::new(FixedJitter(0)),
+        delay,
+    );
+
+    supervisor.start(first.id).unwrap();
+    supervisor.start(second.id).unwrap();
+    let first_entered = tokio::time::timeout(Duration::from_secs(1), room.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    first_entered.forget();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), room.entered.acquire())
+            .await
+            .is_err(),
+        "第二个公开页面请求不应与第一个并发"
+    );
+
+    room.release.add_permits(1);
+    let second_entered = tokio::time::timeout(Duration::from_secs(1), room.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    second_entered.forget();
+    room.release.add_permits(1);
+    supervisor.shutdown().await;
 }
 
 #[tokio::test]
@@ -602,6 +679,126 @@ async fn retryable_room_failure_and_single_entry_invalid_do_not_clear_binding() 
         Some("702")
     );
     assert!(profile.calls.lock().unwrap().is_empty());
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_room_keeps_retrying_after_three_entry_invalid_results() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room("直连失效入口", "704", "room-704", true))
+        .unwrap();
+    let room = Arc::new(FakeRoomDiscovery::new([
+        RoomReply::EntryInvalid,
+        RoomReply::EntryInvalid,
+        RoomReply::EntryInvalid,
+    ]));
+    let delay = Arc::new(ControlledDelay::default());
+    let supervisor = Supervisor::with_dependencies(
+        database.clone(),
+        Arc::new(NoopPublisher),
+        4,
+        Arc::new(FakeProfileDiscovery::new([])),
+        room.clone(),
+        Arc::new(FixedJitter(0)),
+        delay.clone(),
+    );
+
+    supervisor.start(streamer.id).unwrap();
+    for expected_calls in 1..=3 {
+        wait_until(|| room.calls.lock().unwrap().len() == expected_calls).await;
+        wait_until(|| delay.durations.lock().unwrap().len() == expected_calls).await;
+        if expected_calls < 3 {
+            delay.advance();
+        }
+    }
+
+    let failed = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(failed.web_rid.as_deref(), Some("704"));
+    assert_eq!(
+        failed.room_url.as_deref(),
+        Some("https://live.douyin.com/704")
+    );
+    assert_eq!(failed.monitor_status, "entry_invalid");
+    assert_eq!(failed.failure_count, 3);
+    assert!(failed.next_retry_at.is_some());
+    assert_eq!(supervisor.worker_count(), 1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn access_restriction_and_layout_change_preserve_binding_and_track_retry() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer {
+            name: "受限入口主播".to_owned(),
+            source_kind: StreamerSourceKind::Profile,
+            source_url: "https://www.douyin.com/user/profile-restricted".to_owned(),
+            profile_sec_uid: Some("profile-restricted".to_owned()),
+            web_rid: Some("703".to_owned()),
+            room_url: Some("https://live.douyin.com/703".to_owned()),
+            room_id: Some("room-703".to_owned()),
+            monitor_enabled: true,
+            tags: Vec::new(),
+        })
+        .unwrap();
+    let room = Arc::new(FakeRoomDiscovery::new([
+        RoomReply::AccessRestricted,
+        RoomReply::LayoutChanged,
+        RoomReply::Offline("room-703"),
+    ]));
+    let profile = Arc::new(FakeProfileDiscovery::new([]));
+    let delay = Arc::new(ControlledDelay::default());
+    let supervisor = Supervisor::with_dependencies(
+        database.clone(),
+        Arc::new(NoopPublisher),
+        4,
+        profile.clone(),
+        room.clone(),
+        Arc::new(FixedJitter(0)),
+        delay.clone(),
+    );
+
+    supervisor.start(streamer.id).unwrap();
+    wait_until(|| {
+        database
+            .get_streamer(streamer.id)
+            .is_ok_and(|item| item.monitor_status == "access_restricted")
+    })
+    .await;
+    let restricted = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(restricted.web_rid.as_deref(), Some("703"));
+    assert_eq!(restricted.failure_count, 1);
+    assert!(restricted.next_retry_at.is_some());
+    assert_eq!(delay.durations.lock().unwrap()[0], Duration::from_secs(30));
+
+    delay.advance();
+    wait_until(|| {
+        database
+            .get_streamer(streamer.id)
+            .is_ok_and(|item| item.monitor_status == "layout_changed")
+    })
+    .await;
+    let changed = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(changed.web_rid.as_deref(), Some("703"));
+    assert_eq!(changed.failure_count, 2);
+    assert!(changed.next_retry_at.is_some());
+    assert_eq!(delay.durations.lock().unwrap()[1], Duration::from_secs(60));
+    assert!(profile.calls.lock().unwrap().is_empty());
+
+    delay.advance();
+    wait_until(|| {
+        database
+            .get_streamer(streamer.id)
+            .is_ok_and(|item| item.monitor_status == "waiting" && item.failure_count == 0)
+    })
+    .await;
+    let recovered = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(recovered.web_rid.as_deref(), Some("703"));
+    assert_eq!(recovered.next_retry_at, None);
+    assert_eq!(recovered.last_error, None);
     supervisor.shutdown().await;
 }
 

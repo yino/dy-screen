@@ -10,6 +10,7 @@ fn help_exposes_profile_resolve_record_and_asr_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("inspect-profile"));
+    assert!(stdout.contains("inspect-room"));
     assert!(stdout.contains("resolve"));
     assert!(stdout.contains("record"));
     assert!(stdout.contains("asr"));
@@ -47,6 +48,24 @@ fn asr_rejects_missing_video_before_launching_media_processes() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("资源清单缺失"), "{stderr}");
+}
+
+#[test]
+fn inspect_room_reports_invalid_url_as_safe_json_without_network() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dy-screen"))
+        .args(["inspect-room", "https://example.com/not-douyin", "--json"])
+        .output()
+        .expect("run inspect-room command");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"classification\": \"entry_invalid\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"httpStatus\": null"), "{stdout}");
+    assert!(!stdout.contains("cookie"), "{stdout}");
+    assert!(!stdout.contains("<html"), "{stdout}");
 }
 
 #[test]

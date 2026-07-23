@@ -71,7 +71,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
 	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
-	inspect-profile resolve record record-multi clean
+	inspect-profile inspect-room resolve record record-multi clean
 
 help:
 	@printf '%s\n' \
@@ -129,6 +129,7 @@ help:
 		'  make core-build      构建 Rust CLI 调试版本' \
 		'  make release         构建 Rust CLI 发布版本' \
 		'  make inspect-profile 只读检查公开个人主页及直播入口' \
+		'  make inspect-room    安全诊断直播间响应分类（不输出页面正文）' \
 		'  make resolve         解析单个直播间及可用清晰度' \
 		'  make record          录制单个直播间' \
 		'  make record-multi    同时录制多个直播间' \
@@ -401,6 +402,9 @@ resolve: release
 
 inspect-profile: release
 	"$(BINARY)" inspect-profile "$(PROFILE_URL)" $(JSON_ARG)
+
+inspect-room: release
+	"$(BINARY)" inspect-room "$(ROOM_URL)" $(JSON_ARG)
 
 record: release
 	"$(BINARY)" record "$(ROOM_URL)" $(QUALITY_ARG) $(PROTOCOL_ARG) \

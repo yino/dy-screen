@@ -34,6 +34,19 @@ struct FakeInspector {
     calls: Arc<Mutex<Vec<String>>>,
 }
 
+struct RestrictedRoomInspector;
+
+#[async_trait]
+impl SourceInspector for RestrictedRoomInspector {
+    async fn inspect_profile(&self, _source_url: &str) -> RecorderResult<ProfileInspection> {
+        unreachable!("直播间测试不应检查个人主页")
+    }
+
+    async fn inspect_room(&self, _source_url: &str) -> RecorderResult<RoomInspection> {
+        Err(RecorderError::RoomAccessRestricted)
+    }
+}
+
 impl FakeInspector {
     fn live() -> Self {
         Self {
@@ -263,6 +276,35 @@ async fn direct_room_still_requires_a_name() {
 
     assert_eq!(error.code, "name_required");
     assert_eq!(error.field.as_deref(), Some("name"));
+}
+
+#[tokio::test]
+async fn direct_room_access_restriction_saves_stable_entry_for_background_retry() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let worker = FakeWorker::default();
+
+    let streamer = create_streamer_with(
+        &database,
+        &RestrictedRoomInspector,
+        &worker,
+        CreateStreamerRequest {
+            name: "受限直播间".to_owned(),
+            source_url: "https://live.douyin.com/625411260021".to_owned(),
+            monitor_enabled: true,
+            tags: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(streamer.web_rid.as_deref(), Some("625411260021"));
+    assert_eq!(streamer.room_id, None);
+    assert_eq!(streamer.monitor_status, "waiting");
+    assert_eq!(
+        worker.calls.lock().unwrap().as_slice(),
+        [format!("start:{}", streamer.id)]
+    );
 }
 
 #[tokio::test]

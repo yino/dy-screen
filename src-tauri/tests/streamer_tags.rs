@@ -166,6 +166,8 @@ fn 无标签请求和上下文始终输出空数组() {
         monitor_status: "waiting".to_owned(),
         last_checked_at: None,
         last_error: None,
+        failure_count: 0,
+        next_retry_at: None,
         current_video_count: 0,
         history_video_count: 0,
         tags: Vec::new(),

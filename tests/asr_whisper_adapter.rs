@@ -45,7 +45,9 @@ fn write_executable(path: &Path, body: &str) {
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
-fn engine_fixture() -> (tempfile::TempDir, WhisperCppEngine, PreparedAudio) {
+fn engine_fixture_with_accelerator(
+    accelerator: &str,
+) -> (tempfile::TempDir, WhisperCppEngine, PreparedAudio) {
     let directory = tempdir().unwrap();
     let root = directory.path().join("资源 空格");
     let bin = root.join("bin");
@@ -57,8 +59,9 @@ fn engine_fixture() -> (tempfile::TempDir, WhisperCppEngine, PreparedAudio) {
     write_executable(
         &sidecar,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'whisper.cpp version: 1.9.1'; exit 0; fi\nif [ -f '{}' ]; then exec sleep 30; fi\nexit 9\n",
-            marker.display()
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'whisper.cpp version: 1.9.1'; exit 0; fi\nif [ -f '{}' ]; then exec sleep 30; fi\nforce_cpu=0\noutput_file=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --no-gpu) force_cpu=1 ;;\n    --output-file) shift; output_file=$1 ;;\n  esac\n  shift\ndone\nif [ -f '{}' ] && [ \"$force_cpu\" = 1 ]; then\n  printf '%s' '{{\"result\":{{\"language\":\"zh\"}},\"transcription\":[{{\"offsets\":{{\"from\":0,\"to\":1000}},\"text\":\"CPU fallback\",\"tokens\":[]}}]}}' > \"${{output_file}}.json\"\n  exit 0\nfi\nexit 9\n",
+            marker.display(),
+            bin.join("mode-fallback").display(),
         ),
     );
     for name in ["vad sidecar", "ffmpeg", "ffprobe"] {
@@ -102,7 +105,7 @@ fn engine_fixture() -> (tempfile::TempDir, WhisperCppEngine, PreparedAudio) {
             "source":"test","license":"test"
         },
         "platforms":[{
-            "os":os,"arch":std::env::consts::ARCH,"accelerator":"cpu",
+            "os":os,"arch":std::env::consts::ARCH,"accelerator":accelerator,
             "sidecar":"bin/whisper cli","vadSidecar":"bin/vad sidecar",
             "ffmpeg":"bin/ffmpeg","ffprobe":"bin/ffprobe",
             "minimumMemoryBytes":8589934592_u64,"minimumFreeDiskBytes":2147483648_u64,
@@ -132,6 +135,10 @@ fn engine_fixture() -> (tempfile::TempDir, WhisperCppEngine, PreparedAudio) {
         VadConfig::default(),
     );
     (directory, engine, audio)
+}
+
+fn engine_fixture() -> (tempfile::TempDir, WhisperCppEngine, PreparedAudio) {
+    engine_fixture_with_accelerator("cpu")
 }
 
 fn request(audio: PreparedAudio) -> AsrRequest {
@@ -182,4 +189,26 @@ async fn running_sidecar_is_killed_within_bounded_time_on_cancellation() {
         .unwrap_err();
     assert_eq!(error.code, "asr_cancelled");
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[tokio::test]
+async fn metal_process_failure_retries_once_on_cpu_and_reports_warning() {
+    let (directory, engine, audio) = engine_fixture_with_accelerator("metal");
+    std::fs::write(
+        directory.path().join("资源 空格/bin/mode-fallback"),
+        b"fallback",
+    )
+    .unwrap();
+
+    let result = engine
+        .transcribe(
+            request(audio),
+            Arc::new(QuietProgress),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.segments[0].text, "CPU fallback");
+    assert_eq!(result.warnings[0].code, "gpu_fallback_cpu");
 }

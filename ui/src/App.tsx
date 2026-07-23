@@ -68,6 +68,8 @@ const monitorPriority: Record<MonitorStatus, number> = {
   rediscovering: 3,
   recording_error: 4,
   profile_error: 4,
+  access_restricted: 4,
+  layout_changed: 4,
   entry_invalid: 4,
   identity_conflict: 4,
   waiting_first_live: 5,
@@ -89,6 +91,8 @@ const monitorLabels = {
   waiting_first_live: "等待首次开播",
   profile_error: "主页检查失败",
   rediscovering: "重新发现直播间",
+  access_restricted: "访问受限",
+  layout_changed: "页面结构变化",
   entry_invalid: "直播入口失效",
   identity_conflict: "身份冲突已暂停",
   waiting_resource: "等待资源",
@@ -442,6 +446,7 @@ export function App({ api }: AppProps) {
             onPreviewVideo={openPreview}
             onOpenVideo={(id) => void action(() => api.openVideo(id))}
             onRevealVideo={(id) => void action(() => api.revealVideo(id))}
+            onOpenLogs={() => void action(() => api.openLogs())}
           />
         )}
 
@@ -619,6 +624,7 @@ function MonitorPage({
   onPreviewVideo,
   onOpenVideo,
   onRevealVideo,
+  onOpenLogs,
 }: {
   loading: boolean;
   dashboard: Dashboard;
@@ -636,6 +642,7 @@ function MonitorPage({
   onPreviewVideo: (video: VideoItem) => void;
   onOpenVideo: (id: number) => void;
   onRevealVideo: (id: number) => void;
+  onOpenLogs: () => void;
 }) {
   const liveCount = dashboard.streamers.filter((item) => item.liveStatus === "live").length;
   const waitingCount = dashboard.streamers.filter((item) =>
@@ -681,6 +688,7 @@ function MonitorPage({
                       onEdit={() => onEdit(streamer)}
                       onStop={() => onStop(streamer.id)}
                       onArchive={() => onArchive(streamer.id)}
+                      onOpenLogs={onOpenLogs}
                     />
                   ))}
                 </tbody>
@@ -711,7 +719,7 @@ function SummaryCard({ icon: Icon, label, value, hint, tone }: { icon: typeof Ra
   );
 }
 
-function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, onStop, onArchive }: {
+function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, onStop, onArchive, onOpenLogs }: {
   streamer: Streamer;
   selected: boolean;
   onSelect: () => void;
@@ -720,6 +728,7 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
   onEdit: () => void;
   onStop: () => void;
   onArchive: () => void;
+  onOpenLogs: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const sourceLabel = streamer.sourceKind === "profile" ? "个人主页" : "直播间直连";
@@ -730,7 +739,7 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
       : "身份待确认";
   const monitorKind = streamer.monitorStatus === "recording"
     ? "recording"
-    : ["recording_error", "profile_error", "entry_invalid", "identity_conflict"].includes(streamer.monitorStatus)
+    : ["recording_error", "profile_error", "access_restricted", "layout_changed", "entry_invalid", "identity_conflict"].includes(streamer.monitorStatus)
       ? "error"
       : "neutral";
   return (
@@ -738,13 +747,28 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
       <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div className="streamer-primary"><strong>{streamer.name}</strong><span>{sourceLabel} · {identityLabel}</span>{streamer.tags.length > 0 && <div className="streamer-tag-badges" aria-label={`${streamer.name}标签`}>{streamer.tags.slice(0, 2).map((tag) => <span key={tag.id}>{tag.name}</span>)}{streamer.tags.length > 2 && <b title={`另有 ${streamer.tags.length - 2} 个标签`}>+{streamer.tags.length - 2}</b>}</div>}</div></div></td>
       <td><StatusBadge kind={streamer.liveStatus === "live" ? "live" : streamer.liveStatus === "error" ? "error" : "neutral"}>{liveLabels[streamer.liveStatus]}</StatusBadge></td>
       <td><StatusBadge kind={monitorKind}>{monitorLabels[streamer.monitorStatus]}</StatusBadge></td>
-      <td><div className="muted-cell"><span>{formatDate(streamer.lastCheckedAt)}</span>{streamer.lastError && <small title={streamer.lastError}>存在异常</small>}</div></td>
+      <td>
+        <div className="muted-cell diagnostic-cell">
+          <span>{formatDate(streamer.lastCheckedAt)}</span>
+          {streamer.lastError && <small className="diagnostic-error" title={streamer.lastError}>{streamer.lastError}</small>}
+          {streamer.failureCount > 0 && (
+            <small className="diagnostic-meta">
+              连续 {streamer.failureCount} 次
+              {streamer.nextRetryAt && <> · 预计重试 {formatDate(streamer.nextRetryAt)}</>}
+            </small>
+          )}
+        </div>
+      </td>
       <td><div className="video-count"><strong>{streamer.currentVideoCount}</strong><span>本次</span><i /><strong>{streamer.historyVideoCount}</strong><span>历史</span></div></td>
       <td className="actions-cell" onClick={(event) => event.stopPropagation()}>
         <button className="icon-button" aria-label={streamer.name + "操作"} onClick={() => setMenuOpen(!menuOpen)}><MoreHorizontal size={18} /></button>
         {menuOpen && (
           <div className="action-menu">
             <button onClick={() => { onCheck(); setMenuOpen(false); }}><RefreshCw size={15} />立即检查</button>
+            {streamer.roomUrl
+              ? <a href={streamer.roomUrl} target="_blank" rel="noreferrer" aria-label="从操作菜单打开直播间" onClick={() => setMenuOpen(false)}><ExternalLink size={15} />打开直播间</a>
+              : <button type="button" disabled><ExternalLink size={15} />直播间尚未发现</button>}
+            <button onClick={() => { onOpenLogs(); setMenuOpen(false); }}><FolderOpen size={15} />打开日志目录</button>
             <button onClick={() => { onEdit(); setMenuOpen(false); }}><Pencil size={15} />编辑主播</button>
             <button onClick={() => { onToggle(); setMenuOpen(false); }}>{streamer.monitorEnabled ? <Square size={15} /> : <Play size={15} />}{streamer.monitorEnabled ? "暂停监听" : "恢复监听"}</button>
             {streamer.monitorStatus === "recording" && <button onClick={() => { onStop(); setMenuOpen(false); }}><CircleOff size={15} />停止录制</button>}

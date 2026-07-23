@@ -295,10 +295,14 @@ async fn prepare_normalized_streamer(
             web_rid,
         } => {
             let name = normalized_name(&input.name, None, StreamerSourceKind::Room)?;
-            let inspection = inspector
-                .inspect_room(&source_url)
-                .await
-                .map_err(map_room_error)?;
+            let room_id = match inspector.inspect_room(&source_url).await {
+                Ok(inspection) => Some(inspection.room_id().to_owned()),
+                // A numeric live.douyin.com entry is already a stable public identity.
+                // Access verification is transient, so save the entry and let the
+                // supervisor retry instead of forcing the user to add it repeatedly.
+                Err(RecorderError::RoomAccessRestricted) => None,
+                Err(error) => return Err(map_room_error(error)),
+            };
             Ok(NewStreamer {
                 name,
                 source_kind: StreamerSourceKind::Room,
@@ -306,7 +310,7 @@ async fn prepare_normalized_streamer(
                 profile_sec_uid: None,
                 web_rid: Some(web_rid),
                 room_url: Some(source_url),
-                room_id: Some(inspection.room_id().to_owned()),
+                room_id,
                 monitor_enabled: input.monitor_enabled,
                 tags: input.tags.clone(),
             })
@@ -418,6 +422,19 @@ fn map_room_error(error: RecorderError) -> CommandError {
         RecorderError::PageRequest(_) => CommandError::new(
             "room_unavailable",
             "无法访问直播间，请检查网络或确认链接仍然有效",
+        )
+        .field("sourceUrl"),
+        RecorderError::RoomAccessRestricted => CommandError::new(
+            "room_access_restricted",
+            "该直播间当前返回验证码或访问验证页面，无法完成公开访问校验",
+        )
+        .field("sourceUrl"),
+        RecorderError::RoomHttpStatus { status: 404 | 410 } => {
+            CommandError::new("room_entry_invalid", "直播入口不存在或已失效").field("sourceUrl")
+        }
+        RecorderError::RoomHttpStatus { status } => CommandError::new(
+            "room_unavailable",
+            format!("直播间暂时无法访问（HTTP {status}）"),
         )
         .field("sourceUrl"),
         RecorderError::UnsupportedPageLayout => CommandError::new(

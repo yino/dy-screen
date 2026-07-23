@@ -142,6 +142,8 @@ export function createBrowserApi(): ClientApi {
         webRid: item.webRid ?? item.roomUrl?.match(/live\.douyin\.com\/(\d+)/)?.[1] ?? null,
         roomUrl: item.roomUrl ?? null,
         roomId: item.roomId ?? null,
+        failureCount: Number.isFinite(item.failureCount) ? Math.max(0, item.failureCount) : 0,
+        nextRetryAt: item.nextRetryAt ?? null,
         tags: Array.isArray(item.tags)
           ? item.tags.map((tag, index) => ({
               id: Number.isFinite(tag.id) ? tag.id : -(index + 1),
@@ -227,6 +229,8 @@ export function createBrowserApi(): ClientApi {
           : "paused",
         lastCheckedAt: null,
         lastError: null,
+        failureCount: 0,
+        nextRetryAt: null,
         currentVideoCount: 0,
         historyVideoCount: 0,
         tags: normalizeTags(input.tags),
@@ -261,6 +265,9 @@ export function createBrowserApi(): ClientApi {
         monitorStatus: input.monitorEnabled
           ? profileMatch ? "waiting_first_live" : "waiting"
           : "paused",
+        lastError: null,
+        failureCount: 0,
+        nextRetryAt: null,
         tags: normalizeTags(input.tags),
       };
       streamers = streamers.map((item) => item.id === id ? updated : item);
@@ -301,6 +308,9 @@ export function createBrowserApi(): ClientApi {
               ...item,
               monitorEnabled: enabled,
               monitorStatus: enabled ? "waiting" : "paused",
+              lastError: null,
+              failureCount: 0,
+              nextRetryAt: null,
             }
           : item,
       );
@@ -309,7 +319,15 @@ export function createBrowserApi(): ClientApi {
     checkStreamerNow: async (id) => {
       streamers = streamers.map((item) =>
         item.id === id
-          ? { ...item, liveStatus: "offline", lastCheckedAt: new Date().toISOString() }
+          ? {
+              ...item,
+              liveStatus: "offline",
+              monitorStatus: item.monitorEnabled ? "waiting" : "paused",
+              lastCheckedAt: new Date().toISOString(),
+              lastError: null,
+              failureCount: 0,
+              nextRetryAt: null,
+            }
           : item,
       );
       saveStreamers();

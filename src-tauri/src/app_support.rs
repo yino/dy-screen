@@ -55,6 +55,15 @@ pub fn validate_room_access(
         Err(RecorderError::PageRequest(_)) => {
             Err("无法访问直播间，请检查网络或确认链接仍然有效".to_owned())
         }
+        Err(RecorderError::RoomAccessRestricted) => {
+            Err("该直播间当前返回验证码或访问验证页面，无法完成公开访问校验".to_owned())
+        }
+        Err(RecorderError::RoomHttpStatus { status: 404 | 410 }) => {
+            Err("直播入口不存在或已失效".to_owned())
+        }
+        Err(RecorderError::RoomHttpStatus { status }) => {
+            Err(format!("直播间暂时无法访问（HTTP {status}）"))
+        }
         Err(RecorderError::UnsupportedPageLayout) => {
             Err("无法识别该直播间页面，请确认它是公开抖音直播间".to_owned())
         }

@@ -753,13 +753,21 @@ pub(crate) fn migrate_ai_v4(connection: &mut Connection) -> crate::database::Res
         )
         .optional()?
         .is_some();
-    if applied {
+    let ai_table_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('ai_projects', 'ai_project_inputs', 'asr_artifacts', 'transcript_segments')",
+        [],
+        |row| row.get(0),
+    )?;
+    if applied && ai_table_count == 4 {
         return Ok(());
     }
+    // v4 was briefly used by the diagnostics migration in a development build.
+    // Keep that marker and record this repair separately instead of rewriting history.
+    let migration_version = if applied { 6 } else { 4 };
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         r#"
-        CREATE TABLE ai_projects (
+        CREATE TABLE IF NOT EXISTS ai_projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL CHECK(length(trim(name)) > 0),
             status TEXT NOT NULL CHECK(status IN (
@@ -778,7 +786,7 @@ pub(crate) fn migrate_ai_v4(connection: &mut Connection) -> crate::database::Res
             completed_at TEXT
         );
 
-        CREATE TABLE asr_artifacts (
+        CREATE TABLE IF NOT EXISTS asr_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
             source_fingerprint_json TEXT NOT NULL,
@@ -796,7 +804,7 @@ pub(crate) fn migrate_ai_v4(connection: &mut Connection) -> crate::database::Res
             last_used_at TEXT NOT NULL
         );
 
-        CREATE TABLE ai_project_inputs (
+        CREATE TABLE IF NOT EXISTS ai_project_inputs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER NOT NULL REFERENCES ai_projects(id) ON DELETE CASCADE,
             position INTEGER NOT NULL CHECK(position >= 0),
@@ -822,7 +830,7 @@ pub(crate) fn migrate_ai_v4(connection: &mut Connection) -> crate::database::Res
             UNIQUE(project_id, source_fingerprint_hash)
         );
 
-        CREATE TABLE transcript_segments (
+        CREATE TABLE IF NOT EXISTS transcript_segments (
             id TEXT PRIMARY KEY,
             artifact_id INTEGER NOT NULL REFERENCES asr_artifacts(id) ON DELETE CASCADE,
             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
@@ -834,22 +842,22 @@ pub(crate) fn migrate_ai_v4(connection: &mut Connection) -> crate::database::Res
             UNIQUE(artifact_id, ordinal)
         );
 
-        CREATE INDEX idx_ai_projects_status_updated
+        CREATE INDEX IF NOT EXISTS idx_ai_projects_status_updated
             ON ai_projects(status, updated_at DESC);
-        CREATE INDEX idx_ai_inputs_project_status
+        CREATE INDEX IF NOT EXISTS idx_ai_inputs_project_status
             ON ai_project_inputs(project_id, status, position);
-        CREATE INDEX idx_asr_artifacts_source
+        CREATE INDEX IF NOT EXISTS idx_asr_artifacts_source
             ON asr_artifacts(source_fingerprint_hash, recognition_profile_hash, status);
-        CREATE UNIQUE INDEX idx_asr_artifacts_published_cache
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_asr_artifacts_published_cache
             ON asr_artifacts(source_fingerprint_hash, recognition_profile_hash)
             WHERE status = 'published';
-        CREATE INDEX idx_transcript_segments_artifact_time
+        CREATE INDEX IF NOT EXISTS idx_transcript_segments_artifact_time
             ON transcript_segments(artifact_id, source_start_ms, ordinal);
         "#,
     )?;
     transaction.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES(4, ?1)",
-        [Utc::now().to_rfc3339()],
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?1, ?2)",
+        params![migration_version, Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;
     Ok(())

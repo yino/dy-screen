@@ -1,11 +1,15 @@
 use dy_screen::error::RecorderError;
 use dy_screen::model::{Protocol, RoomStreams};
 use dy_screen::resolver::{
-    RoomInspection, parse_room_inspection, parse_room_page, validate_room_url,
+    RoomDiagnosticClassification, RoomInspection, classify_room_http_status,
+    diagnose_room_response, parse_room_inspection, parse_room_page, validate_room_url,
 };
+use reqwest::StatusCode;
 
 const LIVE_PAGE: &str = include_str!("fixtures/live_room.html");
 const OFFLINE_PAGE: &str = include_str!("fixtures/offline_room.html");
+const ACCESS_RESTRICTED_PAGE: &str = include_str!("fixtures/access_restricted_room.html");
+const CAPTCHA_INTERSTITIAL_PAGE: &str = include_str!("fixtures/captcha_interstitial_room.html");
 
 #[test]
 fn validates_douyin_live_urls() {
@@ -63,6 +67,111 @@ fn classifies_decodable_but_unrecognized_layout_as_unsupported() {
     let page = r#"<script>self.__pace_f.push([1,"c:[{\"state\":{\"newRoomShape\":{\"online\":true}}}]"]);</script>"#;
     let error = parse_room_page(page).unwrap_err();
     assert!(matches!(error, RecorderError::UnsupportedPageLayout));
+}
+
+#[test]
+fn distinguishes_access_restriction_from_layout_change() {
+    let restricted = parse_room_inspection(ACCESS_RESTRICTED_PAGE).unwrap_err();
+    assert!(matches!(restricted, RecorderError::RoomAccessRestricted));
+
+    let unknown = r#"<html><script>window.__NEXT_DATA__={"newRoomShape":true};</script></html>"#;
+    let changed = parse_room_inspection(unknown).unwrap_err();
+    assert!(matches!(changed, RecorderError::UnsupportedPageLayout));
+}
+
+#[test]
+fn classifies_http_200_captcha_interstitial_as_access_restricted() {
+    let error = parse_room_inspection(CAPTCHA_INTERSTITIAL_PAGE).unwrap_err();
+    assert!(matches!(error, RecorderError::RoomAccessRestricted));
+
+    let diagnostic = diagnose_room_response(
+        "https://live.douyin.com/559686664524",
+        StatusCode::OK,
+        Some("text/html"),
+        CAPTCHA_INTERSTITIAL_PAGE,
+    );
+    assert_eq!(
+        diagnostic.classification,
+        RoomDiagnosticClassification::AccessRestricted
+    );
+    assert!(diagnostic.markers.access_restricted);
+    assert!(!diagnostic.markers.pace_payload);
+    assert!(!diagnostic.markers.supported_room);
+
+    let serialized = serde_json::to_string(&diagnostic).unwrap();
+    assert!(!serialized.contains("验证码中间页"));
+    assert!(!serialized.contains("sec_sdk_build"));
+    assert!(!serialized.contains("slide"));
+}
+
+#[test]
+fn only_explicit_http_statuses_mark_the_entry_invalid() {
+    assert!(matches!(
+        classify_room_http_status(StatusCode::NOT_FOUND),
+        Err(RecorderError::RoomHttpStatus { status: 404 })
+    ));
+    assert!(matches!(
+        classify_room_http_status(StatusCode::GONE),
+        Err(RecorderError::RoomHttpStatus { status: 410 })
+    ));
+    assert!(matches!(
+        classify_room_http_status(StatusCode::FORBIDDEN),
+        Err(RecorderError::RoomAccessRestricted)
+    ));
+    assert!(matches!(
+        classify_room_http_status(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(RecorderError::RoomHttpStatus { status: 500 })
+    ));
+}
+
+#[test]
+fn diagnostics_only_expose_safe_metadata_and_markers() {
+    let diagnostic = diagnose_room_response(
+        "https://live.douyin.com/452086788686?anchor_id=secret",
+        StatusCode::OK,
+        Some("text/html; charset=utf-8"),
+        ACCESS_RESTRICTED_PAGE,
+    );
+
+    assert_eq!(
+        diagnostic.classification,
+        RoomDiagnosticClassification::AccessRestricted
+    );
+    assert_eq!(diagnostic.room_url, "https://live.douyin.com/452086788686");
+    assert_eq!(diagnostic.http_status, Some(200));
+    assert_eq!(
+        diagnostic.content_type.as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(diagnostic.response_bytes, ACCESS_RESTRICTED_PAGE.len());
+    assert!(diagnostic.markers.access_restricted);
+    assert!(!diagnostic.markers.pace_payload);
+
+    let serialized = serde_json::to_string(&diagnostic).unwrap();
+    assert!(!serialized.contains("fixture-nonce-must-not-leak"));
+    assert!(!serialized.contains("fixture-signature-must-not-leak"));
+    assert!(!serialized.contains("anchor_id"));
+    assert!(!serialized.contains("<html"));
+}
+
+#[test]
+fn diagnostics_classify_unknown_supported_response_as_layout_changed() {
+    let page = "<html><body>unknown public page</body></html>";
+    let diagnostic = diagnose_room_response(
+        "https://live.douyin.com/452086788686",
+        StatusCode::OK,
+        Some("text/html"),
+        page,
+    );
+
+    assert_eq!(
+        diagnostic.classification,
+        RoomDiagnosticClassification::LayoutChanged
+    );
+    assert_eq!(
+        diagnostic.error.as_deref(),
+        Some("抖音直播间页面结构已变化，当前版本暂时无法解析")
+    );
 }
 
 #[test]

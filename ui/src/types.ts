@@ -7,6 +7,8 @@ export type MonitorStatus =
   | "waiting_first_live"
   | "profile_error"
   | "rediscovering"
+  | "access_restricted"
+  | "layout_changed"
   | "entry_invalid"
   | "identity_conflict"
   | "waiting_resource"
@@ -49,6 +51,8 @@ export interface Streamer {
   monitorStatus: MonitorStatus;
   lastCheckedAt: string | null;
   lastError: string | null;
+  failureCount: number;
+  nextRetryAt: string | null;
   currentVideoCount: number;
   historyVideoCount: number;
   tags: StreamerTag[];

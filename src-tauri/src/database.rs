@@ -193,6 +193,18 @@ impl Database {
             migrate_streamer_tags_v3(&mut connection)?;
         }
         crate::ai::migrate_ai_v4(&mut connection)?;
+
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = 5",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            migrate_streamer_diagnostics_v5(&mut connection)?;
+        }
         drop(connection);
         self.ensure_default_settings()
     }
@@ -406,7 +418,7 @@ impl Database {
     pub fn set_monitor_enabled(&self, id: i64, enabled: bool) -> Result<()> {
         let status = if enabled { "waiting" } else { "paused" };
         let changed = self.connection()?.execute(
-            "UPDATE streamers SET monitor_enabled = ?1, monitor_status = ?2, updated_at = ?3 WHERE id = ?4 AND archived = 0",
+            "UPDATE streamers SET monitor_enabled = ?1, monitor_status = ?2, last_error = NULL, failure_count = 0, next_retry_at = NULL, updated_at = ?3 WHERE id = ?4 AND archived = 0",
             params![enabled, status, Utc::now().to_rfc3339(), id],
         )?;
         if changed == 0 {
@@ -431,7 +443,8 @@ impl Database {
             SET name = ?1, source_kind = ?2, source_url = ?3,
                 profile_sec_uid = ?4, web_rid = ?5, room_url = ?6,
                 room_id = ?7, monitor_enabled = ?8, live_status = ?9,
-                monitor_status = ?10, last_error = NULL, updated_at = ?11
+                monitor_status = ?10, last_error = NULL, failure_count = 0,
+                next_retry_at = NULL, updated_at = ?11
             WHERE id = ?12 AND archived = 0
             "#,
             params![
@@ -488,6 +501,9 @@ impl Database {
                     END
                     ELSE monitor_status
                 END,
+                last_error = CASE WHEN ?2 = 0 THEN NULL ELSE last_error END,
+                failure_count = CASE WHEN ?2 = 0 THEN 0 ELSE failure_count END,
+                next_retry_at = CASE WHEN ?2 = 0 THEN NULL ELSE next_retry_at END,
                 updated_at = ?3
             WHERE id = ?4 AND archived = 0
             "#,
@@ -521,8 +537,9 @@ impl Database {
                 profile_sec_uid = ?4, web_rid = ?5, room_url = ?6,
                 room_id = ?7, monitor_enabled = ?8, archived = ?9,
                 live_status = ?10, monitor_status = ?11,
-                last_checked_at = ?12, last_error = ?13, updated_at = ?14
-            WHERE id = ?15
+                last_checked_at = ?12, last_error = ?13, failure_count = ?14,
+                next_retry_at = ?15, updated_at = ?16
+            WHERE id = ?17
             "#,
             params![
                 snapshot.name,
@@ -538,6 +555,8 @@ impl Database {
                 snapshot.monitor_status,
                 snapshot.last_checked_at,
                 snapshot.last_error,
+                snapshot.failure_count,
+                snapshot.next_retry_at,
                 Utc::now().to_rfc3339(),
                 snapshot.id,
             ],
@@ -589,7 +608,8 @@ impl Database {
                 profile_sec_uid = ?4, web_rid = ?5, room_url = ?6,
                 room_id = ?7, monitor_enabled = ?8, archived = 0,
                 live_status = ?9, monitor_status = ?10, last_checked_at = NULL,
-                last_error = NULL, updated_at = ?11
+                last_error = NULL, failure_count = 0, next_retry_at = NULL,
+                updated_at = ?11
             WHERE id = ?12 AND archived = 1
             "#,
             params![
@@ -658,7 +678,8 @@ impl Database {
                 SET web_rid = ?1, room_url = ?2, room_id = ?3,
                     live_status = 'checking', monitor_status = CASE
                         WHEN monitor_enabled = 1 THEN 'waiting' ELSE 'paused' END,
-                    last_error = NULL, updated_at = ?4
+                    last_error = NULL, failure_count = 0, next_retry_at = NULL,
+                    updated_at = ?4
                 WHERE id = ?5
                 "#,
                 params![
@@ -745,7 +766,8 @@ impl Database {
             UPDATE streamers
             SET web_rid = NULL, room_url = NULL, room_id = NULL,
                 live_status = 'offline', monitor_status = 'rediscovering',
-                last_error = NULL, updated_at = ?1
+                last_error = NULL, failure_count = 0, next_retry_at = NULL,
+                updated_at = ?1
             WHERE id = ?2 AND source_kind = 'profile'
             "#,
             params![Utc::now().to_rfc3339(), streamer_id],
@@ -778,7 +800,10 @@ impl Database {
             r#"
             UPDATE streamers
             SET live_status = ?1, monitor_status = ?2, last_checked_at = ?3,
-                last_error = ?4, updated_at = ?3
+                last_error = ?4,
+                failure_count = CASE WHEN ?4 IS NULL THEN 0 ELSE failure_count END,
+                next_retry_at = CASE WHEN ?4 IS NULL THEN NULL ELSE next_retry_at END,
+                updated_at = ?3
             WHERE id = ?5
             "#,
             params![
@@ -792,9 +817,39 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_streamer_failure(
+        &self,
+        id: i64,
+        live_status: &str,
+        monitor_status: &str,
+        error: &str,
+        failure_count: usize,
+        next_retry_at: &str,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            r#"
+            UPDATE streamers
+            SET live_status = ?1, monitor_status = ?2, last_checked_at = ?3,
+                last_error = ?4, failure_count = ?5, next_retry_at = ?6,
+                updated_at = ?3
+            WHERE id = ?7
+            "#,
+            params![
+                live_status,
+                monitor_status,
+                Utc::now().to_rfc3339(),
+                error,
+                failure_count as i64,
+                next_retry_at,
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn archive_streamer(&self, id: i64) -> Result<()> {
         self.connection()?.execute(
-            "UPDATE streamers SET archived = 1, monitor_enabled = 0, monitor_status = 'paused', updated_at = ?1 WHERE id = ?2",
+            "UPDATE streamers SET archived = 1, monitor_enabled = 0, monitor_status = 'paused', last_error = NULL, failure_count = 0, next_retry_at = NULL, updated_at = ?1 WHERE id = ?2",
             params![Utc::now().to_rfc3339(), id],
         )?;
         Ok(())
@@ -1319,6 +1374,45 @@ fn migrate_streamer_tags_v3(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_streamer_diagnostics_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    // Some development builds shipped the same columns under a different
+    // migration number. Detect each column independently so those databases
+    // can be upgraded without failing on a duplicate-column error.
+    let has_failure_count = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('streamers') WHERE name = ?1",
+            ["failure_count"],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_failure_count {
+        transaction.execute(
+            "ALTER TABLE streamers ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0)",
+            [],
+        )?;
+    }
+
+    let has_next_retry_at = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('streamers') WHERE name = ?1",
+            ["next_retry_at"],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_next_retry_at {
+        transaction.execute("ALTER TABLE streamers ADD COLUMN next_retry_at TEXT", [])?;
+    }
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(5, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate_streamers_v2(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction()?;
     let original_count: i64 =
@@ -1642,6 +1736,7 @@ fn streamer_select(suffix: &str) -> String {
         SELECT s.id, s.name, s.source_kind, s.source_url, s.profile_sec_uid,
                s.web_rid, s.room_url, s.room_id, s.monitor_enabled, s.archived,
                s.live_status, s.monitor_status, s.last_checked_at, s.last_error,
+               s.failure_count, s.next_retry_at,
                (
                    SELECT COUNT(*) FROM videos v
                    JOIN recording_sessions rs ON rs.id = v.session_id
@@ -1678,8 +1773,10 @@ fn map_streamer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Streamer> {
         monitor_status: row.get(11)?,
         last_checked_at: row.get(12)?,
         last_error: row.get(13)?,
-        current_video_count: row.get(14)?,
-        history_video_count: row.get(15)?,
+        failure_count: row.get(14)?,
+        next_retry_at: row.get(15)?,
+        current_video_count: row.get(16)?,
+        history_video_count: row.get(17)?,
         tags: Vec::new(),
     })
 }

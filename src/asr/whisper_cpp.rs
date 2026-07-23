@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     AsrCapabilities, AsrConfidenceKind, AsrEngine, AsrEngineIdentity, AsrEnvironmentReport,
     AsrError, AsrErrorKind, AsrProgressEvent, AsrProgressSink, AsrProgressStage, AsrRequest,
-    AsrResult, AsrSegment, EngineResult, ResolvedAsrResources, ResourcePreflight, TimestampPolicy,
-    VadConfig,
+    AsrResult, AsrSegment, AsrWarning, EngineResult, ResolvedAsrResources, ResourcePreflight,
+    TimestampPolicy, VadConfig,
 };
 
 /// `whisper.cpp` CLI 的 Rust 适配器。业务层只看到中立 `AsrEngine` 契约。
@@ -58,6 +58,55 @@ impl WhisperCppEngine {
         let output_json = output_prefix.with_extension("json");
         let _ = tokio::fs::remove_file(&output_json).await;
 
+        let mut status = self
+            .command(request, &output_prefix, false)
+            .status()
+            .await
+            .map_err(spawn_error)?;
+        let used_cpu_fallback = !status.success() && self.resources.use_gpu;
+        if used_cpu_fallback {
+            let _ = tokio::fs::remove_file(&output_json).await;
+            status = self
+                .command(request, &output_prefix, true)
+                .status()
+                .await
+                .map_err(spawn_error)?;
+        }
+        if !status.success() {
+            let _ = tokio::fs::remove_file(&output_json).await;
+            return Err(exit_error(status));
+        }
+        let json = tokio::fs::read(&output_json).await.map_err(|_| {
+            AsrError::new(
+                AsrErrorKind::MalformedOutput,
+                "whisper_output_missing",
+                "本地识别组件没有生成有效结果",
+                true,
+            )
+        })?;
+        let parsed = parse_whisper_json(
+            &json,
+            &request.request_id,
+            self.identity(),
+            request.audio.duration_ms,
+        );
+        let _ = tokio::fs::remove_file(&output_json).await;
+        let mut parsed = parsed?;
+        if used_cpu_fallback {
+            parsed.warnings.push(AsrWarning {
+                code: "gpu_fallback_cpu".to_owned(),
+                message: "Metal 加速不可用，本次已自动改用本机 CPU 识别".to_owned(),
+            });
+        }
+        Ok(parsed)
+    }
+
+    fn command(
+        &self,
+        request: &AsrRequest,
+        output_prefix: &std::path::Path,
+        force_cpu: bool,
+    ) -> Command {
         let mut command = Command::new(&self.resources.whisper_sidecar);
         command
             .arg("--model")
@@ -76,7 +125,7 @@ impl WhisperCppEngine {
             )
             .arg("--output-json-full")
             .arg("--output-file")
-            .arg(&output_prefix)
+            .arg(output_prefix)
             .arg("--no-prints")
             .arg("--vad")
             .arg("--vad-model")
@@ -102,7 +151,7 @@ impl WhisperCppEngine {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if !self.resources.use_gpu {
+        if force_cpu || !self.resources.use_gpu {
             command.arg("--no-gpu");
         }
         if !request.hotwords.is_empty() {
@@ -117,28 +166,7 @@ impl WhisperCppEngine {
                 command.arg("--prompt").arg(prompt);
             }
         }
-
-        let status = command.status().await.map_err(spawn_error)?;
-        if !status.success() {
-            let _ = tokio::fs::remove_file(&output_json).await;
-            return Err(exit_error(status));
-        }
-        let json = tokio::fs::read(&output_json).await.map_err(|_| {
-            AsrError::new(
-                AsrErrorKind::MalformedOutput,
-                "whisper_output_missing",
-                "本地识别组件没有生成有效结果",
-                true,
-            )
-        })?;
-        let parsed = parse_whisper_json(
-            &json,
-            &request.request_id,
-            self.identity(),
-            request.audio.duration_ms,
-        );
-        let _ = tokio::fs::remove_file(&output_json).await;
-        parsed
+        command
     }
 }
 

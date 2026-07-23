@@ -568,8 +568,13 @@ pub fn run() {
                 tray_status: tray_status.clone(),
             });
             let max_concurrent = database.get_settings()?.max_concurrent_recordings;
-            let supervisor = Supervisor::new(database.clone(), publisher, max_concurrent)
-                .map_err(std::io::Error::other)?;
+            let supervisor = Supervisor::new_with_log_dir(
+                database.clone(),
+                publisher,
+                max_concurrent,
+                log_dir.clone(),
+            )
+            .map_err(std::io::Error::other)?;
             let preview_cache_dir = app_cache_dir.join("video-preview");
             std::fs::create_dir_all(&preview_cache_dir)?;
             app.asset_protocol_scope()
@@ -745,10 +750,14 @@ fn desktop_asr_resource_root(_packaged_resource_dir: PathBuf) -> PathBuf {
         if let Some(override_root) = std::env::var_os("ASR_RESOURCE_ROOT") {
             return PathBuf::from(override_root);
         }
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
-            .join("resources/asr")
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")));
+        let staged = workspace_root.join("resources/asr-stage");
+        if staged.join("manifest.json").is_file() {
+            return staged;
+        }
+        workspace_root.join("resources/asr")
     }
     #[cfg(not(debug_assertions))]
     _packaged_resource_dir.join("resources/asr")

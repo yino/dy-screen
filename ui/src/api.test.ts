@@ -36,6 +36,8 @@ describe("浏览器演示标签 API", () => {
       monitorStatus: "waiting",
       lastCheckedAt: null,
       lastError: null,
+      failureCount: 0,
+      nextRetryAt: null,
       currentVideoCount: 0,
       historyVideoCount: 0,
     }]));

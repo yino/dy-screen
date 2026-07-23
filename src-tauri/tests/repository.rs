@@ -116,6 +116,185 @@ fn migration_is_idempotent_and_creates_defaults() {
 }
 
 #[test]
+fn diagnostic_migration_preserves_existing_streamers_and_adds_safe_defaults() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("diagnostic-v5.sqlite3");
+    create_legacy_database(&path);
+
+    let database = Database::open(&path).unwrap();
+    database.migrate().unwrap();
+    database.migrate().unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let values = connection
+        .query_row(
+            "SELECT name, failure_count, next_retry_at FROM streamers WHERE id = 11",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(values, ("旧主播".to_owned(), 0, None));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 5",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+
+    let streamer = database.get_streamer(11).unwrap();
+    assert_eq!(streamer.failure_count, 0);
+    assert_eq!(streamer.next_retry_at, None);
+}
+
+#[test]
+fn diagnostic_migration_recovers_columns_created_by_an_unversioned_build() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("diagnostic-unversioned.sqlite3");
+    create_legacy_database(&path);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE streamers
+                ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0);
+            ALTER TABLE streamers ADD COLUMN next_retry_at TEXT;
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    database
+        .migrate()
+        .expect("已有诊断列但缺少迁移标记时仍应完成升级");
+    database.migrate().expect("修复后的迁移应保持幂等");
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('streamers') WHERE name IN ('failure_count', 'next_retry_at')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 5",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn ai_migration_repairs_a_diagnostics_v4_collision_without_losing_streamers() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("ai-v4-collision.sqlite3");
+    create_legacy_database(&path);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE streamers
+                ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0 CHECK(failure_count >= 0);
+            ALTER TABLE streamers ADD COLUMN next_retry_at TEXT;
+            INSERT INTO schema_migrations(version, applied_at)
+                VALUES(4, '2026-07-22T16:24:59Z');
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(&path).unwrap();
+    database
+        .migrate()
+        .expect("旧诊断 v4 与 AI v4 冲突时应自动修复");
+
+    let connection = Connection::open(&path).unwrap();
+    for table in [
+        "ai_projects",
+        "ai_project_inputs",
+        "asr_artifacts",
+        "transcript_segments",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap(),
+            Some(()),
+            "缺少 AI 表 {table}"
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 6",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(database.get_streamer(11).unwrap().name, "旧主播");
+}
+
+#[test]
+fn repository_persists_failure_diagnostics_and_clears_them_on_success() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room("诊断主播", "911", "room-911", true))
+        .unwrap();
+
+    database
+        .update_streamer_failure(
+            streamer.id,
+            "error",
+            "layout_changed",
+            "抖音直播间页面结构已变化，当前版本暂时无法解析",
+            2,
+            "2026-07-23T01:02:03Z",
+        )
+        .unwrap();
+    let failed = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(failed.failure_count, 2);
+    assert_eq!(
+        failed.next_retry_at.as_deref(),
+        Some("2026-07-23T01:02:03Z")
+    );
+    assert_eq!(failed.monitor_status, "layout_changed");
+
+    database
+        .update_streamer_status(streamer.id, "offline", "waiting", None)
+        .unwrap();
+    let recovered = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(recovered.failure_count, 0);
+    assert_eq!(recovered.next_retry_at, None);
+    assert_eq!(recovered.last_error, None);
+}
+
+#[test]
 fn legacy_migration_preserves_streamers_flags_and_history_relations() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("legacy.sqlite3");

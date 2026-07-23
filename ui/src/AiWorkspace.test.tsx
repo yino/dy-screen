@@ -170,6 +170,82 @@ beforeEach(() => {
 });
 
 describe("AiWorkspace", () => {
+  it("由用户创建项目、选择本地视频并明确点击开始分析", async () => {
+    const user = userEvent.setup();
+    const draftProject: AiProject = {
+      ...project,
+      id: 202,
+      name: "待识别视频",
+      status: "draft",
+      inputFrozen: false,
+      progressPercent: 0,
+      createdAt: "2026-07-23T00:00:00Z",
+      updatedAt: "2026-07-23T00:00:00Z",
+    };
+    const pendingInput: AiProjectDetail["inputs"][number] = {
+      ...completedInput,
+      id: 302,
+      projectId: draftProject.id,
+      displayName: "short_zh.mp4",
+      durationMs: 4_000,
+      status: "pending",
+      progressPercent: 0,
+      artifactId: null,
+    };
+    let projects: AiProject[] = [];
+    let currentDetail: AiProjectDetail = { project: draftProject, inputs: [] };
+    const api = {
+      listAiProjects: vi.fn(async () => projects),
+      getAiProject: vi.fn(async () => currentDetail),
+      queryAiTranscript: vi.fn(async (): Promise<AiTranscriptProjection> => ({
+        project: currentDetail.project,
+        inputs: [],
+      })),
+      diagnoseAiEnvironment: vi.fn().mockResolvedValue(environment),
+      listAiCompletedSessions: vi.fn().mockResolvedValue([]),
+      subscribeAi: vi.fn().mockResolvedValue(() => undefined),
+      subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+      createAiProject: vi.fn(async () => {
+        projects = [draftProject];
+        return draftProject;
+      }),
+      pickAiLocalVideos: vi.fn().mockResolvedValue([{
+        grantId: "selected-video-grant",
+        displayName: pendingInput.displayName,
+      }]),
+      importAiLocalGrants: vi.fn(async () => {
+        currentDetail = { project: draftProject, inputs: [pendingInput] };
+        return { added: [pendingInput], rejected: [] };
+      }),
+      startAiProject: vi.fn(async () => {
+        const queued = {
+          ...draftProject,
+          status: "queued" as const,
+          inputFrozen: true,
+        };
+        projects = [queued];
+        currentDetail = { project: queued, inputs: [pendingInput] };
+        return queued;
+      }),
+    } as unknown as ClientApi;
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "创建项目" }));
+    await user.type(screen.getByLabelText("项目名称"), draftProject.name);
+    await user.click(screen.getByRole("button", { name: "创建草稿" }));
+    await user.click(await screen.findByRole("button", { name: "添加本地视频" }));
+
+    expect(api.pickAiLocalVideos).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(api.importAiLocalGrants).toHaveBeenCalledWith(
+      draftProject.id,
+      ["selected-video-grant"],
+    ));
+    expect(await screen.findByText(pendingInput.displayName)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "开始分析" }));
+    await waitFor(() => expect(api.startAiProject).toHaveBeenCalledWith(draftProject.id));
+  });
+
   it("展示播放器与只读时间戳文本，点击句段跳转并用 WebView 元素显示临时字幕", async () => {
     const user = userEvent.setup();
     const api = createAiApi();
@@ -182,7 +258,7 @@ describe("AiWorkspace", () => {
     await user.click(screen.getByText("欢迎来到直播间。").closest("button")!);
     expect(video.currentTime).toBe(1);
 
-    await user.click(screen.getByLabelText("显示字幕"));
+    expect(screen.getByLabelText("显示字幕")).toBeChecked();
     Object.defineProperty(video, "currentTime", { configurable: true, value: 1.2, writable: true });
     fireEvent.timeUpdate(video);
     expect(await screen.findByText("欢迎来到直播间。", { selector: ".ai-subtitle-overlay" })).toBeInTheDocument();

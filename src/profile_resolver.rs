@@ -136,11 +136,13 @@ pub fn parse_profile_page(page: &str, profile: ProfileUrl) -> Result<ProfileInsp
     })
 }
 
-fn is_access_restricted_page(page: &str) -> bool {
+pub(crate) fn is_access_restricted_page(page: &str) -> bool {
     (page.contains("byted_acrawler")
         && (page.contains("__ac_nonce") || page.contains("__ac_signature")))
         || page.contains("captchaBody")
         || page.contains("verify-center")
+        || (page.contains("验证码中间页") && page.contains("captcha"))
+        || (page.contains("sec_sdk_build") && page.contains("/captcha/index.js"))
 }
 
 fn is_profile_sec_uid(value: &str) -> bool {

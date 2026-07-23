@@ -33,13 +33,19 @@ pub enum RecorderError {
     #[error("公开抖音个人主页需要登录、验证码或额外访问权限")]
     ProfileAccessRestricted,
 
-    #[error("failed to fetch the Douyin room page: {0}")]
+    #[error("访问公开抖音直播间失败")]
     PageRequest(#[from] reqwest::Error),
+
+    #[error("抖音直播间暂时无法访问（HTTP {status}）")]
+    RoomHttpStatus { status: u16 },
+
+    #[error("抖音直播间需要登录、验证码或额外访问权限")]
+    RoomAccessRestricted,
 
     #[error("the live room is offline or has no usable stream")]
     RoomUnavailable,
 
-    #[error("the Douyin page layout is not supported by this Demo")]
+    #[error("抖音直播间页面结构已变化，当前版本暂时无法解析")]
     UnsupportedPageLayout,
 
     #[error("no stream variant is available")]

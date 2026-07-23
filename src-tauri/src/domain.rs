@@ -245,6 +245,10 @@ pub struct Streamer {
     pub monitor_status: String,
     pub last_checked_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub failure_count: i64,
+    #[serde(default)]
+    pub next_retry_at: Option<String>,
     pub current_video_count: i64,
     pub history_video_count: i64,
     #[serde(default)]

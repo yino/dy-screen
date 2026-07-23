@@ -26,6 +26,8 @@ const streamer: Streamer = {
   monitorStatus: "waiting",
   lastCheckedAt: "2026-07-18T20:00:00Z",
   lastError: null,
+  failureCount: 0,
+  nextRetryAt: null,
   currentVideoCount: 0,
   historyVideoCount: 3,
   tags: [],
@@ -626,6 +628,52 @@ describe("App", () => {
     expect(screen.getAllByText("主页检查失败").length).toBeGreaterThan(0);
     expect(screen.getAllByText("等待开播").length).toBeGreaterThan(0);
     expect(screen.getAllByText("重新发现直播间").length).toBeGreaterThan(0);
+  });
+
+  it("表格直接展示房间诊断并提供恢复操作", async () => {
+    const user = userEvent.setup();
+    const diagnosticStreamers = [
+      {
+        ...streamer,
+        id: 31,
+        name: "页面变化主播",
+        monitorStatus: "layout_changed",
+        liveStatus: "error",
+        lastError: "抖音直播间页面结构已变化，当前版本暂时无法解析",
+        failureCount: 2,
+        nextRetryAt: "2026-07-23T01:02:03Z",
+      },
+      {
+        ...streamer,
+        id: 32,
+        name: "访问受限主播",
+        monitorStatus: "access_restricted",
+        liveStatus: "error",
+        lastError: "抖音直播间需要登录、验证码或额外访问权限",
+        failureCount: 1,
+        nextRetryAt: "2026-07-23T01:03:03Z",
+      },
+    ] as Streamer[];
+    const api = createApi(diagnosticStreamers);
+
+    render(<App api={api} />);
+
+    const changedRow = (await screen.findAllByText("页面变化主播"))[0].closest("tr");
+    const restrictedRow = screen.getAllByText("访问受限主播")[0].closest("tr");
+    expect(changedRow).toHaveTextContent("页面结构变化");
+    expect(changedRow).toHaveTextContent("抖音直播间页面结构已变化，当前版本暂时无法解析");
+    expect(changedRow).toHaveTextContent("连续 2 次");
+    expect(changedRow).toHaveTextContent("预计重试");
+    expect(restrictedRow).toHaveTextContent("访问受限");
+    expect(restrictedRow).not.toHaveTextContent("直播入口失效");
+
+    await user.click(screen.getByRole("button", { name: "页面变化主播操作" }));
+    expect(screen.getByRole("link", { name: "从操作菜单打开直播间" })).toHaveAttribute(
+      "href",
+      "https://live.douyin.com/452086788686",
+    );
+    await user.click(screen.getByRole("button", { name: "打开日志目录" }));
+    expect(api.openLogs).toHaveBeenCalledTimes(1);
   });
 
   it("已发现主页展示标准化直播间入口", async () => {

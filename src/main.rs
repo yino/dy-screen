@@ -15,7 +15,7 @@ use dy_screen::manager::{EventSink, LiveJobRunner, RecordingManager};
 use dy_screen::model::{JobEvent, ProfileInspection, Protocol, RecordingRequest, redact_url};
 use dy_screen::profile_resolver::ProfileResolver;
 use dy_screen::recorder::{FfmpegConfig, FfmpegRecorder, RecordingConfig, check_ffmpeg};
-use dy_screen::resolver::{DEFAULT_USER_AGENT, StreamResolver};
+use dy_screen::resolver::{DEFAULT_USER_AGENT, RoomDiagnostic, StreamResolver};
 use serde::Serialize;
 use sha2::Digest;
 use thiserror::Error;
@@ -58,6 +58,8 @@ struct Cli {
 enum Command {
     /// 检查公开抖音个人主页并发现稳定直播入口。
     InspectProfile(ProfileArgs),
+    /// 安全检查公开抖音直播间响应，只输出脱敏元信息和分类。
+    InspectRoom(RoomArgs),
     /// Resolve a room and list its available stream qualities.
     Resolve(ResolveArgs),
     /// Record one or more rooms concurrently through FFmpeg.
@@ -103,6 +105,16 @@ enum AsrStopAfter {
     Vad,
     /// 执行完整流水线并返回识别文本；这是默认行为。
     Asr,
+}
+
+#[derive(Debug, Args)]
+struct RoomArgs {
+    /// 公开 live.douyin.com 直播间 URL。
+    room_url: String,
+
+    /// 输出机器可读的 JSON。
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -365,9 +377,46 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> CliResult<bool> {
     match cli.command {
         Command::InspectProfile(args) => inspect_profile(args).await,
+        Command::InspectRoom(args) => inspect_room(args).await,
         Command::Resolve(args) => resolve(args).await,
         Command::Record(args) => record(args).await,
         Command::Asr(args) => transcribe_video(args).await,
+    }
+}
+
+async fn inspect_room(args: RoomArgs) -> CliResult<bool> {
+    let diagnostic = StreamResolver::new()?.diagnose(&args.room_url).await;
+    print_room_diagnostic(&diagnostic, args.json);
+    Ok(diagnostic.classification.is_success())
+}
+
+fn print_room_diagnostic(diagnostic: &RoomDiagnostic, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(diagnostic).expect("room diagnostic is serializable")
+        );
+        return;
+    }
+    println!(
+        "classification={:?} http_status={} content_type={} response_bytes={}",
+        diagnostic.classification,
+        diagnostic
+            .http_status
+            .map(|status| status.to_string())
+            .as_deref()
+            .unwrap_or("none"),
+        diagnostic.content_type.as_deref().unwrap_or("unknown"),
+        diagnostic.response_bytes,
+    );
+    println!(
+        "markers access_restricted={} pace_payload={} supported_room={}",
+        diagnostic.markers.access_restricted,
+        diagnostic.markers.pace_payload,
+        diagnostic.markers.supported_room,
+    );
+    if let Some(error) = &diagnostic.error {
+        println!("error={error}");
     }
 }
 

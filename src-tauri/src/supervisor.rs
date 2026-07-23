@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use dy_screen::error::RecorderError;
 use dy_screen::model::{
     EventSink, JobEvent, ProfileInspection, Protocol, RoomStreams, SelectedStream,
@@ -14,12 +16,15 @@ use dy_screen::profile_resolver::ProfileResolver;
 use dy_screen::recorder::{FfmpegConfig, FfmpegRecorder, RecordingConfig};
 use dy_screen::resolver::{RoomInspection, StreamResolver};
 use fs2::available_space;
-use tokio::sync::{Notify, broadcast, mpsc};
+use serde::Serialize;
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
 use crate::domain::{DiscoveryBinding, MonitorEvent, NewVideo, Streamer, StreamerSourceKind};
+
+const PUBLIC_PAGE_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorState {
@@ -88,25 +93,143 @@ pub fn recording_session_status(cancelled: bool, success: bool) -> &'static str 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolveFailure {
     Offline,
-    Retryable(String),
-    EntryInvalid(String),
+    Retryable(String, Option<u16>),
+    AccessRestricted(String, Option<u16>),
+    LayoutChanged(String, Option<u16>),
+    EntryInvalid(String, Option<u16>),
 }
 
 fn classify_resolve_error(error: &RecorderError) -> ResolveFailure {
     match error {
         RecorderError::RoomUnavailable => ResolveFailure::Offline,
-        RecorderError::UnsupportedPageLayout
-        | RecorderError::InvalidRoomUrl { .. }
-        | RecorderError::UnsupportedRoomUrl { .. } => {
-            ResolveFailure::EntryInvalid(error.safe_message())
+        RecorderError::RoomAccessRestricted => {
+            ResolveFailure::AccessRestricted(error.safe_message(), None)
+        }
+        RecorderError::UnsupportedPageLayout => {
+            ResolveFailure::LayoutChanged(error.safe_message(), None)
+        }
+        RecorderError::InvalidRoomUrl { .. } | RecorderError::UnsupportedRoomUrl { .. } => {
+            ResolveFailure::EntryInvalid(error.safe_message(), None)
+        }
+        RecorderError::RoomHttpStatus { status: 404 | 410 } => {
+            let status = room_error_http_status(error);
+            ResolveFailure::EntryInvalid(
+                format!("直播入口已失效（HTTP {}）", status.unwrap_or_default()),
+                status,
+            )
+        }
+        RecorderError::RoomHttpStatus { .. } => {
+            ResolveFailure::Retryable(error.safe_message(), room_error_http_status(error))
         }
         RecorderError::PageRequest(source)
-            if source.status().is_some_and(|status| status.as_u16() == 404) =>
+            if source
+                .status()
+                .is_some_and(|status| matches!(status.as_u16(), 404 | 410)) =>
         {
-            ResolveFailure::EntryInvalid("直播入口已失效".to_owned())
+            ResolveFailure::EntryInvalid(
+                "直播入口已失效".to_owned(),
+                source.status().map(|status| status.as_u16()),
+            )
         }
-        _ => ResolveFailure::Retryable(error.safe_message()),
+        _ => ResolveFailure::Retryable(error.safe_message(), room_error_http_status(error)),
     }
+}
+
+fn room_error_http_status(error: &RecorderError) -> Option<u16> {
+    match error {
+        RecorderError::RoomHttpStatus { status } => Some(*status),
+        RecorderError::PageRequest(source) => source.status().map(|status| status.as_u16()),
+        _ => None,
+    }
+}
+
+fn retry_at(wait_seconds: u64) -> String {
+    (Utc::now() + chrono::Duration::seconds(wait_seconds as i64)).to_rfc3339()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoomCheckLogEntry<'a> {
+    timestamp: String,
+    streamer_id: i64,
+    web_rid: Option<&'a str>,
+    classification: &'a str,
+    http_status: Option<u16>,
+    failure_count: usize,
+    next_retry_at: Option<&'a str>,
+}
+
+#[derive(Clone, Default)]
+pub struct MonitorLogger {
+    directory: Option<Arc<PathBuf>>,
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl MonitorLogger {
+    pub fn file(directory: PathBuf) -> Self {
+        Self {
+            directory: Some(Arc::new(directory)),
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn log_room_check(
+        &self,
+        streamer_id: i64,
+        web_rid: Option<&str>,
+        classification: &str,
+        http_status: Option<u16>,
+        failure_count: usize,
+        next_retry_at: Option<&str>,
+    ) {
+        let safe_web_rid = web_rid.filter(|value| {
+            !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+        });
+        let safe_classification = match classification {
+            "live" | "offline" | "access_restricted" | "layout_changed" | "entry_invalid"
+            | "retryable_error" => classification,
+            _ => "unknown",
+        };
+        let safe_next_retry_at =
+            next_retry_at.filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok());
+        let entry = RoomCheckLogEntry {
+            timestamp: Utc::now().to_rfc3339(),
+            streamer_id,
+            web_rid: safe_web_rid,
+            classification: safe_classification,
+            http_status,
+            failure_count,
+            next_retry_at: safe_next_retry_at,
+        };
+        let Ok(line) = serde_json::to_string(&entry) else {
+            return;
+        };
+        #[cfg(debug_assertions)]
+        eprintln!("{line}");
+
+        let Some(directory) = self.directory.as_deref() else {
+            return;
+        };
+        let Ok(_guard) = self.write_lock.lock() else {
+            return;
+        };
+        if let Err(_error) = append_monitor_log(directory, &line) {
+            #[cfg(debug_assertions)]
+            eprintln!("监听诊断日志写入失败：{_error}");
+        }
+    }
+}
+
+fn append_monitor_log(directory: &std::path::Path, line: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join(format!("dy-screen-{}.jsonl", Utc::now().format("%Y-%m-%d")));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.flush()
 }
 
 async fn cancellable_delay(cancellation: &CancellationToken, duration: Duration) -> bool {
@@ -130,11 +253,46 @@ where
     Some(operation.await)
 }
 
+struct PublicRequestGate {
+    next_allowed: AsyncMutex<Instant>,
+    minimum_interval: Duration,
+}
+
+impl PublicRequestGate {
+    fn new(minimum_interval: Duration) -> Self {
+        Self {
+            next_allowed: AsyncMutex::new(Instant::now()),
+            minimum_interval,
+        }
+    }
+
+    async fn run<T, F>(&self, cancellation: &CancellationToken, operation: F) -> Option<T>
+    where
+        F: Future<Output = T>,
+    {
+        let mut next_allowed = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            guard = self.next_allowed.lock() => guard,
+        };
+        let wait = next_allowed.saturating_duration_since(Instant::now());
+        if !wait.is_zero() && !cancellable_delay(cancellation, wait).await {
+            return None;
+        }
+        *next_allowed = Instant::now() + self.minimum_interval;
+        tokio::select! {
+            _ = cancellation.cancelled() => None,
+            result = operation => Some(result),
+        }
+    }
+}
+
 enum ResolveAttempt {
     Live(RoomStreams),
     Offline { room_id: Option<String> },
-    Retryable(String),
-    EntryInvalid(String),
+    Retryable(String, Option<u16>),
+    AccessRestricted(String, Option<u16>),
+    LayoutChanged(String, Option<u16>),
+    EntryInvalid(String, Option<u16>),
     Cancelled,
 }
 
@@ -286,6 +444,8 @@ pub struct Supervisor {
     worker_generation: Arc<AtomicU64>,
     recording_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
     recording_limiter: Arc<RecordingLimiter>,
+    public_request_gate: Arc<PublicRequestGate>,
+    monitor_logger: MonitorLogger,
     shutdown: CancellationToken,
     changes: broadcast::Sender<MonitorEvent>,
 }
@@ -298,7 +458,7 @@ impl Supervisor {
     ) -> Result<Self, String> {
         let profile_discovery = ProfileResolver::new().map_err(|error| error.safe_message())?;
         let room_discovery = StreamResolver::new().map_err(|error| error.safe_message())?;
-        Ok(Self::with_dependencies(
+        let mut supervisor = Self::with_dependencies(
             database,
             publisher,
             max_concurrent,
@@ -306,7 +466,21 @@ impl Supervisor {
             Arc::new(room_discovery),
             Arc::new(SystemJitter),
             Arc::new(TokioDelay),
-        ))
+        );
+        supervisor.public_request_gate =
+            Arc::new(PublicRequestGate::new(PUBLIC_PAGE_REQUEST_INTERVAL));
+        Ok(supervisor)
+    }
+
+    pub fn new_with_log_dir(
+        database: Database,
+        publisher: Arc<dyn MonitorPublisher>,
+        max_concurrent: usize,
+        log_dir: PathBuf,
+    ) -> Result<Self, String> {
+        let mut supervisor = Self::new(database, publisher, max_concurrent)?;
+        supervisor.monitor_logger = MonitorLogger::file(log_dir);
+        Ok(supervisor)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -331,6 +505,8 @@ impl Supervisor {
             worker_generation: Arc::new(AtomicU64::new(0)),
             recording_tokens: Arc::new(Mutex::new(HashMap::new())),
             recording_limiter: Arc::new(RecordingLimiter::new(max_concurrent)),
+            public_request_gate: Arc::new(PublicRequestGate::new(Duration::ZERO)),
+            monitor_logger: MonitorLogger::default(),
             shutdown: CancellationToken::new(),
             changes,
         }
@@ -524,6 +700,7 @@ impl Supervisor {
         let mut room_failures = 0usize;
         let mut profile_failures = 0usize;
         let mut entry_invalid_count = 0usize;
+        let mut restored_failure_count = false;
         loop {
             if cancellation.is_cancelled() {
                 break;
@@ -532,6 +709,18 @@ impl Supervisor {
                 Ok(streamer) if streamer.monitor_enabled && !streamer.archived => streamer,
                 _ => break,
             };
+            if !restored_failure_count {
+                let saved_failures = streamer.failure_count.max(0) as usize;
+                match streamer.monitor_status.as_str() {
+                    "profile_error" => profile_failures = saved_failures,
+                    "entry_invalid" => entry_invalid_count = saved_failures,
+                    "access_restricted" | "layout_changed" | "retrying" => {
+                        room_failures = saved_failures
+                    }
+                    _ => {}
+                }
+                restored_failure_count = true;
+            }
 
             if streamer.source_kind == StreamerSourceKind::Profile
                 && (streamer.web_rid.is_none() || streamer.room_url.is_none())
@@ -548,9 +737,15 @@ impl Supervisor {
                     None,
                 );
                 self.emit("streamer_changed", Some(streamer_id)).await;
-                let inspection = tokio::select! {
-                    _ = cancellation.cancelled() => break,
-                    result = self.profile_discovery.inspect(&streamer.source_url) => result,
+                let Some(inspection) = self
+                    .public_request_gate
+                    .run(
+                        &cancellation,
+                        self.profile_discovery.inspect(&streamer.source_url),
+                    )
+                    .await
+                else {
+                    break;
                 };
                 match inspection {
                     Ok(ProfileInspection::Offline { .. }) => {
@@ -603,15 +798,17 @@ impl Supervisor {
                             Err(error) => {
                                 profile_failures += 1;
                                 let safe_error = error.to_string();
-                                let _ = self.database.update_streamer_status(
+                                let wait =
+                                    profile_backoff_seconds(profile_failures.saturating_sub(1));
+                                let _ = self.database.update_streamer_failure(
                                     streamer_id,
                                     "error",
                                     "profile_error",
-                                    Some(&safe_error),
+                                    &safe_error,
+                                    profile_failures,
+                                    &retry_at(wait),
                                 );
                                 self.emit("streamer_changed", Some(streamer_id)).await;
-                                let wait =
-                                    profile_backoff_seconds(profile_failures.saturating_sub(1));
                                 if !self
                                     .wait_for_next(
                                         Duration::from_secs(wait),
@@ -629,14 +826,16 @@ impl Supervisor {
                     Err(error) => {
                         profile_failures += 1;
                         let safe_error = error.safe_message();
-                        let _ = self.database.update_streamer_status(
+                        let wait = profile_backoff_seconds(profile_failures.saturating_sub(1));
+                        let _ = self.database.update_streamer_failure(
                             streamer_id,
                             "error",
                             "profile_error",
-                            Some(&safe_error),
+                            &safe_error,
+                            profile_failures,
+                            &retry_at(wait),
                         );
                         self.emit("streamer_changed", Some(streamer_id)).await;
-                        let wait = profile_backoff_seconds(profile_failures.saturating_sub(1));
                         if !self
                             .wait_for_next(
                                 Duration::from_secs(wait),
@@ -658,6 +857,14 @@ impl Supervisor {
                     "error",
                     "entry_invalid",
                     Some("直播间来源缺少可用入口"),
+                );
+                self.monitor_logger.log_room_check(
+                    streamer_id,
+                    streamer.web_rid.as_deref(),
+                    "entry_invalid",
+                    None,
+                    1,
+                    None,
                 );
                 break;
             };
@@ -688,6 +895,14 @@ impl Supervisor {
                         None,
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
+                    self.monitor_logger.log_room_check(
+                        streamer_id,
+                        streamer.web_rid.as_deref(),
+                        "live",
+                        None,
+                        0,
+                        None,
+                    );
                     match self.record_live(streamer, cancellation.clone()).await {
                         Ok(SessionEnd::Completed) => {
                             let _ = self.database.update_streamer_status(
@@ -730,39 +945,127 @@ impl Supervisor {
                         None,
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
+                    self.monitor_logger.log_room_check(
+                        streamer_id,
+                        streamer.web_rid.as_deref(),
+                        "offline",
+                        None,
+                        0,
+                        None,
+                    );
                     30
                 }
-                ResolveAttempt::Retryable(safe_error) => {
+                ResolveAttempt::Retryable(safe_error, http_status) => {
                     entry_invalid_count = 0;
                     room_failures += 1;
-                    let _ = self.database.update_streamer_status(
+                    let wait = backoff_seconds(room_failures.saturating_sub(1));
+                    let next_retry_at = retry_at(wait);
+                    let _ = self.database.update_streamer_failure(
                         streamer_id,
                         "error",
-                        "waiting",
-                        Some(&safe_error),
+                        "retrying",
+                        &safe_error,
+                        room_failures,
+                        &next_retry_at,
+                    );
+                    self.monitor_logger.log_room_check(
+                        streamer_id,
+                        streamer.web_rid.as_deref(),
+                        "retryable_error",
+                        http_status,
+                        room_failures,
+                        Some(&next_retry_at),
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
-                    backoff_seconds(room_failures.saturating_sub(1))
+                    wait
                 }
-                ResolveAttempt::EntryInvalid(safe_error) => {
+                ResolveAttempt::AccessRestricted(safe_error, http_status) => {
+                    entry_invalid_count = 0;
+                    room_failures += 1;
+                    let wait = backoff_seconds(room_failures.saturating_sub(1));
+                    let next_retry_at = retry_at(wait);
+                    let _ = self.database.update_streamer_failure(
+                        streamer_id,
+                        "error",
+                        "access_restricted",
+                        &safe_error,
+                        room_failures,
+                        &next_retry_at,
+                    );
+                    self.monitor_logger.log_room_check(
+                        streamer_id,
+                        streamer.web_rid.as_deref(),
+                        "access_restricted",
+                        http_status,
+                        room_failures,
+                        Some(&next_retry_at),
+                    );
+                    self.emit("streamer_changed", Some(streamer_id)).await;
+                    wait
+                }
+                ResolveAttempt::LayoutChanged(safe_error, http_status) => {
+                    entry_invalid_count = 0;
+                    room_failures += 1;
+                    let wait = backoff_seconds(room_failures.saturating_sub(1));
+                    let next_retry_at = retry_at(wait);
+                    let _ = self.database.update_streamer_failure(
+                        streamer_id,
+                        "error",
+                        "layout_changed",
+                        &safe_error,
+                        room_failures,
+                        &next_retry_at,
+                    );
+                    self.monitor_logger.log_room_check(
+                        streamer_id,
+                        streamer.web_rid.as_deref(),
+                        "layout_changed",
+                        http_status,
+                        room_failures,
+                        Some(&next_retry_at),
+                    );
+                    self.emit("streamer_changed", Some(streamer_id)).await;
+                    wait
+                }
+                ResolveAttempt::EntryInvalid(safe_error, http_status) => {
                     room_failures = 0;
-                    entry_invalid_count += 1;
+                    entry_invalid_count = entry_invalid_count.saturating_add(1);
                     if streamer.source_kind == StreamerSourceKind::Profile
                         && entry_invalid_count >= 3
                         && self.database.clear_room_binding(streamer_id).is_ok()
                     {
+                        self.monitor_logger.log_room_check(
+                            streamer_id,
+                            streamer.web_rid.as_deref(),
+                            "entry_invalid",
+                            http_status,
+                            entry_invalid_count,
+                            None,
+                        );
                         self.emit("streamer_changed", Some(streamer_id)).await;
                         entry_invalid_count = 0;
                         continue;
                     }
-                    let _ = self.database.update_streamer_status(
+                    let wait = 30;
+                    let next_retry_at = retry_at(wait);
+                    let _ = self.database.update_streamer_failure(
                         streamer_id,
                         "error",
                         "entry_invalid",
-                        Some(&safe_error),
+                        &safe_error,
+                        entry_invalid_count,
+                        &next_retry_at,
+                    );
+                    self.monitor_logger.log_room_check(
+                        streamer_id,
+                        streamer.web_rid.as_deref(),
+                        "entry_invalid",
+                        http_status,
+                        entry_invalid_count,
+                        Some(&next_retry_at),
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
-                    30
+                    wait
                 }
                 ResolveAttempt::Cancelled => break,
             };
@@ -798,19 +1101,33 @@ impl Supervisor {
         room_url: &str,
         cancellation: &CancellationToken,
     ) -> ResolveAttempt {
-        tokio::select! {
-            _ = cancellation.cancelled() => ResolveAttempt::Cancelled,
-            result = self.room_discovery.inspect(room_url) => match result {
-                Ok(RoomInspection::Live(room)) => ResolveAttempt::Live(room),
-                Ok(RoomInspection::Offline { room_id }) => ResolveAttempt::Offline {
-                    room_id: Some(room_id),
-                },
-                Err(error) => match classify_resolve_error(&error) {
-                    ResolveFailure::Offline => ResolveAttempt::Offline { room_id: None },
-                    ResolveFailure::Retryable(error) => ResolveAttempt::Retryable(error),
-                    ResolveFailure::EntryInvalid(error) => ResolveAttempt::EntryInvalid(error),
-                },
-            }
+        let Some(result) = self
+            .public_request_gate
+            .run(cancellation, self.room_discovery.inspect(room_url))
+            .await
+        else {
+            return ResolveAttempt::Cancelled;
+        };
+        match result {
+            Ok(RoomInspection::Live(room)) => ResolveAttempt::Live(room),
+            Ok(RoomInspection::Offline { room_id }) => ResolveAttempt::Offline {
+                room_id: Some(room_id),
+            },
+            Err(error) => match classify_resolve_error(&error) {
+                ResolveFailure::Offline => ResolveAttempt::Offline { room_id: None },
+                ResolveFailure::Retryable(error, status) => {
+                    ResolveAttempt::Retryable(error, status)
+                }
+                ResolveFailure::AccessRestricted(error, status) => {
+                    ResolveAttempt::AccessRestricted(error, status)
+                }
+                ResolveFailure::LayoutChanged(error, status) => {
+                    ResolveAttempt::LayoutChanged(error, status)
+                }
+                ResolveFailure::EntryInvalid(error, status) => {
+                    ResolveAttempt::EntryInvalid(error, status)
+                }
+            },
         }
     }
 
@@ -830,7 +1147,10 @@ impl Supervisor {
         let room = match self.resolve_room(&room_url, &worker_cancellation).await {
             ResolveAttempt::Live(room) => room,
             ResolveAttempt::Offline { .. } => return Ok(SessionEnd::Completed),
-            ResolveAttempt::Retryable(error) | ResolveAttempt::EntryInvalid(error) => {
+            ResolveAttempt::Retryable(error, _)
+            | ResolveAttempt::AccessRestricted(error, _)
+            | ResolveAttempt::LayoutChanged(error, _)
+            | ResolveAttempt::EntryInvalid(error, _) => {
                 return Err(error);
             }
             ResolveAttempt::Cancelled => return Ok(SessionEnd::Cancelled),
@@ -935,9 +1255,10 @@ impl Supervisor {
                     ResolveAttempt::Offline { .. } => break 'recording SessionEnd::Completed,
                     ResolveAttempt::Cancelled => break 'recording SessionEnd::Cancelled,
                     ResolveAttempt::Live(_) => {}
-                    ResolveAttempt::Retryable(error) | ResolveAttempt::EntryInvalid(error) => {
-                        last_error = error
-                    }
+                    ResolveAttempt::Retryable(error, _)
+                    | ResolveAttempt::AccessRestricted(error, _)
+                    | ResolveAttempt::LayoutChanged(error, _)
+                    | ResolveAttempt::EntryInvalid(error, _) => last_error = error,
                 }
                 if retries >= 3 {
                     break 'recording SessionEnd::Error(last_error);
@@ -965,18 +1286,25 @@ impl Supervisor {
                 match refreshed {
                     ResolveAttempt::Offline { .. } => break 'recording SessionEnd::Completed,
                     ResolveAttempt::Cancelled => break 'recording SessionEnd::Cancelled,
-                    ResolveAttempt::Retryable(error) => {
-                        confirmation = ResolveAttempt::Retryable(error);
+                    ResolveAttempt::Retryable(error, status) => {
+                        confirmation = ResolveAttempt::Retryable(error, status);
                     }
-                    ResolveAttempt::EntryInvalid(error) => {
-                        confirmation = ResolveAttempt::EntryInvalid(error);
+                    ResolveAttempt::AccessRestricted(error, status) => {
+                        confirmation = ResolveAttempt::AccessRestricted(error, status);
+                    }
+                    ResolveAttempt::LayoutChanged(error, status) => {
+                        confirmation = ResolveAttempt::LayoutChanged(error, status);
+                    }
+                    ResolveAttempt::EntryInvalid(error, status) => {
+                        confirmation = ResolveAttempt::EntryInvalid(error, status);
                     }
                     ResolveAttempt::Live(room) => {
                         current_selected =
                             match room.select(Some(&settings.quality), Some(protocol)) {
                                 Ok(selected) => selected,
                                 Err(error) => {
-                                    confirmation = ResolveAttempt::Retryable(error.safe_message());
+                                    confirmation =
+                                        ResolveAttempt::Retryable(error.safe_message(), None);
                                     continue;
                                 }
                             };
@@ -1173,7 +1501,19 @@ mod tests {
         );
         assert!(matches!(
             classify_resolve_error(&RecorderError::UnsupportedPageLayout),
-            ResolveFailure::EntryInvalid(message) if !message.is_empty()
+            ResolveFailure::LayoutChanged(message, _) if !message.is_empty()
+        ));
+        assert!(matches!(
+            classify_resolve_error(&RecorderError::RoomAccessRestricted),
+            ResolveFailure::AccessRestricted(message, _) if !message.is_empty()
+        ));
+        assert!(matches!(
+            classify_resolve_error(&RecorderError::RoomHttpStatus { status: 404 }),
+            ResolveFailure::EntryInvalid(message, Some(404)) if !message.is_empty()
+        ));
+        assert!(matches!(
+            classify_resolve_error(&RecorderError::RoomHttpStatus { status: 503 }),
+            ResolveFailure::Retryable(message, Some(503)) if !message.is_empty()
         ));
     }
 

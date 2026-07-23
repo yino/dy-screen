@@ -145,7 +145,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
   const [preview, setPreview] = useState<PreviewSnapshot | null>(null);
   const [currentSegmentId, setCurrentSegmentId] = useState<string | null>(null);
   const [followPlayback, setFollowPlayback] = useState(true);
-  const [showSubtitles, setShowSubtitles] = useState(false);
+  const [showSubtitles, setShowSubtitles] = useState(true);
   const [segmentPage, setSegmentPage] = useState(0);
   const [createOpen, setCreateOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -255,7 +255,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
 
   useEffect(() => {
     setCurrentSegmentId(null);
-    setShowSubtitles(false);
+    setShowSubtitles(true);
     setSegmentPage(0);
     setPreview(null);
     if (!currentInput || !["completed", "skipped"].includes(currentInput.status)) return;
