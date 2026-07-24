@@ -847,6 +847,25 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_streamer_verification_required(
+        &self,
+        id: i64,
+        error: &str,
+        failure_count: usize,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            r#"
+            UPDATE streamers
+            SET live_status = 'error', monitor_status = 'verification_required',
+                last_checked_at = ?1, last_error = ?2, failure_count = ?3,
+                next_retry_at = NULL, updated_at = ?1
+            WHERE id = ?4
+            "#,
+            params![Utc::now().to_rfc3339(), error, failure_count as i64, id],
+        )?;
+        Ok(())
+    }
+
     pub fn archive_streamer(&self, id: i64) -> Result<()> {
         self.connection()?.execute(
             "UPDATE streamers SET archived = 1, monitor_enabled = 0, monitor_status = 'paused', last_error = NULL, failure_count = 0, next_retry_at = NULL, updated_at = ?1 WHERE id = ?2",
@@ -1007,6 +1026,14 @@ impl Database {
         self.connection()?.execute(
             "UPDATE recording_sessions SET retry_count = ?1, status = 'retrying' WHERE id = ?2",
             params![retry_count, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_session_recording(&self, id: i64) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE recording_sessions SET status = 'recording', error = NULL WHERE id = ?1 AND ended_at IS NULL",
+            [id],
         )?;
         Ok(())
     }
@@ -1218,6 +1245,24 @@ impl Database {
         let interrupted_at = Utc::now().to_rfc3339();
         self.connection()?.execute(
             "UPDATE recording_sessions SET ended_at = ?1, status = 'interrupted', error = COALESCE(error, '应用异常中断') WHERE ended_at IS NULL",
+            [&interrupted_at],
+        )?;
+        self.connection()?.execute(
+            r#"
+            UPDATE streamers
+            SET monitor_status = CASE
+                    WHEN monitor_enabled = 1 AND archived = 0 THEN 'waiting'
+                    ELSE 'paused'
+                END,
+                updated_at = ?1
+            WHERE monitor_status IN ('recording', 'waiting_resource')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM recording_sessions rs
+                  WHERE rs.streamer_id = streamers.id
+                    AND rs.ended_at IS NULL
+              )
+            "#,
             [&interrupted_at],
         )?;
         for mut session in sessions {

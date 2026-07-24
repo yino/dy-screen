@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use dy_screen::asr::FrozenMediaSource;
+use dy_screen::resolver::StreamResolver;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
@@ -17,17 +18,23 @@ use crate::ai::{
     AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService, AiRepository, LocalAsrRuntime,
     SourceFingerprint,
 };
+use crate::app_lifecycle::{
+    InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, log_lifecycle,
+};
 use crate::app_support::{delete_recording_session, delete_recording_video, validate_settings};
 use crate::database::Database;
 use crate::domain::{
-    AppSettings, CommandError, CreateStreamerRequest, Dashboard, EnvironmentStatus, MonitorEvent,
-    Streamer, StreamerPromptContext, VideoFilter, VideoPage,
+    AppSettings, BrowserAccessState, BrowserAccessStatus, CommandError, CreateStreamerRequest,
+    Dashboard, EnvironmentStatus, MonitorEvent, Streamer, StreamerPromptContext, VideoFilter,
+    VideoPage,
 };
 use crate::preview::{
     PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
 };
+use crate::room_resolution::{RoomResolutionPublisher, RoomResolutionService};
 use crate::streamer_service::{PublicSourceInspector, create_streamer_with, update_streamer_with};
-use crate::supervisor::{MonitorPublisher, Supervisor};
+use crate::supervisor::{MonitorLogger, MonitorPublisher, Supervisor};
+use crate::tauri_browser::TauriBrowserPageDriver;
 use crate::thumbnail::{
     FfmpegThumbnailExecutor, ThumbnailBatch, ThumbnailCache, ThumbnailEvent, ThumbnailFailure,
     ThumbnailPublisher, ThumbnailRequest, ThumbnailService, ThumbnailSnapshot,
@@ -37,13 +44,56 @@ use crate::thumbnail::{
 type TrayStatus = Arc<Mutex<Option<MenuItem<tauri::Wry>>>>;
 
 struct AppState {
+    _instance_lock: InstanceLock,
     database: Database,
     supervisor: Supervisor,
+    room_resolution: Arc<RoomResolutionService>,
     preview: PreviewService,
     thumbnail: ThumbnailService,
     ai_runtime: Arc<LocalAsrRuntime>,
     log_dir: PathBuf,
-    quitting: Arc<AtomicBool>,
+    shutdown_gate: ShutdownGate,
+}
+
+#[derive(Clone)]
+struct DesktopRoomResolutionPublisher {
+    app: AppHandle,
+    database: Database,
+    logger: MonitorLogger,
+    verification_notified: Arc<AtomicBool>,
+}
+
+impl RoomResolutionPublisher for DesktopRoomResolutionPublisher {
+    fn publish_access_state(&self, state: &BrowserAccessState) {
+        let _ = self.app.emit("browser-access-event", state);
+        if should_notify_verification(&self.verification_notified, state.status)
+            && self
+                .database
+                .get_settings()
+                .is_ok_and(|settings| settings.notifications_enabled)
+        {
+            let _ = self
+                .app
+                .notification()
+                .builder()
+                .title("需要访问验证")
+                .body("请打开直播管家的抖音验证窗口")
+                .show();
+        }
+    }
+
+    fn publish_diagnostic(&self, entry: &dy_screen::access::AccessDiagnosticEntry) {
+        self.logger.log_access(entry);
+    }
+}
+
+fn should_notify_verification(notified: &AtomicBool, status: BrowserAccessStatus) -> bool {
+    if status == BrowserAccessStatus::VerificationRequired {
+        !notified.swap(true, Ordering::SeqCst)
+    } else {
+        notified.store(false, Ordering::SeqCst);
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -154,7 +204,10 @@ async fn create_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
 ) -> Result<Streamer, CommandError> {
-    let inspector = PublicSourceInspector::new()?;
+    let inspector = PublicSourceInspector::new(
+        state.room_resolution.clone(),
+        state.room_resolution.public_request_gate(),
+    )?;
     create_streamer_with(&state.database, &inspector, &state.supervisor, input).await
 }
 
@@ -164,7 +217,10 @@ async fn update_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
 ) -> Result<Streamer, CommandError> {
-    let inspector = PublicSourceInspector::new()?;
+    let inspector = PublicSourceInspector::new(
+        state.room_resolution.clone(),
+        state.room_resolution.public_request_gate(),
+    )?;
     update_streamer_with(&state.database, &inspector, &state.supervisor, id, input).await
 }
 
@@ -184,6 +240,47 @@ async fn set_monitor_enabled(
 #[tauri::command]
 fn check_streamer_now(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     state.supervisor.check_now(id)
+}
+
+#[tauri::command]
+fn get_browser_access_state(state: State<'_, AppState>) -> BrowserAccessState {
+    state.room_resolution.access_state()
+}
+
+#[tauri::command]
+async fn show_douyin_verification(state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .room_resolution
+        .show_verification()
+        .await
+        .map_err(|error| error.safe_message())
+}
+
+#[tauri::command]
+async fn recheck_douyin_access(state: State<'_, AppState>) -> Result<BrowserAccessState, String> {
+    let access = state
+        .room_resolution
+        .recheck()
+        .await
+        .map_err(|error| error.safe_message())?;
+    state.supervisor.check_all_now()?;
+    Ok(access)
+}
+
+#[tauri::command]
+async fn clear_douyin_session(
+    confirmed: bool,
+    state: State<'_, AppState>,
+) -> Result<BrowserAccessState, String> {
+    if !confirmed {
+        return Err("需要确认后才能清除抖音浏览器会话".to_owned());
+    }
+    state
+        .room_resolution
+        .clear_session()
+        .await
+        .map_err(|error| error.safe_message())?;
+    Ok(state.room_resolution.access_state())
 }
 
 #[tauri::command]
@@ -550,14 +647,7 @@ fn request_exit(force: bool, app: AppHandle, state: State<'_, AppState>) -> Resu
     if active_recordings > 0 && !force {
         return Err("当前仍有活动录制，需要确认后才能退出".to_owned());
     }
-    begin_shutdown(
-        &app,
-        state.supervisor.clone(),
-        state.preview.clone(),
-        state.thumbnail.clone(),
-        state.ai_runtime.clone(),
-        state.quitting.clone(),
-    );
+    begin_shutdown(&app, state.inner(), ShutdownReason::UserRequest);
     Ok(())
 }
 
@@ -578,6 +668,10 @@ pub fn run() {
             update_streamer,
             set_monitor_enabled,
             check_streamer_now,
+            get_browser_access_state,
+            show_douyin_verification,
+            recheck_douyin_access,
+            clear_douyin_session,
             archive_streamer,
             stop_recording,
             list_videos,
@@ -630,9 +724,20 @@ pub fn run() {
             let app_cache_dir = app.path().app_cache_dir()?;
             let log_dir = app.path().app_log_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
+            let instance_lock = match InstanceLock::acquire(&app_data_dir) {
+                Ok(lock) => {
+                    log_lifecycle(LifecycleEvent::InstanceLockAcquired, None);
+                    lock
+                }
+                Err(_) => {
+                    log_lifecycle(LifecycleEvent::InstanceRejected, None);
+                    app.handle().exit(0);
+                    return Ok(());
+                }
+            };
             std::fs::create_dir_all(&app_cache_dir)?;
             std::fs::create_dir_all(&log_dir)?;
-            cleanup_old_logs(&log_dir, 14);
+            cleanup_old_logs(&log_dir, 30);
 
             let database = Database::open(&app_data_dir.join("dy-screen.sqlite3"))?;
             database.migrate()?;
@@ -679,11 +784,36 @@ pub fn run() {
                 tray_status: tray_status.clone(),
             });
             let max_concurrent = database.get_settings()?.max_concurrent_recordings;
-            let supervisor = Supervisor::new_with_log_dir(
+            let monitor_logger = MonitorLogger::file(log_dir.clone());
+            let browser_driver = Arc::new(
+                TauriBrowserPageDriver::new(
+                    app.handle().clone(),
+                    app_data_dir.join("douyin-browser-session"),
+                )
+                .map_err(|error| std::io::Error::other(error.safe_message()))?,
+            );
+            let room_resolution_publisher = Arc::new(DesktopRoomResolutionPublisher {
+                app: app.handle().clone(),
+                database: database.clone(),
+                logger: monitor_logger.clone(),
+                verification_notified: Arc::new(AtomicBool::new(false)),
+            });
+            let native_room_resolver = Arc::new(
+                StreamResolver::new()
+                    .map_err(|error| std::io::Error::other(error.safe_message()))?,
+            );
+            let room_resolution = Arc::new(RoomResolutionService::new(
+                native_room_resolver,
+                browser_driver,
+                room_resolution_publisher,
+            ));
+            let supervisor = Supervisor::new_with_room_discovery(
                 database.clone(),
                 publisher,
                 max_concurrent,
-                log_dir.clone(),
+                room_resolution.clone(),
+                room_resolution.public_request_gate(),
+                monitor_logger,
             )
             .map_err(std::io::Error::other)?;
             let preview_cache_dir = app_cache_dir.join("video-preview");
@@ -708,17 +838,20 @@ pub fn run() {
                 }),
             )
             .map_err(std::io::Error::other)?;
-            let quitting = Arc::new(AtomicBool::new(false));
+            let shutdown_gate = ShutdownGate::default();
 
             app.manage(AppState {
+                _instance_lock: instance_lock,
                 database,
                 supervisor: supervisor.clone(),
+                room_resolution,
                 preview,
                 thumbnail,
                 ai_runtime: ai_components.runtime,
                 log_dir,
-                quitting,
+                shutdown_gate,
             });
+            install_shutdown_signal_handlers(app.handle().clone());
 
             let tray_menu = MenuBuilder::new(app)
                 .text("show", "打开主窗口")
@@ -756,8 +889,9 @@ pub fn run() {
         .expect("无法创建直播管家应用");
     app.run(|app, event| match event {
         RunEvent::ExitRequested { api, .. } => {
-            let state = app.state::<AppState>();
-            if !state.quitting.load(Ordering::SeqCst) {
+            if let Some(state) = app.try_state::<AppState>()
+                && !state.shutdown_gate.is_started()
+            {
                 api.prevent_exit();
                 let active_recordings = state
                     .database
@@ -774,19 +908,16 @@ pub fn run() {
                         },
                     );
                 } else {
-                    begin_shutdown(
-                        app,
-                        state.supervisor.clone(),
-                        state.preview.clone(),
-                        state.thumbnail.clone(),
-                        state.ai_runtime.clone(),
-                        state.quitting.clone(),
-                    );
+                    begin_shutdown(app, state.inner(), ShutdownReason::TauriExitRequested);
                 }
             }
         }
         RunEvent::Resumed => {
-            let _ = app.state::<AppState>().supervisor.check_all_now();
+            if let Some(state) = app.try_state::<AppState>()
+                && !state.shutdown_gate.is_started()
+            {
+                let _ = state.supervisor.check_all_now();
+            }
         }
         _ => {}
     });
@@ -826,14 +957,7 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
                     },
                 );
             } else {
-                begin_shutdown(
-                    app,
-                    state.supervisor.clone(),
-                    state.preview.clone(),
-                    state.thumbnail.clone(),
-                    state.ai_runtime.clone(),
-                    state.quitting.clone(),
-                );
+                begin_shutdown(app, state.inner(), ShutdownReason::Tray);
             }
         }
         _ => {}
@@ -847,28 +971,65 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn begin_shutdown(
-    app: &AppHandle,
-    supervisor: Supervisor,
-    preview: PreviewService,
-    thumbnail: ThumbnailService,
-    ai_runtime: Arc<LocalAsrRuntime>,
-    quitting: Arc<AtomicBool>,
-) {
-    if quitting.swap(true, Ordering::SeqCst) {
+fn begin_shutdown(app: &AppHandle, state: &AppState, reason: ShutdownReason) {
+    if !state.shutdown_gate.try_begin() {
+        log_lifecycle(LifecycleEvent::ShutdownDeduplicated, Some(reason));
         return;
     }
+    log_lifecycle(LifecycleEvent::ShutdownStarted, Some(reason));
     let app = app.clone();
+    let supervisor = state.supervisor.clone();
+    let room_resolution = state.room_resolution.clone();
+    let preview = state.preview.clone();
+    let thumbnail = state.thumbnail.clone();
+    let ai_runtime = state.ai_runtime.clone();
     tauri::async_runtime::spawn(async move {
-        let (_, _, _, _) = tokio::join!(
-            preview.shutdown(),
-            thumbnail.shutdown(),
-            supervisor.shutdown(),
-            ai_runtime.shutdown()
-        );
+        let shutdown = async {
+            let (_, _, _, _, _) = tokio::join!(
+                preview.shutdown(),
+                thumbnail.shutdown(),
+                supervisor.shutdown(),
+                room_resolution.shutdown(),
+                ai_runtime.shutdown()
+            );
+        };
+        let event = if tokio::time::timeout(Duration::from_secs(20), shutdown)
+            .await
+            .is_ok()
+        {
+            LifecycleEvent::ShutdownCompleted
+        } else {
+            LifecycleEvent::ShutdownTimedOut
+        };
+        log_lifecycle(event, Some(reason));
         app.exit(0);
     });
 }
+
+#[cfg(unix)]
+fn install_shutdown_signal_handlers(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let Ok(mut sigterm) = signal(SignalKind::terminate()) else {
+            log_lifecycle(LifecycleEvent::SignalRegistrationFailed, None);
+            return;
+        };
+        let Ok(mut sigint) = signal(SignalKind::interrupt()) else {
+            log_lifecycle(LifecycleEvent::SignalRegistrationFailed, None);
+            return;
+        };
+        let reason = tokio::select! {
+            _ = sigterm.recv() => ShutdownReason::Sigterm,
+            _ = sigint.recv() => ShutdownReason::Sigint,
+        };
+        let state = app.state::<AppState>();
+        begin_shutdown(&app, state.inner(), reason);
+    });
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handlers(_app: AppHandle) {}
 
 fn desktop_asr_resource_root(_packaged_resource_dir: PathBuf) -> PathBuf {
     #[cfg(debug_assertions)]
@@ -1080,5 +1241,32 @@ fn cleanup_old_logs(directory: &Path, retention_days: u64) {
         if modified.elapsed().is_ok_and(|age| age > retention) && metadata.is_file() {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_verification_notification_is_deduplicated_until_session_recovers() {
+        let notified = AtomicBool::new(false);
+
+        assert!(should_notify_verification(
+            &notified,
+            BrowserAccessStatus::VerificationRequired
+        ));
+        assert!(!should_notify_verification(
+            &notified,
+            BrowserAccessStatus::VerificationRequired
+        ));
+        assert!(!should_notify_verification(
+            &notified,
+            BrowserAccessStatus::SessionReady
+        ));
+        assert!(should_notify_verification(
+            &notified,
+            BrowserAccessStatus::VerificationRequired
+        ));
     }
 }

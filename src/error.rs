@@ -42,6 +42,18 @@ pub enum RecorderError {
     #[error("抖音直播间需要登录、验证码或额外访问权限")]
     RoomAccessRestricted,
 
+    #[error("抖音浏览器会话需要手动完成访问验证")]
+    RoomAccessVerificationRequired,
+
+    #[error("浏览器页面快照无效或超过安全限制")]
+    InvalidBrowserSnapshot,
+
+    #[error("抖音浏览器会话暂时不可用")]
+    BrowserSessionUnavailable,
+
+    #[error("浏览器页面回调已经失效")]
+    BrowserRequestSuperseded,
+
     #[error("the live room is offline or has no usable stream")]
     RoomUnavailable,
 

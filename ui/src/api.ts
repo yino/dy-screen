@@ -13,6 +13,7 @@ import type {
   AiTranscriptProjection,
   AiTrustedFileGrant,
   AppSettings,
+  BrowserAccessState,
   ClientApi,
   CreateStreamerInput,
   Dashboard,
@@ -83,6 +84,11 @@ const tauriApi: ClientApi = {
   deleteSession: (sessionId) => invoke<void>("delete_session", { sessionId }),
   openLogs: () => invoke<void>("open_logs"),
   diagnoseEnvironment: () => invoke<EnvironmentStatus>("diagnose_environment"),
+  getBrowserAccessState: () => invoke<BrowserAccessState>("get_browser_access_state"),
+  showDouyinVerification: () => invoke<void>("show_douyin_verification"),
+  recheckDouyinAccess: () => invoke<BrowserAccessState>("recheck_douyin_access"),
+  clearDouyinSession: (confirmed) =>
+    invoke<BrowserAccessState>("clear_douyin_session", { confirmed }),
   listAiProjects: () => invoke<AiProject[]>("ai_list_projects"),
   getAiProject: (projectId) => invoke<AiProjectDetail>("ai_get_project", { projectId }),
   createAiProject: (input) => invoke<AiProject>("ai_create_project", { input }),
@@ -127,6 +133,12 @@ const tauriApi: ClientApi = {
     });
     return unlisten;
   },
+  subscribeBrowserAccess: async (listener) => {
+    const unlisten = await listen<BrowserAccessState>("browser-access-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
   subscribePreview: async (listener) => {
     const unlisten = await listen<PreviewSnapshot>("video-preview-event", (event) => {
       listener(event.payload);
@@ -151,6 +163,16 @@ export function createBrowserApi(): ClientApi {
   let streamers: Streamer[] = [];
   let settings = defaultSettings;
   const thumbnailBatches = new Map<string, ThumbnailBatch>();
+  const desktopAccessUnavailable = (): BrowserAccessState => ({
+    status: "session_expired",
+    pendingCount: 0,
+    activeStreamerId: null,
+    currentWebRid: null,
+    lastReason: "真实访问验证仅桌面端可用",
+    updatedAt: new Date().toISOString(),
+  });
+  const rejectDesktopAccess = (): Promise<never> =>
+    Promise.reject(new Error("真实访问验证仅桌面端可用"));
   try {
     streamers = (JSON.parse(window.localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
       .map((item) => ({
@@ -438,6 +460,10 @@ export function createBrowserApi(): ClientApi {
       ffmpeg: false,
       ffprobe: false,
     }),
+    getBrowserAccessState: async () => desktopAccessUnavailable(),
+    showDouyinVerification: rejectDesktopAccess,
+    recheckDouyinAccess: rejectDesktopAccess,
+    clearDouyinSession: async () => rejectDesktopAccess(),
     listAiProjects: async () => [],
     getAiProject: async () => {
       throw new Error("浏览器演示模式没有本地 AI 项目数据库");
@@ -517,6 +543,7 @@ export function createBrowserApi(): ClientApi {
     }),
     requestExit: async () => undefined,
     subscribe: async () => () => undefined,
+    subscribeBrowserAccess: async () => () => undefined,
     subscribePreview: async () => () => undefined,
     subscribeThumbnail: async () => () => undefined,
     subscribeAi: async () => () => undefined,

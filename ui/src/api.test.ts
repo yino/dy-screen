@@ -110,3 +110,20 @@ describe("浏览器演示封面 API", () => {
     await expect(api.getVideoThumbnails(batch.batchId)).rejects.toThrow("找不到浏览器演示封面批次");
   });
 });
+
+describe("浏览器演示公开页访问会话 API", () => {
+  it("稳定返回桌面端不可用状态且不伪造会话恢复", async () => {
+    const api = createBrowserApi();
+
+    await expect(api.getBrowserAccessState()).resolves.toMatchObject({
+      status: "session_expired",
+      pendingCount: 0,
+      activeStreamerId: null,
+      currentWebRid: null,
+      lastReason: "真实访问验证仅桌面端可用",
+    });
+    await expect(api.showDouyinVerification()).rejects.toThrow("真实访问验证仅桌面端可用");
+    await expect(api.recheckDouyinAccess()).rejects.toThrow("真实访问验证仅桌面端可用");
+    await expect(api.clearDouyinSession(true)).rejects.toThrow("真实访问验证仅桌面端可用");
+  });
+});

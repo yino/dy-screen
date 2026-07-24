@@ -10,6 +10,10 @@ use crate::flight::decode_pace_payload;
 use crate::model::{Protocol, RoomStreams, StreamVariant};
 use crate::profile_resolver::is_access_restricted_page;
 
+pub use crate::access::{
+    AccessClassification as RoomDiagnosticClassification, AccessMarkers as RoomDiagnosticMarkers,
+};
+
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0 Safari/537.36";
 
 #[derive(Clone)]
@@ -23,31 +27,6 @@ pub enum RoomInspection {
     Offline { room_id: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoomDiagnosticClassification {
-    Live,
-    Offline,
-    AccessRestricted,
-    LayoutChanged,
-    EntryInvalid,
-    RetryableError,
-}
-
-impl RoomDiagnosticClassification {
-    pub fn is_success(self) -> bool {
-        matches!(self, Self::Live | Self::Offline)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RoomDiagnosticMarkers {
-    pub access_restricted: bool,
-    pub pace_payload: bool,
-    pub supported_room: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoomDiagnostic {
@@ -58,6 +37,12 @@ pub struct RoomDiagnostic {
     pub markers: RoomDiagnosticMarkers,
     pub classification: RoomDiagnosticClassification,
     pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct RoomInspectionAttempt {
+    pub inspection: Result<RoomInspection>,
+    pub diagnostic: RoomDiagnostic,
 }
 
 impl RoomInspection {
@@ -87,30 +72,30 @@ impl StreamResolver {
     }
 
     pub async fn inspect(&self, room_url: &str) -> Result<RoomInspection> {
-        let url = validate_room_url(room_url)?;
-        let response = self
-            .client
-            .get(url)
-            .header(reqwest::header::REFERER, "https://live.douyin.com/")
-            .send()
-            .await?;
-        classify_room_http_status(response.status())?;
-        let page = response.text().await?;
-        parse_room_inspection(&page)
+        self.inspect_attempt(room_url).await.inspection
     }
 
     pub async fn diagnose(&self, room_url: &str) -> RoomDiagnostic {
+        self.inspect_attempt(room_url).await.diagnostic
+    }
+
+    pub async fn inspect_attempt(&self, room_url: &str) -> RoomInspectionAttempt {
         let url = match validate_room_url(room_url) {
             Ok(url) => url,
             Err(error) => {
-                return diagnostic_without_response(
+                let diagnostic = diagnostic_without_response(
                     room_url,
                     RoomDiagnosticClassification::EntryInvalid,
                     error.safe_message(),
                 );
+                return RoomInspectionAttempt {
+                    inspection: Err(error),
+                    diagnostic,
+                };
             }
         };
         let safe_url = canonical_room_url(&url);
+        let expected_web_rid = room_web_rid(&url);
         let response = match self
             .client
             .get(url)
@@ -119,12 +104,15 @@ impl StreamResolver {
             .await
         {
             Ok(response) => response,
-            Err(_) => {
-                return diagnostic_without_response(
-                    &safe_url,
-                    RoomDiagnosticClassification::RetryableError,
-                    "访问公开抖音直播间失败".to_owned(),
-                );
+            Err(error) => {
+                return RoomInspectionAttempt {
+                    inspection: Err(RecorderError::PageRequest(error)),
+                    diagnostic: diagnostic_without_response(
+                        &safe_url,
+                        RoomDiagnosticClassification::RetryableError,
+                        "访问公开抖音直播间失败".to_owned(),
+                    ),
+                };
             }
         };
         let status = response.status();
@@ -134,20 +122,32 @@ impl StreamResolver {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         match response.bytes().await {
-            Ok(body) => diagnose_room_response(
-                &safe_url,
-                status,
-                content_type.as_deref(),
-                &String::from_utf8_lossy(&body),
-            ),
-            Err(_) => RoomDiagnostic {
-                room_url: safe_url,
-                http_status: Some(status.as_u16()),
-                content_type,
-                response_bytes: 0,
-                markers: empty_diagnostic_markers(),
-                classification: RoomDiagnosticClassification::RetryableError,
-                error: Some("读取公开抖音直播间响应失败".to_owned()),
+            Ok(body) => {
+                let page = String::from_utf8_lossy(&body);
+                let diagnostic =
+                    diagnose_room_response(&safe_url, status, content_type.as_deref(), &page);
+                let inspection = classify_room_http_status(status).and_then(|_| {
+                    expected_web_rid.as_deref().map_or_else(
+                        || parse_room_inspection(&page),
+                        |web_rid| parse_room_inspection_for_web_rid(&page, web_rid),
+                    )
+                });
+                RoomInspectionAttempt {
+                    inspection,
+                    diagnostic,
+                }
+            }
+            Err(error) => RoomInspectionAttempt {
+                inspection: Err(RecorderError::PageRequest(error)),
+                diagnostic: RoomDiagnostic {
+                    room_url: safe_url,
+                    http_status: Some(status.as_u16()),
+                    content_type,
+                    response_bytes: 0,
+                    markers: empty_diagnostic_markers(),
+                    classification: RoomDiagnosticClassification::RetryableError,
+                    error: Some("读取公开抖音直播间响应失败".to_owned()),
+                },
             },
         }
     }
@@ -175,7 +175,14 @@ pub fn diagnose_room_response(
     let access_restricted = is_access_restricted_page(page);
     let pace_payload = page.contains("self.__pace_f.push");
     let parsed = if status.is_success() && !access_restricted {
-        parse_room_inspection(page).ok()
+        Url::parse(&room_url)
+            .ok()
+            .and_then(|url| room_web_rid(&url))
+            .map_or_else(
+                || parse_room_inspection(page),
+                |web_rid| parse_room_inspection_for_web_rid(page, &web_rid),
+            )
+            .ok()
     } else {
         None
     };
@@ -274,6 +281,12 @@ pub fn validate_room_url(input: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn room_web_rid(url: &Url) -> Option<String> {
+    url.path_segments()?
+        .find(|segment| !segment.is_empty())
+        .map(str::to_owned)
+}
+
 pub fn parse_room_page(page: &str) -> Result<RoomStreams> {
     match parse_room_inspection(page)? {
         RoomInspection::Live(room) => Ok(room),
@@ -282,26 +295,70 @@ pub fn parse_room_page(page: &str) -> Result<RoomStreams> {
 }
 
 pub fn parse_room_inspection(page: &str) -> Result<RoomInspection> {
+    parse_room_inspection_with_identity(page, None)
+}
+
+pub fn parse_room_inspection_for_web_rid(
+    page: &str,
+    expected_web_rid: &str,
+) -> Result<RoomInspection> {
+    parse_room_inspection_with_identity(page, Some(expected_web_rid))
+}
+
+fn parse_room_inspection_with_identity(
+    page: &str,
+    expected_web_rid: Option<&str>,
+) -> Result<RoomInspection> {
     if is_access_restricted_page(page) {
         return Err(RecorderError::RoomAccessRestricted);
     }
     let document = Html::parse_document(page);
     let selector = Selector::parse("script").expect("static script selector");
+    let scripts = document.select(&selector).filter_map(|script| {
+        let text = script.text().collect::<String>();
+        text.contains("self.__pace_f.push").then_some(text)
+    });
+    parse_room_scripts_with_identity(scripts, expected_web_rid)
+}
+
+pub fn parse_room_scripts<I, S>(scripts: I) -> Result<RoomInspection>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    parse_room_scripts_with_identity(scripts, None)
+}
+
+pub fn parse_room_scripts_for_web_rid<I, S>(
+    scripts: I,
+    expected_web_rid: &str,
+) -> Result<RoomInspection>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    parse_room_scripts_with_identity(scripts, Some(expected_web_rid))
+}
+
+fn parse_room_scripts_with_identity<I, S>(
+    scripts: I,
+    expected_web_rid: Option<&str>,
+) -> Result<RoomInspection>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let mut offline_room_id = None;
 
-    for script in document.select(&selector) {
-        let text = script.text().collect::<String>();
-        if !text.contains("self.__pace_f.push") {
-            continue;
-        }
-        let Some(payload) = decode_pace_payload(&text) else {
+    for text in scripts {
+        let Some(payload) = decode_pace_payload(text.as_ref()) else {
             continue;
         };
 
-        if let Some(room) = find_room_object(&payload, true) {
+        if let Some(room) = find_room_object(&payload, true, expected_web_rid) {
             return normalize_room(room).map(RoomInspection::Live);
         }
-        if let Some(room) = find_room_object(&payload, false)
+        if let Some(room) = find_room_object(&payload, false, expected_web_rid)
             && let Some(room_id) = room.get("id_str").and_then(Value::as_str)
         {
             offline_room_id = Some(room_id.to_owned());
@@ -315,26 +372,61 @@ pub fn parse_room_inspection(page: &str) -> Result<RoomInspection> {
     }
 }
 
-fn find_room_object(value: &Value, require_stream: bool) -> Option<&Map<String, Value>> {
+fn find_room_object<'a>(
+    value: &'a Value,
+    require_stream: bool,
+    expected_web_rid: Option<&str>,
+) -> Option<&'a Map<String, Value>> {
+    find_room_object_with_identity(value, require_stream, expected_web_rid, false)
+}
+
+fn find_room_object_with_identity<'a>(
+    value: &'a Value,
+    require_stream: bool,
+    expected_web_rid: Option<&str>,
+    ancestor_matches: bool,
+) -> Option<&'a Map<String, Value>> {
     match value {
         Value::Object(object) => {
+            let identity_matches = ancestor_matches
+                || expected_web_rid.is_some_and(|expected| room_matches_web_rid(object, expected));
             let is_room = if require_stream {
                 object.get("stream_url").is_some_and(Value::is_object)
             } else {
                 object.contains_key("id_str") && object.contains_key("status")
             };
-            if is_room {
+            if is_room && (expected_web_rid.is_none() || identity_matches) {
                 return Some(object);
             }
-            object
-                .values()
-                .find_map(|child| find_room_object(child, require_stream))
+            object.values().find_map(|child| {
+                find_room_object_with_identity(
+                    child,
+                    require_stream,
+                    expected_web_rid,
+                    identity_matches,
+                )
+            })
         }
-        Value::Array(values) => values
-            .iter()
-            .find_map(|child| find_room_object(child, require_stream)),
+        Value::Array(values) => values.iter().find_map(|child| {
+            find_room_object_with_identity(
+                child,
+                require_stream,
+                expected_web_rid,
+                ancestor_matches,
+            )
+        }),
         _ => None,
     }
+}
+
+fn room_matches_web_rid(room: &Map<String, Value>, expected_web_rid: &str) -> bool {
+    let direct = room.get("web_rid").and_then(Value::as_str);
+    let owner = room
+        .get("owner")
+        .and_then(Value::as_object)
+        .and_then(|owner| owner.get("web_rid"))
+        .and_then(Value::as_str);
+    direct.or(owner) == Some(expected_web_rid)
 }
 
 fn normalize_room(room: &Map<String, Value>) -> Result<RoomStreams> {

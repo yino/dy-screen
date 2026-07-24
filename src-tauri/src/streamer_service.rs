@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use dy_screen::error::{RecorderError, Result as RecorderResult};
 use dy_screen::model::ProfileInspection;
 use dy_screen::profile_resolver::ProfileResolver;
-use dy_screen::resolver::{RoomInspection, StreamResolver};
+use dy_screen::resolver::RoomInspection;
+use tokio_util::sync::CancellationToken;
 
 use crate::app_support::{NormalizedStreamerSource, parse_streamer_source};
 use crate::database::{Database, DatabaseError};
@@ -10,6 +13,7 @@ use crate::domain::{
     CommandError, CreateStreamerRequest, NewStreamer, Streamer, StreamerSourceKind,
     StreamerTagValidationError, normalize_streamer_tags,
 };
+use crate::room_resolution::{PublicPageRequestGate, RoomDiscovery};
 use crate::supervisor::Supervisor;
 
 #[async_trait]
@@ -20,14 +24,19 @@ pub trait SourceInspector: Send + Sync {
 
 pub struct PublicSourceInspector {
     profile_resolver: ProfileResolver,
-    room_resolver: StreamResolver,
+    room_resolver: Arc<dyn RoomDiscovery>,
+    public_request_gate: Arc<PublicPageRequestGate>,
 }
 
 impl PublicSourceInspector {
-    pub fn new() -> Result<Self, CommandError> {
+    pub fn new(
+        room_resolver: Arc<dyn RoomDiscovery>,
+        public_request_gate: Arc<PublicPageRequestGate>,
+    ) -> Result<Self, CommandError> {
         Ok(Self {
             profile_resolver: ProfileResolver::new().map_err(map_profile_error)?,
-            room_resolver: StreamResolver::new().map_err(map_room_error)?,
+            room_resolver,
+            public_request_gate,
         })
     }
 }
@@ -35,7 +44,13 @@ impl PublicSourceInspector {
 #[async_trait]
 impl SourceInspector for PublicSourceInspector {
     async fn inspect_profile(&self, source_url: &str) -> RecorderResult<ProfileInspection> {
-        self.profile_resolver.inspect(source_url).await
+        self.public_request_gate
+            .run(
+                &CancellationToken::new(),
+                self.profile_resolver.inspect(source_url),
+            )
+            .await
+            .ok_or(RecorderError::Cancelled)?
     }
 
     async fn inspect_room(&self, source_url: &str) -> RecorderResult<RoomInspection> {
@@ -300,7 +315,10 @@ async fn prepare_normalized_streamer(
                 // A numeric live.douyin.com entry is already a stable public identity.
                 // Access verification is transient, so save the entry and let the
                 // supervisor retry instead of forcing the user to add it repeatedly.
-                Err(RecorderError::RoomAccessRestricted) => None,
+                Err(
+                    RecorderError::RoomAccessRestricted
+                    | RecorderError::RoomAccessVerificationRequired,
+                ) => None,
                 Err(error) => return Err(map_room_error(error)),
             };
             Ok(NewStreamer {
@@ -427,6 +445,11 @@ fn map_room_error(error: RecorderError) -> CommandError {
         RecorderError::RoomAccessRestricted => CommandError::new(
             "room_access_restricted",
             "该直播间当前返回验证码或访问验证页面，无法完成公开访问校验",
+        )
+        .field("sourceUrl"),
+        RecorderError::RoomAccessVerificationRequired => CommandError::new(
+            "room_verification_required",
+            "该直播间需要在客户端中完成访问验证，已保留稳定直播入口",
         )
         .field("sourceUrl"),
         RecorderError::RoomHttpStatus { status: 404 | 410 } => {

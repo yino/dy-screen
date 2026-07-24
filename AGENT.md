@@ -61,6 +61,9 @@ dy-screen/
 │       └── styles.css           客户端样式
 ├── src-tauri/                   Tauri 2.0 桌面后端
 │   ├── src/app.rs               Tauri command、事件、托盘和应用生命周期
+│   ├── src/app_lifecycle.rs     单实例锁、关闭领取和生命周期安全诊断
+│   ├── src/room_resolution.rs   原生 HTTP/WebView 双通道解析与共享会话
+│   ├── src/tauri_browser.rs     受限验证窗口、最小快照和导航策略
 │   ├── src/app_support.rs       command 公共校验和文件操作辅助
 │   ├── src/streamer_service.rs  主播创建、编辑和来源校验服务
 │   ├── src/database.rs          SQLite migration 和 repository
@@ -80,7 +83,7 @@ dy-screen/
 
 - `src/` 不依赖 Tauri UI，负责公开页面解析、流选择、FFmpeg 录制和多房间任务。
 - `ProfileResolver` 只负责公开个人主页身份和稳定直播入口发现。
-- `StreamResolver` 只负责公开直播间状态和签名直播流解析。
+- `StreamResolver` 负责原生 HTTP 直播间状态和签名直播流解析；Tauri 业务层必须通过 `RoomResolutionService` 统一使用原生/WebView 双通道。
 - FFmpeg 只能接收经过 `StreamResolver` 验证的直播流地址。
 - 不得把完整 HTML、React Flight 载荷或签名直播流 URL写入日志、错误或事件。
 
@@ -91,6 +94,8 @@ dy-screen/
 - `streamer_service.rs` 负责业务编排，`database.rs` 负责持久化，`supervisor.rs` 负责长期任务状态机。
 - 后台任务必须支持取消、暂停、恢复、应用退出和系统唤醒。
 - 同一个主播最多只能存在一个有效监听 worker 和一个活动录制会话。
+- 桌面进程必须在打开 SQLite 和执行启动恢复前获取独占实例锁；第二实例不得访问业务数据库或启动后台任务。
+- `SIGTERM`、`SIGINT`、托盘和前端退出必须复用同一个幂等、有界关闭流程，禁止直接结束父进程后遗留 FFmpeg。
 
 ### 4.3 React 前端
 
@@ -123,7 +128,9 @@ dy-screen/
 
 - 未发现 `web_rid` 的个人主页按 60 秒基础周期加 0–10 秒抖动检查。
 - 主页可重试错误按 60、120、300 秒封顶退避。
-- 已发现直播入口后按 30 秒基础周期检查直播间。
+- 已发现且离线的直播入口按 60 秒基础周期加 0–15 秒抖动检查，所有公开页面访问至少间隔 5 秒。
+- 原生 HTTP 返回 `access_restricted` 后必须切换共享持久 WebView，并在冷却期内避免重复原生请求。
+- `verification_required` 必须等待用户主动处理，不能记为下播、入口失效或消耗录制续接次数。
 - 普通离线和网络错误不得清除稳定 `web_rid`。
 - 只有连续 3 次明确入口失效，个人主页来源才回退到重新发现阶段。
 - 等待录制资源后必须重新解析直播间，并持久化最新 `room_id` 后再启动录制。
@@ -233,7 +240,7 @@ openspec validate --all --strict
 make doctor       # 检查 Node、npm、Cargo、FFmpeg 和 FFprobe
 make install      # 安装前端依赖
 make web-dev      # 仅启动浏览器演示界面
-make app-dev      # 启动 Tauri 开发客户端
+make app-dev      # 启动 Tauri 客户端；仅保留前端热更新，Rust 修改后需安全手动重启
 make app-build    # 构建桌面应用
 ```
 
@@ -252,6 +259,9 @@ make test-migration           # SQLite 身份 migration 测试
 make test-supervisor-profile  # 个人主页/直播间双阶段状态机测试
 make test-preview             # 视频预览服务和前端播放器测试
 make test-preview-integration # 使用真实 FFmpeg 样本验证预览转换
+make test-browser-access      # 双通道解析、WebView、安全日志和前端聚焦测试
+make test-app-lifecycle      # 单实例锁和幂等关闭领取测试
+make accept-access-fixtures  # 本地支持页/验证页 stderr 与 JSONL 验收
 ```
 
 ### 9.3 验证选择
@@ -262,6 +272,7 @@ make test-preview-integration # 使用真实 FFmpeg 样本验证预览转换
 - 修改 React/TypeScript：执行 `npm test`、`npm run build`，最终执行 `make check`。
 - 修改预览或 FFmpeg 行为：执行 `make test-preview`；环境具备 FFmpeg 时执行 `make test-preview-integration`。
 - 修改发布、配置或桌面生命周期：执行 `make verify`。
+- 录制期间禁止使用 Tauri Rust watcher；项目开发入口必须保持 `--no-watch`，Rust 改动后先等待 `shutdown_completed` 再重启。
 
 真实公开页面验收只能作为自动化测试的补充，不能替代 fixture 和状态机测试。
 
@@ -308,8 +319,9 @@ AI 标识统一使用以下格式：
 
 ## 11. 安全、隐私和合规边界
 
-- 只支持普通公开 HTTP 页面，不使用浏览器自动化绕过平台访问控制。
-- 禁止导入、保存或使用账号 Cookie、登录态、验证码结果和私有访问令牌。
+- 只支持普通公开页面；原生 HTTP 受限时允许使用隔离、持久化且权限受限的系统 WebView 执行标准页面脚本。
+- 禁止应用逻辑导入、复制、导出、记录或注入账号 Cookie、登录态、验证码结果和私有访问令牌；平台 WebView browsing data 只能由系统管理并允许用户显式清除。
+- 禁止自动识别验证码、模拟验证交互、第三方打码、代理池、账号自动登录或其他访问控制绕过。
 - 禁止绕过付费、私密直播、DRM、地区限制或其他权限控制。
 - 页面要求登录、验证码或额外访问权限时，应返回脱敏错误并按策略重试或停止。
 - 不得将主播信息、视频元数据、录像、日志或设置上传到外部服务，除非后续规格和用户明确授权。

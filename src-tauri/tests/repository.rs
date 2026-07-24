@@ -699,6 +699,28 @@ fn startup_reconciliation_registers_manifest_segments_from_interrupted_session()
 }
 
 #[test]
+fn startup_reconciliation_resets_stale_recording_status_without_an_active_session() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room("退出恢复主播", "303", "room-303", true))
+        .unwrap();
+    let session = database.start_session(streamer.id, "/tmp").unwrap();
+    database
+        .update_streamer_status(streamer.id, "live", "recording", None)
+        .unwrap();
+    database
+        .finish_session(session.id, "cancelled", Some("录制已取消"))
+        .unwrap();
+
+    database.reconcile_startup().unwrap();
+
+    let restored = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(restored.live_status, "live");
+    assert_eq!(restored.monitor_status, "waiting");
+}
+
+#[test]
 fn reconciliation_registers_missing_manifest_segments_from_completed_session() {
     let directory = tempdir().unwrap();
     let database = Database::open_in_memory().unwrap();

@@ -22,6 +22,11 @@ OUTPUT ?= recordings
 SEGMENT_SECONDS ?= 900
 PROBE_TIMEOUT_SECONDS ?= 3
 JSON ?= 0
+ACCESS_FIXTURE_LOG_DIR ?= /private/tmp/dy-screen-access-fixtures
+ACCEPT_ROOM_URL ?= https://live.douyin.com/703940802949
+ACCEPT_ROOM_URLS ?= https://live.douyin.com/703940802949 https://live.douyin.com/168376497175 https://live.douyin.com/452086788686
+ACCEPT_MINUTES ?= 30
+APP_LOG_DIR ?= $(HOME)/Library/Logs/com.yino.dyscreen
 ASR_SOURCE ?=
 ASR_STAGE ?= resources/asr-stage
 ASR_RESOURCE_ROOT ?=
@@ -68,6 +73,8 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
+	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
+	diagnose-real-room tail-access-log accept-real-room accept-real-multi \
 	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
 	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
@@ -80,12 +87,12 @@ help:
 		'首次使用：' \
 		'  make doctor          检查 Node、npm、Cargo、FFmpeg 和 FFprobe' \
 		'  make install         安装前端依赖' \
-		'  make app-dev         启动 Tauri 桌面客户端开发模式' \
+		'  make app-dev         启动 Tauri 桌面客户端（前端热更新，Rust 安全手动重启）' \
 		'' \
 		'客户端目标：' \
 		'  make web-dev         仅预览 React 界面（使用浏览器本地模拟数据）' \
 		'  make frontend-build  类型检查并构建前端' \
-		'  make app-dev         启动 Tauri 开发客户端' \
+		'  make app-dev         启动 Tauri 开发客户端（禁用强制结束录制的 Rust watcher）' \
 		'  make app-build       构建 macOS .app 安装产物' \
 		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL ASR FFmpeg' \
 		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
@@ -124,6 +131,19 @@ help:
 		'  make test-tag-repository 执行主播标签 repository 与生命周期测试' \
 		'  make test-tag-service 执行主播创建、编辑和标签校验服务测试' \
 		'  make test-tag-ui     执行标签表单、展示和浏览器演示测试' \
+		'  make test-browser-access 执行浏览器会话解析的全部聚焦测试' \
+		'  make test-access-core 执行核心浏览器快照和安全诊断测试' \
+		'  make test-room-resolution 执行双通道解析服务状态机测试' \
+		'  make test-tauri-browser 执行 Tauri 验证窗口安全策略测试' \
+		'  make test-access-supervisor 执行监听、验证等待和续录测试' \
+		'  make test-access-ui   执行访问横幅、操作和浏览器降级测试' \
+		'  make test-access-fixtures 校验 stderr 与 JSONL 验收输出一致' \
+		'  make test-app-lifecycle 执行单实例锁和幂等关闭领取测试' \
+		'  make accept-access-fixtures [ACCESS_FIXTURE_LOG_DIR=...] 运行本地双页面验收工具' \
+		'  make diagnose-real-room [ACCEPT_ROOM_URL=...] 输出真实房间原生 HTTP 脱敏诊断' \
+		'  make tail-access-log [APP_LOG_DIR=...] 持续查看当天访问 JSONL' \
+		'  make accept-real-room [ACCEPT_ROOM_URL=...] 启动桌面客户端执行单房 WebView/录制验收' \
+		'  make accept-real-multi [ACCEPT_ROOM_URLS="..."] [ACCEPT_MINUTES=30] 启动多房长时验收' \
 		'  make check           执行格式、Clippy、测试和前端构建' \
 		'  make spec-validate   严格校验当前 OpenSpec 变更' \
 		'  make verify          执行 check、OpenSpec 校验和桌面应用构建' \
@@ -402,6 +422,60 @@ test-tag-ui:
 	"$(NPM)" test -- --run ui/src/App.test.tsx ui/src/api.test.ts
 
 test-tags: test-tag-migration test-tag-repository test-tag-service test-tag-ui
+
+test-access-core:
+	"$(CARGO)" test --test browser_snapshot
+
+test-room-resolution:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test room_resolution
+
+test-tauri-browser:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml tauri_browser::tests
+
+test-access-supervisor:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test supervisor
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test supervisor_profile
+
+test-access-ui:
+	"$(NPM)" test -- --run ui/src/App.test.tsx ui/src/api.test.ts
+
+test-access-fixtures:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test access_fixture_acceptance
+
+test-app-lifecycle:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --test app_lifecycle
+
+test-browser-access: test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle
+
+accept-access-fixtures:
+	@mkdir -p "$(ACCESS_FIXTURE_LOG_DIR)"
+	"$(CARGO)" run --manifest-path src-tauri/Cargo.toml --bin access_fixture -- supported "$(ACCESS_FIXTURE_LOG_DIR)"
+	"$(CARGO)" run --manifest-path src-tauri/Cargo.toml --bin access_fixture -- challenge "$(ACCESS_FIXTURE_LOG_DIR)"
+	@printf '验收 JSONL：%s/dy-screen-%s.jsonl\n' "$(ACCESS_FIXTURE_LOG_DIR)" "$$(date -u +%Y-%m-%d)"
+
+diagnose-real-room: release
+	"$(BINARY)" inspect-room "$(ACCEPT_ROOM_URL)" --json
+
+tail-access-log:
+	@mkdir -p "$(APP_LOG_DIR)"
+	@log="$(APP_LOG_DIR)/dy-screen-$$(date -u +%Y-%m-%d).jsonl"; \
+	printf '持续查看：%s\n' "$$log"; \
+	touch "$$log"; \
+	tail -f "$$log"
+
+accept-real-room: doctor
+	@printf '%s\n' \
+		'真实网络验收不会自动绕过访问验证。' \
+		'启动后请在客户端添加或立即检查：$(ACCEPT_ROOM_URL)' \
+		'观察控制台、访问状态横幅、FFmpeg 启动和录像目录；必要时点击“立即验证”。'
+	"$(NPM)" run tauri:dev
+
+accept-real-multi: doctor
+	@printf '%s\n' \
+		'多房长时验收地址：$(ACCEPT_ROOM_URLS)' \
+		'要求连续观察至少 $(ACCEPT_MINUTES) 分钟，并确认共享会话串行解析、并发录制和一次同会话续录。' \
+		'真实网络验收不会自动进入普通 test/check/CI。'
+	"$(NPM)" run tauri:dev
 
 test: test-frontend test-core test-app
 

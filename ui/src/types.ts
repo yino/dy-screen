@@ -8,6 +8,7 @@ export type MonitorStatus =
   | "profile_error"
   | "rediscovering"
   | "access_restricted"
+  | "verification_required"
   | "layout_changed"
   | "entry_invalid"
   | "identity_conflict"
@@ -120,6 +121,22 @@ export interface EnvironmentStatus {
 export interface MonitorEvent {
   kind: string;
   streamerId: number | null;
+}
+
+export type BrowserAccessStatus =
+  | "native"
+  | "browser_resolving"
+  | "verification_required"
+  | "session_ready"
+  | "session_expired";
+
+export interface BrowserAccessState {
+  status: BrowserAccessStatus;
+  pendingCount: number;
+  activeStreamerId: number | null;
+  currentWebRid: string | null;
+  lastReason: string | null;
+  updatedAt: string;
 }
 
 export type AiProjectStatus =
@@ -391,6 +408,10 @@ export interface ClientApi {
   deleteSession(sessionId: number): Promise<void>;
   openLogs(): Promise<void>;
   diagnoseEnvironment(): Promise<EnvironmentStatus>;
+  getBrowserAccessState(): Promise<BrowserAccessState>;
+  showDouyinVerification(): Promise<void>;
+  recheckDouyinAccess(): Promise<BrowserAccessState>;
+  clearDouyinSession(confirmed: boolean): Promise<BrowserAccessState>;
   listAiProjects(): Promise<AiProject[]>;
   getAiProject(projectId: number): Promise<AiProjectDetail>;
   createAiProject(input: { name: string; hotwords: string[] }): Promise<AiProject>;
@@ -417,6 +438,7 @@ export interface ClientApi {
   retryAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
   requestExit(force: boolean): Promise<void>;
   subscribe(listener: (event: MonitorEvent) => void): Promise<() => void>;
+  subscribeBrowserAccess(listener: (state: BrowserAccessState) => void): Promise<() => void>;
   subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
   subscribeThumbnail(listener: (event: ThumbnailEvent) => void): Promise<() => void>;
   subscribeAi(listener: (event: AiJobEvent) => void): Promise<() => void>;

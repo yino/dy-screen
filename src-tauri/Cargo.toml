@@ -1,5 +1,6 @@
 [package]
 name = "dy-screen-app"
+default-run = "dy-screen-app"
 version = "0.2.0"
 description = "Tauri 2.0 抖音主播监听客户端"
 edition = "2024"

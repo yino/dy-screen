@@ -26,6 +26,8 @@ import {
   Save,
   Search,
   Settings,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Square,
   Tag,
@@ -38,6 +40,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AppSettings,
+  BrowserAccessState,
   ClientApi,
   CreateStreamerInput,
   Dashboard,
@@ -72,6 +75,7 @@ const monitorPriority: Record<MonitorStatus, number> = {
   recording_error: 4,
   profile_error: 4,
   access_restricted: 4,
+  verification_required: 4,
   layout_changed: 4,
   entry_invalid: 4,
   identity_conflict: 4,
@@ -95,6 +99,7 @@ const monitorLabels = {
   profile_error: "主页检查失败",
   rediscovering: "重新发现直播间",
   access_restricted: "访问受限",
+  verification_required: "需要访问验证",
   layout_changed: "页面结构变化",
   entry_invalid: "直播入口失效",
   identity_conflict: "身份冲突已暂停",
@@ -186,6 +191,18 @@ function thumbnailMediaUrl(path: string): string {
   return "__TAURI_INTERNALS__" in window ? convertFileSrc(path) : path;
 }
 
+function isOlderBrowserAccessState(
+  incoming: BrowserAccessState,
+  current: BrowserAccessState | null,
+): boolean {
+  if (!current) return false;
+  const incomingUpdatedAt = Date.parse(incoming.updatedAt);
+  const currentUpdatedAt = Date.parse(current.updatedAt);
+  if (Number.isNaN(incomingUpdatedAt)) return !Number.isNaN(currentUpdatedAt);
+  if (Number.isNaN(currentUpdatedAt)) return false;
+  return incomingUpdatedAt < currentUpdatedAt;
+}
+
 interface AppProps {
   api: ClientApi;
 }
@@ -209,6 +226,9 @@ export function App({ api }: AppProps) {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [preview, setPreview] = useState<ActivePreview | null>(null);
   const [thumbnailBatch, setThumbnailBatch] = useState<ThumbnailBatch | null>(null);
+  const [browserAccess, setBrowserAccess] = useState<BrowserAccessState | null>(null);
+  const [accessBusy, setAccessBusy] = useState<"verify" | "check" | "clear" | null>(null);
+  const browserAccessRef = useRef<BrowserAccessState | null>(null);
   const selectedIdRef = useRef(selectedId);
   const pageRef = useRef(page);
   const historyPageRef = useRef(historyPage);
@@ -219,6 +239,13 @@ export function App({ api }: AppProps) {
   historyPageRef.current = historyPage;
   historyStreamerIdRef.current = historyStreamerId;
   historyFiltersRef.current = historyFilters;
+
+  const acceptBrowserAccess = useCallback((state: BrowserAccessState): boolean => {
+    if (isOlderBrowserAccessState(state, browserAccessRef.current)) return false;
+    browserAccessRef.current = state;
+    setBrowserAccess(state);
+    return true;
+  }, []);
 
   const refreshDashboard = useCallback(async () => {
     try {
@@ -297,6 +324,28 @@ export function App({ api }: AppProps) {
       unsubscribe?.();
     };
   }, [api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    const updateAccess = (state: BrowserAccessState) => {
+      if (disposed) return;
+      if (acceptBrowserAccess(state) && state.status === "session_ready") void refreshDashboard();
+    };
+    void api.getBrowserAccessState()
+      .then(updateAccess)
+      .catch((error) => {
+        if (!disposed) setNotice(errorMessage(error, "读取抖音访问状态失败"));
+      });
+    void api.subscribeBrowserAccess(updateAccess).then((handler) => {
+      if (disposed) handler();
+      else unsubscribe = handler;
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, [acceptBrowserAccess, api, refreshDashboard]);
 
   useEffect(() => {
     let disposed = false;
@@ -477,6 +526,45 @@ export function App({ api }: AppProps) {
       .catch((error) => setNotice(errorMessage(error, "视频封面重试失败")));
   }, [api, thumbnailBatch?.batchId]);
 
+  const showVerification = async () => {
+    setAccessBusy("verify");
+    try {
+      await api.showDouyinVerification();
+    } catch (error) {
+      setNotice(errorMessage(error, "无法打开抖音访问验证窗口"));
+    } finally {
+      setAccessBusy(null);
+    }
+  };
+
+  const recheckAccess = async () => {
+    setAccessBusy("check");
+    try {
+      const state = await api.recheckDouyinAccess();
+      acceptBrowserAccess(state);
+      await refreshDashboard();
+      setNotice("已重新检查抖音公开页访问状态");
+    } catch (error) {
+      setNotice(errorMessage(error, "重新检查抖音访问状态失败"));
+    } finally {
+      setAccessBusy(null);
+    }
+  };
+
+  const clearAccessSession = async () => {
+    if (!window.confirm("清除后需要重新建立抖音访问会话，但不会删除主播、录像或设置。确认继续？")) return;
+    setAccessBusy("clear");
+    try {
+      const state = await api.clearDouyinSession(true);
+      acceptBrowserAccess(state);
+      setNotice("抖音浏览器会话已清除");
+    } catch (error) {
+      setNotice(errorMessage(error, "清除抖音浏览器会话失败"));
+    } finally {
+      setAccessBusy(null);
+    }
+  };
+
   return (
     <div className="app-shell">
       <Sidebar
@@ -520,6 +608,8 @@ export function App({ api }: AppProps) {
             streamers={sortedStreamers}
             selected={selectedStreamer}
             videos={currentVideos}
+            browserAccess={browserAccess}
+            accessBusy={accessBusy}
             onAdd={() => { setEditingStreamer(null); setAddOpen(true); }}
             onSelect={setSelectedId}
             onRefresh={() => void refreshDashboard()}
@@ -539,6 +629,8 @@ export function App({ api }: AppProps) {
             onOpenVideo={(id) => void action(() => api.openVideo(id))}
             onRevealVideo={(id) => void action(() => api.revealVideo(id))}
             onOpenLogs={() => void action(() => api.openLogs())}
+            onVerify={() => void showVerification()}
+            onRecheckAccess={() => void recheckAccess()}
           />
         )}
 
@@ -593,8 +685,13 @@ export function App({ api }: AppProps) {
           <SettingsPage
             settings={settings}
             environment={environment}
+            browserAccess={browserAccess}
+            accessBusy={accessBusy}
             onOpenLogs={() => void action(() => api.openLogs())}
             onDiagnose={() => void api.diagnoseEnvironment().then(setEnvironment)}
+            onVerifyAccess={() => void showVerification()}
+            onRecheckAccess={() => void recheckAccess()}
+            onClearAccess={() => void clearAccessSession()}
             onSave={(next) => void action(async () => {
               await api.saveSettings(next);
               setSettings(next);
@@ -707,6 +804,8 @@ function MonitorPage({
   streamers,
   selected,
   videos,
+  browserAccess,
+  accessBusy,
   onAdd,
   onSelect,
   onRefresh,
@@ -719,12 +818,16 @@ function MonitorPage({
   onOpenVideo,
   onRevealVideo,
   onOpenLogs,
+  onVerify,
+  onRecheckAccess,
 }: {
   loading: boolean;
   dashboard: Dashboard;
   streamers: Streamer[];
   selected: Streamer | null;
   videos: VideoItem[];
+  browserAccess: BrowserAccessState | null;
+  accessBusy: "verify" | "check" | "clear" | null;
   onAdd: () => void;
   onSelect: (id: number) => void;
   onRefresh: () => void;
@@ -737,6 +840,8 @@ function MonitorPage({
   onOpenVideo: (id: number) => void;
   onRevealVideo: (id: number) => void;
   onOpenLogs: () => void;
+  onVerify: () => void;
+  onRecheckAccess: () => void;
 }) {
   const liveCount = dashboard.streamers.filter((item) => item.liveStatus === "live").length;
   const waitingCount = dashboard.streamers.filter((item) =>
@@ -744,9 +849,17 @@ function MonitorPage({
   ).length;
   return (
     <div className="page-content">
+      {browserAccess && browserAccess.status !== "native" && (
+        <BrowserAccessBanner
+          state={browserAccess}
+          busy={accessBusy}
+          onVerify={onVerify}
+          onRecheck={onRecheckAccess}
+        />
+      )}
       <section className="summary-grid">
         <SummaryCard icon={Radio} label="监控主播" value={dashboard.streamers.length} hint="已配置的活动主播" tone="green" />
-        <SummaryCard icon={Wifi} label="正在直播" value={liveCount} hint="状态每 30 秒刷新" tone="orange" />
+        <SummaryCard icon={Wifi} label="正在直播" value={liveCount} hint="离线约 60 秒刷新" tone="orange" />
         <SummaryCard icon={Video} label="活动录制" value={dashboard.activeRecordings} hint="默认最多同时 4 路" tone="blue" />
         <SummaryCard icon={Clock3} label="等待开播" value={waitingCount} hint="应用关闭窗口后继续" tone="purple" />
       </section>
@@ -775,6 +888,7 @@ function MonitorPage({
                     <StreamerRow
                       key={streamer.id}
                       streamer={streamer}
+                      browserAccess={browserAccess}
                       selected={selected?.id === streamer.id}
                       onSelect={() => onSelect(streamer.id)}
                       onToggle={() => onToggle(streamer)}
@@ -783,6 +897,7 @@ function MonitorPage({
                       onStop={() => onStop(streamer.id)}
                       onArchive={() => onArchive(streamer.id)}
                       onOpenLogs={onOpenLogs}
+                      onVerify={onVerify}
                     />
                   ))}
                 </tbody>
@@ -803,6 +918,53 @@ function MonitorPage({
   );
 }
 
+function BrowserAccessBanner({ state, busy, onVerify, onRecheck }: {
+  state: BrowserAccessState;
+  busy: "verify" | "check" | "clear" | null;
+  onVerify: () => void;
+  onRecheck: () => void;
+}) {
+  const requiresAction = state.status === "verification_required" || state.status === "session_expired";
+  const title = state.status === "browser_resolving"
+    ? "正在通过浏览器检查直播间"
+    : state.status === "verification_required"
+      ? "需要访问验证"
+      : state.status === "session_ready"
+        ? "浏览器会话可用"
+        : "浏览器会话需要重新建立";
+  const queueLabel = state.pendingCount > 0 ? `等待处理 ${state.pendingCount} 个直播间` : null;
+  return (
+    <section
+      className={`access-banner ${state.status}`}
+      role={requiresAction ? "alert" : "status"}
+      aria-label="抖音访问状态"
+    >
+      <div className="access-banner-icon">
+        {requiresAction ? <ShieldAlert size={21} /> : <ShieldCheck size={21} />}
+      </div>
+      <div className="access-banner-copy">
+        <strong>{title}</strong>
+        <div>
+          {queueLabel && <span>{queueLabel}</span>}
+          {state.lastReason && <span>{state.lastReason}</span>}
+        </div>
+      </div>
+      <div className="access-banner-actions">
+        {requiresAction && (
+          <button className="primary-button" disabled={busy !== null} onClick={onVerify}>
+            {busy === "verify" ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+            立即验证
+          </button>
+        )}
+        <button className="secondary-button" disabled={busy !== null} onClick={onRecheck}>
+          {busy === "check" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
+          检查访问状态
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function SummaryCard({ icon: Icon, label, value, hint, tone }: { icon: typeof Radio; label: string; value: number; hint: string; tone: string }) {
   return (
     <article className="summary-card">
@@ -813,8 +975,9 @@ function SummaryCard({ icon: Icon, label, value, hint, tone }: { icon: typeof Ra
   );
 }
 
-function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, onStop, onArchive, onOpenLogs }: {
+function StreamerRow({ streamer, browserAccess, selected, onSelect, onToggle, onCheck, onEdit, onStop, onArchive, onOpenLogs, onVerify }: {
   streamer: Streamer;
+  browserAccess: BrowserAccessState | null;
   selected: boolean;
   onSelect: () => void;
   onToggle: () => void;
@@ -823,6 +986,7 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
   onStop: () => void;
   onArchive: () => void;
   onOpenLogs: () => void;
+  onVerify: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const sourceLabel = streamer.sourceKind === "profile" ? "个人主页" : "直播间直连";
@@ -831,16 +995,19 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
     : streamer.profileSecUid
       ? `主页 ${streamer.profileSecUid.slice(-8)}`
       : "身份待确认";
+  const browserResolving = browserAccess?.status === "browser_resolving"
+    && browserAccess.activeStreamerId === streamer.id;
+  const monitorLabel = browserResolving ? "浏览器解析中" : monitorLabels[streamer.monitorStatus];
   const monitorKind = streamer.monitorStatus === "recording"
     ? "recording"
-    : ["recording_error", "profile_error", "access_restricted", "layout_changed", "entry_invalid", "identity_conflict"].includes(streamer.monitorStatus)
+    : ["recording_error", "profile_error", "access_restricted", "verification_required", "layout_changed", "entry_invalid", "identity_conflict"].includes(streamer.monitorStatus)
       ? "error"
       : "neutral";
   return (
     <tr data-testid="streamer-row" className={selected ? "selected-row" : ""} onClick={onSelect}>
       <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div className="streamer-primary"><strong>{streamer.name}</strong><span>{sourceLabel} · {identityLabel}</span>{streamer.tags.length > 0 && <div className="streamer-tag-badges" aria-label={`${streamer.name}标签`}>{streamer.tags.slice(0, 2).map((tag) => <span key={tag.id}>{tag.name}</span>)}{streamer.tags.length > 2 && <b title={`另有 ${streamer.tags.length - 2} 个标签`}>+{streamer.tags.length - 2}</b>}</div>}</div></div></td>
       <td><StatusBadge kind={streamer.liveStatus === "live" ? "live" : streamer.liveStatus === "error" ? "error" : "neutral"}>{liveLabels[streamer.liveStatus]}</StatusBadge></td>
-      <td><StatusBadge kind={monitorKind}>{monitorLabels[streamer.monitorStatus]}</StatusBadge></td>
+      <td><StatusBadge kind={monitorKind}>{monitorLabel}</StatusBadge></td>
       <td>
         <div className="muted-cell diagnostic-cell">
           <span>{formatDate(streamer.lastCheckedAt)}</span>
@@ -859,6 +1026,7 @@ function StreamerRow({ streamer, selected, onSelect, onToggle, onCheck, onEdit, 
         {menuOpen && (
           <div className="action-menu">
             <button onClick={() => { onCheck(); setMenuOpen(false); }}><RefreshCw size={15} />立即检查</button>
+            {streamer.monitorStatus === "verification_required" && <button onClick={() => { onVerify(); setMenuOpen(false); }}><ShieldCheck size={15} />立即验证</button>}
             {streamer.roomUrl
               ? <a href={streamer.roomUrl} target="_blank" rel="noreferrer" aria-label="从操作菜单打开直播间" onClick={() => setMenuOpen(false)}><ExternalLink size={15} />打开直播间</a>
               : <button type="button" disabled><ExternalLink size={15} />直播间尚未发现</button>}
@@ -1105,7 +1273,7 @@ function VideoPreviewDialog({ api, video, snapshot, onSnapshot, onRetry, onOpenS
   );
 }
 
-function SettingsPage({ settings, environment, onOpenLogs, onDiagnose, onSave }: { settings: AppSettings; environment: EnvironmentStatus | null; onOpenLogs: () => void; onDiagnose: () => void; onSave: (settings: AppSettings) => void }) {
+function SettingsPage({ settings, environment, browserAccess, accessBusy, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onSave }: { settings: AppSettings; environment: EnvironmentStatus | null; browserAccess: BrowserAccessState | null; accessBusy: "verify" | "check" | "clear" | null; onOpenLogs: () => void; onDiagnose: () => void; onVerifyAccess: () => void; onRecheckAccess: () => void; onClearAccess: () => void; onSave: (settings: AppSettings) => void }) {
   const [form, setForm] = useState(settings);
   const submit = (event: FormEvent) => { event.preventDefault(); onSave(form); };
   return (
@@ -1114,10 +1282,19 @@ function SettingsPage({ settings, environment, onOpenLogs, onDiagnose, onSave }:
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div><HardDrive size={22} /></div><label>录像保存目录<input value={form.outputRoot} onChange={(event) => setForm({ ...form, outputRoot: event.target.value })} /><small>默认位于下载目录，修改后只影响新录制。</small></label><div className="form-grid"><label>清晰度<select value={form.quality} onChange={(event) => setForm({ ...form, quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label><label>分片时长（秒）<input type="number" min="60" value={form.segmentSeconds} onChange={(event) => setForm({ ...form, segmentSeconds: Number(event.target.value) })} /></label><label>最大并发录制<input type="number" min="1" max="16" value={form.maxConcurrentRecordings} onChange={(event) => setForm({ ...form, maxConcurrentRecordings: Number(event.target.value) })} /></label></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div><button type="button" className="secondary-button" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button></div><label>FFmpeg 路径<input value={form.ffmpegPath} onChange={(event) => setForm({ ...form, ffmpegPath: event.target.value })} /></label><label>FFprobe 路径<input value={form.ffprobePath} onChange={(event) => setForm({ ...form, ffprobePath: event.target.value })} /></label><div className="diagnostic-list"><div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未检测到"}</b></div><div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未检测到"}</b></div></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DESKTOP</p><h2>桌面行为</h2></div><Settings size={22} /></div><label className="switch-row"><div><strong>系统通知</strong><small>开播、录制结束、失败和磁盘不足时提醒。</small></div><input type="checkbox" checked={form.notificationsEnabled} onChange={(event) => setForm({ ...form, notificationsEnabled: event.target.checked })} /></label><label className="switch-row"><div><strong>开机自动启动</strong><small>登录系统后恢复已启用的监听任务。</small></div><input type="checkbox" checked={form.autostartEnabled} onChange={(event) => setForm({ ...form, autostartEnabled: event.target.checked })} /></label><button type="button" className="secondary-button full" onClick={onOpenLogs}><FolderOpen size={16} />打开日志目录</button><p className="tray-note">关闭主窗口后应用会驻留系统托盘；请通过托盘菜单显式退出。</p></section>
+        <section className="panel settings-card access-settings-card"><div className="panel-header"><div><p className="section-kicker">DOUYIN ACCESS</p><h2>抖音访问会话</h2></div><ShieldCheck size={22} /></div><div className="access-session-summary"><StatusBadge kind={browserAccess?.status === "verification_required" || browserAccess?.status === "session_expired" ? "error" : "neutral"}>{browserAccess ? accessStatusLabel(browserAccess) : "正在读取"}</StatusBadge>{browserAccess?.lastReason && <p>{browserAccess.lastReason}</p>}<small>会话仅保存在系统 WebView 中；清除操作不会影响主播和录像。</small></div><div className="access-settings-actions"><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onRecheckAccess}>{accessBusy === "check" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}检查访问状态</button><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onVerifyAccess}>{accessBusy === "verify" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重新验证</button><button type="button" className="danger-button" disabled={accessBusy !== null} onClick={onClearAccess}>{accessBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}清除抖音会话</button></div></section>
       </div>
       <div className="save-bar"><span><CheckCircle2 size={16} />数据库和录像均保存在本地</span><button className="primary-button" type="submit"><Save size={17} />保存设置</button></div>
     </form>
   );
+}
+
+function accessStatusLabel(state: BrowserAccessState): string {
+  if (state.status === "native") return "原生访问正常";
+  if (state.status === "browser_resolving") return "浏览器解析中";
+  if (state.status === "verification_required") return "需要访问验证";
+  if (state.status === "session_ready") return "浏览器会话可用";
+  return "会话需要重新建立";
 }
 
 function AddStreamerModal({ api, initial, onClose, onSubmit }: { api: ClientApi; initial: Streamer | null; onClose: () => void; onSubmit: (input: CreateStreamerInput) => Promise<void> }) {

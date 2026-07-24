@@ -1,25 +1,4 @@
-# 抖音直播流发现规格
-
-## Purpose
-
-定义从公开抖音直播间页面安全、确定性地发现当前有效 FLV/HLS 直播流的行为，包括 URL 校验、页面解析、清晰度/协议选择和签名地址脱敏。
-
-## Requirements
-
-### Requirement: 校验支持的直播间 URL
-系统 SHALL 接受 host 为 `live.douyin.com` 的公开直播间 URL 作为直播流解析输入，并 SHALL 接受经过个人主页发现流程验证的标准化直播间 URL；任何用于 FFmpeg 的流发现请求最终 MUST 规范化为 `https://live.douyin.com/{web_rid}`。
-
-#### Scenario: 有效的公开直播间 URL
-- **WHEN** 用户直接提供或个人主页发现流程返回一个 HTTPS `live.douyin.com/{web_rid}` URL
-- **THEN** 系统接受该 URL 并用于现有直播流发现
-
-#### Scenario: 个人主页尚未发现直播入口
-- **WHEN** 个人主页有效但当前没有稳定 `web_rid`
-- **THEN** 系统不得调用直播流 resolver 或启动 FFmpeg，而是继续等待主页发现
-
-#### Scenario: 不支持的 host
-- **WHEN** 最终直播间 URL host 不是 `live.douyin.com`
-- **THEN** 系统返回校验错误，且不启动 FFmpeg
+## ADDED Requirements
 
 ### Requirement: 在原生 HTTP 和浏览器会话之间受控回退
 系统 SHALL 以原生 HTTP 作为公开直播页快速通道，并 SHALL 在其返回 `access_restricted` 时通过持久化浏览器会话重试；浏览器回退结果 MUST 使用与原生通道相同的 `RoomInspection` 和流选择规则。
@@ -59,6 +38,8 @@
 - **WHEN** 单次原生试探再次返回访问限制
 - **THEN** 系统重置冷却期并继续使用浏览器通道
 
+## MODIFIED Requirements
+
 ### Requirement: 从页面初始化数据发现直播流
 系统 SHALL 从原生 HTTP 响应或受控浏览器最小页面快照中解析公开直播页的受支持 React Flight 初始化数据，并返回稳定直播入口对应的当前房间标识、直播状态、默认清晰度以及可用的签名 FLV/HLS 直播流变体；系统 MUST 在解析前区分访问限制页面、需要用户访问验证、明确失效 HTTP 状态和未知页面结构。
 
@@ -85,47 +66,3 @@
 #### Scenario: HTTP 明确表示入口失效
 - **WHEN** 规范化直播间的原生请求返回 HTTP 404 或 410
 - **THEN** 系统返回 `entry_invalid` 分类，不启动浏览器回退且不把其他 HTTP 错误归入该分类
-
-### Requirement: 提供安全的直播间诊断
-系统 SHALL 提供只读直播间诊断能力，并 MUST 将输出限制为规范化房间 URL、可选 HTTP 状态、可选 Content-Type、响应字节数、安全 marker 布尔值、分类和脱敏中文错误。
-
-#### Scenario: 诊断未识别页面
-- **WHEN** 用户对请求成功但结构未知的公开直播间执行 `inspect-room`
-- **THEN** 命令返回 `layout_changed`、HTTP 元信息和安全 marker，不输出 HTML、Cookie、React Flight 原始载荷或签名流 URL
-
-#### Scenario: 诊断网络失败
-- **WHEN** 直播间请求在收到 HTTP 响应前发生超时或网络错误
-- **THEN** 命令返回 `retryable_error` 和脱敏错误，HTTP 状态为空且不输出底层请求敏感信息
-
-#### Scenario: 诊断输入 URL 无效
-- **WHEN** 输入不是受支持的 `live.douyin.com` 公开直播间 URL
-- **THEN** 命令不发起网络请求并返回 `entry_invalid` 和脱敏校验错误
-
-### Requirement: 仅支持经过 fixture 验证的页面格式
-系统 MUST 只为具有脱敏 fixture、成功解析测试、离线测试和敏感数据不泄露测试的页面格式增加直播间解析适配。
-
-#### Scenario: 线上出现未知字段组合
-- **WHEN** 公开页面出现尚无脱敏 fixture 覆盖的新字段组合
-- **THEN** 系统保持 `layout_changed` 分类，不通过宽泛字段猜测选择房间对象或签名直播流
-
-### Requirement: 确定性选择直播流变体
-系统 SHALL 在用户请求的清晰度可用时选择该清晰度，否则选择页面默认清晰度，否则选择已知最高的可用清晰度；在选定清晰度中，除非用户明确请求协议，否则系统 SHALL 优先选择 FLV 而不是 HLS。
-
-#### Scenario: 请求的清晰度和协议均可用
-- **WHEN** 用户请求 `HD1` 和 FLV，且两者都可用
-- **THEN** 系统选择 `HD1` FLV URL
-
-#### Scenario: 请求的清晰度不可用
-- **WHEN** 请求的清晰度不存在，但页面默认清晰度可用
-- **THEN** 系统选择页面默认清晰度并报告发生了回退
-
-#### Scenario: 选定清晰度没有 FLV
-- **WHEN** 系统优先选择 FLV，但选定清晰度只有 HLS
-- **THEN** 系统选择 HLS 变体
-
-### Requirement: 避免在常规状态输出中泄露签名 URL
-系统 MUST NOT 在普通日志、错误或结构化状态事件中包含签名 CDN URL 的查询字符串。
-
-#### Scenario: 直播流解析成功
-- **WHEN** 系统解析到包含鉴权查询参数的直播流 URL
-- **THEN** 常规输出只标识协议、清晰度和已脱敏 endpoint，不暴露查询字符串

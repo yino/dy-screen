@@ -18,6 +18,7 @@ use dy_screen_app_lib::supervisor::{
     Supervisor, profile_backoff_seconds,
 };
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 enum ProfileReply {
@@ -88,6 +89,7 @@ enum RoomReply {
     Offline(&'static str),
     EntryInvalid,
     AccessRestricted,
+    VerificationRequired,
     LayoutChanged,
     Retryable,
 }
@@ -99,6 +101,7 @@ struct FakeRoomDiscovery {
     binding_observations: Arc<Mutex<Vec<bool>>>,
     database: Option<Database>,
     streamer_id: Option<i64>,
+    access_changes: Arc<Semaphore>,
 }
 
 impl FakeRoomDiscovery {
@@ -109,12 +112,18 @@ impl FakeRoomDiscovery {
             binding_observations: Arc::new(Mutex::new(Vec::new())),
             database: None,
             streamer_id: None,
+            access_changes: Arc::new(Semaphore::new(0)),
         }
     }
 
     fn observing(mut self, database: Database, streamer_id: i64) -> Self {
         self.database = Some(database);
         self.streamer_id = Some(streamer_id);
+        self
+    }
+
+    fn with_access_changes(self, count: usize) -> Self {
+        self.access_changes.add_permits(count);
         self
     }
 }
@@ -154,8 +163,16 @@ impl RoomDiscovery for FakeRoomDiscovery {
             }),
             RoomReply::EntryInvalid => Err(RecorderError::RoomHttpStatus { status: 404 }),
             RoomReply::AccessRestricted => Err(RecorderError::RoomAccessRestricted),
+            RoomReply::VerificationRequired => Err(RecorderError::RoomAccessVerificationRequired),
             RoomReply::LayoutChanged => Err(RecorderError::UnsupportedPageLayout),
             RoomReply::Retryable => Err(RecorderError::RoomHttpStatus { status: 503 }),
+        }
+    }
+
+    async fn wait_for_access_change(&self, cancellation: &CancellationToken) -> bool {
+        tokio::select! {
+            _ = cancellation.cancelled() => false,
+            permit = self.access_changes.acquire() => permit.is_ok(),
         }
     }
 }
@@ -564,8 +581,8 @@ async fn offline_room_updates_current_room_id_without_changing_stable_identity()
         4,
         Arc::new(FakeProfileDiscovery::new([])),
         Arc::new(FakeRoomDiscovery::new([RoomReply::Offline("new-room-id")])),
-        Arc::new(FixedJitter(0)),
-        delay,
+        Arc::new(FixedJitter(7)),
+        delay.clone(),
     );
 
     supervisor.start(streamer.id).unwrap();
@@ -582,6 +599,51 @@ async fn offline_room_updates_current_room_id_without_changing_stable_identity()
     let saved = database.get_streamer(streamer.id).unwrap();
     assert_eq!(saved.web_rid.as_deref(), Some("701"));
     assert_eq!(saved.room_id.as_deref(), Some("new-room-id"));
+    assert_eq!(delay.durations.lock().unwrap()[0], Duration::from_secs(67));
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn browser_verification_wait_preserves_binding_without_scheduling_dense_retry() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room(
+            "待验证主播",
+            "703940802949",
+            "known-room-id",
+            true,
+        ))
+        .unwrap();
+    let delay = Arc::new(ControlledDelay::default());
+    let supervisor = Supervisor::with_dependencies(
+        database.clone(),
+        Arc::new(NoopPublisher),
+        4,
+        Arc::new(FakeProfileDiscovery::new([])),
+        Arc::new(FakeRoomDiscovery::new([RoomReply::VerificationRequired])),
+        Arc::new(FixedJitter(0)),
+        delay.clone(),
+    );
+
+    supervisor.start(streamer.id).unwrap();
+    wait_until(|| {
+        database
+            .get_streamer(streamer.id)
+            .is_ok_and(|item| item.monitor_status == "verification_required")
+    })
+    .await;
+
+    let waiting = database.get_streamer(streamer.id).unwrap();
+    assert_eq!(waiting.live_status, "error");
+    assert_eq!(waiting.web_rid.as_deref(), Some("703940802949"));
+    assert_eq!(waiting.room_id.as_deref(), Some("known-room-id"));
+    assert_eq!(waiting.failure_count, 0);
+    assert_eq!(waiting.next_retry_at, None);
+    assert_eq!(
+        delay.durations.lock().unwrap()[0],
+        Duration::from_secs(60 * 60)
+    );
     supervisor.shutdown().await;
 }
 
@@ -999,5 +1061,53 @@ async fn recording_revalidation_persists_and_uses_the_latest_room_id() {
     );
     assert!(directory.path().join("room-B").is_dir());
     assert!(!directory.path().join("room-A").exists());
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn recording_waits_for_browser_verification_without_consuming_retry_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let mut settings = AppSettings::defaults();
+    settings.output_root = directory.path().to_string_lossy().into_owned();
+    settings.ffmpeg_path = "/usr/bin/true".to_owned();
+    settings.ffprobe_path = "/usr/bin/true".to_owned();
+    database.save_settings(&settings).unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room("验证恢复主播", "906", "room-906", true))
+        .unwrap();
+    let room = Arc::new(
+        FakeRoomDiscovery::new([
+            RoomReply::Live("room-906"),
+            RoomReply::Live("room-906"),
+            RoomReply::VerificationRequired,
+            RoomReply::Live("room-906"),
+            RoomReply::Offline("room-906"),
+        ])
+        .with_access_changes(1),
+    );
+    let supervisor = Supervisor::with_dependencies(
+        database.clone(),
+        Arc::new(NoopPublisher),
+        4,
+        Arc::new(FakeProfileDiscovery::new([])),
+        room.clone(),
+        Arc::new(FixedJitter(0)),
+        Arc::new(ControlledDelay::default()),
+    );
+
+    supervisor.start(streamer.id).unwrap();
+    wait_until(|| {
+        database
+            .get_session(1)
+            .is_ok_and(|session| session.ended_at.is_some())
+    })
+    .await;
+
+    let session = database.get_session(1).unwrap();
+    assert_eq!(session.status, "completed");
+    assert_eq!(session.retry_count, 0);
+    assert!(room.calls.lock().unwrap().len() >= 5);
     supervisor.shutdown().await;
 }

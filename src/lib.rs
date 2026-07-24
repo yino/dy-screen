@@ -1,4 +1,6 @@
+pub mod access;
 pub mod asr;
+pub mod browser_snapshot;
 pub mod error;
 mod flight;
 pub mod manager;

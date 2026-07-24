@@ -401,3 +401,37 @@ pub struct MonitorEvent {
     pub kind: String,
     pub streamer_id: Option<i64>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserAccessStatus {
+    Native,
+    BrowserResolving,
+    VerificationRequired,
+    SessionReady,
+    SessionExpired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserAccessState {
+    pub status: BrowserAccessStatus,
+    pub pending_count: usize,
+    pub active_streamer_id: Option<i64>,
+    pub current_web_rid: Option<String>,
+    pub last_reason: Option<String>,
+    pub updated_at: String,
+}
+
+impl BrowserAccessState {
+    pub fn native() -> Self {
+        Self {
+            status: BrowserAccessStatus::Native,
+            pending_count: 0,
+            active_streamer_id: None,
+            current_web_rid: None,
+            last_reason: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}

@@ -2,7 +2,8 @@ use dy_screen::error::RecorderError;
 use dy_screen::model::{Protocol, RoomStreams};
 use dy_screen::resolver::{
     RoomDiagnosticClassification, RoomInspection, classify_room_http_status,
-    diagnose_room_response, parse_room_inspection, parse_room_page, validate_room_url,
+    diagnose_room_response, parse_room_inspection, parse_room_page, parse_room_scripts_for_web_rid,
+    validate_room_url,
 };
 use reqwest::StatusCode;
 
@@ -52,6 +53,34 @@ fn inspects_canonical_identity_for_offline_room() {
             room_id: "offline-room".to_owned()
         }
     );
+}
+
+#[test]
+fn target_identity_ignores_an_unrelated_live_room_before_the_requested_room() {
+    let live_script = LIVE_PAGE
+        .split("<script>")
+        .nth(1)
+        .and_then(|value| value.split("</script>").next())
+        .unwrap();
+    let offline_script = OFFLINE_PAGE
+        .split("<script>")
+        .nth(1)
+        .and_then(|value| value.split("</script>").next())
+        .unwrap();
+
+    let inspection = parse_room_scripts_for_web_rid([live_script, offline_script], "offline-room")
+        .expect("requested offline room");
+
+    assert_eq!(
+        inspection,
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned(),
+        }
+    );
+    assert!(matches!(
+        parse_room_scripts_for_web_rid([live_script], "different-room"),
+        Err(RecorderError::UnsupportedPageLayout)
+    ));
 }
 
 #[test]

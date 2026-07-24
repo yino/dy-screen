@@ -11,11 +11,14 @@
 - 个人主页未开播时允许先保存，后台持续等待首次开播；
 - 使用 `profile_sec_uid`、稳定 `web_rid` 和当前 `room_id` 区分主页身份、长期直播入口和本次直播场次；
 - 首次发现直播入口后持久化标准化 `https://live.douyin.com/{web_rid}`，随后复用现有直播解析与录制链路；
+- 直播间解析优先使用原生 HTTP；命中公开页访问限制后自动回退到一个全局、持久化且串行共享的系统 WebView；
+- WebView 能自行进入公开直播页时静默恢复监听，确实需要交互时才显示“需要访问验证”，由用户主动打开验证窗口；
+- 多个主播共享同一浏览器会话，浏览器解析期间不会阻塞已经运行的 FFmpeg 录制；
 - 规范化来源链接、真实访问公开页面、提取身份并阻止重复主页或稳定直播入口；
 - 使用 SQLite 保存主播、监听状态、设置、录制会话和视频分片；
 - 应用启动后自动恢复之前开启的监听任务；
 - 尚未发现直播入口的个人主页约每 60 秒加 0–10 秒抖动检查，错误按 60、120、300 秒退避；
-- 已发现直播入口后每 30 秒检查一次；只有连续 3 次非法 URL、HTTP 404 或 410 才回查个人主页，普通离线、访问受限、页面结构变化和网络错误不会清除稳定入口；
+- 已发现且离线的直播入口按 60 秒基础周期加 0–15 秒抖动检查；所有公开页面访问至少间隔 5 秒；只有连续 3 次非法 URL、HTTP 404 或 410 才回查个人主页，普通离线、访问受限、页面结构变化和网络错误不会清除稳定入口；
 - 检测到开播后自动启动 FFmpeg，直播结束后关闭本次录制会话；
 - FFmpeg 退出后重新确认房间状态；仍在直播时在同一逻辑会话中最多续录 3 次，只有明确未开播才结束会话；
 - 默认最多同时录制 4 个直播间，可在设置页修改；
@@ -29,7 +32,8 @@
 - 支持删除单个视频或整个已结束会话；删除失败时恢复数据库状态并显示错误；
 - 关闭主窗口后驻留系统托盘，监听和录制继续运行；
 - 托盘提供打开窗口、暂停全部、恢复全部和退出；
-- 提供安全的直播间响应诊断、FFmpeg/FFprobe 环境诊断、结构化监听日志、系统通知、日志目录和可选开机启动；
+- 每次原生请求、浏览器导航、页面探测状态变化、回退和最终动作都会向控制台及按日 JSONL 输出同一条脱敏诊断；不变的页面探测最多每 30 秒记录一次心跳；
+- 提供安全的直播间响应诊断、FFmpeg/FFprobe 环境诊断、访问验证状态、去重系统通知、日志目录和可选开机启动；
 - 磁盘低于 10 GB 时警告，低于 2 GB 时不启动新录制，低于 1 GB 时安全停止活动录制；
 - AI 剪辑工作区支持创建项目、通过系统文件选择器导入多个本地视频，或选择一场已结束直播并按稳定顺序展开全部登记分片；
 - 只有用户点击“开始分析”后才运行 ASR，打开页面、应用启动和新录像完成都不会自动识别；
@@ -57,7 +61,7 @@
 
 ```text
 dy-screen/
-├── src/                         Rust 直播解析、FFmpeg 录制和多任务核心
+├── src/                         Rust 直播解析、浏览器快照、FFmpeg 录制和多任务核心
 ├── tests/                       录制核心测试与页面 fixture
 ├── ui/                          React + TypeScript + Vite 客户端界面
 │   └── src/
@@ -68,6 +72,8 @@ dy-screen/
 ├── src-tauri/                   Tauri 2.0 桌面后端
 │   ├── src/database.rs          SQLite migration 和 repository
 │   ├── src/supervisor.rs        监听 worker、自动录制、重试和磁盘保护
+│   ├── src/room_resolution.rs   原生 HTTP/WebView 双通道解析与共享会话状态机
+│   ├── src/tauri_browser.rs     受限抖音验证窗口、最小快照和导航安全策略
 │   ├── src/preview.rs           预览队列、FFmpeg 转换、缓存和状态模型
 │   ├── src/thumbnail.rs         首帧封面、分页批次、JPEG 缓存和生命周期
 │   ├── src/ai/                  AI 项目、命令、调度、恢复和本地 ASR 运行时
@@ -147,7 +153,9 @@ make app-dev
 5. 保持“添加后立即监听”开启；
 6. 可选添加“带货”“搞笑”等主播标签，并使用上移、下移按钮调整未来切片上下文优先级；
 7. 保存后，后台会立即检查一次主页或直播状态；
-8. 主播开播时自动录制，下播时自动结束会话。
+8. 原生 HTTP 受限时客户端会自动切换到隐藏的系统 WebView，不会自动弹窗抢焦点；
+9. 如果监控中心显示“需要访问验证”，点击“立即验证”并在抖音窗口完成人工操作；客户端检测到恢复后会自动隐藏窗口并继续等待任务；若窗口停在灰色加载页，点击“检查访问状态”会先重试当前目标的原生通道，仍受限时才重载浏览器页面；
+10. 主播开播时自动录制，下播时自动结束会话。
 
 直播间可能随时下播，示例地址只用于展示格式。
 
@@ -215,7 +223,7 @@ make web-dev
 http://localhost:1420/
 ```
 
-浏览器预览使用 `localStorage` 模拟主播、标签和设置，不能解析真实直播状态，也不能启动 FFmpeg。浏览器演示中的标签不会写入 SQLite；真实监听和录制必须使用 `make app-dev`。
+浏览器预览使用 `localStorage` 模拟主播、标签和设置，不能解析真实直播状态、建立抖音 WebView 会话或启动 FFmpeg。访问会话固定显示“真实访问验证仅桌面端可用”，不会伪造恢复成功。浏览器演示中的标签不会写入 SQLite；真实监听和录制必须使用 `make app-dev`。
 
 ## 构建桌面应用
 
@@ -288,10 +296,13 @@ AVX/AVX2/BMI2，避免构建机 CPU 自动优化导致安装后非法指令崩�
     │       ├── 未发现入口：60 秒 + 0–10 秒抖动后重试
     │       ├── 暂时失败：60/120/300 秒退避
     │       └── 首次发现：先保存 web_rid/room_url/room_id，再立即检查直播间
-    └── 是：每 30 秒检查标准化直播间
+    └── 是：按 60 秒 + 0–15 秒抖动检查标准化直播间
             ├── 未开播：保留稳定入口
             ├── 网络失败：退避但不回查主页
-            ├── 访问受限/页面结构变化：保留入口并退避重试
+            ├── 原生 HTTP 访问受限：切换共享 WebView
+            │       ├── 浏览器可解析：恢复监听或录制
+            │       └── 仍需交互：等待用户主动完成访问验证
+            ├── 页面结构变化：保留入口并退避重试
             ├── 连续 3 次 404/410：清除直播绑定并回查主页
             └── 正在直播
             ↓
@@ -311,7 +322,9 @@ AVX/AVX2/BMI2，避免构建机 CPU 自动优化导致安装后非法指令崩�
 直播状态和监听状态分开保存：
 
 - 直播状态：检查中、未开播、直播中、检查失败；
-- 监听状态：已暂停、正在发现直播间、等待首次开播、主页检查失败、重新发现直播间、等待开播、等待资源、录制中、正在重试、录制异常。
+- 监听状态：已暂停、正在发现直播间、等待首次开播、主页检查失败、重新发现直播间、等待开播、浏览器解析中、需要访问验证、等待资源、录制中、正在重试、录制异常。
+
+全局浏览器访问状态另行显示为：原生访问正常、浏览器解析中、需要访问验证、浏览器会话可用或会话需要重新建立。它不会把主播误报为下播或直播入口失效。
 
 因此，“主播未开播”和“应用没有监听”不会被混为同一个状态。
 
@@ -371,12 +384,28 @@ macOS 默认日志目录：
 
 设置页和检查失败主播的操作菜单都可以打开日志目录。监听检查按 UTC 日期写入 `dy-screen-YYYY-MM-DD.jsonl`，每行只包含：
 
-- `timestamp`：检查时间；
-- `streamerId` 和可选 `webRid`：本地主播与稳定入口标识；
-- `classification`：`live`、`offline`、`access_restricted`、`layout_changed`、`entry_invalid` 或 `retryable_error`；
-- 可选 `httpStatus`、`failureCount` 和 `nextRetryAt`。
+- `timestamp`、`streamerId`、可选 `webRid` 和内部 `requestId`；
+- `channel`：真实访问使用 `native` 或 `browser`，Supervisor 的派生状态汇总使用 `monitor`，避免把浏览器结果误标成原生响应；
+- `stage`：请求、响应、导航、探测、回退或最终结果；
+- `classification`：`live`、`offline`、`access_restricted`、`verification_required`、`layout_changed`、`entry_invalid`、`retryable_error` 等白名单枚举；
+- 可选 HTTP 状态、Content-Type、响应字节数和安全 marker 布尔值；
+- 耗时、连续失败次数、下一动作和可选重试时间。
 
-日志不会写入 HTML、Cookie、React Flight 原始载荷、直播间查询参数、错误正文或签名流地址。应用启动时只清理超过 14 天的应用日志，不会删除录像或数据库。
+每次真实访问在全局访问门放行后先输出 `request/pending`，完成时再输出原生 `response` 或浏览器 `navigation`；随后页面探测状态变化、回退和最终监听结果继续使用同一个 `requestId`。验证页面状态持续不变时只记录首次状态和最长 30 秒一次的心跳，不按 watcher 轮询频率刷屏。如果只有请求开始而没有完成记录，说明该访问仍在进行、已被取消或进程在返回前中断。每条白名单 JSON 都同时写到 stderr 和当日 JSONL。实例锁和退出流程还会向 stderr 输出 `instance_lock_acquired`、`instance_rejected`、`signal_registration_failed`、`shutdown_started`、`shutdown_deduplicated`、`shutdown_completed` 或 `shutdown_timed_out` 生命周期事件，只包含时间、固定事件和固定退出原因。日志不会写入 HTML、Cookie、React Flight 原始载荷、页面标题、直播间查询参数、错误正文、PID、本地路径或签名流地址。应用启动时只清理超过 30 天的应用日志，不会删除录像或数据库。
+
+### 抖音浏览器会话
+
+原生 HTTP 返回访问验证中间页后，客户端会按需创建标签为 `douyin-access` 的系统 WebView。该窗口默认隐藏，多个直播间串行共用同一个平台浏览数据目录；应用重启后会重新探测，而不是直接假定旧会话仍然有效。
+
+- 房间解析目标只允许 `https://live.douyin.com`；WKWebView 导航回调还只允许验证码组件所需的精确 `about:blank` 和 `https://rmc.bytedance.com/verifycenter/captcha/` 路径，其他站点、相似域名、非 HTTPS、新窗口和下载会被拒绝；
+- 远程页面不具备主窗口 capability，不能调用客户端通用 Tauri command 或读取本地文件；
+- Rust 只主动读取规范化 URL、加载状态、安全 marker 和有界的受支持初始化脚本；
+- 每次导航都校验请求代次、目标 URL、完整加载状态和目标 `web_rid`；旧房间页面或推荐房间对象不会被用于启动录制；
+- 应用不读取、导出或写日志记录 Cookie、账号密码、完整 HTML、`localStorage` 或签名流参数；
+- 应用不会自动识别验证码、模拟拖动或点击、接入第三方打码、切换代理或自动登录；
+- 用户关闭验证窗口只会隐藏窗口并保留会话；设置页“清除抖音会话”会取消待处理浏览器解析并删除 WebView browsing data，但保留主播、录像和设置；
+- 一个房间等待人工验证时，后续浏览器导航会暂停以保留当前页面，但其他房间仍可执行原生 HTTP 检查；窗口打开期间客户端自动观察当前页，“检查访问状态”会先尝试原生恢复，仍受限时才受控重载当前目标，恢复后自动唤醒所有主播；
+- 清除会话时已经运行的 FFmpeg 不会被强制停止，只有后续状态刷新或流地址续签需要重新建立会话。
 
 ## 主播标签与未来切片上下文
 
@@ -407,7 +436,10 @@ macOS 默认日志目录：
 - 托盘支持暂停全部和恢复全部监听；
 - 显式退出且存在活动录制时，主窗口会要求确认；
 - 确认后，后端先取消活动录制并等待完成分片收尾，超时后才会结束任务；
-- 所有 worker 共享一个全局 10 秒退出期限，超时任务会终止并执行 SQLite 会话对账，退出耗时不会随主播数量线性增加。
+- macOS/Linux 的 `SIGTERM` 和 `SIGINT` 与前端、托盘、Tauri 退出请求共用同一个幂等关闭流程，重复退出事件不会重复结束会话；
+- 所有 worker 共享 10 秒 Supervisor 子期限，整个应用关闭使用 20 秒总期限；正常路径会等待 FFmpeg、WebView、预览、缩略图和 AI runtime 清理后退出；
+- 应用数据目录持有进程级独占锁，锁在打开 SQLite 和执行启动恢复前获取；第二实例只输出 `instance_rejected` 并退出，不会把第一实例的活动会话误标为中断或启动重复 FFmpeg；
+- 只有旧实例完成关闭并释放锁后，新实例才能协调遗留分片并恢复已启用监听。
 
 ## 视频预览与 MKV 打开方式
 
@@ -483,7 +515,7 @@ make help
 | `make web-dev` | 启动浏览器界面预览 |
 | `make typecheck` | 执行 React/TypeScript 类型检查 |
 | `make frontend-build` | 类型检查并构建 React 前端 |
-| `make app-dev` | 启动 Tauri 桌面开发客户端 |
+| `make app-dev` | 启动 Tauri 桌面开发客户端；保留 Vite 前端热更新并禁用会强制结束录制进程的 Rust watcher |
 | `make app-build` | 构建桌面应用 |
 | `make asr-ffmpeg-macos FFMPEG_SOURCE=...` | 从锁定官方源码构建 LGPL、无网络、可相对定位的 macOS ASR FFmpeg |
 | `make asr-stage-macos ASR_SOURCE=...` | 校验并准备单平台 macOS arm64 ASR 随包目录 |
@@ -525,6 +557,19 @@ make help
 | `make test-tag-repository` | 执行标签持久化、合并、重启和上下文测试 |
 | `make test-tag-service` | 执行标签校验及主播创建、编辑服务测试 |
 | `make test-tag-ui` | 执行标签表单、徽章、详情和浏览器演示测试 |
+| `make test-browser-access` | 聚合执行核心快照、双通道服务、Tauri driver、Supervisor、React 和日志 fixture 测试 |
+| `make test-access-core` | 执行浏览器最小快照、严格解析和诊断白名单测试 |
+| `make test-room-resolution` | 执行原生优先、WebView 回退、粘性模式、串行队列、取消和恢复测试 |
+| `make test-tauri-browser` | 执行验证窗口导航、下载、新窗口、旧 callback 和 capability 安全测试 |
+| `make test-access-supervisor` | 执行多房访问门、验证等待、状态持久化和同会话续录测试 |
+| `make test-access-ui` | 执行访问横幅、主播行、设置操作、事件恢复和浏览器降级测试 |
+| `make test-access-fixtures` | 比对本地受支持页/验证页产生的 stderr 与 JSONL，并检查敏感值不泄漏 |
+| `make test-app-lifecycle` | 执行实例锁互斥、锁释放后重获和关闭只领取一次的测试 |
+| `make accept-access-fixtures ACCESS_FIXTURE_LOG_DIR=...` | 运行本地双页面验收并保留可查看的按日 JSONL |
+| `make diagnose-real-room ACCEPT_ROOM_URL=...` | 对真实公开房间执行原生 HTTP 脱敏诊断，不启动 WebView |
+| `make tail-access-log APP_LOG_DIR=...` | 持续查看客户端当天的访问 JSONL |
+| `make accept-real-room ACCEPT_ROOM_URL=...` | 显式启动 Tauri，执行单房 WebView 回退、验证和录制验收 |
+| `make accept-real-multi ACCEPT_ROOM_URLS="..." ACCEPT_MINUTES=30` | 显式启动至少三房的长时间监听与续录验收 |
 | `make test` | 执行全部测试 |
 | `make check` | 执行格式、Clippy、全部测试和前端构建 |
 | `make spec-validate` | 严格校验全部 OpenSpec 主规格和活动变更 |
@@ -590,13 +635,14 @@ make inspect-room \
 | 分类 | 含义 | 监听处理 |
 | --- | --- | --- |
 | `live` | 找到受支持的在线房间结构 | 进入录制流程 |
-| `offline` | 找到房间身份但当前无可用直播流 | 保留入口并按 30 秒周期等待 |
-| `access_restricted` | HTTP 状态或安全 marker 表明需要额外访问权限 | 保留入口并有界退避 |
+| `offline` | 找到房间身份但当前无可用直播流 | 保留入口并按 60 秒加抖动等待 |
+| `access_restricted` | 原生 HTTP 状态或安全 marker 表明需要额外访问验证 | 桌面客户端切换共享 WebView；CLI 只报告分类 |
+| `verification_required` | WebView 有界探测后仍需要用户交互 | 保留入口和录制会话，等待用户主动验证 |
 | `layout_changed` | 请求成功但当前版本无法识别页面结构 | 保留入口并有界退避 |
 | `entry_invalid` | URL 非法或返回 HTTP 404/410 | 个人主页来源连续 3 次后重新发现 |
 | `retryable_error` | 网络错误或其他暂时 HTTP 错误 | 保留入口并有界退避 |
 
-输出只包含规范化直播间 URL、HTTP 状态、Content-Type、响应字节数、安全 marker 布尔值、分类和脱敏错误，不包含页面正文、Cookie、React Flight 原始载荷或签名流地址。该命令只读访问普通公开页面，不导入登录态，也不会处理或绕过验证码。
+输出只包含规范化直播间 URL、HTTP 状态、Content-Type、响应字节数、安全 marker 布尔值、分类和脱敏错误，不包含页面正文、Cookie、React Flight 原始载荷或签名流地址。该 CLI 命令只使用原生 HTTP，不会启动桌面 WebView；因此它返回 `access_restricted` 而 Tauri 客户端随后通过浏览器恢复，是符合设计的正常结果。
 
 解析直播间：
 
@@ -627,6 +673,8 @@ make record-multi \
 
 ## 开发与验证
 
+`make app-dev` 默认使用 `tauri dev --no-watch`。React/TypeScript 仍由 Vite 热更新；修改 Rust 后按 `Ctrl-C` 等待 `shutdown_completed`，再重新执行 `make app-dev`。不要直接使用带 Rust watcher 的 `tauri dev`，该 watcher 在 macOS 重建时会强制终止父进程，应用无法接管该终止并安全关闭 FFmpeg。
+
 执行全量检查：
 
 ```bash
@@ -646,13 +694,49 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 openspec validate --all --strict
 ```
 
+浏览器会话解析的离线聚焦验证：
+
+```bash
+make test-browser-access
+make accept-access-fixtures \
+  ACCESS_FIXTURE_LOG_DIR=/private/tmp/dy-screen-access-fixtures
+```
+
+真实公开房间不进入普通 `test`、`check` 或 CI。先确认原生通道的当前分类：
+
+```bash
+make diagnose-real-room \
+  ACCEPT_ROOM_URL='https://live.douyin.com/703940802949'
+```
+
+然后启动桌面验收，并在另一个终端持续查看访问日志：
+
+```bash
+make accept-real-room \
+  ACCEPT_ROOM_URL='https://live.douyin.com/703940802949'
+
+make tail-access-log
+```
+
+单房验收必须同时保留以下证据：原生 `access_restricted` 诊断、浏览器通道 `live`、FFmpeg 启动、SQLite 中的活动会话、实际生成且 FFprobe 确认含音轨的 MKV，以及主动结束一次 FFmpeg 后在同一逻辑会话产生的后续分片。房间已下播时应换用当时正在直播且有权录制的公开房间，不能把离线结果写成成功。
+
+多房验收使用至少三个公开房间：
+
+```bash
+make accept-real-multi \
+  ACCEPT_ROOM_URLS='https://live.douyin.com/ROOM_A https://live.douyin.com/ROOM_B https://live.douyin.com/ROOM_C' \
+  ACCEPT_MINUTES=30
+```
+
+连续观察至少 30 分钟，确认页面访问按至少 5 秒间隔串行执行、多个 FFmpeg 可以独立并发、重复验证状态只通知一次、人工恢复后等待 worker 被唤醒，并至少完成一次同会话地址刷新续录。
+
 ## 当前限制
 
 - 录制、托盘、通知和文件管理器行为仍优先在 macOS 开发；Windows x64 的本地 ASR 适配器和安装配置已有自动化覆盖，但正式安装、签名、SmartScreen、中文用户目录与卸载仍需 Windows 实机发行验收；
 - 普通开发构建继续允许使用设置中的 FFmpeg/FFprobe；正式 ASR 安装包通过平台覆盖配置携带独立 sidecar，发行流水线必须提供非符号链接、许可明确的可分发二进制；
 - 抖音修改页面或 React Flight 数据结构后，客户端会显示“页面结构变化”并保留稳定入口；只有取得合法脱敏 fixture 和测试覆盖后才增加新格式支持；
-- 仅支持无需登录即可访问的公开个人主页和直播间；访问受限、要求登录或页面结构变化时会显示独立的可重试状态、连续失败次数和预计重试时间；
-- 不支持验证码、Cookie 自动化、DRM、付费或私有直播间绕过；
+- 只支持普通公开个人主页和直播间；原生 HTTP 受限后可由隔离 WebView 恢复，页面仍要求交互时会显示“需要访问验证”，不会把它误报为离线或入口失效；
+- 不支持验证码自动识别、行为模拟、第三方打码、账号自动登录、Cookie 导出、代理池、DRM、付费或私有直播间绕过；
 - 不录制弹幕、礼物动画或网页 UI；
 - 内置播放器一次只预览单个已完成分片，不提供整场分片合并、统一时间轴或无缝连播；
 - 预览仅在需要时生成可清理 MP4 缓存，不会在每次录制结束后自动转换全部录像；
@@ -666,10 +750,10 @@ openspec validate --all --strict
 
 ### 真实页面验收边界
 
-2026-07-21 使用公开示例主页执行了只读 HTTP 验收。请求可以到达抖音，但当时返回的是包含 `__ac_nonce`、`__ac_signature` 和 `byted_acrawler` 的访问控制引导页，没有公开主页身份或 React Flight 数据。客户端会把该响应识别为“需要登录、验证码或额外访问权限”，按个人主页错误退避重试，不保存页面内容，也不尝试绕过。
+2026-07-24 的只读 HTTP 诊断确认：同一设备上的普通浏览器可以打开公开直播间时，无状态请求仍可能获得 HTTP 200 的访问验证中间页。这不仅可能与 IP 有关，还与持久会话、JavaScript 环境、TLS/HTTP 特征和浏览器上下文有关，不能通过更换 User-Agent 可靠解决。
 
-脱敏 fixture、SQLite 迁移、重启恢复、首次发现、直播间 resolver 接管、录制会话创建、入口连续失效回查和界面状态均已在 macOS 开发环境通过自动化测试。当前公开示例主页的真实“发现直播入口”步骤仍取决于平台是否再次提供无需登录和风控脚本的公开 HTML。Windows/Linux 的托盘、通知、文件管理器和真实网络差异尚待对应实机验证。
+客户端现在会先记录原生尝试，再切换到隔离的持久化 WKWebView；如果系统 WebView 也停留在验证页，则等待用户主动打开同一窗口处理。脱敏 fixture、状态机、串行队列、会话清除、通知去重、监听等待、录制续接和 UI 操作均有自动化测试。真实房间是否正在直播以及目标页面是否继续在 WKWebView 主文档暴露受支持初始化脚本，仍必须按上节命令当场验收；未完成真实录制和 30 分钟多房证据前，不应宣称线上问题已经彻底解决。Windows/Linux 的系统 WebView、托盘、通知和真实网络差异仍需对应实机验证。
 
 ## 合规说明
 
-仅应录制你有权保存和处理的内容，并遵守平台规则、版权要求、隐私要求及适用法律。本项目只请求普通公开 HTTP 页面，不导入 Cookie，不使用浏览器自动化，不尝试登录或处理验证码，也不会绕过权限控制、付费限制或 DRM。
+仅应录制你有权保存和处理的内容，并遵守平台规则、版权要求、隐私要求及适用法律。本项目只处理普通公开页面；系统 WebView 仅执行标准页面脚本和用户主动完成的页面交互。应用不会自动识别或绕过验证码，不导入、复制、导出或记录 Cookie，不模拟行为，不使用代理池，也不会绕过权限控制、付费限制或 DRM。

@@ -11,7 +11,7 @@
     "test": "vitest run --config ui/vite.config.ts",
     "test:watch": "vitest --config ui/vite.config.ts",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
+    "tauri:dev": "tauri dev --no-watch",
     "tauri:build": "tauri build"
   },
   "dependencies": {

@@ -6,6 +6,7 @@ import type {
   AiEnvironmentDiagnostic,
   AiProject,
   AiProjectDetail,
+  BrowserAccessState,
   ClientApi,
   Streamer,
   Video,
@@ -86,6 +87,15 @@ const readyAiEnvironment: AiEnvironmentDiagnostic = {
   message: "本地 ASR 环境就绪，识别过程不会上传视频",
 };
 
+const nativeAccessState: BrowserAccessState = {
+  status: "native",
+  pendingCount: 0,
+  activeStreamerId: null,
+  currentWebRid: null,
+  lastReason: null,
+  updatedAt: "2026-07-24T00:00:00Z",
+};
+
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
   return {
     getDashboard: vi.fn().mockResolvedValue({
@@ -148,6 +158,14 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     deleteSession: vi.fn().mockResolvedValue(undefined),
     openLogs: vi.fn().mockResolvedValue(undefined),
     diagnoseEnvironment: vi.fn().mockResolvedValue({ ffmpeg: true, ffprobe: true }),
+    getBrowserAccessState: vi.fn().mockResolvedValue(nativeAccessState),
+    showDouyinVerification: vi.fn().mockResolvedValue(undefined),
+    recheckDouyinAccess: vi.fn().mockResolvedValue(nativeAccessState),
+    clearDouyinSession: vi.fn().mockResolvedValue({
+      ...nativeAccessState,
+      status: "session_expired",
+      lastReason: "抖音浏览器会话已清除",
+    }),
     listAiProjects: vi.fn().mockResolvedValue([]),
     getAiProject: vi.fn().mockResolvedValue(emptyAiDetail),
     createAiProject: vi.fn().mockResolvedValue(aiProject),
@@ -188,6 +206,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     retryAiInputPreview: vi.fn().mockRejectedValue("测试未配置 AI 视频预览重试"),
     requestExit: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockResolvedValue(() => undefined),
+    subscribeBrowserAccess: vi.fn().mockResolvedValue(() => undefined),
     subscribePreview: vi.fn().mockResolvedValue(() => undefined),
     subscribeThumbnail: vi.fn().mockResolvedValue(() => undefined),
     subscribeAi: vi.fn().mockResolvedValue(() => undefined),
@@ -195,6 +214,132 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
 }
 
 describe("App", () => {
+  it("需要访问验证时显示全局横幅并由用户主动打开窗口", async () => {
+    const user = userEvent.setup();
+    const api = createApi([{
+      ...streamer,
+      monitorStatus: "verification_required",
+      liveStatus: "error",
+      lastError: "抖音公开页需要完成访问验证",
+    }]);
+    api.getBrowserAccessState = vi.fn().mockResolvedValue({
+      ...nativeAccessState,
+      status: "verification_required",
+      pendingCount: 2,
+      activeStreamerId: streamer.id,
+      currentWebRid: streamer.webRid,
+      lastReason: "抖音公开页需要完成访问验证",
+    });
+
+    render(<App api={api} />);
+
+    const banner = await screen.findByRole("alert", { name: "抖音访问状态" });
+    expect(banner).toHaveTextContent("需要访问验证");
+    expect(banner).toHaveTextContent("等待处理 2 个直播间");
+    expect(banner).toHaveTextContent("抖音公开页需要完成访问验证");
+    expect((await screen.findAllByTestId("streamer-row"))[0]).toHaveTextContent("需要访问验证");
+    expect(api.showDouyinVerification).not.toHaveBeenCalled();
+
+    await user.click(screen.getAllByRole("button", { name: "立即验证" })[0]);
+    expect(api.showDouyinVerification).toHaveBeenCalledTimes(1);
+  });
+
+  it("浏览器解析状态展示排队数量和当前主播且会话恢复后刷新", async () => {
+    let accessListener: ((state: BrowserAccessState) => void) | undefined;
+    const api = createApi([streamer]);
+    api.getBrowserAccessState = vi.fn().mockResolvedValue({
+      ...nativeAccessState,
+      status: "browser_resolving",
+      pendingCount: 3,
+      activeStreamerId: streamer.id,
+      currentWebRid: streamer.webRid,
+      lastReason: "原生请求触发访问限制，已切换浏览器解析",
+    });
+    api.subscribeBrowserAccess = vi.fn().mockImplementation(async (listener) => {
+      accessListener = listener;
+      return () => undefined;
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("status", { name: "抖音访问状态" })).toHaveTextContent("等待处理 3 个直播间");
+    expect((await screen.findAllByTestId("streamer-row"))[0]).toHaveTextContent("浏览器解析中");
+
+    await act(async () => {
+      accessListener?.({
+        ...nativeAccessState,
+        status: "session_ready",
+        lastReason: "浏览器访问会话已恢复",
+      });
+    });
+
+    expect(await screen.findByRole("status", { name: "抖音访问状态" })).toHaveTextContent("浏览器会话可用");
+    await waitFor(() => expect(api.getDashboard).toHaveBeenCalledTimes(2));
+  });
+
+  it("拒绝让延迟返回的初始化查询覆盖更新的浏览器访问事件", async () => {
+    let accessListener: ((state: BrowserAccessState) => void) | undefined;
+    let resolveInitial: ((state: BrowserAccessState) => void) | undefined;
+    const api = createApi([streamer]);
+    api.getBrowserAccessState = vi.fn().mockImplementation(() => new Promise((resolve) => {
+      resolveInitial = resolve;
+    }));
+    api.subscribeBrowserAccess = vi.fn().mockImplementation(async (listener) => {
+      accessListener = listener;
+      return () => undefined;
+    });
+
+    render(<App api={api} />);
+    await waitFor(() => expect(accessListener).toBeDefined());
+
+    await act(async () => {
+      accessListener?.({
+        ...nativeAccessState,
+        status: "verification_required",
+        pendingCount: 1,
+        activeStreamerId: streamer.id,
+        currentWebRid: streamer.webRid,
+        lastReason: "抖音公开页需要完成访问验证",
+        updatedAt: "2026-07-24T00:01:00Z",
+      });
+    });
+    expect(await screen.findByRole("alert", { name: "抖音访问状态" })).toHaveTextContent("需要访问验证");
+
+    await act(async () => {
+      resolveInitial?.({
+        ...nativeAccessState,
+        updatedAt: "2026-07-24T00:00:00Z",
+      });
+    });
+
+    expect(screen.getByRole("alert", { name: "抖音访问状态" })).toHaveTextContent("需要访问验证");
+    expect(screen.getByRole("alert", { name: "抖音访问状态" })).toHaveTextContent("等待处理 1 个直播间");
+  });
+
+  it("设置页可以检查、重新验证并确认清除浏览器会话", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.getBrowserAccessState = vi.fn().mockResolvedValue({
+      ...nativeAccessState,
+      status: "session_ready",
+      lastReason: "浏览器访问会话已恢复",
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    expect(await screen.findByText("抖音访问会话")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "检查访问状态" }));
+    expect(api.recheckDouyinAccess).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "重新验证" }));
+    expect(api.showDouyinVerification).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "清除抖音会话" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("不会删除主播、录像或设置"));
+    expect(api.clearDouyinSession).toHaveBeenCalledWith(true);
+    confirm.mockRestore();
+  });
+
   it("首次启动时显示添加主播空状态", async () => {
     render(<App api={createApi()} />);
     expect(await screen.findByText("还没有监控主播")).toBeInTheDocument();
