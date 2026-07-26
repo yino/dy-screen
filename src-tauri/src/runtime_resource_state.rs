@@ -10,7 +10,7 @@ use chrono::Utc;
 use dy_screen::runtime_resources::{
     ResourceProgress, ResourceStatus, ResourceStatusSnapshot, ResolvedRuntimeResources,
     RuntimeDownloader, RuntimeInstaller, RuntimeManifest, RuntimeResourceError,
-    resolve_runtime_resources,
+    compare_versions, resolve_runtime_resources,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -155,9 +155,9 @@ impl RuntimeResourceState {
     }
 
     pub fn current_root(&self) -> Option<PathBuf> {
-        RuntimeInstaller::new(self.install_root.clone())
+        self.find_and_resolve()
             .ok()
-            .and_then(|installer| installer.current_root())
+            .map(|(_, resources, _)| resources.root)
     }
 
     pub fn refresh(&self) -> RuntimeResourceView {
@@ -266,21 +266,41 @@ impl RuntimeResourceState {
     fn find_and_resolve(&self) -> Result<(RuntimeManifest, ResolvedRuntimeResources, String), RuntimeResourceError> {
         let installer = RuntimeInstaller::new(self.install_root.clone())?;
         installer.cleanup_temporary()?;
-        if let Some(root) = installer.current_root()
-            && let Some(found) = self.read_manifest(&root)
-        {
-            let (manifest, _text) = found?;
-            manifest.require_app_version(env!("CARGO_PKG_VERSION"))?;
-            let resolved = resolve_runtime_resources(&root, &manifest)?;
-            return Ok((manifest, resolved, "应用数据目录".to_owned()));
+        let mut candidates = Vec::new();
+        let mut first_error = None;
+        for (root, source) in [
+            (installer.current_root(), "应用数据目录"),
+            (Some(self.bundled_root.clone()), "安装包内资源"),
+        ] {
+            let Some(root) = root else { continue };
+            let Some(found) = self.read_manifest(&root) else { continue };
+            match found {
+                Ok((manifest, _)) => {
+                    if let Err(error) = manifest.require_app_version(env!("CARGO_PKG_VERSION")) {
+                        first_error.get_or_insert(error);
+                    } else {
+                        candidates.push((manifest, root, source));
+                    }
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        if let Some(found) = self.read_manifest(&self.bundled_root) {
-            let (manifest, _text) = found?;
-            manifest.require_app_version(env!("CARGO_PKG_VERSION"))?;
-            let resolved = resolve_runtime_resources(&self.bundled_root, &manifest)?;
-            return Ok((manifest, resolved, "安装包内资源".to_owned()));
+        candidates.sort_by(|(left, _, _), (right, _, _)| {
+            compare_versions(&right.bundle_version, &left.bundle_version)
+        });
+        for (manifest, root, source) in candidates {
+            match resolve_runtime_resources(&root, &manifest) {
+                Ok(resolved) => return Ok((manifest, resolved, source.to_owned())),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        Err(RuntimeResourceError::MissingFile("runtime-manifest.json".into()))
+        Err(first_error.unwrap_or_else(|| {
+            RuntimeResourceError::MissingFile("runtime-manifest.json".into())
+        }))
     }
 
     fn read_manifest(&self, root: &Path) -> Option<Result<(RuntimeManifest, String), RuntimeResourceError>> {

@@ -265,14 +265,14 @@ make app-build-resources ASR_SOURCE=/absolute/path/to/resources
 # 生成自有 HTTPS 静态托管目录（上传前必须用正式 Ed25519 私钥签署清单）
 make runtime-resource-publish \
   ASR_STAGE=resources/asr-stage \
-  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.2/ \
+  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.3/ \
   RESOURCE_RELEASE_DIR=dist/runtime-resources
 ```
 
 托管目录约定为 `channel/appVersion/platform/arch/bundleVersion/`，并在同一固定地址提供 `runtime-manifest.json` 及清单声明的资源文件。服务器应支持 HTTPS、Range 和大文件缓存；应用不会上传视频、音频、转写、主播信息、Cookie 或本地数据库。用户安装后如果资源未就绪，只能在资源页查看版本/大小/组件、下载、取消、重试或重新检测，监控、录制、视频库和 AI 剪辑保持锁定。
 
 当前 macOS arm64 发行构建使用的固定资源基地址为：
-`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.2/`。
+`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.3/`。
 `index.json` 仅用于发布目录索引，不能直接作为下载基地址。
 
 macOS 的 ASR 专用 FFmpeg 应从锁定的官方 `ffmpeg-8.1.2.tar.xz` 构建：

@@ -61,12 +61,12 @@ FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg
 WHISPER_SOURCE ?= $(if $(wildcard resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz),resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz,)
 WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper
 POWERSHELL ?= powershell.exe
-RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.2/
+RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.3/
 RESOURCE_RELEASE_DIR ?= dist/runtime-resources
 RESOURCE_CHANNEL ?= stable
 RESOURCE_APP_VERSION ?= 0.2.0
 # 必须与 resources/asr-source/manifest.json 中的 bundleVersion 一致。
-RESOURCE_BUNDLE_VERSION ?= 2026.07.2
+RESOURCE_BUNDLE_VERSION ?= 2026.07.3
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
 

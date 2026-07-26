@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "bundleVersion": "2026.07.2",
+  "bundleVersion": "2026.07.3",
   "engine": {
     "id": "whisper.cpp",
     "version": "v1.9.1",

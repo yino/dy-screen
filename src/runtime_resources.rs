@@ -352,7 +352,7 @@ fn validate_hash(value: &str) -> Result<(), RuntimeResourceError> {
     Ok(())
 }
 
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+pub fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
     let parse = |value: &str| {
         value
             .split(['.', '-', '+'])
@@ -956,6 +956,13 @@ mod tests {
             manifest.require_app_version("0.1.9"),
             Err(RuntimeResourceError::VersionTooOld)
         ));
+    }
+
+    #[test]
+    fn compares_numeric_resource_versions() {
+        assert!(compare_versions("2026.07.10", "2026.07.3").is_gt());
+        assert!(compare_versions("2026.08.1", "2026.07.99").is_gt());
+        assert!(compare_versions("2026.07.3", "2026.07.3").is_eq());
     }
 
     #[test]

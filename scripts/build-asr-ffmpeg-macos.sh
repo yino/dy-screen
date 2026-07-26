@@ -151,7 +151,7 @@ for encoder in aac h264_videotoolbox mjpeg pcm_s16le; do
     exit 1
   }
 done
-printf '%s\n' "$FILTERS_OUTPUT" | rg -q '^ [A-Z.]{3} +scale +' || {
+printf '%s\n' "$FILTERS_OUTPUT" | rg -q '^ [A-Z.]+ +scale +' || {
   printf '%s\n' '错误：运行时 FFmpeg 缺少 scale filter。' >&2
   exit 1
 }
