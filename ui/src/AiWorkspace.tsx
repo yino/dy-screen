@@ -44,6 +44,22 @@ import type {
 
 const segmentPageSize = 200;
 
+type HighlightView = "transcript" | "candidates" | "selected";
+type HighlightSort = "score" | "time";
+
+interface PendingHighlightSeek {
+  candidateId: number;
+  inputId: number;
+  segmentId: string | null;
+  startMs: number;
+}
+
+interface HighlightPlaybackRange {
+  candidateId: number;
+  startMs: number;
+  endMs: number;
+}
+
 const projectStatusLabels: Record<AiProjectStatus, string> = {
   draft: "草稿",
   queued: "排队中",
@@ -307,11 +323,18 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const [llmSettings, setLlmSettings] = useState<LlmProviderSettings | null>(null);
   const [analysisRun, setAnalysisRun] = useState<AiHighlightRun | null>(null);
   const [highlightCandidates, setHighlightCandidates] = useState<AiHighlightCandidate[]>([]);
+  const [highlightView, setHighlightView] = useState<HighlightView>("transcript");
+  const [highlightSort, setHighlightSort] = useState<HighlightSort>("score");
+  const [activeHighlightCandidateId, setActiveHighlightCandidateId] = useState<number | null>(null);
+  const [pendingHighlightSeek, setPendingHighlightSeek] = useState<PendingHighlightSeek | null>(null);
+  const [selectionSavingCandidateId, setSelectionSavingCandidateId] = useState<number | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisProgressVisible, setAnalysisProgressVisible] = useState(false);
   const [projectTags, setProjectTags] = useState("");
   const [analysisGoal, setAnalysisGoal] = useState("");
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const previewInputRef = useRef<number | null>(null);
+  const highlightPlaybackRef = useRef<HighlightPlaybackRange | null>(null);
   const selectedProjectRef = useRef<number | null>(null);
   const currentSegmentRef = useRef<string | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
@@ -389,9 +412,32 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   }, [analysisBusy]);
 
   useEffect(() => {
+    const projectId = detail?.project.id;
+    let disposed = false;
     setAnalysisRun(null);
     setHighlightCandidates([]);
-  }, [detail?.project.id]);
+    setHighlightView("transcript");
+    setHighlightSort("score");
+    setActiveHighlightCandidateId(null);
+    setPendingHighlightSeek(null);
+    setSelectionSavingCandidateId(null);
+    highlightPlaybackRef.current = null;
+    if (!projectId || !api.getLatestAiHighlightRun) return;
+    void api.getLatestAiHighlightRun(projectId).then(async (run) => {
+      if (disposed || !run) return;
+      const candidates = api.listAiHighlightCandidates
+        ? await api.listAiHighlightCandidates(run.id)
+        : [];
+      if (disposed) return;
+      setAnalysisRun(run);
+      setHighlightCandidates(candidates);
+    }).catch((error) => {
+      if (!disposed) setMessage(safeError(error, "无法恢复历史高光评分"));
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [api, detail?.project.id]);
 
   useEffect(() => {
     let disposed = false;
@@ -437,6 +483,58 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const currentTranscript = transcript?.inputs.find((input) => input.inputId === currentInputId) ?? null;
   const segments = currentTranscript?.segments ?? [];
   const currentSegment = segments.find((segment) => segment.stableSegmentId === currentSegmentId) ?? null;
+  const sortedHighlightCandidates = useMemo(() => {
+    const inputPositions = new Map(detail?.inputs.map((input) => [input.id, input.position]) ?? []);
+    return [...highlightCandidates].sort((left, right) => {
+      if (highlightSort === "time") {
+        const positionDifference = (inputPositions.get(left.inputId) ?? Number.MAX_SAFE_INTEGER)
+          - (inputPositions.get(right.inputId) ?? Number.MAX_SAFE_INTEGER);
+        if (positionDifference !== 0) return positionDifference;
+        if (left.startMs !== right.startMs) return left.startMs - right.startMs;
+      } else {
+        if (left.totalScore !== right.totalScore) return right.totalScore - left.totalScore;
+        const leftRank = left.rank ?? Number.MAX_SAFE_INTEGER;
+        const rightRank = right.rank ?? Number.MAX_SAFE_INTEGER;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+      }
+      return left.id - right.id;
+    });
+  }, [detail?.inputs, highlightCandidates, highlightSort]);
+  const selectedHighlightCandidates = useMemo(
+    () => sortedHighlightCandidates.filter((candidate) => candidate.selected),
+    [sortedHighlightCandidates],
+  );
+  const navigableHighlightCandidates = highlightView === "selected"
+    ? selectedHighlightCandidates
+    : sortedHighlightCandidates;
+  const activeHighlightCandidate = (
+    navigableHighlightCandidates.find((candidate) => candidate.id === activeHighlightCandidateId)
+    ?? (highlightView === "transcript" ? null : navigableHighlightCandidates[0])
+  );
+  const activeHighlightTranscript = activeHighlightCandidate
+    ? transcript?.inputs.find((input) => input.inputId === activeHighlightCandidate.inputId) ?? null
+    : null;
+  const activeHighlightSegmentIds = useMemo(
+    () => new Set(activeHighlightCandidate?.segmentIds ?? []),
+    [activeHighlightCandidate?.segmentIds],
+  );
+  const activeHighlightSegments = useMemo(
+    () => activeHighlightTranscript?.segments.filter((segment) => (
+      activeHighlightSegmentIds.has(segment.stableSegmentId)
+    )) ?? [],
+    [activeHighlightSegmentIds, activeHighlightTranscript?.segments],
+  );
+  const highlightCandidatesBySegment = useMemo(() => {
+    const matches = new Map<string, AiHighlightCandidate[]>();
+    for (const candidate of highlightCandidates) {
+      for (const segmentId of candidate.segmentIds) {
+        const segmentMatches = matches.get(segmentId) ?? [];
+        segmentMatches.push(candidate);
+        matches.set(segmentId, segmentMatches);
+      }
+    }
+    return matches;
+  }, [highlightCandidates]);
 
   useEffect(() => {
     setCurrentSegmentId(null);
@@ -444,20 +542,30 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     setPortraitVideo(false);
     setSegmentPage(0);
     setPreview(null);
+    previewInputRef.current = null;
+    highlightPlaybackRef.current = null;
     if (!currentInput || !["completed", "skipped"].includes(currentInput.status)) return;
     let disposed = false;
     void api.requestAiInputPreview(currentInput.projectId, currentInput.id)
-      .then((snapshot) => !disposed && setPreview(snapshot))
-      .catch((error) => !disposed && setPreview({
-        requestId: `ai-preview-failed-${currentInput.id}`,
-        videoId: -currentInput.id,
-        state: "failed",
-        progressPercent: null,
-        message: "预览不可用",
-        media: null,
-        errorCode: "preview_unavailable",
-        errorMessage: safeError(error, "无法准备视频预览，仍可浏览转写文本"),
-      }));
+      .then((snapshot) => {
+        if (disposed) return;
+        previewInputRef.current = currentInput.id;
+        setPreview(snapshot);
+      })
+      .catch((error) => {
+        if (disposed) return;
+        previewInputRef.current = currentInput.id;
+        setPreview({
+          requestId: `ai-preview-failed-${currentInput.id}`,
+          videoId: -currentInput.id,
+          state: "failed",
+          progressPercent: null,
+          message: "预览不可用",
+          media: null,
+          errorCode: "preview_unavailable",
+          errorMessage: safeError(error, "无法准备视频预览，仍可浏览转写文本"),
+        });
+      });
     return () => {
       disposed = true;
     };
@@ -491,6 +599,33 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     const row = document.getElementById(`ai-segment-${currentSegmentId}`);
     if (row && "scrollIntoView" in row) row.scrollIntoView({ block: "nearest" });
   }, [currentSegmentId, followPlayback, segments]);
+
+  useEffect(() => {
+    if (!pendingHighlightSeek || currentInputId !== pendingHighlightSeek.inputId) return;
+    const targetIndex = pendingHighlightSeek.segmentId
+      ? segments.findIndex((segment) => segment.stableSegmentId === pendingHighlightSeek.segmentId)
+      : -1;
+    if (targetIndex >= 0) {
+      setSegmentPage(Math.floor(targetIndex / segmentPageSize));
+      setCurrentSegmentId(pendingHighlightSeek.segmentId);
+    }
+    if (previewInputRef.current !== pendingHighlightSeek.inputId) return;
+    if (preview?.state === "failed") {
+      setPendingHighlightSeek(null);
+      return;
+    }
+    if (preview?.state !== "ready" || !preview.media || !videoRef.current) return;
+    videoRef.current.currentTime = pendingHighlightSeek.startMs / 1_000;
+    setPendingHighlightSeek(null);
+  }, [currentInputId, pendingHighlightSeek, preview?.media, preview?.state, segments]);
+
+  useEffect(() => {
+    if (highlightView === "transcript" || !activeHighlightCandidate) return;
+    const segmentId = activeHighlightSegments[0]?.stableSegmentId;
+    if (!segmentId || activeHighlightCandidate.inputId !== currentInputId) return;
+    const row = document.getElementById(`ai-segment-${segmentId}`);
+    if (row && "scrollIntoView" in row) row.scrollIntoView({ block: "nearest" });
+  }, [activeHighlightCandidate, activeHighlightSegments, currentInputId, highlightView]);
 
   const run = async (operation: () => Promise<void>, success?: string) => {
     setBusy(true);
@@ -627,14 +762,80 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     }
   };
 
-  const saveHighlightSelection = async () => {
-    if (!analysisRun || !api.selectAiHighlightCandidates) return;
-    const selected = highlightCandidates.filter((candidate) => candidate.selected).map((candidate) => candidate.id);
+  const selectHighlightCandidate = (candidate: AiHighlightCandidate) => {
+    highlightPlaybackRef.current = null;
+    setActiveHighlightCandidateId(candidate.id);
+    const source = transcript?.inputs.find((input) => input.inputId === candidate.inputId) ?? null;
+    const segmentId = candidate.segmentIds.find((id) => (
+      source?.segments.some((segment) => segment.stableSegmentId === id)
+    )) ?? null;
+    setPendingHighlightSeek({
+      candidateId: candidate.id,
+      inputId: candidate.inputId,
+      segmentId,
+      startMs: candidate.startMs,
+    });
+    setCurrentInputId(candidate.inputId);
+    if (!segmentId) setMessage("候选对应的稳定句段不可用，仍可查看评分和时间范围");
+  };
+
+  const changeHighlightView = (view: HighlightView) => {
+    setHighlightView(view);
+    if (view === "transcript") return;
+    const candidates = view === "selected"
+      ? selectedHighlightCandidates
+      : sortedHighlightCandidates;
+    const target = candidates.find((candidate) => candidate.id === activeHighlightCandidateId)
+      ?? candidates[0];
+    if (target) selectHighlightCandidate(target);
+  };
+
+  const toggleHighlightSelection = async (candidate: AiHighlightCandidate) => {
+    if (!analysisRun || !api.selectAiHighlightCandidates || selectionSavingCandidateId !== null) return;
+    const selectedIds = highlightCandidates
+      .filter((item) => item.id === candidate.id ? !candidate.selected : item.selected)
+      .map((item) => item.id);
+    setSelectionSavingCandidateId(candidate.id);
     try {
-      setHighlightCandidates(await api.selectAiHighlightCandidates(analysisRun.id, selected));
-      setMessage("高光候选选择已保存，当前版本不会生成视频文件");
+      const confirmed = await api.selectAiHighlightCandidates(analysisRun.id, selectedIds);
+      setHighlightCandidates(confirmed);
+      const confirmedCandidate = confirmed.find((item) => item.id === candidate.id);
+      if (highlightView === "selected" && !confirmedCandidate?.selected) {
+        const confirmedById = new Map(confirmed.map((item) => [item.id, item]));
+        const next = sortedHighlightCandidates
+          .map((item) => confirmedById.get(item.id))
+          .find((item) => item?.selected);
+        if (next) selectHighlightCandidate(next);
+        else {
+          setActiveHighlightCandidateId(null);
+          setPendingHighlightSeek(null);
+        }
+      }
+      setMessage(candidate.selected ? "已从待切片中移除" : "已加入待切片，当前版本不会生成视频文件");
     } catch (error) {
-      setMessage(safeError(error, "保存高光选择失败"));
+      setMessage(safeError(error, "保存高光选择失败，已保留上一次确认状态"));
+    } finally {
+      setSelectionSavingCandidateId(null);
+    }
+  };
+
+  const playHighlightCandidate = async () => {
+    const candidate = activeHighlightCandidate;
+    const video = videoRef.current;
+    if (!candidate || currentInputId !== candidate.inputId || !previewReady || !video) return;
+    highlightPlaybackRef.current = {
+      candidateId: candidate.id,
+      startMs: candidate.startMs,
+      endMs: candidate.endMs,
+    };
+    video.currentTime = candidate.startMs / 1_000;
+    const segment = currentSegmentAt(segments, candidate.startMs);
+    setCurrentSegmentId(segment?.stableSegmentId ?? candidate.segmentIds[0] ?? null);
+    try {
+      await video.play();
+    } catch (error) {
+      highlightPlaybackRef.current = null;
+      setMessage(safeError(error, "无法播放当前高光片段"));
     }
   };
 
@@ -647,7 +848,13 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const updateCurrentSegment = () => {
     const video = videoRef.current;
     if (!video) return;
-    const segment = currentSegmentAt(segments, Math.round(video.currentTime * 1_000));
+    const currentTimeMs = Math.round(video.currentTime * 1_000);
+    const playback = highlightPlaybackRef.current;
+    if (playback && (currentTimeMs < playback.startMs - 250 || currentTimeMs >= playback.endMs)) {
+      if (currentTimeMs >= playback.endMs) video.pause();
+      highlightPlaybackRef.current = null;
+    }
+    const segment = currentSegmentAt(segments, currentTimeMs);
     const nextId = segment?.stableSegmentId ?? null;
     if (nextId !== currentSegmentRef.current) setCurrentSegmentId(nextId);
   };
@@ -673,9 +880,15 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     safePage * segmentPageSize,
     (safePage + 1) * segmentPageSize,
   );
-  const previewReady = preview?.state === "ready" && Boolean(preview.media);
+  const displayedSegments = highlightView === "transcript"
+    ? visibleSegments
+    : activeHighlightSegments;
+  const previewReady = preview?.state === "ready"
+    && Boolean(preview.media)
+    && previewInputRef.current === currentInputId;
   const analysisCompleted = analysisRun?.status === "completed";
   const qualifiedCandidateCount = highlightCandidates.filter((candidate) => candidate.totalScore >= 70).length;
+  const selectedCandidateCount = selectedHighlightCandidates.length;
 
   useEffect(() => {
     setProjectTags(detail?.project.projectTags?.join("、") ?? "");
@@ -781,37 +994,60 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
                 <section className="ai-result-workspace">
                   {detail.project.status === "completed" || detail.project.status === "completed_with_errors" ? (
                     <section className="panel ai-highlight-panel">
-                      <header><div><p className="section-kicker">HIGHLIGHT AGENT</p><h3>高光候选</h3></div><span>{llmSettings?.keyConfigured ? `${llmSettings.modelId} · 仅发送文本` : "未配置 DeepSeek"}</span></header>
+                      <header><div><p className="section-kicker">HIGHLIGHT AGENT</p><h3>高光评分与候选</h3></div><span>{llmSettings?.keyConfigured ? `${llmSettings.modelId} · 仅发送文本` : "未配置 DeepSeek"}</span></header>
                       <div className="ai-highlight-consent"><div><strong>独立于本地 ASR</strong><p>需要显式授权后，候选 Agent 和评分 Agent 才会读取规范化转写。视频、音频、本地路径和 Key 不会发送。</p></div><button className="primary-button" disabled={analysisBusy || !llmSettings?.keyConfigured || !api.startAiHighlightAnalysis} onClick={() => void startHighlightAnalysis()}><Sparkles size={15} />{analysisBusy ? "分析中…" : analysisCompleted ? "刷新分析结果" : "开始高光分析"}</button></div>
                       {analysisProgressVisible && <div className="ai-highlight-progress" role="status" aria-live="polite"><div><strong>正在分析项目转写</strong><span>{analysisInputCount} 个视频 · {analysisSegmentCount} 个句段</span></div><div className="ai-highlight-progress-track" role="progressbar" aria-label="高光分析进行中"><span /></div><small>按视频分批生成候选，全部候选完成后统一评分排序。请保持应用运行。</small></div>}
                       {analysisRun && <div className="ai-highlight-run-meta"><span>状态：{highlightRunStatusLabels[analysisRun.status]}</span><span>范围：{analysisRun.estimatedBatches} 批 · {analysisRun.totalSegments} 句</span><span>模型消耗：{analysisRun.totalTokens} Token</span><span>策略：{analysisRun.skillsSnapshot.join("、") || "通用"}</span></div>}
-                      <HighlightAudit project={detail.project} transcript={transcript} run={analysisRun} candidates={highlightCandidates} />
                       {!analysisBusy && (highlightCandidates.length > 0 ? <>
                         <div className="ai-highlight-summary"><strong>{highlightCandidates.length} 个评分候选</strong><span>{qualifiedCandidateCount} 个达到 70 分 · {highlightCandidates.length - qualifiedCandidateCount} 个参考候选</span></div>
-                        <div className="ai-highlight-candidate-list">{highlightCandidates.map((candidate) => {
-                          const qualified = candidate.totalScore >= 70;
-                          return <label key={candidate.id} className={`ai-highlight-candidate ${qualified ? "qualified" : "reference"}`}><input type="checkbox" checked={candidate.selected} onChange={(event) => setHighlightCandidates((items) => items.map((item) => item.id === candidate.id ? { ...item, selected: event.target.checked } : item))} /><div><div className="ai-highlight-candidate-title"><strong>{candidate.title}</strong><span>{qualified ? "高光候选" : "参考候选"}</span><b>{candidate.totalScore.toFixed(0)} 分</b></div><small>{formatTimestamp(candidate.startMs)}–{formatTimestamp(candidate.endMs)} · {candidate.matchedTags.join("、") || "通用内容"}</small><div className="ai-highlight-score-grid" aria-label={`${candidate.title} 评分明细`}><span><b>{candidate.hookScore.toFixed(0)}</b>吸引力</span><span><b>{candidate.informationScore.toFixed(0)}</b>信息量</span><span><b>{candidate.emotionScore.toFixed(0)}</b>情绪</span><span><b>{candidate.tagRelevanceScore.toFixed(0)}</b>标签相关</span><span><b>{candidate.completenessScore.toFixed(0)}</b>完整度</span><span><b>{candidate.shareabilityScore.toFixed(0)}</b>传播性</span></div><p>{candidate.reason}</p></div></label>;
-                        })}</div>
-                        <button className="secondary-button" onClick={() => void saveHighlightSelection()}>保存候选选择</button>
+                        <button className="ai-highlight-open-results" onClick={() => changeHighlightView("candidates")}><Sparkles size={14} />在 ASR 中查看和选择<span>已选择 {selectedCandidateCount}</span><ChevronRight size={14} /></button>
                       </> : <div className="ai-highlight-empty">{analysisCompleted ? "分析已完成，但模型没有返回可用候选。" : "完成分析后，这里会展示评分最高的前 10 个候选；70 分以上标记为高光候选。"}</div>)}
+                      <HighlightAudit project={detail.project} transcript={transcript} run={analysisRun} candidates={highlightCandidates} />
                     </section>
                   ) : null}
                   <aside className="panel ai-result-inputs">
                     <header><p className="section-kicker">VIDEOS</p><h3>视频与状态</h3></header>
-                    <div className="ai-result-input-list">{detail.inputs.map((input, index) => <div key={input.id} className={`ai-result-input-row ${input.id === currentInputId ? "active" : ""}`}><button className="ai-result-input-select" onClick={() => setCurrentInputId(input.id)}><span>{index + 1}</span><div><strong title={input.displayName}>{input.displayName}</strong><small>{inputStatusLabels[input.status]} · {input.progressPercent}%</small>{input.lastErrorMessage && <em title={input.lastErrorMessage}>{input.lastErrorMessage}</em>}</div></button><div className="ai-queue-actions">{input.status === "pending" && <><button aria-label={`下一个处理 ${input.displayName}`} onClick={() => promoteInput(input.id)}>下一个</button><button aria-label={`立即切换 ${input.displayName}`} onClick={() => preemptInput(input.id)}>立即切换</button></>}{(input.status === "failed" || input.status === "cancelled") && <button className="ai-retry" aria-label={`重新识别 ${input.displayName}`} title="重新识别" onClick={() => void retryInput(input.id)}><RotateCcw size={14} /></button>}</div></div>)}</div>
+                    <div className="ai-result-input-list">{detail.inputs.map((input, index) => <div key={input.id} className={`ai-result-input-row ${input.id === currentInputId ? "active" : ""}`}><button className="ai-result-input-select" onClick={() => { setHighlightView("transcript"); setPendingHighlightSeek(null); highlightPlaybackRef.current = null; setCurrentInputId(input.id); }}><span>{index + 1}</span><div><strong title={input.displayName}>{input.displayName}</strong><small>{inputStatusLabels[input.status]} · {input.progressPercent}%</small>{input.lastErrorMessage && <em title={input.lastErrorMessage}>{input.lastErrorMessage}</em>}</div></button><div className="ai-queue-actions">{input.status === "pending" && <><button aria-label={`下一个处理 ${input.displayName}`} onClick={() => promoteInput(input.id)}>下一个</button><button aria-label={`立即切换 ${input.displayName}`} onClick={() => preemptInput(input.id)}>立即切换</button></>}{(input.status === "failed" || input.status === "cancelled") && <button className="ai-retry" aria-label={`重新识别 ${input.displayName}`} title="重新识别" onClick={() => void retryInput(input.id)}><RotateCcw size={14} /></button>}</div></div>)}</div>
                   </aside>
 
                   <div className="ai-result-main">
                     <section className="panel ai-player-panel">
                       <header><div><p className="section-kicker">PLAYER</p><h3>{currentInput?.displayName ?? "选择视频"}</h3></div><div className="ai-player-toggles"><label><input type="checkbox" checked={followPlayback} onChange={(event) => setFollowPlayback(event.target.checked)} />跟随播放</label><label><input type="checkbox" checked={showSubtitles} disabled={!previewReady} onChange={(event) => setShowSubtitles(event.target.checked)} />显示字幕</label></div></header>
                       <div className={`ai-player-stage ${portraitVideo ? "portrait" : ""}`}>
-                        {previewReady && preview?.media ? <><video ref={videoRef} controls aria-label="AI 视频播放器" src={mediaUrl(preview.media.path)} onTimeUpdate={updateCurrentSegment} /><div className={`ai-subtitle-overlay ${showSubtitles && currentSegment ? "visible" : ""}`} aria-live="polite">{showSubtitles ? currentSegment?.normalizedText : ""}</div></> : preview?.state === "failed" ? <div className="ai-player-unavailable"><AlertTriangle size={26} /><strong>播放器联动不可用</strong><p>{preview.errorMessage}</p><button className="secondary-button" onClick={() => currentInput && void api.retryAiInputPreview(currentInput.projectId, currentInput.id).then(setPreview)}><RotateCcw size={14} />重试预览</button></div> : currentInput && ["completed", "skipped"].includes(currentInput.status) ? <div className="ai-player-unavailable"><LoaderCircle className="spin" size={25} /><strong>正在准备本地预览</strong><p>预览只服务界面播放，不参与 ASR 缓存指纹。</p></div> : <div className="ai-player-unavailable"><Video size={28} /><strong>等待当前视频处理完成</strong><p>转写和预览都不会修改原视频。</p></div>}
+                        {previewReady && preview?.media ? <><video ref={videoRef} controls aria-label="AI 视频播放器" src={mediaUrl(preview.media.path)} onTimeUpdate={updateCurrentSegment} /><div className={`ai-subtitle-overlay ${showSubtitles && currentSegment ? "visible" : ""}`} aria-live="polite">{showSubtitles ? currentSegment?.normalizedText : ""}</div></> : preview?.state === "failed" ? <div className="ai-player-unavailable"><AlertTriangle size={26} /><strong>播放器联动不可用</strong><p>{preview.errorMessage}</p><button className="secondary-button" onClick={() => currentInput && void api.retryAiInputPreview(currentInput.projectId, currentInput.id).then((snapshot) => { previewInputRef.current = currentInput.id; setPreview(snapshot); })}><RotateCcw size={14} />重试预览</button></div> : currentInput && ["completed", "skipped"].includes(currentInput.status) ? <div className="ai-player-unavailable"><LoaderCircle className="spin" size={25} /><strong>正在准备本地预览</strong><p>预览只服务界面播放，不参与 ASR 缓存指纹。</p></div> : <div className="ai-player-unavailable"><Video size={28} /><strong>等待当前视频处理完成</strong><p>转写和预览都不会修改原视频。</p></div>}
                       </div>
                     </section>
 
                     <section className="panel ai-transcript-panel">
-                      <header><div><p className="section-kicker">TIMESTAMPED TEXT</p><h3>只读时间戳文本</h3></div><div className="ai-result-actions"><button disabled={!currentInput || segments.length === 0} onClick={() => currentInput && void copy(() => api.copyAiInputText(detail.project.id, currentInput.id), "已复制当前视频全文")}><Clipboard size={14} />复制当前视频</button><button disabled={!transcript} onClick={() => void copy(() => api.copyAiProjectText(detail.project.id), "已复制项目全文")}><Clipboard size={14} />复制项目</button><button onClick={() => void run(async () => { const result = await api.exportAiTxt(detail.project.id); if (result.saved) setMessage("TXT 已导出"); })}><FileText size={14} />TXT</button><button onClick={() => void run(async () => { const result = await api.exportAiJson(detail.project.id); if (result.saved) setMessage("JSON 已导出"); })}><FileJson size={14} />JSON</button></div></header>
-                      {segments.length === 0 ? <div className="ai-transcript-empty">{currentTranscript?.errorMessage ?? "当前视频还没有可用转写文本"}</div> : <><div className="ai-segment-list" aria-label="转写句段列表">{visibleSegments.map((segment) => <div id={`ai-segment-${segment.stableSegmentId}`} key={segment.stableSegmentId} className={`ai-segment-row ${segment.stableSegmentId === currentSegmentId ? "active" : ""}`}><button className="ai-segment-main" disabled={!previewReady} onClick={() => seekSegment(segment)}><time>{formatTimestamp(segment.sourceStartMs)}<span>– {formatTimestamp(segment.sourceEndMs)}</span></time><p>{segment.normalizedText}</p>{segment.confidence !== null && segment.confidence < 0.55 && <em>低置信</em>}</button><button className="ai-segment-copy" aria-label={`复制句段 ${formatTimestamp(segment.sourceStartMs)}`} onClick={() => void copy(() => api.copyAiSegmentText(detail.project.id, segment.stableSegmentId), "已复制句段")}><Clipboard size={13} /></button></div>)}</div>{pageCount > 1 && <footer className="ai-segment-pagination"><button disabled={safePage === 0} onClick={() => setSegmentPage((page) => Math.max(0, page - 1))}><ChevronLeft size={14} />上一页</button><span>{safePage + 1} / {pageCount} · 共 {segments.length} 句</span><button disabled={safePage >= pageCount - 1} onClick={() => setSegmentPage((page) => Math.min(pageCount - 1, page + 1))}>下一页<ChevronRight size={14} /></button></footer>}</>}
+                      <header><div><p className="section-kicker">TIMESTAMPED TEXT</p><h3>ASR 文本与高光</h3></div><div className="ai-result-actions"><button disabled={!currentInput || segments.length === 0} onClick={() => currentInput && void copy(() => api.copyAiInputText(detail.project.id, currentInput.id), "已复制当前视频全文")}><Clipboard size={14} />复制当前视频</button><button disabled={!transcript} onClick={() => void copy(() => api.copyAiProjectText(detail.project.id), "已复制项目全文")}><Clipboard size={14} />复制项目</button><button onClick={() => void run(async () => { const result = await api.exportAiTxt(detail.project.id); if (result.saved) setMessage("TXT 已导出"); })}><FileText size={14} />TXT</button><button onClick={() => void run(async () => { const result = await api.exportAiJson(detail.project.id); if (result.saved) setMessage("JSON 已导出"); })}><FileJson size={14} />JSON</button></div></header>
+                      {analysisRun && highlightCandidates.length > 0 && <div className="ai-highlight-browser">
+                        <div className="ai-highlight-browser-toolbar">
+                          <div className="ai-highlight-view-switcher" role="group" aria-label="ASR 高光视图">
+                            <button aria-label="全文" aria-pressed={highlightView === "transcript"} onClick={() => changeHighlightView("transcript")}>全文</button>
+                            <button aria-label={`高光候选 ${highlightCandidates.length}`} aria-pressed={highlightView === "candidates"} onClick={() => changeHighlightView("candidates")}>高光候选 <span>{highlightCandidates.length}</span></button>
+                            <button aria-label={`已选择 ${selectedCandidateCount}`} aria-pressed={highlightView === "selected"} onClick={() => changeHighlightView("selected")}>已选择 <span>{selectedCandidateCount}</span></button>
+                          </div>
+                          {highlightView !== "transcript" && <label className="ai-highlight-sort">候选排序<select aria-label="候选排序" value={highlightSort} onChange={(event) => setHighlightSort(event.target.value as HighlightSort)}><option value="score">按评分</option><option value="time">按时间</option></select></label>}
+                        </div>
+                        {highlightView !== "transcript" && <>
+                          {navigableHighlightCandidates.length > 0 ? <div className="ai-highlight-navigation" aria-label="高光候选导航">{navigableHighlightCandidates.map((candidate, index) => {
+                            const sourceName = detail.inputs.find((input) => input.id === candidate.inputId)?.displayName ?? "来源视频不可用";
+                            return <button key={candidate.id} className={candidate.id === activeHighlightCandidate?.id ? "active" : ""} aria-label={`查看候选 ${candidate.title}，${candidate.totalScore.toFixed(0)} 分`} aria-pressed={candidate.id === activeHighlightCandidate?.id} onClick={() => selectHighlightCandidate(candidate)}><span>#{candidate.rank ?? index + 1}</span><div><strong>{candidate.title}</strong><small>{formatTimestamp(candidate.startMs)}–{formatTimestamp(candidate.endMs)} · {sourceName}</small></div><b>{candidate.totalScore.toFixed(0)}<small>分</small></b></button>;
+                          })}</div> : <div className="ai-highlight-browser-empty">还没有加入待切片的候选，请先在“高光候选”中选择。</div>}
+                          {activeHighlightCandidate && <article className="ai-highlight-current" aria-label="当前高光候选">
+                            <header><div><span className={activeHighlightCandidate.totalScore >= 70 ? "qualified" : "reference"}>{activeHighlightCandidate.totalScore >= 70 ? "高光候选" : "参考候选"}</span><h4>{activeHighlightCandidate.title}</h4><strong>{activeHighlightCandidate.totalScore.toFixed(0)} 分</strong></div><small>{formatTimestamp(activeHighlightCandidate.startMs)}–{formatTimestamp(activeHighlightCandidate.endMs)} · {activeHighlightCandidate.matchedTags.join("、") || "通用内容"}</small></header>
+                            <div className="ai-highlight-current-actions"><button className="secondary-button" aria-label="播放高光片段" disabled={!previewReady || currentInputId !== activeHighlightCandidate.inputId || activeHighlightCandidate.endMs <= activeHighlightCandidate.startMs} onClick={() => void playHighlightCandidate()}><Play size={14} />播放片段</button><label className="ai-highlight-selection"><span>{selectionSavingCandidateId === activeHighlightCandidate.id ? "保存中" : "加入待切片"}</span><input type="checkbox" aria-label="加入待切片" checked={activeHighlightCandidate.selected} disabled={selectionSavingCandidateId !== null || !api.selectAiHighlightCandidates} onChange={() => void toggleHighlightSelection(activeHighlightCandidate)} /></label></div>
+                            <p>{activeHighlightCandidate.reason}</p>
+                            <details className="ai-highlight-score-details" open><summary>六项评分明细</summary><div className="ai-highlight-score-grid" aria-label={`${activeHighlightCandidate.title} 评分明细`}><span><b>{activeHighlightCandidate.hookScore.toFixed(0)}</b>吸引力</span><span><b>{activeHighlightCandidate.informationScore.toFixed(0)}</b>信息量</span><span><b>{activeHighlightCandidate.emotionScore.toFixed(0)}</b>情绪</span><span><b>{activeHighlightCandidate.tagRelevanceScore.toFixed(0)}</b>标签相关</span><span><b>{activeHighlightCandidate.completenessScore.toFixed(0)}</b>完整度</span><span><b>{activeHighlightCandidate.shareabilityScore.toFixed(0)}</b>传播性</span></div></details>
+                            {activeHighlightSegments.length === 0 && <small className="ai-highlight-segment-missing">候选对应的稳定句段不可用，仍可参考评分和时间范围。</small>}
+                          </article>}
+                        </>}
+                      </div>}
+                      {segments.length === 0 ? <div className="ai-transcript-empty">{currentTranscript?.errorMessage ?? "当前视频还没有可用转写文本"}</div> : highlightView !== "transcript" && !activeHighlightCandidate ? null : displayedSegments.length === 0 ? <div className="ai-transcript-empty">当前候选没有可用的稳定 ASR 句段</div> : <><div className="ai-segment-list" aria-label="转写句段列表">{displayedSegments.map((segment) => {
+                        const segmentCandidates = highlightCandidatesBySegment.get(segment.stableSegmentId) ?? [];
+                        const currentHighlight = activeHighlightSegmentIds.has(segment.stableSegmentId);
+                        return <div id={`ai-segment-${segment.stableSegmentId}`} key={segment.stableSegmentId} className={`ai-segment-row ${segment.stableSegmentId === currentSegmentId ? "active" : ""} ${currentHighlight ? "highlight-current" : segmentCandidates.length > 0 ? "highlight-related" : ""}`}><button className="ai-segment-main" disabled={!previewReady} onClick={() => seekSegment(segment)}><time>{formatTimestamp(segment.sourceStartMs)}<span>– {formatTimestamp(segment.sourceEndMs)}</span></time><p>{segment.normalizedText}</p>{segment.confidence !== null && segment.confidence < 0.55 && <em>低置信</em>}</button>{segmentCandidates.length > 0 && <span className="ai-segment-highlight-marker" aria-label={`句段包含 ${segmentCandidates.length} 个高光候选`} title={segmentCandidates.map((candidate) => `${candidate.title} ${candidate.totalScore.toFixed(0)} 分`).join("；")}>{segmentCandidates.length > 1 ? `${segmentCandidates.length} 个候选` : `${segmentCandidates[0].totalScore.toFixed(0)} 分`}</span>}<button className="ai-segment-copy" aria-label={`复制句段 ${formatTimestamp(segment.sourceStartMs)}`} onClick={() => void copy(() => api.copyAiSegmentText(detail.project.id, segment.stableSegmentId), "已复制句段")}><Clipboard size={13} /></button></div>;
+                      })}</div>{highlightView === "transcript" && pageCount > 1 && <footer className="ai-segment-pagination"><button disabled={safePage === 0} onClick={() => setSegmentPage((page) => Math.max(0, page - 1))}><ChevronLeft size={14} />上一页</button><span>{safePage + 1} / {pageCount} · 共 {segments.length} 句</span><button disabled={safePage >= pageCount - 1} onClick={() => setSegmentPage((page) => Math.min(pageCount - 1, page + 1))}>下一页<ChevronRight size={14} /></button></footer>}</>}
                     </section>
                   </div>
                 </section>

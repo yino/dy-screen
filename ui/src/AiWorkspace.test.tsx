@@ -169,8 +169,8 @@ const highlightCandidates: AiHighlightCandidate[] = [{
   title: "普通互动",
   inputId: completedInput.id,
   segmentIds: ["seg-a", "seg-b"],
-  startMs: 20_000,
-  endMs: 38_000,
+  startMs: 500,
+  endMs: 17_500,
   totalScore: 64,
   hookScore: 61,
   informationScore: 58,
@@ -515,33 +515,169 @@ describe("AiWorkspace", () => {
     expect(screen.getByText("已读取相同内容的历史高光分析结果")).toBeInTheDocument();
   });
 
-  it("同时展示达标和参考候选的总分与六项评分", async () => {
+  it("将高光候选与 ASR 整合，并且一次只展开当前候选详情", async () => {
     const user = userEvent.setup();
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     const api = createAiApi();
-    api.getAiLlmSettings = vi.fn().mockResolvedValue({
-      provider: "deepseek",
-      modelId: "deepseek-chat",
-      timeoutMs: 30_000,
-      promptVersion: "highlight-v1",
-      keyConfigured: true,
-      updatedAt: "2026-07-22T00:00:00Z",
-    });
-    api.startAiHighlightAnalysis = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
     api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
     render(<AiWorkspace api={api} />);
 
-    const startButton = await screen.findByRole("button", { name: "开始高光分析" });
-    await waitFor(() => expect(startButton).toBeEnabled());
-    await user.click(startButton);
-
     expect(await screen.findByText("2 个评分候选")).toBeInTheDocument();
     expect(screen.getByText("1 个达到 70 分 · 1 个参考候选")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "全文" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "高光候选 2" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "已选择 0" })).toBeInTheDocument();
+    expect(screen.queryByText(highlightCandidates[0].reason)).not.toBeInTheDocument();
+    expect(screen.queryByText(highlightCandidates[1].reason)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "高光候选 2" }));
+
+    const navigation = screen.getByLabelText("高光候选导航");
+    expect(within(navigation).getByRole("button", { name: "查看候选 价格反转，82 分" })).toBeInTheDocument();
+    expect(within(navigation).getByRole("button", { name: "查看候选 普通互动，64 分" })).toBeInTheDocument();
+    expect(within(navigation).getAllByRole("button")[0]).toHaveAccessibleName("查看候选 价格反转，82 分");
+    expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("价格反转");
     expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("86吸引力");
     expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("91标签相关");
+    expect(screen.getByText(highlightCandidates[0].reason)).toBeInTheDocument();
+    expect(screen.queryByLabelText("普通互动 评分明细")).not.toBeInTheDocument();
+    expect(screen.getAllByLabelText("句段包含 2 个高光候选")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "保存候选选择" })).not.toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("候选排序"), "time");
+    expect(within(navigation).getAllByRole("button")[0]).toHaveAccessibleName("查看候选 普通互动，64 分");
+    await user.click(within(navigation).getByRole("button", { name: "查看候选 普通互动，64 分" }));
+    expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("普通互动");
     expect(screen.getByLabelText("普通互动 评分明细")).toHaveTextContent("65传播性");
-    expect(screen.getByText("82 分")).toBeInTheDocument();
-    expect(screen.getByText("64 分")).toBeInTheDocument();
+    expect(screen.queryByText(highlightCandidates[0].reason)).not.toBeInTheDocument();
+  });
+
+  it("重新打开项目时恢复最近一次高光运行和评分候选", async () => {
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
+    render(<AiWorkspace api={api} />);
+
+    expect(await screen.findByText("2 个评分候选")).toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "高光候选 2" }));
+    expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("82 分");
+    expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("91标签相关");
+    expect(api.getLatestAiHighlightRun).toHaveBeenCalledWith(project.id);
+    expect(api.listAiHighlightCandidates).toHaveBeenCalledWith(completedHighlightRun.id);
+  });
+
+  it("点击跨视频候选后定位 ASR 和播放器，并只播放候选时间范围", async () => {
+    const user = userEvent.setup();
+    const secondInput: AiProjectDetail["inputs"][number] = {
+      ...completedInput,
+      id: 302,
+      position: 1,
+      displayName: "第二段直播.mp4",
+      durationMs: 20_000,
+    };
+    const secondSegment: AiTranscriptSegment = {
+      ...segments[0],
+      stableSegmentId: "seg-second-highlight",
+      inputId: secondInput.id,
+      sourceStartMs: 6_000,
+      sourceEndMs: 9_000,
+      projectStartMs: 16_000,
+      projectEndMs: 19_000,
+      rawText: "第二段高光原文",
+      normalizedText: "第二段高光原文。",
+    };
+    const secondCandidate: AiHighlightCandidate = {
+      ...highlightCandidates[0],
+      id: 903,
+      candidateKey: "candidate-second-video",
+      title: "跨视频高光",
+      inputId: secondInput.id,
+      segmentIds: [secondSegment.stableSegmentId],
+      startMs: 6_000,
+      endMs: 9_000,
+      totalScore: 77,
+      rank: 3,
+    };
+    const multiDetail: AiProjectDetail = { project, inputs: [completedInput, secondInput] };
+    const multiTranscript: AiTranscriptProjection = {
+      project,
+      inputs: [transcript.inputs[0], {
+        ...transcript.inputs[0],
+        inputId: secondInput.id,
+        position: 1,
+        displayName: secondInput.displayName,
+        durationMs: secondInput.durationMs,
+        projectOffsetMs: 10_000,
+        segments: [secondSegment],
+      }],
+    };
+    const api = createAiApi(multiDetail, multiTranscript);
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue([...highlightCandidates, secondCandidate]);
+    api.requestAiInputPreview = vi.fn(async (_projectId, inputId) => ({
+      ...readyPreview,
+      requestId: `preview-${inputId}`,
+      videoId: -inputId,
+    }));
+    const play = vi.spyOn(window.HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    const pause = vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "高光候选 3" }));
+    await user.click(screen.getByRole("button", { name: "查看候选 跨视频高光，77 分" }));
+
+    await waitFor(() => expect(api.requestAiInputPreview).toHaveBeenCalledWith(project.id, secondInput.id));
+    expect(await screen.findByText(secondSegment.normalizedText, { selector: ".ai-segment-main p" })).toBeInTheDocument();
+    const video = await screen.findByLabelText("AI 视频播放器") as HTMLVideoElement;
+    await waitFor(() => expect(video.currentTime).toBe(6));
+
+    await user.click(screen.getByRole("button", { name: "播放高光片段" }));
+    expect(play).toHaveBeenCalled();
+    expect(video.currentTime).toBe(6);
+    video.currentTime = 9;
+    fireEvent.timeUpdate(video);
+    expect(pause).toHaveBeenCalled();
+  });
+
+  it("即时保存加入待切片状态，并在失败时保留后端已确认选择", async () => {
+    const user = userEvent.setup();
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
+    api.selectAiHighlightCandidates = vi.fn()
+      .mockResolvedValueOnce(highlightCandidates.map((candidate) => ({
+        ...candidate,
+        selected: candidate.id === highlightCandidates[0].id,
+      })))
+      .mockRejectedValueOnce(new Error("选择保存失败"));
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "高光候选 2" }));
+    const selection = screen.getByRole("checkbox", { name: "加入待切片" });
+    await user.click(selection);
+
+    await waitFor(() => expect(api.selectAiHighlightCandidates).toHaveBeenCalledWith(
+      completedHighlightRun.id,
+      [highlightCandidates[0].id],
+    ));
+    expect(selection).toBeChecked();
+    expect(screen.getByRole("button", { name: "已选择 1" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "已选择 1" }));
+    expect(within(screen.getByLabelText("高光候选导航")).getAllByRole("button")).toHaveLength(1);
+    expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("价格反转");
+    await user.click(screen.getByRole("button", { name: "高光候选 2" }));
+    await user.click(screen.getByRole("button", { name: "查看候选 普通互动，64 分" }));
+    const secondSelection = screen.getByRole("checkbox", { name: "加入待切片" });
+    await user.click(secondSelection);
+
+    await waitFor(() => expect(screen.getByText("选择保存失败")).toBeInTheDocument());
+    expect(secondSelection).not.toBeChecked();
+    expect(screen.getByRole("button", { name: "已选择 1" })).toBeInTheDocument();
+    expect(api.selectAiHighlightCandidates).toHaveBeenLastCalledWith(
+      completedHighlightRun.id,
+      [highlightCandidates[0].id, highlightCandidates[1].id],
+    );
   });
 
   it("允许审计高光分析的请求、步骤、输入范围和结构化结果", async () => {
