@@ -555,6 +555,14 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
         })
         .unwrap();
     assert_eq!(run.tags_snapshot, vec!["带货"]);
+    assert_eq!(
+        repository
+            .latest_highlight_run_for_project(project.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        run.id
+    );
     let unauthorized = repository.create_highlight_run(NewAiHighlightRun {
         analysis_fingerprint: "fingerprint-2".to_owned(),
         user_authorized: false,
@@ -591,39 +599,55 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
             .unwrap()
             .is_empty()
     );
+    let persisted_draft = HighlightCandidateDraft {
+        candidate_key: "candidate-1".to_owned(),
+        title: "价格反转".to_owned(),
+        input_id: project_input.id,
+        segment_ids: vec!["seg_1".to_owned()],
+        start_ms: 0,
+        end_ms: 15_000,
+        hook_score: 82.0,
+        information_score: 78.0,
+        emotion_score: 75.0,
+        tag_relevance_score: 92.0,
+        completeness_score: 80.0,
+        shareability_score: 84.0,
+        reason: "包含明确卖点和反转".to_owned(),
+        matched_tags: vec!["带货".to_owned()],
+    };
+    repository
+        .mark_highlight_chunk_running(run.id, chunks[0].id)
+        .unwrap();
+    repository
+        .complete_highlight_chunk(run.id, chunks[0].id, &[persisted_draft.clone()], 7)
+        .unwrap();
+    let progress = repository.highlight_progress(run.id).unwrap();
+    assert_eq!(progress.total_batches, 1);
+    assert_eq!(progress.completed_batches, 1);
+    assert_eq!(progress.failed_batches, 0);
+    assert_eq!(progress.candidate_count, 1);
+    let restored = repository.list_completed_highlight_drafts(run.id).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].1, vec![persisted_draft.clone()]);
+    let persisted_score = HighlightCandidateScore {
+        candidate_key: "candidate-1".to_owned(),
+        total_score: 82.0,
+        hook_score: 82.0,
+        information_score: 78.0,
+        emotion_score: 75.0,
+        tag_relevance_score: 92.0,
+        completeness_score: 80.0,
+        shareability_score: 84.0,
+        rank: 1,
+        reason: "带货标签相关".to_owned(),
+    };
 
     let candidates = repository
         .publish_highlight_results(
             run.id,
             chunks[0].id,
-            &[HighlightCandidateDraft {
-                candidate_key: "candidate-1".to_owned(),
-                title: "价格反转".to_owned(),
-                input_id: project_input.id,
-                segment_ids: vec!["seg_1".to_owned()],
-                start_ms: 0,
-                end_ms: 15_000,
-                hook_score: 82.0,
-                information_score: 78.0,
-                emotion_score: 75.0,
-                tag_relevance_score: 92.0,
-                completeness_score: 80.0,
-                shareability_score: 84.0,
-                reason: "包含明确卖点和反转".to_owned(),
-                matched_tags: vec!["带货".to_owned()],
-            }],
-            &[HighlightCandidateScore {
-                candidate_key: "candidate-1".to_owned(),
-                total_score: 82.0,
-                hook_score: 82.0,
-                information_score: 78.0,
-                emotion_score: 75.0,
-                tag_relevance_score: 92.0,
-                completeness_score: 80.0,
-                shareability_score: 84.0,
-                rank: 1,
-                reason: "带货标签相关".to_owned(),
-            }],
+            &[persisted_draft.clone()],
+            &[persisted_score.clone()],
             12,
         )
         .unwrap();
@@ -633,6 +657,14 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
         .select_highlight_candidates(run.id, &[candidates[0].id])
         .unwrap();
     assert!(selected[0].selected);
+    let reranked = repository
+        .replace_highlight_results(
+            run.id,
+            &[(chunks[0].id, persisted_draft)],
+            &[persisted_score],
+        )
+        .unwrap();
+    assert!(reranked[0].selected);
     let invalid = repository.select_highlight_candidates(run.id, &[999_999]);
     assert!(invalid.is_err());
     assert!(
@@ -641,6 +673,29 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
             .unwrap()
             .iter()
             .any(|candidate| candidate.selected)
+    );
+    let newer = repository
+        .create_highlight_run(NewAiHighlightRun {
+            project_id: project.id,
+            model_id: "deepseek-chat".to_owned(),
+            prompt_version: "highlight-v1".to_owned(),
+            tags_snapshot: Vec::new(),
+            skills_snapshot: vec!["generic-hook@1.0.0".to_owned()],
+            analysis_goal: None,
+            analysis_fingerprint: "fingerprint-latest".to_owned(),
+            total_segments: 2,
+            total_chars: 20,
+            estimated_batches: 1,
+            user_authorized: true,
+        })
+        .unwrap();
+    assert_eq!(
+        repository
+            .latest_highlight_run_for_project(project.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        newer.id
     );
 }
 

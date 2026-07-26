@@ -419,6 +419,16 @@ export interface AiHighlightRun {
   updatedAt: string;
 }
 
+export interface AiHighlightProgress {
+  runId: number;
+  totalBatches: number;
+  pendingBatches: number;
+  runningBatches: number;
+  completedBatches: number;
+  failedBatches: number;
+  candidateCount: number;
+}
+
 export interface AiHighlightCandidate {
   id: number;
   runId: number;
@@ -576,6 +586,9 @@ export interface ClientApi {
   clearAiLlmKey?(): Promise<void>;
   diagnoseAiLlmProvider?(): Promise<ProviderDiagnostic>;
   startAiHighlightAnalysis?(projectId: number, confirmed: boolean): Promise<AiHighlightRun>;
+  getLatestAiHighlightRun?(projectId: number): Promise<AiHighlightRun | null>;
+  getAiHighlightProgress?(runId: number): Promise<AiHighlightProgress>;
+  resumeAiHighlightAnalysis?(runId: number): Promise<AiHighlightRun>;
   listAiHighlightCandidates?(runId: number): Promise<AiHighlightCandidate[]>;
   selectAiHighlightCandidates?(runId: number, candidateIds: number[]): Promise<AiHighlightCandidate[]>;
   requestAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;

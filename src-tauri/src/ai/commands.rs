@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AiHighlightCandidate, AiHighlightRun, AiInputSourceKind, AiInputStatus, AiProject,
-    AiProjectDetail, AiProjectInput, AiProjectService, AiProjectStatus, AiProjectSummary,
-    AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore, HighlightWorkflow,
-    ImportBatchResult, ImportRejection, LlmProviderSettings, ProviderDiagnostic,
-    RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
+    AiHighlightCandidate, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus,
+    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectService,
+    AiProjectStatus, AiProjectSummary, AiRepository, AiSessionOption, AiTranscriptProjection,
+    CredentialStore, HighlightWorkflow, ImportBatchResult, ImportRejection, LlmProviderSettings,
+    ProviderDiagnostic, RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +187,7 @@ pub struct AiCommandService {
     controller: Arc<dyn AiJobController>,
     grants: Arc<TrustedFileGrantStore>,
     highlight_workflow: Option<Arc<HighlightWorkflow>>,
+    highlight_tasks: Arc<Mutex<HashSet<i64>>>,
     credential_store: Option<Arc<dyn CredentialStore>>,
 }
 
@@ -202,6 +203,7 @@ impl AiCommandService {
             controller,
             grants: Arc::new(TrustedFileGrantStore::default()),
             highlight_workflow: None,
+            highlight_tasks: Arc::new(Mutex::new(HashSet::new())),
             credential_store: None,
         }
     }
@@ -430,16 +432,73 @@ impl AiCommandService {
                 true,
             )
         })?;
-        workflow
-            .analyze(
-                project_id,
-                confirmed,
-                tokio_util::sync::CancellationToken::new(),
+        let run = workflow.prepare(project_id, confirmed).map_err(|error| {
+            AiCommandError::new("highlight_analysis_failed", error.to_string(), true)
+        })?;
+        if matches!(run.status, AiHighlightRunStatus::Completed) {
+            return Ok(run);
+        }
+        self.ensure_highlight_task(workflow, run.id)?;
+        Ok(run)
+    }
+
+    pub fn resume_highlight_analysis(&self, run_id: i64) -> Result<AiHighlightRun, AiCommandError> {
+        let workflow = self.highlight_workflow.as_ref().ok_or_else(|| {
+            AiCommandError::new(
+                "llm_provider_unavailable",
+                "高光分析 Provider 尚未配置",
+                true,
             )
-            .await
-            .map_err(|error| {
-                AiCommandError::new("highlight_analysis_failed", error.to_string(), true)
-            })
+        })?;
+        let run = self
+            .repository
+            .get_highlight_run(run_id)
+            .map_err(repository_error)?;
+        if !run.user_authorized {
+            return Err(AiCommandError::new(
+                "highlight_authorization_required",
+                "该高光运行没有用户授权，不能自动恢复",
+                false,
+            ));
+        }
+        if !matches!(run.status, AiHighlightRunStatus::Completed) {
+            self.ensure_highlight_task(workflow, run.id)?;
+        }
+        Ok(run)
+    }
+
+    fn ensure_highlight_task(
+        &self,
+        workflow: &Arc<HighlightWorkflow>,
+        run_id: i64,
+    ) -> Result<(), AiCommandError> {
+        let should_start = self
+            .highlight_tasks
+            .lock()
+            .map_err(|_| {
+                AiCommandError::new(
+                    "highlight_task_state_unavailable",
+                    "高光分析任务状态不可用",
+                    true,
+                )
+            })?
+            .insert(run_id);
+        if should_start {
+            let workflow = Arc::clone(workflow);
+            let tasks = Arc::clone(&self.highlight_tasks);
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = workflow
+                    .execute(run_id, tokio_util::sync::CancellationToken::new())
+                    .await
+                {
+                    workflow.record_fatal_error(run_id, &error);
+                }
+                if let Ok(mut active) = tasks.lock() {
+                    active.remove(&run_id);
+                }
+            });
+        }
+        Ok(())
     }
 
     pub async fn diagnose_llm_provider(&self) -> Result<ProviderDiagnostic, AiCommandError> {
@@ -468,6 +527,21 @@ impl AiCommandService {
     ) -> Result<Vec<AiHighlightCandidate>, AiCommandError> {
         self.repository
             .list_highlight_candidates(run_id)
+            .map_err(repository_error)
+    }
+
+    pub fn latest_highlight_run(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<AiHighlightRun>, AiCommandError> {
+        self.repository
+            .latest_highlight_run_for_project(project_id)
+            .map_err(repository_error)
+    }
+
+    pub fn highlight_progress(&self, run_id: i64) -> Result<AiHighlightProgress, AiCommandError> {
+        self.repository
+            .highlight_progress(run_id)
             .map_err(repository_error)
     }
 
@@ -782,4 +856,21 @@ fn untrusted_grant_error() -> AiCommandError {
         "本地视频必须通过系统文件选择器添加",
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn tauri_background_tasks_can_start_without_a_current_tokio_reactor() {
+        let (sender, receiver) = mpsc::channel();
+        tauri::async_runtime::spawn(async move {
+            let _ = sender.send(());
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Tauri 全局运行时应执行后台任务");
+    }
 }

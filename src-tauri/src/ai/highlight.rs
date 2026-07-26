@@ -1,6 +1,6 @@
 //! 受 Rust 控制的高光分析工作流与版本化 Skills。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -13,7 +13,11 @@ use super::{
     RankingAgentRequest,
 };
 
-const RESULT_POLICY_VERSION: &str = "top-10-with-reference-candidates-v2";
+const RESULT_POLICY_VERSION: &str = "top-10-resumable-batches-v3";
+const MAX_CANDIDATES_PER_CHUNK: usize = 5;
+const MAX_RANKING_CANDIDATES: usize = 60;
+const MAX_CHUNK_ATTEMPTS: usize = 2;
+const MAX_CONSECUTIVE_CHUNK_FAILURES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightSkill {
@@ -203,19 +207,17 @@ impl HighlightWorkflow {
         }
     }
 
-    pub async fn analyze(
+    pub fn prepare(
         &self,
         project_id: i64,
         authorization_confirmed: bool,
-        cancellation: CancellationToken,
     ) -> Result<AiHighlightRun, LlmError> {
         if !authorization_confirmed {
             return Err(LlmError::InvalidConfiguration(
                 "必须确认将规范化转写发送给 DeepSeek".to_owned(),
             ));
         }
-        let key = self
-            .credentials
+        self.credentials
             .get()
             .map_err(|_| LlmError::Credential)?
             .ok_or(LlmError::Credential)?;
@@ -293,47 +295,178 @@ impl HighlightWorkflow {
                 })
                 .collect::<Vec<_>>(),
         )?;
+        Ok(self.repository.get_highlight_run(run.id)?)
+    }
+
+    pub async fn execute(
+        &self,
+        run_id: i64,
+        cancellation: CancellationToken,
+    ) -> Result<AiHighlightRun, LlmError> {
+        let run = self.repository.get_highlight_run(run_id)?;
+        if matches!(run.status, AiHighlightRunStatus::Completed) {
+            return Ok(run);
+        }
+        let key = self
+            .credentials
+            .get()
+            .map_err(|_| LlmError::Credential)?
+            .ok_or(LlmError::Credential)?;
+        let settings = self.repository.get_llm_provider_settings(true)?;
+        let segments = load_segments(&self.repository, run.project_id)?;
+        let segments_by_id = segments
+            .into_iter()
+            .map(|segment| (segment.stable_id.clone(), segment))
+            .collect::<HashMap<_, _>>();
+        let skills = skills_from_snapshot(&run.skills_snapshot);
+        let chunk_rows = self.repository.list_highlight_chunks(run.id)?;
+        let chunks = chunk_rows
+            .iter()
+            .map(|row| AnalysisChunk {
+                ordinal: row.ordinal,
+                input_id: row.input_id,
+                segment_ids: row.segment_ids.clone(),
+                context_segment_ids: row.context_segment_ids.clone(),
+                segments: row
+                    .segment_ids
+                    .iter()
+                    .filter_map(|id| segments_by_id.get(id).cloned())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
         self.repository
             .update_highlight_run_status(run.id, AiHighlightRunStatus::Running, None)?;
-        let mut drafts_by_chunk = Vec::new();
-        for chunk in &chunks {
+        let mut consecutive_chunk_failures = 0_usize;
+        for (chunk_row, chunk) in chunk_rows.iter().zip(chunks.iter()) {
+            if chunk_row.status == "completed" {
+                continue;
+            }
             cancellation.check_cancelled()?;
+            if consecutive_chunk_failures >= MAX_CONSECUTIVE_CHUNK_FAILURES {
+                self.repository.fail_highlight_chunk(
+                    run.id,
+                    chunk_row.id,
+                    "highlight_provider_circuit_open",
+                    "Provider 连续多批不可用，剩余批次已暂停，可稍后重试",
+                )?;
+                continue;
+            }
+            if chunk.segments.len() != chunk.segment_ids.len() {
+                self.repository.fail_highlight_chunk(
+                    run.id,
+                    chunk_row.id,
+                    "highlight_segments_missing",
+                    "批次引用的 ASR 句段已经不可用",
+                )?;
+                continue;
+            }
             let prompt = build_candidate_prompt(
                 chunk,
-                &tags,
+                &run.tags_snapshot,
                 &skills,
-                detail.project.analysis_goal.as_deref(),
+                run.analysis_goal.as_deref(),
             );
-            let response = self
-                .provider
-                .discover_candidates(
-                    &settings,
-                    &key,
-                    CandidateAgentRequest { prompt },
-                    cancellation.child_token(),
-                )
-                .await?;
-            let valid = validate_candidates(response.candidates, chunk);
-            drafts_by_chunk.push((chunk.ordinal, valid, response.token_usage));
+            let mut final_error = None;
+            for attempt in 0..MAX_CHUNK_ATTEMPTS {
+                self.repository
+                    .mark_highlight_chunk_running(run.id, chunk_row.id)?;
+                match self
+                    .provider
+                    .discover_candidates(
+                        &settings,
+                        &key,
+                        CandidateAgentRequest {
+                            prompt: prompt.clone(),
+                        },
+                        cancellation.child_token(),
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        let mut valid = validate_candidates(response.candidates, chunk);
+                        valid.sort_by(|left, right| {
+                            discovery_score(right)
+                                .partial_cmp(&discovery_score(left))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| left.candidate_key.cmp(&right.candidate_key))
+                        });
+                        valid.truncate(MAX_CANDIDATES_PER_CHUNK);
+                        self.repository.complete_highlight_chunk(
+                            run.id,
+                            chunk_row.id,
+                            &valid,
+                            response.token_usage,
+                        )?;
+                        consecutive_chunk_failures = 0;
+                        final_error = None;
+                        break;
+                    }
+                    Err(error) if attempt + 1 < MAX_CHUNK_ATTEMPTS && retryable(&error) => {
+                        final_error = Some(error);
+                    }
+                    Err(error) => {
+                        final_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = final_error {
+                if matches!(error, LlmError::Cancelled) {
+                    return Err(error);
+                }
+                self.repository.fail_highlight_chunk(
+                    run.id,
+                    chunk_row.id,
+                    llm_error_code(&error),
+                    &error.to_string(),
+                )?;
+                consecutive_chunk_failures += 1;
+            }
         }
+
+        cancellation.check_cancelled()?;
+        let progress = self.repository.highlight_progress(run.id)?;
+        let completed_drafts = self.repository.list_completed_highlight_drafts(run.id)?;
         let mut seen_candidates = HashSet::new();
-        let all_drafts = drafts_by_chunk
-            .iter()
-            .flat_map(|(_, drafts, _)| drafts.iter().cloned())
-            .filter(|draft| seen_candidates.insert(draft.candidate_key.clone()))
+        let mut all_drafts = completed_drafts
+            .into_iter()
+            .flat_map(|(chunk, drafts)| drafts.into_iter().map(move |draft| (chunk.id, draft)))
+            .filter(|(_, draft)| seen_candidates.insert(draft.candidate_key.clone()))
             .collect::<Vec<_>>();
         if all_drafts.is_empty() {
-            self.repository.update_highlight_run_status(
-                run.id,
-                AiHighlightRunStatus::Completed,
-                None,
-            )?;
-            return Ok(self.repository.get_highlight_run(run.id)?);
+            let status = if progress.failed_batches == progress.total_batches {
+                AiHighlightRunStatus::Failed
+            } else if progress.failed_batches > 0 {
+                AiHighlightRunStatus::Partial
+            } else {
+                AiHighlightRunStatus::Completed
+            };
+            let error = (progress.failed_batches > 0).then_some((
+                "highlight_batches_failed",
+                "部分批次分析失败，且没有生成可用候选",
+            ));
+            return Ok(self
+                .repository
+                .update_highlight_run_status(run.id, status, error)?);
         }
+        all_drafts.sort_by(|(_, left), (_, right)| {
+            discovery_score(right)
+                .partial_cmp(&discovery_score(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.candidate_key.cmp(&right.candidate_key))
+        });
+        all_drafts.truncate(MAX_RANKING_CANDIDATES);
         self.repository
             .update_highlight_run_status(run.id, AiHighlightRunStatus::Ranking, None)?;
-        let ranking_prompt =
-            build_ranking_prompt(&all_drafts, &tags, detail.project.analysis_goal.as_deref());
+        let ranking_drafts = all_drafts
+            .iter()
+            .map(|(_, draft)| draft.clone())
+            .collect::<Vec<_>>();
+        let ranking_prompt = build_ranking_prompt(
+            &ranking_drafts,
+            &run.tags_snapshot,
+            run.analysis_goal.as_deref(),
+        );
         let ranked = self
             .provider
             .rank_candidates(
@@ -344,44 +477,85 @@ impl HighlightWorkflow {
                 },
                 cancellation.child_token(),
             )
-            .await?;
-        let ranking_tokens = ranked.token_usage;
-        let candidate_keys = all_drafts
+            .await;
+        let candidate_keys = ranking_drafts
             .iter()
             .map(|draft| draft.candidate_key.clone())
             .collect::<HashSet<_>>();
-        let scores = select_top_scores(ranked.scores, &candidate_keys);
+        let (scores, ranking_failed) = match ranked {
+            Ok(ranked) => {
+                self.repository
+                    .add_highlight_run_tokens(run.id, ranked.token_usage)?;
+                let scores = select_top_scores(ranked.scores, &candidate_keys);
+                if scores.is_empty() {
+                    (fallback_scores(&ranking_drafts), true)
+                } else {
+                    (scores, false)
+                }
+            }
+            Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
+            Err(_) => (fallback_scores(&ranking_drafts), true),
+        };
+        let selected = all_drafts
+            .into_iter()
+            .filter(|(_, draft)| {
+                scores
+                    .iter()
+                    .any(|score| score.candidate_key == draft.candidate_key)
+            })
+            .collect::<Vec<_>>();
         self.repository
-            .add_highlight_run_tokens(run.id, ranking_tokens)?;
-        for (ordinal, drafts, tokens) in drafts_by_chunk {
-            cancellation.check_cancelled()?;
-            let chunk_row = self
-                .repository
-                .list_highlight_chunks(run.id)?
-                .into_iter()
-                .find(|chunk| chunk.ordinal == ordinal)
-                .ok_or(LlmError::InvalidResponse)?;
-            let chunk_drafts = drafts
-                .into_iter()
-                .filter(|draft| {
-                    scores
-                        .iter()
-                        .any(|score| score.candidate_key == draft.candidate_key)
-                })
-                .collect::<Vec<_>>();
-            self.repository.publish_highlight_results(
-                run.id,
-                chunk_row.id,
-                &chunk_drafts,
-                &scores,
-                tokens,
-            )?;
+            .replace_highlight_results(run.id, &selected, &scores)?;
+        let has_failures = progress.failed_batches > 0 || ranking_failed;
+        let status = if has_failures {
+            AiHighlightRunStatus::Partial
+        } else {
+            AiHighlightRunStatus::Completed
+        };
+        let error = if ranking_failed {
+            Some((
+                "highlight_ranking_failed",
+                "统一评分失败，已按候选分项分数发布备用排序",
+            ))
+        } else if progress.failed_batches > 0 {
+            Some((
+                "highlight_batches_failed",
+                "部分批次分析失败，已发布其余批次的候选",
+            ))
+        } else {
+            None
+        };
+        Ok(self
+            .repository
+            .update_highlight_run_status(run.id, status, error)?)
+    }
+
+    pub async fn analyze(
+        &self,
+        project_id: i64,
+        authorization_confirmed: bool,
+        cancellation: CancellationToken,
+    ) -> Result<AiHighlightRun, LlmError> {
+        let run = self.prepare(project_id, authorization_confirmed)?;
+        if matches!(run.status, AiHighlightRunStatus::Completed) {
+            Ok(run)
+        } else {
+            self.execute(run.id, cancellation).await
         }
-        Ok(self.repository.update_highlight_run_status(
-            run.id,
-            AiHighlightRunStatus::Completed,
-            None,
-        )?)
+    }
+
+    pub fn record_fatal_error(&self, run_id: i64, error: &LlmError) {
+        let status = if matches!(error, LlmError::Cancelled) {
+            AiHighlightRunStatus::Cancelled
+        } else {
+            AiHighlightRunStatus::Failed
+        };
+        let message = error.to_string();
+        let _ = self.repository.update_highlight_run_status(
+            run_id,
+            status,
+            Some((llm_error_code(error), &message)),
+        );
     }
 
     /// 只发送最小连接探测提示，不读取或发送项目转写，也不创建高光运行。
@@ -403,6 +577,108 @@ impl HighlightWorkflow {
     }
 }
 
+fn load_segments(
+    repository: &AiRepository,
+    project_id: i64,
+) -> Result<Vec<AnalysisSegment>, LlmError> {
+    let projection = super::AiTranscriptProjection::load(repository, project_id).map_err(
+        |error| match error {
+            super::AiProjectionError::Repository(error) => LlmError::Repository(error),
+            _ => LlmError::InvalidResponse,
+        },
+    )?;
+    Ok(projection
+        .inputs
+        .iter()
+        .flat_map(|input| {
+            input.segments.iter().map(|segment| AnalysisSegment {
+                stable_id: segment.stable_segment_id.clone(),
+                input_id: segment.input_id,
+                start_ms: segment.source_start_ms,
+                end_ms: segment.source_end_ms,
+                text: segment.normalized_text.clone(),
+            })
+        })
+        .collect())
+}
+
+fn skills_from_snapshot(snapshot: &[String]) -> Vec<HighlightSkill> {
+    let mut skills = snapshot
+        .iter()
+        .filter_map(|value| match value.split('@').next().unwrap_or_default() {
+            "generic-hook" => Some(GENERIC_HOOK),
+            "ecommerce-conversion" => Some(ECOMMERCE_CONVERSION),
+            "comedy-payoff" => Some(COMEDY_PAYOFF),
+            "knowledge-density" => Some(KNOWLEDGE_DENSITY),
+            "story-emotion" => Some(STORY_EMOTION),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        skills.push(GENERIC_HOOK);
+    }
+    skills
+}
+
+fn discovery_score(draft: &HighlightCandidateDraft) -> f32 {
+    (draft.hook_score
+        + draft.information_score
+        + draft.emotion_score
+        + draft.tag_relevance_score
+        + draft.completeness_score
+        + draft.shareability_score)
+        / 6.0
+}
+
+fn fallback_scores(drafts: &[HighlightCandidateDraft]) -> Vec<HighlightCandidateScore> {
+    let mut drafts = drafts.to_vec();
+    drafts.sort_by(|left, right| {
+        discovery_score(right)
+            .partial_cmp(&discovery_score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.candidate_key.cmp(&right.candidate_key))
+    });
+    drafts
+        .into_iter()
+        .take(10)
+        .enumerate()
+        .map(|(index, draft)| {
+            let total_score = discovery_score(&draft).clamp(0.0, 100.0);
+            HighlightCandidateScore {
+                candidate_key: draft.candidate_key,
+                total_score,
+                hook_score: draft.hook_score,
+                information_score: draft.information_score,
+                emotion_score: draft.emotion_score,
+                tag_relevance_score: draft.tag_relevance_score,
+                completeness_score: draft.completeness_score,
+                shareability_score: draft.shareability_score,
+                rank: (index + 1) as u32,
+                reason: draft.reason,
+            }
+        })
+        .collect()
+}
+
+fn retryable(error: &LlmError) -> bool {
+    matches!(
+        error,
+        LlmError::Temporary | LlmError::Provider | LlmError::InvalidResponse
+    )
+}
+
+fn llm_error_code(error: &LlmError) -> &'static str {
+    match error {
+        LlmError::InvalidConfiguration(_) => "highlight_invalid_configuration",
+        LlmError::Credential => "highlight_credential_unavailable",
+        LlmError::Temporary => "highlight_provider_timeout",
+        LlmError::InvalidResponse => "highlight_invalid_response",
+        LlmError::Cancelled => "highlight_cancelled",
+        LlmError::Provider => "highlight_provider_failed",
+        LlmError::Repository(_) => "highlight_repository_failed",
+    }
+}
+
 fn select_top_scores(
     scores: Vec<HighlightCandidateScore>,
     candidate_keys: &HashSet<String>,
@@ -411,6 +687,20 @@ fn select_top_scores(
     let mut scores = scores
         .into_iter()
         .filter(|score| candidate_keys.contains(&score.candidate_key))
+        .filter(|score| {
+            score.rank > 0
+                && [
+                    score.total_score,
+                    score.hook_score,
+                    score.information_score,
+                    score.emotion_score,
+                    score.tag_relevance_score,
+                    score.completeness_score,
+                    score.shareability_score,
+                ]
+                .into_iter()
+                .all(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+        })
         .filter(|score| seen_scores.insert(score.candidate_key.clone()))
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| {
@@ -477,6 +767,16 @@ fn validate_candidates(
             candidate.input_id == chunk.input_id
                 && candidate.end_ms > candidate.start_ms
                 && (15_000..=90_000).contains(&(candidate.end_ms - candidate.start_ms))
+                && [
+                    candidate.hook_score,
+                    candidate.information_score,
+                    candidate.emotion_score,
+                    candidate.tag_relevance_score,
+                    candidate.completeness_score,
+                    candidate.shareability_score,
+                ]
+                .into_iter()
+                .all(|score| score.is_finite() && (0.0..=100.0).contains(&score))
                 && !candidate.segment_ids.is_empty()
                 && referenced.len() == candidate.segment_ids.len()
                 && candidate
@@ -507,6 +807,131 @@ impl WorkflowCancellation for CancellationToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::ai::{
+        AiArtifactStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus, MemoryCredentialStore,
+        NewAiProjectInput, NewAsrArtifact, RecognitionProfile, SourceFingerprint,
+        TranscriptSegmentDraft,
+    };
+    use crate::database::Database;
+
+    #[derive(Default)]
+    struct FirstChunkTimesOut {
+        candidate_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HighlightAgentProvider for FirstChunkTimesOut {
+        async fn diagnose(
+            &self,
+            _settings: &super::super::LlmProviderSettings,
+            _api_key: &str,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderDiagnostic, LlmError> {
+            unreachable!()
+        }
+
+        async fn discover_candidates(
+            &self,
+            _settings: &super::super::LlmProviderSettings,
+            _api_key: &str,
+            _request: CandidateAgentRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<super::super::CandidateAgentOutput, LlmError> {
+            let call = self.candidate_calls.fetch_add(1, Ordering::SeqCst);
+            if call < MAX_CHUNK_ATTEMPTS {
+                Err(LlmError::Temporary)
+            } else {
+                Ok(super::super::CandidateAgentOutput {
+                    candidates: Vec::new(),
+                    token_usage: 7,
+                })
+            }
+        }
+
+        async fn rank_candidates(
+            &self,
+            _settings: &super::super::LlmProviderSettings,
+            _api_key: &str,
+            _request: RankingAgentRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<super::super::RankingAgentOutput, LlmError> {
+            unreachable!()
+        }
+    }
+
+    fn test_profile() -> RecognitionProfile {
+        RecognitionProfile {
+            engine_id: "whisper.cpp".to_owned(),
+            engine_version: "test".to_owned(),
+            model_id: "small".to_owned(),
+            model_version: "test".to_owned(),
+            language_hint: Some("zh".to_owned()),
+            vad_model_id: "silero".to_owned(),
+            vad_threshold_millis: 500,
+            vad_padding_ms: 500,
+            timestamp_policy: "segment".to_owned(),
+            normalization_version: "test".to_owned(),
+            hotwords: Vec::new(),
+        }
+    }
+
+    fn add_completed_input(
+        repository: &AiRepository,
+        project_id: i64,
+        position: i64,
+    ) -> i64 {
+        let path = format!("/tmp/highlight-{position}.mp4");
+        let fingerprint = SourceFingerprint {
+            normalized_path: path.clone(),
+            size_bytes: 1_000 + position as u64,
+            modified_at_ms: 1_700_000_000_000 + position,
+            video_id: None,
+        };
+        let input = repository
+            .add_input(
+                project_id,
+                NewAiProjectInput {
+                    position,
+                    source_kind: AiInputSourceKind::LocalFile,
+                    video_id: None,
+                    display_name: format!("highlight-{position}.mp4"),
+                    source_path: path,
+                    source_fingerprint: fingerprint.clone(),
+                    duration_ms: Some(20_000),
+                    audio_present: Some(true),
+                },
+            )
+            .unwrap();
+        let artifact = repository
+            .create_artifact(NewAsrArtifact {
+                source_fingerprint: fingerprint,
+                recognition_profile_hash: test_profile().fingerprint().unwrap(),
+                engine_id: "whisper.cpp".to_owned(),
+                engine_version: "test".to_owned(),
+                model_id: "small".to_owned(),
+                model_version: "test".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(artifact.status, AiArtifactStatus::Pending);
+        repository
+            .publish_artifact(
+                artifact.id,
+                20_000,
+                Some("zh"),
+                &[TranscriptSegmentDraft {
+                    source_start_ms: 0,
+                    source_end_ms: 20_000,
+                    raw_text: format!("第 {position} 段直播内容"),
+                    normalized_text: format!("第 {position} 段直播内容。"),
+                    confidence: Some(0.9),
+                }],
+            )
+            .unwrap();
+        repository.attach_artifact(input.id, artifact.id).unwrap();
+        input.id
+    }
 
     #[test]
     fn skill_selection_is_deterministic_and_unknown_labels_are_data_only() {
@@ -611,5 +1036,54 @@ mod tests {
         assert_eq!(selected[0].candidate_key, "qualified");
         assert_eq!(selected[1].candidate_key, "reference");
         assert_eq!(selected[1].total_score, 64.0);
+    }
+
+    #[tokio::test]
+    async fn chunk_timeout_is_persisted_and_does_not_discard_later_batches() {
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("长直播高光", &test_profile())
+            .unwrap();
+        let input_ids = [
+            add_completed_input(&repository, project.id, 0),
+            add_completed_input(&repository, project.id, 1),
+        ];
+        repository.freeze_project(project.id).unwrap();
+        repository
+            .transition_project(project.id, AiProjectStatus::Running)
+            .unwrap();
+        for input_id in input_ids {
+            repository
+                .transition_input(input_id, AiInputStatus::Validating, None)
+                .unwrap();
+            repository
+                .transition_input(input_id, AiInputStatus::Completed, None)
+                .unwrap();
+        }
+        repository.recompute_project_progress(project.id).unwrap();
+        let credentials = MemoryCredentialStore::new();
+        credentials.set("test-key").unwrap();
+        let provider = Arc::new(FirstChunkTimesOut::default());
+        let workflow = HighlightWorkflow::new(
+            repository.clone(),
+            provider.clone(),
+            Arc::new(credentials),
+        );
+
+        let run = workflow.prepare(project.id, true).unwrap();
+        assert_eq!(run.estimated_batches, 2);
+        let finished = workflow
+            .execute(run.id, CancellationToken::new())
+            .await
+            .unwrap();
+        let progress = repository.highlight_progress(run.id).unwrap();
+
+        assert_eq!(finished.status, AiHighlightRunStatus::Partial);
+        assert_eq!(progress.failed_batches, 1);
+        assert_eq!(progress.completed_batches, 1);
+        assert_eq!(finished.total_tokens, 7);
+        assert_eq!(provider.candidate_calls.load(Ordering::SeqCst), 3);
     }
 }

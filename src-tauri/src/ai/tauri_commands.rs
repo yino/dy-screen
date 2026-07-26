@@ -8,9 +8,9 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
-    AiHighlightCandidate, AiHighlightRun, AiImportBatchView, AiProject, AiProjectDetailView,
-    AiProjectSummary, AiSessionImportView, AiSessionOption, AiTranscriptProjection,
-    AiTrustedFileGrant, LlmProviderSettings, ProviderDiagnostic,
+    AiHighlightCandidate, AiHighlightProgress, AiHighlightRun, AiImportBatchView, AiProject,
+    AiProjectDetailView, AiProjectSummary, AiSessionImportView, AiSessionOption,
+    AiTranscriptProjection, AiTrustedFileGrant, LlmProviderSettings, ProviderDiagnostic,
 };
 
 pub struct AiDesktopState {
@@ -320,6 +320,30 @@ pub(crate) async fn ai_start_highlight_analysis(
         .commands
         .start_highlight_analysis(project_id, confirmed)
         .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_latest_highlight_run(
+    project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<Option<AiHighlightRun>, AiCommandError> {
+    state.commands.latest_highlight_run(project_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_highlight_progress(
+    run_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiHighlightProgress, AiCommandError> {
+    state.commands.highlight_progress(run_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_resume_highlight_analysis(
+    run_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiHighlightRun, AiCommandError> {
+    state.commands.resume_highlight_analysis(run_id)
 }
 
 #[tauri::command]

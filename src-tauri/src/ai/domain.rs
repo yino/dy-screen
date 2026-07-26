@@ -444,6 +444,18 @@ pub struct AiHighlightChunk {
     pub last_error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiHighlightProgress {
+    pub run_id: i64,
+    pub total_batches: u64,
+    pub pending_batches: u64,
+    pub running_batches: u64,
+    pub completed_batches: u64,
+    pub failed_batches: u64,
+    pub candidate_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AiHighlightCandidate {

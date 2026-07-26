@@ -211,6 +211,7 @@ impl Database {
         }
         crate::ai::migrate_ai_v4(&mut connection)?;
         crate::ai::migrate_ai_v7(&mut connection)?;
+        crate::ai::migrate_ai_v9(&mut connection)?;
 
         let applied = connection
             .query_row(

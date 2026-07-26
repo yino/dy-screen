@@ -842,6 +842,9 @@ pub fn run() {
             ai_clear_llm_key,
             ai_diagnose_llm_provider,
             ai_start_highlight_analysis,
+            ai_get_latest_highlight_run,
+            ai_get_highlight_progress,
+            ai_resume_highlight_analysis,
             ai_list_highlight_candidates,
             ai_select_highlight_candidates,
             request_exit

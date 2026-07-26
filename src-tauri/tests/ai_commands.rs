@@ -6,8 +6,10 @@ use async_trait::async_trait;
 use dy_screen::asr::{AsrError, EngineResult, FrozenMediaSource, MediaInspection, MediaInspector};
 use dy_screen_app_lib::ai::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
-    AiEnvironmentDiagnostic, AiInputStatus, AiJobController, AiPreflight, AiProjectService,
-    AiProjectStatus, AiRepository, PreflightReport, RecognitionProfile,
+    AiEnvironmentDiagnostic, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
+    AiJobController, AiPreflight, AiProjectService, AiProjectStatus, AiRepository, CredentialStore,
+    FakeHighlightProvider, HighlightWorkflow, MemoryCredentialStore, NewAiHighlightRun,
+    NewAiProjectInput, PreflightReport, RecognitionProfile, SourceFingerprint,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
@@ -321,4 +323,107 @@ async fn typed_commands_create_start_cancel_retry_query_and_diagnose_projects() 
         retried_cancelled.inputs[0].status,
         AiInputStatus::Pending
     );
+}
+
+#[test]
+fn highlight_resume_from_sync_tauri_command_thread_does_not_require_a_tokio_reactor() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let repository = AiRepository::new(database.clone());
+    let (commands, _) = command_service(database, Arc::new(AtomicUsize::new(0)));
+    let project = repository
+        .create_project("同步恢复高光", &ReadyControllerProfile::profile())
+        .unwrap();
+    let source_path = "/tmp/sync-highlight-resume.mp4";
+    let input = repository
+        .add_input(
+            project.id,
+            NewAiProjectInput {
+                position: 0,
+                source_kind: AiInputSourceKind::LocalFile,
+                video_id: None,
+                display_name: "sync-highlight-resume.mp4".to_owned(),
+                source_path: source_path.to_owned(),
+                source_fingerprint: SourceFingerprint {
+                    normalized_path: source_path.to_owned(),
+                    size_bytes: 1,
+                    modified_at_ms: 1,
+                    video_id: None,
+                },
+                duration_ms: Some(20_000),
+                audio_present: Some(true),
+            },
+        )
+        .unwrap();
+    repository.freeze_project(project.id).unwrap();
+    repository
+        .transition_project(project.id, AiProjectStatus::Running)
+        .unwrap();
+    repository
+        .transition_input(input.id, AiInputStatus::Validating, None)
+        .unwrap();
+    repository
+        .transition_input(input.id, AiInputStatus::Completed, None)
+        .unwrap();
+    repository.recompute_project_progress(project.id).unwrap();
+    let run = repository
+        .create_highlight_run(NewAiHighlightRun {
+            project_id: project.id,
+            model_id: "deepseek-chat".to_owned(),
+            prompt_version: "highlight-v1".to_owned(),
+            tags_snapshot: Vec::new(),
+            skills_snapshot: vec!["generic-hook@1.0.0".to_owned()],
+            analysis_goal: None,
+            analysis_fingerprint: "sync-resume-no-reactor".to_owned(),
+            total_segments: 0,
+            total_chars: 0,
+            estimated_batches: 0,
+            user_authorized: true,
+        })
+        .unwrap();
+    let credentials = MemoryCredentialStore::new();
+    credentials.set("test-key").unwrap();
+    let commands = commands.with_highlight_workflow(Arc::new(HighlightWorkflow::new(
+        repository.clone(),
+        Arc::new(FakeHighlightProvider::default()),
+        Arc::new(credentials),
+    )));
+
+    let resumed = commands.resume_highlight_analysis(run.id).unwrap();
+    assert_eq!(resumed.status, AiHighlightRunStatus::Pending);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let status = repository.get_highlight_run(run.id).unwrap().status;
+        if !matches!(
+            status,
+            AiHighlightRunStatus::Pending
+                | AiHighlightRunStatus::Running
+                | AiHighlightRunStatus::Candidates
+                | AiHighlightRunStatus::Ranking
+        ) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "后台高光恢复未结束");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+struct ReadyControllerProfile;
+
+impl ReadyControllerProfile {
+    fn profile() -> RecognitionProfile {
+        RecognitionProfile {
+            engine_id: "fake-engine".to_owned(),
+            engine_version: "1".to_owned(),
+            model_id: "fake-model".to_owned(),
+            model_version: "1".to_owned(),
+            language_hint: Some("zh".to_owned()),
+            vad_model_id: "fake-vad".to_owned(),
+            vad_threshold_millis: 500,
+            vad_padding_ms: 500,
+            timestamp_policy: "segment".to_owned(),
+            normalization_version: "zh-normalize-v1".to_owned(),
+            hotwords: Vec::new(),
+        }
+    }
 }

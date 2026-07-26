@@ -5,6 +5,7 @@ import type {
   AiExportResult,
   AiImportBatch,
   AiHighlightCandidate,
+  AiHighlightProgress,
   AiHighlightRun,
   AiJobEvent,
   AiProject,
@@ -149,6 +150,12 @@ const tauriApi: ClientApi = {
   diagnoseAiLlmProvider: () => invoke<ProviderDiagnostic>("ai_diagnose_llm_provider"),
   startAiHighlightAnalysis: (projectId, confirmed) =>
     invoke<AiHighlightRun>("ai_start_highlight_analysis", { projectId, confirmed }),
+  getLatestAiHighlightRun: (projectId) =>
+    invoke<AiHighlightRun | null>("ai_get_latest_highlight_run", { projectId }),
+  getAiHighlightProgress: (runId) =>
+    invoke<AiHighlightProgress>("ai_get_highlight_progress", { runId }),
+  resumeAiHighlightAnalysis: (runId) =>
+    invoke<AiHighlightRun>("ai_resume_highlight_analysis", { runId }),
   listAiHighlightCandidates: (runId) =>
     invoke<AiHighlightCandidate[]>("ai_list_highlight_candidates", { runId }),
   selectAiHighlightCandidates: (runId, candidateIds) =>
@@ -602,6 +609,19 @@ export function createBrowserApi(): ClientApi {
   diagnoseAiLlmProvider: async () => ({ ok: false, category: "browser_demo", message: "浏览器演示模式不会调用 DeepSeek" }),
     startAiHighlightAnalysis: async () => {
       throw new Error("浏览器演示模式不会调用 DeepSeek");
+    },
+    getLatestAiHighlightRun: async () => null,
+    getAiHighlightProgress: async (runId) => ({
+      runId,
+      totalBatches: 0,
+      pendingBatches: 0,
+      runningBatches: 0,
+      completedBatches: 0,
+      failedBatches: 0,
+      candidateCount: 0,
+    }),
+    resumeAiHighlightAnalysis: async () => {
+      throw new Error("浏览器演示模式不会恢复 DeepSeek 分析");
     },
     listAiHighlightCandidates: async () => [],
     selectAiHighlightCandidates: async () => [],

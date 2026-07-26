@@ -26,6 +26,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import type {
   AiEnvironmentDiagnostic,
   AiHighlightCandidate,
+  AiHighlightProgress,
   AiHighlightRun,
   AiInputStatus,
   AiJobEvent,
@@ -106,6 +107,10 @@ function safeError(error: unknown, fallback: string): string {
     if (typeof message === "string" && message.trim()) return message;
   }
   return fallback;
+}
+
+function highlightRunIsActive(run: AiHighlightRun | null): boolean {
+  return run !== null && ["pending", "running", "candidates", "ranking"].includes(run.status);
 }
 
 function formatDuration(milliseconds: number | null): string {
@@ -322,6 +327,7 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const [latestEvent, setLatestEvent] = useState<AiJobEvent | null>(null);
   const [llmSettings, setLlmSettings] = useState<LlmProviderSettings | null>(null);
   const [analysisRun, setAnalysisRun] = useState<AiHighlightRun | null>(null);
+  const [analysisProgress, setAnalysisProgress] = useState<AiHighlightProgress | null>(null);
   const [highlightCandidates, setHighlightCandidates] = useState<AiHighlightCandidate[]>([]);
   const [highlightView, setHighlightView] = useState<HighlightView>("transcript");
   const [highlightSort, setHighlightSort] = useState<HighlightSort>("score");
@@ -403,18 +409,20 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   }, [api]);
 
   useEffect(() => {
-    if (!analysisBusy) {
+    if (!analysisBusy && !highlightRunIsActive(analysisRun)) {
       setAnalysisProgressVisible(false);
       return;
     }
     const timer = window.setTimeout(() => setAnalysisProgressVisible(true), 300);
     return () => window.clearTimeout(timer);
-  }, [analysisBusy]);
+  }, [analysisBusy, analysisRun]);
 
   useEffect(() => {
     const projectId = detail?.project.id;
     let disposed = false;
+    if (!active) return;
     setAnalysisRun(null);
+    setAnalysisProgress(null);
     setHighlightCandidates([]);
     setHighlightView("transcript");
     setHighlightSort("score");
@@ -425,11 +433,16 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     if (!projectId || !api.getLatestAiHighlightRun) return;
     void api.getLatestAiHighlightRun(projectId).then(async (run) => {
       if (disposed || !run) return;
-      const candidates = api.listAiHighlightCandidates
-        ? await api.listAiHighlightCandidates(run.id)
-        : [];
+      const restoredRun = highlightRunIsActive(run) && api.resumeAiHighlightAnalysis
+        ? await api.resumeAiHighlightAnalysis(run.id)
+        : run;
+      const [candidates, progress] = await Promise.all([
+        api.listAiHighlightCandidates ? api.listAiHighlightCandidates(restoredRun.id) : [],
+        api.getAiHighlightProgress ? api.getAiHighlightProgress(restoredRun.id) : null,
+      ]);
       if (disposed) return;
-      setAnalysisRun(run);
+      setAnalysisRun(restoredRun);
+      setAnalysisProgress(progress);
       setHighlightCandidates(candidates);
     }).catch((error) => {
       if (!disposed) setMessage(safeError(error, "无法恢复历史高光评分"));
@@ -437,7 +450,40 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     return () => {
       disposed = true;
     };
-  }, [api, detail?.project.id]);
+  }, [active, api, detail?.project.id]);
+
+  useEffect(() => {
+    const projectId = detail?.project.id;
+    if (!active || !projectId || !highlightRunIsActive(analysisRun) || !api.getLatestAiHighlightRun) return;
+    let disposed = false;
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        const run = await api.getLatestAiHighlightRun!(projectId);
+        if (disposed || !run) return;
+        const [progress, candidates] = await Promise.all([
+          api.getAiHighlightProgress ? api.getAiHighlightProgress(run.id) : null,
+          api.listAiHighlightCandidates ? api.listAiHighlightCandidates(run.id) : [],
+        ]);
+        if (disposed) return;
+        setAnalysisRun(run);
+        setAnalysisProgress(progress);
+        setHighlightCandidates(candidates);
+      } catch (error) {
+        if (!disposed) setMessage(safeError(error, "无法刷新高光分析进度"));
+      } finally {
+        refreshing = false;
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1_200);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [active, analysisRun?.id, analysisRun?.status, api, detail?.project.id]);
 
   useEffect(() => {
     let disposed = false;
@@ -752,9 +798,18 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     try {
       const run = await api.startAiHighlightAnalysis(detail.project.id, true);
       setAnalysisRun(run);
-      if (api.listAiHighlightCandidates) setHighlightCandidates(await api.listAiHighlightCandidates(run.id));
+      const [progress, candidates] = await Promise.all([
+        api.getAiHighlightProgress ? api.getAiHighlightProgress(run.id) : null,
+        api.listAiHighlightCandidates ? api.listAiHighlightCandidates(run.id) : [],
+      ]);
+      setAnalysisProgress(progress);
+      setHighlightCandidates(candidates);
       const reused = Date.parse(run.updatedAt) < requestedAt - 1_000;
-      setMessage(reused ? "已读取相同内容的历史高光分析结果" : "高光分析已完成，候选结果可人工选择");
+      if (highlightRunIsActive(run)) {
+        setMessage("高光分析已在后台开始，可以切换菜单后再回来查看进度");
+      } else {
+        setMessage(reused ? "已读取相同内容的历史高光分析结果" : "高光分析已完成，候选结果可人工选择");
+      }
     } catch (error) {
       setMessage(safeError(error, "高光分析失败，ASR 结果已保留"));
     } finally {
@@ -886,7 +941,21 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const previewReady = preview?.state === "ready"
     && Boolean(preview.media)
     && previewInputRef.current === currentInputId;
+  const analysisInProgress = highlightRunIsActive(analysisRun);
+  const analysisWorking = analysisBusy || analysisInProgress;
   const analysisCompleted = analysisRun?.status === "completed";
+  const analysisFinished = analysisRun !== null
+    && ["completed", "partial", "failed", "cancelled"].includes(analysisRun.status);
+  const analysisTotalBatches = analysisProgress?.totalBatches ?? analysisRun?.estimatedBatches ?? 0;
+  const analysisFinishedBatches = (analysisProgress?.completedBatches ?? 0)
+    + (analysisProgress?.failedBatches ?? 0);
+  const analysisProgressPercent = analysisFinished
+    ? 100
+    : analysisRun?.status === "ranking"
+      ? 95
+      : analysisTotalBatches > 0
+        ? Math.min(90, Math.round((analysisFinishedBatches / analysisTotalBatches) * 90))
+        : 0;
   const qualifiedCandidateCount = highlightCandidates.filter((candidate) => candidate.totalScore >= 70).length;
   const selectedCandidateCount = selectedHighlightCandidates.length;
 
@@ -995,13 +1064,14 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
                   {detail.project.status === "completed" || detail.project.status === "completed_with_errors" ? (
                     <section className="panel ai-highlight-panel">
                       <header><div><p className="section-kicker">HIGHLIGHT AGENT</p><h3>高光评分与候选</h3></div><span>{llmSettings?.keyConfigured ? `${llmSettings.modelId} · 仅发送文本` : "未配置 DeepSeek"}</span></header>
-                      <div className="ai-highlight-consent"><div><strong>独立于本地 ASR</strong><p>需要显式授权后，候选 Agent 和评分 Agent 才会读取规范化转写。视频、音频、本地路径和 Key 不会发送。</p></div><button className="primary-button" disabled={analysisBusy || !llmSettings?.keyConfigured || !api.startAiHighlightAnalysis} onClick={() => void startHighlightAnalysis()}><Sparkles size={15} />{analysisBusy ? "分析中…" : analysisCompleted ? "刷新分析结果" : "开始高光分析"}</button></div>
-                      {analysisProgressVisible && <div className="ai-highlight-progress" role="status" aria-live="polite"><div><strong>正在分析项目转写</strong><span>{analysisInputCount} 个视频 · {analysisSegmentCount} 个句段</span></div><div className="ai-highlight-progress-track" role="progressbar" aria-label="高光分析进行中"><span /></div><small>按视频分批生成候选，全部候选完成后统一评分排序。请保持应用运行。</small></div>}
+                      <div className="ai-highlight-consent"><div><strong>独立于本地 ASR</strong><p>需要显式授权后，候选 Agent 和评分 Agent 才会读取规范化转写。视频、音频、本地路径和 Key 不会发送。</p></div><button className="primary-button" disabled={analysisWorking || !llmSettings?.keyConfigured || !api.startAiHighlightAnalysis} onClick={() => void startHighlightAnalysis()}><Sparkles size={15} />{analysisWorking ? "分析中…" : analysisCompleted ? "刷新分析结果" : analysisRun?.status === "partial" || analysisRun?.status === "failed" ? "重试未完成批次" : "开始高光分析"}</button></div>
+                      {analysisProgressVisible && <div className="ai-highlight-progress" role="status" aria-live="polite"><div><strong>{analysisRun?.status === "ranking" ? "正在统一评分" : "正在分批生成候选"}</strong><span>已处理 {analysisFinishedBatches} / {analysisTotalBatches} 批 · {analysisProgress?.completedBatches ?? 0} 成功 · {analysisProgress?.failedBatches ?? 0} 失败</span></div><div className="ai-highlight-progress-track" role="progressbar" aria-label="高光分析进行中" aria-valuemin={0} aria-valuemax={100} aria-valuenow={analysisProgressPercent}><span style={{ width: `${analysisProgressPercent}%` }} /></div><small>{analysisInputCount} 个视频 · {analysisSegmentCount} 个句段 · 已发现 {analysisProgress?.candidateCount ?? 0} 个候选草稿</small></div>}
                       {analysisRun && <div className="ai-highlight-run-meta"><span>状态：{highlightRunStatusLabels[analysisRun.status]}</span><span>范围：{analysisRun.estimatedBatches} 批 · {analysisRun.totalSegments} 句</span><span>模型消耗：{analysisRun.totalTokens} Token</span><span>策略：{analysisRun.skillsSnapshot.join("、") || "通用"}</span></div>}
-                      {!analysisBusy && (highlightCandidates.length > 0 ? <>
+                      {analysisRun?.lastErrorMessage && <div className="ai-highlight-error"><AlertTriangle size={15} /><span>{analysisRun.lastErrorMessage}</span></div>}
+                      {!analysisWorking && (highlightCandidates.length > 0 ? <>
                         <div className="ai-highlight-summary"><strong>{highlightCandidates.length} 个评分候选</strong><span>{qualifiedCandidateCount} 个达到 70 分 · {highlightCandidates.length - qualifiedCandidateCount} 个参考候选</span></div>
                         <button className="ai-highlight-open-results" onClick={() => changeHighlightView("candidates")}><Sparkles size={14} />在 ASR 中查看和选择<span>已选择 {selectedCandidateCount}</span><ChevronRight size={14} /></button>
-                      </> : <div className="ai-highlight-empty">{analysisCompleted ? "分析已完成，但模型没有返回可用候选。" : "完成分析后，这里会展示评分最高的前 10 个候选；70 分以上标记为高光候选。"}</div>)}
+                      </> : <div className="ai-highlight-empty">{analysisCompleted ? "分析已完成，但模型没有返回可用候选。" : analysisFinished ? "本次分析没有生成可用候选，请查看上方状态后重试未完成批次。" : "完成分析后，这里会展示评分最高的前 10 个候选；70 分以上标记为高光候选。"}</div>)}
                       <HighlightAudit project={detail.project} transcript={transcript} run={analysisRun} candidates={highlightCandidates} />
                     </section>
                   ) : null}

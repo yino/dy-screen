@@ -10,11 +10,11 @@ use thiserror::Error;
 use crate::database::{Database, DatabaseError};
 
 use super::domain::{
-    AiArtifactStatus, AiHighlightCandidate, AiHighlightChunk, AiHighlightRun, AiHighlightRunStatus,
-    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
-    AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact,
-    RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
-    TranscriptSegmentDraft,
+    AiArtifactStatus, AiHighlightCandidate, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
+    AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail,
+    AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun,
+    NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint,
+    TranscriptSegment, TranscriptSegmentDraft,
 };
 
 use super::llm::{HighlightCandidateDraft, HighlightCandidateScore, LlmProviderSettings};
@@ -562,6 +562,22 @@ impl AiRepository {
         parse_highlight_run(row)
     }
 
+    pub fn latest_highlight_run_for_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<AiHighlightRun>> {
+        self.get_project_row(project_id)?;
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT id, project_id, status, model_id, prompt_version, tags_snapshot_json, skills_snapshot_json, analysis_goal, analysis_fingerprint, user_authorized, total_segments, total_chars, estimated_batches, total_tokens, last_error_code, last_error_message, created_at, updated_at FROM ai_highlight_runs WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
+                [project_id],
+                map_highlight_run,
+            )
+            .optional()?;
+        row.map(parse_highlight_run).transpose()
+    }
+
     pub fn update_highlight_run_status(
         &self,
         run_id: i64,
@@ -622,6 +638,193 @@ impl AiRepository {
             .into_iter()
             .map(parse_highlight_chunk)
             .collect()
+    }
+
+    pub fn highlight_progress(&self, run_id: i64) -> Result<AiHighlightProgress> {
+        self.get_highlight_run(run_id)?;
+        let connection = self.database.connection()?;
+        let (total, pending, running, completed, failed, candidates) = connection.query_row(
+            r#"SELECT
+                COUNT(*),
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END),
+                COALESCE(SUM(candidate_count), 0)
+               FROM ai_highlight_chunks WHERE run_id = ?1"#,
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        let count = |value: i64| {
+            u64::try_from(value)
+                .map_err(|_| AiRepositoryError::Integrity("高光批次统计无效".to_owned()))
+        };
+        Ok(AiHighlightProgress {
+            run_id,
+            total_batches: count(total)?,
+            pending_batches: count(pending)?,
+            running_batches: count(running)?,
+            completed_batches: count(completed)?,
+            failed_batches: count(failed)?,
+            candidate_count: count(candidates)?,
+        })
+    }
+
+    pub fn mark_highlight_chunk_running(&self, run_id: i64, chunk_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE ai_highlight_chunks SET status = 'running', attempt_count = attempt_count + 1, last_error_code = NULL, last_error_message = NULL, updated_at = ?1 WHERE id = ?2 AND run_id = ?3 AND status != 'completed'",
+            params![now, chunk_id, run_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::InvalidState(
+                "高光批次不存在或已经完成".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE ai_highlight_runs SET status = 'running', updated_at = ?1 WHERE id = ?2",
+            params![now, run_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_highlight_chunk(
+        &self,
+        run_id: i64,
+        chunk_id: i64,
+        drafts: &[HighlightCandidateDraft],
+        token_usage: u64,
+    ) -> Result<()> {
+        let drafts_json = serde_json::to_string(drafts)
+            .map_err(|_| AiRepositoryError::Serialization("高光候选草稿无法序列化".to_owned()))?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE ai_highlight_chunks SET status = 'completed', candidate_count = ?1, token_usage = ?2, candidate_drafts_json = ?3, last_error_code = NULL, last_error_message = NULL, updated_at = ?4 WHERE id = ?5 AND run_id = ?6 AND status != 'completed'",
+            params![drafts.len() as i64, token_usage as i64, drafts_json, now, chunk_id, run_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::InvalidState(
+                "高光批次不存在或已经完成".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE ai_highlight_runs SET total_tokens = total_tokens + ?1, updated_at = ?2 WHERE id = ?3",
+            params![token_usage as i64, now, run_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn fail_highlight_chunk(
+        &self,
+        run_id: i64,
+        chunk_id: i64,
+        code: &str,
+        message: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE ai_highlight_chunks SET status = 'failed', last_error_code = ?1, last_error_message = ?2, updated_at = ?3 WHERE id = ?4 AND run_id = ?5",
+            params![code, message, now, chunk_id, run_id],
+        )?;
+        transaction.execute(
+            "UPDATE ai_highlight_runs SET last_error_code = ?1, last_error_message = ?2, updated_at = ?3 WHERE id = ?4",
+            params![code, message, now, run_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_completed_highlight_drafts(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<(AiHighlightChunk, Vec<HighlightCandidateDraft>)>> {
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, ordinal, input_id, segment_ids_json, context_segment_ids_json, status, candidate_count, token_usage, last_error_code, last_error_message, candidate_drafts_json FROM ai_highlight_chunks WHERE run_id = ?1 AND status = 'completed' ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([run_id], |row| {
+            Ok((map_highlight_chunk(row)?, row.get::<_, String>(11)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(row, drafts_json)| {
+                let chunk = parse_highlight_chunk(row)?;
+                let drafts = serde_json::from_str(&drafts_json)
+                    .map_err(|_| AiRepositoryError::Integrity("高光候选草稿快照损坏".to_owned()))?;
+                Ok((chunk, drafts))
+            })
+            .collect()
+    }
+
+    pub fn replace_highlight_results(
+        &self,
+        run_id: i64,
+        drafts: &[(i64, HighlightCandidateDraft)],
+        scores: &[HighlightCandidateScore],
+    ) -> Result<Vec<AiHighlightCandidate>> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let selected_keys = {
+            let mut statement = transaction.prepare(
+                "SELECT candidate_key FROM ai_highlight_candidates WHERE run_id = ?1 AND selected = 1",
+            )?;
+            statement
+                .query_map([run_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        transaction.execute(
+            "DELETE FROM ai_highlight_candidates WHERE run_id = ?1",
+            [run_id],
+        )?;
+        for (chunk_id, draft) in drafts {
+            validate_candidate_draft(
+                &draft.segment_ids,
+                draft.start_ms,
+                draft.end_ms,
+                &draft.candidate_key,
+            )?;
+            let score = scores
+                .iter()
+                .find(|score| score.candidate_key == draft.candidate_key)
+                .ok_or_else(|| AiRepositoryError::Integrity("候选缺少全局评分".to_owned()))?;
+            validate_score(score)?;
+            transaction.execute(
+                r#"INSERT INTO ai_highlight_candidates(
+                    run_id, chunk_id, candidate_key, title, input_id, segment_ids_json,
+                    start_ms, end_ms, total_score, hook_score, information_score,
+                    emotion_score, tag_relevance_score, completeness_score,
+                    shareability_score, reason, matched_tags_json, rank, selected, created_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
+                params![run_id, chunk_id, draft.candidate_key, draft.title, draft.input_id,
+                    serde_json::to_string(&draft.segment_ids).map_err(|_| AiRepositoryError::Serialization("候选句段无法序列化".to_owned()))?,
+                    draft.start_ms as i64, draft.end_ms as i64, score.total_score, score.hook_score,
+                    score.information_score, score.emotion_score, score.tag_relevance_score,
+                    score.completeness_score, score.shareability_score, score.reason,
+                    serde_json::to_string(&draft.matched_tags).map_err(|_| AiRepositoryError::Serialization("命中标签无法序列化".to_owned()))?, score.rank,
+                    selected_keys.iter().any(|key| key == &draft.candidate_key), now],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.list_highlight_candidates(run_id)
     }
 
     /// 将一个分块的候选和全局评分在同一事务中发布，避免 UI 看到半条候选。
@@ -1470,6 +1673,56 @@ pub(crate) fn migrate_ai_v7(connection: &mut Connection) -> crate::database::Res
     })();
     connection.pragma_update(None, "foreign_keys", "ON")?;
     migration
+}
+
+/// v9 保存逐批候选草稿，使长时间高光分析可以展示真实进度并在中断后继续。
+pub(crate) fn migrate_ai_v9(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 9",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    let has_drafts = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('ai_highlight_chunks') WHERE name = 'candidate_drafts_json'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_drafts {
+        transaction.execute(
+            "ALTER TABLE ai_highlight_chunks ADD COLUMN candidate_drafts_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    let has_attempt_count = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('ai_highlight_chunks') WHERE name = 'attempt_count'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_attempt_count {
+        transaction.execute(
+            "ALTER TABLE ai_highlight_chunks ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(9, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 type ProjectRow = (

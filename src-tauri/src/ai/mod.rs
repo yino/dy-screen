@@ -18,16 +18,16 @@ pub(crate) mod tauri_commands;
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiProjectDetailView,
-    AiRuntimeComponentDiagnostic, AiRuntimeResourceDiagnostic,
-    AiProjectInputView, AiSessionImportView, AiTrustedFileGrant,
+    AiProjectInputView, AiRuntimeComponentDiagnostic, AiRuntimeResourceDiagnostic,
+    AiSessionImportView, AiTrustedFileGrant,
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
-    AiArtifactStatus, AiHighlightCandidate, AiHighlightChunk, AiHighlightRun, AiHighlightRunStatus,
-    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
-    AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact,
-    RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
-    TranscriptSegmentDraft,
+    AiArtifactStatus, AiHighlightCandidate, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
+    AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail,
+    AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun,
+    NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint,
+    TranscriptSegment, TranscriptSegmentDraft,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION, GENERIC_HOOK,
@@ -55,4 +55,4 @@ pub use service::{
     ImportRejection, PreflightReport, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
-pub(crate) use repository::{migrate_ai_v4, migrate_ai_v7};
+pub(crate) use repository::{migrate_ai_v4, migrate_ai_v7, migrate_ai_v9};

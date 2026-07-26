@@ -588,8 +588,10 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .ai-highlight-progress span, .ai-highlight-progress small { color: var(--muted); font-size: 11px; }
 .ai-highlight-progress small { display: block; margin-top: 8px; }
 .ai-highlight-progress-track { height: 6px; margin-top: 10px; overflow: hidden; border-radius: 4px; background: var(--line); }
-.ai-highlight-progress-track > span { width: 38%; height: 100%; display: block; border-radius: inherit; background: var(--green); animation: ai-highlight-loading 1.35s ease-in-out infinite; }
+.ai-highlight-progress-track > span { height: 100%; display: block; border-radius: inherit; background: var(--green); transition: width .25s ease; }
 .ai-highlight-run-meta { justify-content: flex-start; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+.ai-highlight-error { margin: 10px 0 0; padding: 9px 10px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid #f1c7c0; border-radius: 7px; color: #9b4339; background: #fff4f1; font-size: 11px; line-height: 1.5; }
+.ai-highlight-error svg { flex: 0 0 auto; margin-top: 1px; }
 .ai-highlight-audit { margin-top: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .ai-highlight-audit > summary { min-height: 42px; display: flex; align-items: center; gap: 8px; color: var(--ink); cursor: pointer; list-style: none; font-size: 12px; font-weight: 700; }
 .ai-highlight-audit > summary::-webkit-details-marker, .ai-highlight-transcript-audit > summary::-webkit-details-marker { display: none; }
@@ -688,14 +690,8 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .ai-queue-actions button:hover { color: var(--green-dark); border-color: var(--green); }
 @media (max-width: 760px) { .ai-project-context { grid-template-columns: 1fr; } .ai-highlight-consent { align-items: stretch; flex-direction: column; } }
 
-@keyframes ai-highlight-loading {
-  0% { transform: translateX(-105%); }
-  55% { transform: translateX(115%); }
-  100% { transform: translateX(275%); }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .ai-highlight-progress-track > span { width: 100%; opacity: .55; animation: none; }
+  .ai-highlight-progress-track > span { transition: none; }
 }
 
 @container ai-results (max-width: 760px) {

@@ -475,8 +475,8 @@ describe("AiWorkspace", () => {
     await user.click(startButton);
 
     expect(await screen.findByRole("progressbar", { name: "高光分析进行中" })).toBeInTheDocument();
-    expect(screen.getByText("1 个视频 · 2 个句段")).toBeInTheDocument();
-    expect(screen.getByText(/按视频分批生成候选/)).toBeInTheDocument();
+    expect(screen.getByText("1 个视频 · 2 个句段 · 已发现 0 个候选草稿")).toBeInTheDocument();
+    expect(screen.getByText("正在分批生成候选")).toBeInTheDocument();
     expect(screen.queryByText(/完成分析后/)).not.toBeInTheDocument();
 
     completeAnalysis(completedHighlightRun);
@@ -487,6 +487,41 @@ describe("AiWorkspace", () => {
     expect(screen.getByText("模型消耗：320 Token")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新分析结果" })).toBeEnabled();
     expect(screen.getByText("分析已完成，但模型没有返回可用候选。")).toBeInTheDocument();
+  });
+
+  it("恢复长批次后台分析并展示真实完成数和失败批次", async () => {
+    const runningRun: AiHighlightRun = {
+      ...completedHighlightRun,
+      status: "running",
+      estimatedBatches: 57,
+      totalSegments: 21_663,
+      totalTokens: 12_480,
+      lastErrorCode: "highlight_provider_timeout",
+      lastErrorMessage: "Provider 暂时不可用",
+    };
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(runningRun);
+    api.resumeAiHighlightAnalysis = vi.fn().mockResolvedValue(runningRun);
+    api.getAiHighlightProgress = vi.fn().mockResolvedValue({
+      runId: runningRun.id,
+      totalBatches: 57,
+      pendingBatches: 36,
+      runningBatches: 1,
+      completedBatches: 18,
+      failedBatches: 2,
+      candidateCount: 41,
+    });
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue([]);
+    render(<AiWorkspace api={api} />);
+
+    const progressbar = await screen.findByRole("progressbar", { name: "高光分析进行中" });
+    expect(progressbar).toHaveAttribute("aria-valuenow", "32");
+    expect(screen.getByText("已处理 20 / 57 批 · 18 成功 · 2 失败")).toBeInTheDocument();
+    expect(screen.getByText("1 个视频 · 2 个句段 · 已发现 41 个候选草稿")).toBeInTheDocument();
+    expect(screen.getByText("模型消耗：12480 Token")).toBeInTheDocument();
+    expect(screen.getByText("Provider 暂时不可用")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "分析中…" })).toBeDisabled();
+    expect(api.resumeAiHighlightAnalysis).toHaveBeenCalledWith(runningRun.id);
   });
 
   it("相同内容命中历史高光结果时不闪烁运行进度", async () => {
