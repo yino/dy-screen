@@ -49,7 +49,7 @@ pub use runtime::{
 };
 pub use scheduler::{
     AsrJobExecutor, RecordingActivityGate, SchedulerEvent, SchedulerEventSink, SchedulerJob,
-    TranscriptionScheduler,
+    SchedulerQueueEntry, SchedulerSnapshot, TranscriptionScheduler,
 };
 pub use transcript::{
     AssembledTranscript, ProjectTimelineGap, ProjectTranscriptSegment, TranscriptAssembler,

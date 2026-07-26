@@ -1,4 +1,4 @@
-//! 桌面进程中的真实 FFprobe、FFmpeg、VAD、ASR、调度器和录制门控装配。
+//! 桌面进程中的真实 FFprobe、FFmpeg、VAD、ASR 和调度器装配。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -278,6 +278,45 @@ impl LocalAsrRuntime {
             .map_err(|error| AiCommandError::new("ai_recovery_failed", error.to_string(), true))
     }
 
+    /// 启动恢复后从 SQLite 重建待处理队列；进程内 token 不跨重启持久化。
+    pub async fn recover_startup_and_requeue(&self) -> Result<AiRecoveryReport, AiCommandError> {
+        let report = self.recover_startup()?;
+        let Some(scheduler) = &self.scheduler else {
+            return Ok(report);
+        };
+        for project in self
+            .repository
+            .list_projects()
+            .map_err(repository_command_error)?
+        {
+            if !matches!(
+                project.status,
+                AiProjectStatus::Queued | AiProjectStatus::Running
+            ) {
+                continue;
+            }
+            let detail = self
+                .repository
+                .get_project(project.id)
+                .map_err(repository_command_error)?;
+            for input in detail
+                .inputs
+                .into_iter()
+                .filter(|input| input.status == AiInputStatus::Pending)
+            {
+                let _ = scheduler
+                    .enqueue(SchedulerJob {
+                        id: job_id(project.id, input.id),
+                        project_id: project.id,
+                        input_id: input.id,
+                        generation: input.scheduler_generation,
+                    })
+                    .await;
+            }
+        }
+        Ok(report)
+    }
+
     pub async fn shutdown(&self) -> Result<AiRecoveryReport, AiCommandError> {
         if let Some(scheduler) = &self.scheduler {
             self.lifecycle
@@ -340,6 +379,7 @@ impl AiJobController for LocalAsrRuntime {
                     id: job_id(project_id, input.id),
                     project_id,
                     input_id: input.id,
+                    generation: input.scheduler_generation,
                 })
                 .await
                 .map_err(command_asr_error)?;
@@ -348,22 +388,19 @@ impl AiJobController for LocalAsrRuntime {
     }
 
     async fn cancel_project(&self, project_id: i64) -> Result<(), AiCommandError> {
-        let detail = self
+        let is_deleting = self
             .repository
             .get_project(project_id)
+            .map(|detail| detail.project.status == AiProjectStatus::Deleting)
             .map_err(repository_command_error)?;
         if let Some(scheduler) = &self.scheduler {
-            for input in &detail.inputs {
-                if !matches!(
-                    input.status,
-                    AiInputStatus::Completed
-                        | AiInputStatus::Skipped
-                        | AiInputStatus::Cancelled
-                        | AiInputStatus::Failed
-                ) {
-                    scheduler.cancel(&job_id(project_id, input.id));
-                }
-            }
+            scheduler
+                .cancel_project_and_wait(project_id, Duration::from_secs(15))
+                .await
+                .map_err(command_asr_error)?;
+        }
+        if is_deleting {
+            return Ok(());
         }
         self.repository
             .cancel_project(project_id)
@@ -382,6 +419,7 @@ impl AiJobController for LocalAsrRuntime {
                 id: job_id(input.project_id, input.id),
                 project_id: input.project_id,
                 input_id: input.id,
+                generation: input.scheduler_generation,
             })
             .await
             .map_err(command_asr_error)
@@ -389,6 +427,57 @@ impl AiJobController for LocalAsrRuntime {
 
     async fn diagnose(&self) -> Result<AiEnvironmentDiagnostic, AiCommandError> {
         Ok(self.environment.diagnostic().await)
+    }
+
+    async fn promote_next_input(&self, input_id: i64) -> Result<(), AiCommandError> {
+        let scheduler = self.scheduler()?;
+        let input = self
+            .repository
+            .get_input(input_id)
+            .map_err(repository_command_error)?;
+        if input.status != AiInputStatus::Pending {
+            return Err(AiCommandError::new(
+                "scheduler_job_not_pending",
+                "只能调整待处理的视频",
+                false,
+            ));
+        }
+        scheduler
+            .promote_next(&job_id(input.project_id, input.id))
+            .await
+            .map(|_| ())
+            .map_err(command_asr_error)
+    }
+
+    async fn preempt_with_input(
+        &self,
+        input_id: i64,
+        confirmed: bool,
+    ) -> Result<(), AiCommandError> {
+        if !confirmed {
+            return Err(AiCommandError::new(
+                "confirmation_required",
+                "立即切换必须二次确认",
+                false,
+            ));
+        }
+        let scheduler = self.scheduler()?;
+        let input = self
+            .repository
+            .get_input(input_id)
+            .map_err(repository_command_error)?;
+        if input.status != AiInputStatus::Pending {
+            return Err(AiCommandError::new(
+                "scheduler_job_not_pending",
+                "只能切换到待处理的视频",
+                false,
+            ));
+        }
+        scheduler
+            .preempt_with(&job_id(input.project_id, input.id))
+            .await
+            .map(|_| ())
+            .map_err(command_asr_error)
     }
 }
 
@@ -404,7 +493,12 @@ impl AsrJobExecutor for ProcessorExecutor {
         cancellation: CancellationToken,
     ) -> EngineResult<()> {
         self.processor
-            .process_input(job.project_id, job.input_id, cancellation)
+            .process_input_with_generation(
+                job.project_id,
+                job.input_id,
+                job.generation,
+                cancellation,
+            )
             .await
             .map(|_| ())
             .map_err(|error| match error {
@@ -427,9 +521,14 @@ struct DatabaseRecordingGate {
 impl RecordingActivityGate for DatabaseRecordingGate {
     fn is_recording_active(&self) -> bool {
         self.database
-            .dashboard()
-            .map(|dashboard| dashboard.active_recordings > 0)
+            .get_settings()
+            .map(|settings| !settings.asr_during_recording)
             .unwrap_or(true)
+            && self
+                .database
+                .dashboard()
+                .map(|dashboard| dashboard.active_recordings > 0)
+                .unwrap_or(true)
     }
 
     async fn wait_until_idle(&self, cancellation: CancellationToken) -> EngineResult<()> {
@@ -458,7 +557,7 @@ impl SchedulerEventSink for RuntimeSchedulerEvents {
         let (job, stage, message) = match event {
             SchedulerEvent::Queued(job) => (job, "queued", "已加入本地语音识别队列"),
             SchedulerEvent::WaitingForRecording(job) => {
-                (job, "waiting_for_recording", "正在等待录制资源释放")
+                (job, "waiting_for_recording", "录制优先模式：正在等待录制结束")
             }
             SchedulerEvent::Started(job) => {
                 if self
@@ -493,6 +592,8 @@ impl SchedulerEventSink for RuntimeSchedulerEvents {
                 );
                 (job, "cancelled", "视频处理已取消")
             }
+            SchedulerEvent::Preempted { requeued, .. } => (requeued, "requeued", "视频已重新排队"),
+            SchedulerEvent::QueueChanged(_) => return,
         };
         let progress = self
             .repository
@@ -582,6 +683,36 @@ fn mark_scheduler_terminal(
         let _ = repository.transition_input(job.input_id, status, Some((code, message)));
     }
     let _ = repository.recompute_project_progress(job.project_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseRecordingGate;
+    use crate::database::Database;
+    use crate::domain::NewStreamer;
+    use dy_screen::asr::RecordingActivityGate;
+
+    #[test]
+    fn recording_gate_allows_parallel_asr_by_default_and_supports_priority_mode() {
+        let database = Database::open_in_memory().expect("打开测试数据库");
+        database.migrate().expect("完成测试数据库迁移");
+        let streamer = database
+            .add_streamer(&NewStreamer::room("并行测试主播", "parallel-1", "parallel-room", true))
+            .expect("创建测试主播");
+        database
+            .update_streamer_status(streamer.id, "live", "recording", None)
+            .expect("设置录制状态");
+
+        let gate = DatabaseRecordingGate {
+            database: database.clone(),
+        };
+        assert!(!gate.is_recording_active());
+
+        let mut settings = database.get_settings().expect("读取设置");
+        settings.asr_during_recording = false;
+        database.save_settings(&settings).expect("保存录制优先设置");
+        assert!(gate.is_recording_active());
+    }
 }
 
 fn job_id(project_id: i64, input_id: i64) -> String {

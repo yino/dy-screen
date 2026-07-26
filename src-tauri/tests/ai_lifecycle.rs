@@ -192,6 +192,7 @@ async fn explicit_shutdown_cancels_work_invalidates_pending_artifacts_and_cleans
             id: "project-1-input-1".to_owned(),
             project_id,
             input_id,
+            generation: 1,
         })
         .await
         .unwrap();

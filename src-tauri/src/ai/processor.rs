@@ -99,8 +99,20 @@ impl AiInputProcessor {
         input_id: i64,
         cancellation: CancellationToken,
     ) -> Result<AiProcessOutcome, AiProcessorError> {
+        let generation = self.repository.get_input(input_id)?.scheduler_generation;
+        self.process_input_with_generation(project_id, input_id, generation, cancellation)
+            .await
+    }
+
+    pub async fn process_input_with_generation(
+        &self,
+        project_id: i64,
+        input_id: i64,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<AiProcessOutcome, AiProcessorError> {
         let result = self
-            .process_input_inner(project_id, input_id, cancellation)
+            .process_input_inner(project_id, input_id, generation, cancellation)
             .await;
         if let Err(error) = &result {
             let (code, message) = match error {
@@ -118,8 +130,9 @@ impl AiInputProcessor {
                         | AiInputStatus::Failed
                 )
             {
-                let _ = self.repository.transition_input(
+                let _ = self.repository.accept_scheduler_event(
                     input_id,
+                    generation,
                     if code == "asr_cancelled" {
                         AiInputStatus::Cancelled
                     } else {
@@ -138,6 +151,7 @@ impl AiInputProcessor {
         &self,
         project_id: i64,
         input_id: i64,
+        generation: u64,
         cancellation: CancellationToken,
     ) -> Result<AiProcessOutcome, AiProcessorError> {
         let detail = self.repository.get_project(project_id)?;
@@ -147,13 +161,15 @@ impl AiInputProcessor {
             );
         }
         let input = self.repository.get_input(input_id)?;
-        if input.project_id != project_id || input.status != AiInputStatus::Pending {
+        if input.project_id != project_id
+            || input.status != AiInputStatus::Pending
+            || input.scheduler_generation != generation
+        {
             return Err(
                 AiRepositoryError::InvalidState("项目输入不处于可执行状态".to_owned()).into(),
             );
         }
-        self.repository
-            .transition_input(input_id, AiInputStatus::Validating, None)?;
+        self.transition_generation(input_id, generation, AiInputStatus::Validating, None)?;
         self.publish(project_id, input_id, "validating", 10, "正在验证原始视频");
         if cancellation.is_cancelled() {
             return Err(AsrError::cancelled().into());
@@ -188,8 +204,7 @@ impl AiInputProcessor {
             .find_published_artifact(&current_source, &detail.project.recognition_profile_hash)?
         {
             self.repository.attach_artifact(input_id, artifact.id)?;
-            self.repository
-                .transition_input(input_id, AiInputStatus::Completed, None)?;
+            self.transition_generation(input_id, generation, AiInputStatus::Completed, None)?;
             self.publish(
                 project_id,
                 input_id,
@@ -213,8 +228,7 @@ impl AiInputProcessor {
             )
             .into());
         }
-        self.repository
-            .transition_input(input_id, AiInputStatus::PreparingAudio, None)?;
+        self.transition_generation(input_id, generation, AiInputStatus::PreparingAudio, None)?;
         self.publish(
             project_id,
             input_id,
@@ -236,8 +250,7 @@ impl AiInputProcessor {
             .prepare_temporary_wav(&preparation, cancellation.child_token())
             .await?;
 
-        self.repository
-            .transition_input(input_id, AiInputStatus::DetectingSpeech, None)?;
+        self.transition_generation(input_id, generation, AiInputStatus::DetectingSpeech, None)?;
         self.publish(
             project_id,
             input_id,
@@ -250,8 +263,7 @@ impl AiInputProcessor {
             .detect(audio.audio(), &self.vad_config, cancellation.child_token())
             .await?;
         if speech_regions.is_empty() {
-            self.repository
-                .transition_input(input_id, AiInputStatus::Skipped, None)?;
+            self.transition_generation(input_id, generation, AiInputStatus::Skipped, None)?;
             self.publish(project_id, input_id, "skipped", 100, "没有检测到有效人声");
             return Ok(AiProcessOutcome::SkippedNoSpeech);
         }
@@ -271,8 +283,7 @@ impl AiInputProcessor {
             )
             .into());
         }
-        self.repository
-            .transition_input(input_id, AiInputStatus::Transcribing, None)?;
+        self.transition_generation(input_id, generation, AiInputStatus::Transcribing, None)?;
         self.publish(project_id, input_id, "transcribing", 70, "正在识别语音");
         let progress: Arc<dyn AsrProgressSink> = Arc::new(ProcessorProgressSink {
             project_id,
@@ -297,8 +308,7 @@ impl AiInputProcessor {
             )
             .await?;
         if result.segments.is_empty() {
-            self.repository
-                .transition_input(input_id, AiInputStatus::Skipped, None)?;
+            self.transition_generation(input_id, generation, AiInputStatus::Skipped, None)?;
             self.publish(project_id, input_id, "skipped", 100, "识别结果没有有效文本");
             return Ok(AiProcessOutcome::SkippedNoSpeech);
         }
@@ -329,10 +339,28 @@ impl AiInputProcessor {
             &drafts,
         )?;
         self.repository.attach_artifact(input_id, artifact.id)?;
-        self.repository
-            .transition_input(input_id, AiInputStatus::Completed, None)?;
+        self.transition_generation(input_id, generation, AiInputStatus::Completed, None)?;
         self.publish(project_id, input_id, "completed", 100, "语音识别完成");
         Ok(AiProcessOutcome::Transcribed)
+    }
+
+    fn transition_generation(
+        &self,
+        input_id: i64,
+        generation: u64,
+        next: AiInputStatus,
+        error: Option<(&str, &str)>,
+    ) -> Result<(), AiProcessorError> {
+        if !self
+            .repository
+            .accept_scheduler_event(input_id, generation, next, error)?
+        {
+            return Err(AiRepositoryError::InvalidState(
+                "ASR 任务代次已变化，忽略旧任务".to_owned(),
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn publish(&self, project_id: i64, input_id: i64, stage: &str, progress: u8, message: &str) {

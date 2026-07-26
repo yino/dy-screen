@@ -107,6 +107,7 @@ export interface AppSettings {
   protocol: string;
   segmentSeconds: number;
   maxConcurrentRecordings: number;
+  asrDuringRecording: boolean;
   ffmpegPath: string;
   ffprobePath: string;
   notificationsEnabled: boolean;
@@ -143,6 +144,7 @@ export type AiProjectStatus =
   | "draft"
   | "queued"
   | "running"
+  | "deleting"
   | "completed"
   | "completed_with_errors"
   | "cancelled"
@@ -183,6 +185,9 @@ export interface AiProject {
   progressPercent: number;
   lastErrorCode: string | null;
   lastErrorMessage: string | null;
+  projectTags?: string[];
+  analysisGoal?: string | null;
+  deletingAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -202,6 +207,9 @@ export interface AiProjectInput {
   artifactId: number | null;
   lastErrorCode: string | null;
   lastErrorMessage: string | null;
+  schedulerGeneration?: number;
+  queuePriority?: number;
+  queueSequence?: number | null;
 }
 
 export interface AiProjectDetail {
@@ -315,6 +323,61 @@ export interface AiJobEvent {
   message: string;
 }
 
+export interface LlmProviderSettings {
+  provider: "deepseek";
+  modelId: string;
+  timeoutMs: number;
+  promptVersion: string;
+  keyConfigured: boolean;
+  updatedAt: string | null;
+}
+
+export type AiHighlightRunStatus = "pending" | "running" | "candidates" | "ranking" | "completed" | "partial" | "cancelled" | "failed";
+
+export interface AiHighlightRun {
+  id: number;
+  projectId: number;
+  status: AiHighlightRunStatus;
+  modelId: string;
+  promptVersion: string;
+  tagsSnapshot: string[];
+  skillsSnapshot: string[];
+  analysisGoal: string | null;
+  analysisFingerprint: string;
+  userAuthorized: boolean;
+  totalSegments: number;
+  totalChars: number;
+  estimatedBatches: number;
+  totalTokens: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiHighlightCandidate {
+  id: number;
+  runId: number;
+  chunkId: number | null;
+  candidateKey: string;
+  title: string;
+  inputId: number;
+  segmentIds: string[];
+  startMs: number;
+  endMs: number;
+  totalScore: number;
+  hookScore: number;
+  informationScore: number;
+  emotionScore: number;
+  tagRelevanceScore: number;
+  completenessScore: number;
+  shareabilityScore: number;
+  reason: string;
+  matchedTags: string[];
+  rank: number | null;
+  selected: boolean;
+}
+
 export interface AiExportResult {
   saved: boolean;
 }
@@ -416,6 +479,7 @@ export interface ClientApi {
   getAiProject(projectId: number): Promise<AiProjectDetail>;
   createAiProject(input: { name: string; hotwords: string[] }): Promise<AiProject>;
   renameAiProject(projectId: number, name: string): Promise<AiProject>;
+  setAiProjectContext?(projectId: number, tags: string[], analysisGoal: string | null): Promise<AiProject>;
   deleteAiProject(projectId: number): Promise<void>;
   pickAiLocalVideos(): Promise<AiTrustedFileGrant[]>;
   importAiLocalGrants(projectId: number, grantIds: string[]): Promise<AiImportBatch>;
@@ -426,6 +490,8 @@ export interface ClientApi {
   getAiProjectSummary(projectId: number): Promise<AiProjectSummary>;
   startAiProject(projectId: number): Promise<AiProject>;
   cancelAiProject(projectId: number): Promise<AiProject>;
+  promoteAiNextInput?(inputId: number): Promise<AiProjectDetail>;
+  preemptAiWithInput?(inputId: number, confirmed: boolean): Promise<AiProjectDetail>;
   retryAiInput(inputId: number): Promise<AiProjectDetail>;
   queryAiTranscript(projectId: number): Promise<AiTranscriptProjection>;
   copyAiSegmentText(projectId: number, stableSegmentId: string): Promise<string>;
@@ -434,6 +500,13 @@ export interface ClientApi {
   exportAiTxt(projectId: number): Promise<AiExportResult>;
   exportAiJson(projectId: number): Promise<AiExportResult>;
   diagnoseAiEnvironment(): Promise<AiEnvironmentDiagnostic>;
+  getAiLlmSettings?(): Promise<LlmProviderSettings>;
+  saveAiLlmSettings?(settings: LlmProviderSettings, apiKey?: string): Promise<LlmProviderSettings>;
+  clearAiLlmKey?(): Promise<void>;
+  diagnoseAiLlmProvider?(): Promise<ProviderDiagnostic>;
+  startAiHighlightAnalysis?(projectId: number, confirmed: boolean): Promise<AiHighlightRun>;
+  listAiHighlightCandidates?(runId: number): Promise<AiHighlightCandidate[]>;
+  selectAiHighlightCandidates?(runId: number, candidateIds: number[]): Promise<AiHighlightCandidate[]>;
   requestAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
   retryAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
   requestExit(force: boolean): Promise<void>;
@@ -442,4 +515,10 @@ export interface ClientApi {
   subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
   subscribeThumbnail(listener: (event: ThumbnailEvent) => void): Promise<() => void>;
   subscribeAi(listener: (event: AiJobEvent) => void): Promise<() => void>;
+}
+
+export interface ProviderDiagnostic {
+  ok: boolean;
+  category: string;
+  message: string;
 }

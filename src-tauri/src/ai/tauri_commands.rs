@@ -8,8 +8,9 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
-    AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiSessionImportView,
-    AiSessionOption, AiTranscriptProjection, AiTrustedFileGrant,
+    AiHighlightCandidate, AiHighlightRun, AiImportBatchView, AiProject, AiProjectDetailView,
+    AiProjectSummary, AiSessionImportView, AiSessionOption, AiTranscriptProjection,
+    AiTrustedFileGrant, LlmProviderSettings, ProviderDiagnostic,
 };
 
 pub struct AiDesktopState {
@@ -58,6 +59,18 @@ pub(crate) fn ai_rename_project(
     state: State<'_, AiDesktopState>,
 ) -> Result<AiProject, AiCommandError> {
     state.commands.rename_project(project_id, &name)
+}
+
+#[tauri::command]
+pub(crate) fn ai_set_project_context(
+    project_id: i64,
+    tags: Vec<String>,
+    analysis_goal: Option<String>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProject, AiCommandError> {
+    state
+        .commands
+        .set_project_context(project_id, tags, analysis_goal)
 }
 
 #[tauri::command]
@@ -172,6 +185,23 @@ pub(crate) async fn ai_cancel_project(
 }
 
 #[tauri::command]
+pub(crate) async fn ai_promote_next_input(
+    input_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state.commands.promote_next_input(input_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_preempt_with_input(
+    input_id: i64,
+    confirmed: bool,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiProjectDetailView, AiCommandError> {
+    state.commands.preempt_with_input(input_id, confirmed).await
+}
+
+#[tauri::command]
 pub(crate) async fn ai_retry_input(
     input_id: i64,
     state: State<'_, AiDesktopState>,
@@ -256,6 +286,66 @@ pub(crate) async fn ai_diagnose_environment(
     state: State<'_, AiDesktopState>,
 ) -> Result<AiEnvironmentDiagnostic, AiCommandError> {
     state.commands.diagnose().await
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_llm_settings(
+    state: State<'_, AiDesktopState>,
+) -> Result<LlmProviderSettings, AiCommandError> {
+    let key_configured = state.commands.llm_key_configured()?;
+    state.commands.get_llm_provider_settings(key_configured)
+}
+
+#[tauri::command]
+pub(crate) fn ai_save_llm_settings(
+    settings: LlmProviderSettings,
+    api_key: Option<String>,
+    state: State<'_, AiDesktopState>,
+) -> Result<LlmProviderSettings, AiCommandError> {
+    state.commands.save_llm_provider_settings(settings, api_key)
+}
+
+#[tauri::command]
+pub(crate) fn ai_clear_llm_key(state: State<'_, AiDesktopState>) -> Result<(), AiCommandError> {
+    state.commands.clear_llm_api_key()
+}
+
+#[tauri::command]
+pub(crate) async fn ai_start_highlight_analysis(
+    project_id: i64,
+    confirmed: bool,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiHighlightRun, AiCommandError> {
+    state
+        .commands
+        .start_highlight_analysis(project_id, confirmed)
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_diagnose_llm_provider(
+    state: State<'_, AiDesktopState>,
+) -> Result<ProviderDiagnostic, AiCommandError> {
+    state.commands.diagnose_llm_provider().await
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_highlight_candidates(
+    run_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<Vec<AiHighlightCandidate>, AiCommandError> {
+    state.commands.list_highlight_candidates(run_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_select_highlight_candidates(
+    run_id: i64,
+    candidate_ids: Vec<i64>,
+    state: State<'_, AiDesktopState>,
+) -> Result<Vec<AiHighlightCandidate>, AiCommandError> {
+    state
+        .commands
+        .select_highlight_candidates(run_id, &candidate_ids)
 }
 
 async fn save_export(

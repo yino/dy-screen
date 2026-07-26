@@ -10,5 +10,9 @@
 /resources/asr-stage/*
 !/resources/asr-stage/
 !/resources/asr-stage/.dy-screen-asr-stage
+/resources/asr-source/*
+!/resources/asr-source/
+!/resources/asr-source/README.md
+!/resources/asr-source/SHA256SUMS
 *.sqlite
 *.sqlite3

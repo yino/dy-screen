@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectService,
-    AiProjectStatus, AiProjectSummary, AiRepository, AiSessionOption, AiTranscriptProjection,
-    ImportBatchResult, ImportRejection, RecognitionProfile, ServiceError, SessionImportResult,
-    TrustedLocalFile,
+    AiHighlightCandidate, AiHighlightRun, AiInputSourceKind, AiInputStatus, AiProject,
+    AiProjectDetail, AiProjectInput, AiProjectService, AiProjectStatus, AiProjectSummary,
+    AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore, HighlightWorkflow,
+    ImportBatchResult, ImportRejection, LlmProviderSettings, ProviderDiagnostic,
+    RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +131,33 @@ pub trait AiJobController: Send + Sync {
     async fn cancel_project(&self, project_id: i64) -> Result<(), AiCommandError>;
     async fn retry_input(&self, input_id: i64) -> Result<(), AiCommandError>;
     async fn diagnose(&self) -> Result<AiEnvironmentDiagnostic, AiCommandError>;
+    async fn promote_next_input(&self, input_id: i64) -> Result<(), AiCommandError> {
+        let _ = input_id;
+        Err(AiCommandError::new(
+            "scheduler_control_unavailable",
+            "当前运行时不支持调整队列",
+            true,
+        ))
+    }
+    async fn preempt_with_input(
+        &self,
+        input_id: i64,
+        confirmed: bool,
+    ) -> Result<(), AiCommandError> {
+        let _ = input_id;
+        if !confirmed {
+            return Err(AiCommandError::new(
+                "confirmation_required",
+                "立即切换必须二次确认",
+                false,
+            ));
+        }
+        Err(AiCommandError::new(
+            "scheduler_control_unavailable",
+            "当前运行时不支持调整队列",
+            true,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +166,8 @@ pub struct AiCommandService {
     repository: AiRepository,
     controller: Arc<dyn AiJobController>,
     grants: Arc<TrustedFileGrantStore>,
+    highlight_workflow: Option<Arc<HighlightWorkflow>>,
+    credential_store: Option<Arc<dyn CredentialStore>>,
 }
 
 impl AiCommandService {
@@ -151,7 +181,19 @@ impl AiCommandService {
             repository,
             controller,
             grants: Arc::new(TrustedFileGrantStore::default()),
+            highlight_workflow: None,
+            credential_store: None,
         }
+    }
+
+    pub fn with_highlight_workflow(mut self, workflow: Arc<HighlightWorkflow>) -> Self {
+        self.highlight_workflow = Some(workflow);
+        self
+    }
+
+    pub fn with_credential_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
+        self.credential_store = Some(store);
+        self
     }
 
     pub fn list_projects(&self) -> Result<Vec<AiProject>, AiCommandError> {
@@ -182,6 +224,17 @@ impl AiCommandService {
             .map_err(repository_error)
     }
 
+    pub fn set_project_context(
+        &self,
+        project_id: i64,
+        tags: Vec<String>,
+        analysis_goal: Option<String>,
+    ) -> Result<AiProject, AiCommandError> {
+        self.repository
+            .set_project_context(project_id, &tags, analysis_goal.as_deref())
+            .map_err(repository_error)
+    }
+
     pub async fn delete_project(&self, project_id: i64) -> Result<(), AiCommandError> {
         let project = self
             .repository
@@ -191,7 +244,14 @@ impl AiCommandService {
             project.project.status,
             AiProjectStatus::Queued | AiProjectStatus::Running
         ) {
+            self.repository
+                .mark_project_deleting(project_id)
+                .map_err(repository_error)?;
             self.controller.cancel_project(project_id).await?;
+            self.repository
+                .delete_deleting_project(project_id)
+                .map_err(repository_error)?;
+            return Ok(());
         }
         self.repository
             .delete_project(project_id)
@@ -302,6 +362,33 @@ impl AiCommandService {
             .map_err(repository_error)
     }
 
+    pub async fn promote_next_input(
+        &self,
+        input_id: i64,
+    ) -> Result<AiProjectDetailView, AiCommandError> {
+        self.controller.promote_next_input(input_id).await?;
+        let input = self
+            .repository
+            .get_input(input_id)
+            .map_err(repository_error)?;
+        self.get_project(input.project_id)
+    }
+
+    pub async fn preempt_with_input(
+        &self,
+        input_id: i64,
+        confirmed: bool,
+    ) -> Result<AiProjectDetailView, AiCommandError> {
+        self.controller
+            .preempt_with_input(input_id, confirmed)
+            .await?;
+        let input = self
+            .repository
+            .get_input(input_id)
+            .map_err(repository_error)?;
+        self.get_project(input.project_id)
+    }
+
     pub async fn retry_input(&self, input_id: i64) -> Result<AiProjectDetailView, AiCommandError> {
         self.controller.retry_input(input_id).await?;
         let input = self
@@ -309,6 +396,124 @@ impl AiCommandService {
             .get_input(input_id)
             .map_err(repository_error)?;
         self.get_project(input.project_id)
+    }
+
+    pub async fn start_highlight_analysis(
+        &self,
+        project_id: i64,
+        confirmed: bool,
+    ) -> Result<AiHighlightRun, AiCommandError> {
+        let workflow = self.highlight_workflow.as_ref().ok_or_else(|| {
+            AiCommandError::new(
+                "llm_provider_unavailable",
+                "高光分析 Provider 尚未配置",
+                true,
+            )
+        })?;
+        workflow
+            .analyze(
+                project_id,
+                confirmed,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| {
+                AiCommandError::new("highlight_analysis_failed", error.to_string(), true)
+            })
+    }
+
+    pub async fn diagnose_llm_provider(&self) -> Result<ProviderDiagnostic, AiCommandError> {
+        let workflow = self.highlight_workflow.as_ref().ok_or_else(|| {
+            AiCommandError::new(
+                "llm_provider_unavailable",
+                "高光分析 Provider 尚未配置",
+                true,
+            )
+        })?;
+        workflow
+            .diagnose(tokio_util::sync::CancellationToken::new())
+            .await
+            .map_err(|error| {
+                let retryable = matches!(
+                    error,
+                    super::LlmError::Temporary | super::LlmError::Provider
+                );
+                AiCommandError::new("llm_diagnosis_failed", error.to_string(), retryable)
+            })
+    }
+
+    pub fn list_highlight_candidates(
+        &self,
+        run_id: i64,
+    ) -> Result<Vec<AiHighlightCandidate>, AiCommandError> {
+        self.repository
+            .list_highlight_candidates(run_id)
+            .map_err(repository_error)
+    }
+
+    pub fn select_highlight_candidates(
+        &self,
+        run_id: i64,
+        candidate_ids: &[i64],
+    ) -> Result<Vec<AiHighlightCandidate>, AiCommandError> {
+        self.repository
+            .select_highlight_candidates(run_id, candidate_ids)
+            .map_err(repository_error)
+    }
+
+    pub fn get_llm_provider_settings(
+        &self,
+        key_configured: bool,
+    ) -> Result<LlmProviderSettings, AiCommandError> {
+        self.repository
+            .get_llm_provider_settings(key_configured)
+            .map_err(repository_error)
+    }
+
+    pub fn llm_key_configured(&self) -> Result<bool, AiCommandError> {
+        self.credential_store
+            .as_ref()
+            .ok_or_else(|| AiCommandError::new("credential_unavailable", "系统凭据库不可用", true))?
+            .get()
+            .map(|value| value.is_some())
+            .map_err(|_| {
+                AiCommandError::new("credential_read_failed", "无法读取系统凭据状态", true)
+            })
+    }
+
+    pub fn save_llm_provider_settings(
+        &self,
+        mut settings: LlmProviderSettings,
+        api_key: Option<String>,
+    ) -> Result<LlmProviderSettings, AiCommandError> {
+        if let Some(store) = &self.credential_store {
+            if let Some(key) = api_key {
+                store.set(&key).map_err(|_| {
+                    AiCommandError::new("credential_save_failed", "无法保存系统凭据", true)
+                })?;
+                settings.key_configured = true;
+            } else {
+                // 由凭据库的真实状态决定返回值，避免前端旧 DTO 覆盖已保存的 Key 状态。
+                settings.key_configured = store.get().map(|value| value.is_some()).unwrap_or(false);
+            }
+        } else if api_key.is_some() {
+            return Err(AiCommandError::new(
+                "credential_unavailable",
+                "系统凭据库不可用，未保存 Key",
+                true,
+            ));
+        }
+        self.repository
+            .save_llm_provider_settings(&settings)
+            .map_err(repository_error)
+    }
+
+    pub fn clear_llm_api_key(&self) -> Result<(), AiCommandError> {
+        self.credential_store
+            .as_ref()
+            .ok_or_else(|| AiCommandError::new("credential_unavailable", "系统凭据库不可用", true))?
+            .clear()
+            .map_err(|_| AiCommandError::new("credential_clear_failed", "无法清除系统凭据", true))
     }
 
     pub fn query_transcript(

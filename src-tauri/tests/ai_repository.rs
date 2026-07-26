@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use dy_screen_app_lib::ai::{
     AiArtifactStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus, AiRepository,
+    HighlightCandidateDraft, HighlightCandidateScore, NewAiHighlightChunk, NewAiHighlightRun,
     NewAiProjectInput, NewAsrArtifact, RecognitionProfile, SourceFingerprint,
     TranscriptSegmentDraft,
 };
@@ -66,6 +67,10 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         "ai_project_inputs",
         "asr_artifacts",
         "transcript_segments",
+        "llm_provider_settings",
+        "ai_highlight_runs",
+        "ai_highlight_chunks",
+        "ai_highlight_candidates",
     ] {
         assert_eq!(
             connection
@@ -105,6 +110,32 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
             .unwrap(),
         1
     );
+    for column in ["project_tags_json", "analysis_goal", "deleting_at"] {
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('ai_projects') WHERE name = ?1",
+                    [column],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+    }
+    for column in ["scheduler_generation", "queue_priority", "queue_sequence"] {
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('ai_project_inputs') WHERE name = ?1",
+                    [column],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+    }
 }
 
 #[test]
@@ -467,5 +498,177 @@ fn video_deletion_invalidates_then_cleans_artifacts_without_deleting_media_or_mo
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../resources/asr/manifest.json")
             .is_file()
+    );
+}
+
+#[test]
+fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let repository = AiRepository::new(database);
+    let project = repository.create_project("高光候选", &profile()).unwrap();
+    let project_input = repository
+        .add_input(project.id, input("/tmp/highlight.mp4", 0))
+        .unwrap();
+    repository
+        .set_project_context(
+            project.id,
+            &["带货".to_owned(), "搞笑".to_owned()],
+            Some("重点找出反转和卖点"),
+        )
+        .unwrap();
+    repository.freeze_project(project.id).unwrap();
+    repository
+        .transition_project(project.id, AiProjectStatus::Running)
+        .unwrap();
+    repository
+        .transition_input(project_input.id, AiInputStatus::Validating, None)
+        .unwrap();
+    repository
+        .transition_input(project_input.id, AiInputStatus::Completed, None)
+        .unwrap();
+    repository.recompute_project_progress(project.id).unwrap();
+    let run = repository
+        .create_highlight_run(NewAiHighlightRun {
+            project_id: project.id,
+            model_id: "deepseek-chat".to_owned(),
+            prompt_version: "highlight-v1".to_owned(),
+            tags_snapshot: vec!["带货".to_owned()],
+            skills_snapshot: vec![
+                "generic-hook@1.0.0".to_owned(),
+                "ecommerce-conversion@1.0.0".to_owned(),
+            ],
+            analysis_goal: Some("重点找出反转和卖点".to_owned()),
+            analysis_fingerprint: "fingerprint-1".to_owned(),
+            total_segments: 2,
+            total_chars: 20,
+            estimated_batches: 1,
+            user_authorized: true,
+        })
+        .unwrap();
+    assert_eq!(run.tags_snapshot, vec!["带货"]);
+    let unauthorized = repository.create_highlight_run(NewAiHighlightRun {
+        analysis_fingerprint: "fingerprint-2".to_owned(),
+        user_authorized: false,
+        ..NewAiHighlightRun {
+            project_id: project.id,
+            model_id: "deepseek-chat".to_owned(),
+            prompt_version: "highlight-v1".to_owned(),
+            tags_snapshot: Vec::new(),
+            skills_snapshot: vec!["generic-hook@1.0.0".to_owned()],
+            analysis_goal: None,
+            analysis_fingerprint: "fingerprint-2".to_owned(),
+            total_segments: 0,
+            total_chars: 0,
+            estimated_batches: 0,
+            user_authorized: false,
+        }
+    });
+    assert!(unauthorized.is_err());
+    let chunks = repository
+        .add_highlight_chunks(
+            run.id,
+            &[NewAiHighlightChunk {
+                ordinal: 0,
+                input_id: project_input.id,
+                segment_ids: vec!["seg_1".to_owned()],
+                context_segment_ids: Vec::new(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert!(
+        repository
+            .list_highlight_candidates(run.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let candidates = repository
+        .publish_highlight_results(
+            run.id,
+            chunks[0].id,
+            &[HighlightCandidateDraft {
+                candidate_key: "candidate-1".to_owned(),
+                title: "价格反转".to_owned(),
+                input_id: project_input.id,
+                segment_ids: vec!["seg_1".to_owned()],
+                start_ms: 0,
+                end_ms: 15_000,
+                hook_score: 82.0,
+                information_score: 78.0,
+                emotion_score: 75.0,
+                tag_relevance_score: 92.0,
+                completeness_score: 80.0,
+                shareability_score: 84.0,
+                reason: "包含明确卖点和反转".to_owned(),
+                matched_tags: vec!["带货".to_owned()],
+            }],
+            &[HighlightCandidateScore {
+                candidate_key: "candidate-1".to_owned(),
+                total_score: 82.0,
+                hook_score: 82.0,
+                information_score: 78.0,
+                emotion_score: 75.0,
+                tag_relevance_score: 92.0,
+                completeness_score: 80.0,
+                shareability_score: 84.0,
+                rank: 1,
+                reason: "带货标签相关".to_owned(),
+            }],
+            12,
+        )
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(!candidates[0].selected);
+    let selected = repository
+        .select_highlight_candidates(run.id, &[candidates[0].id])
+        .unwrap();
+    assert!(selected[0].selected);
+    let invalid = repository.select_highlight_candidates(run.id, &[999_999]);
+    assert!(invalid.is_err());
+    assert!(
+        repository
+            .list_highlight_candidates(run.id)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.selected)
+    );
+}
+
+#[test]
+fn stale_scheduler_events_are_ignored_after_generation_changes() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let repository = AiRepository::new(database);
+    let project = repository.create_project("代次隔离", &profile()).unwrap();
+    let project_input = repository
+        .add_input(project.id, input("/tmp/generation.mp4", 0))
+        .unwrap();
+    assert!(
+        !repository
+            .accept_scheduler_event(project_input.id, 2, AiInputStatus::Validating, None,)
+            .unwrap()
+    );
+    assert_eq!(
+        repository.get_input(project_input.id).unwrap().status,
+        AiInputStatus::Pending
+    );
+    repository
+        .update_scheduler_state(project_input.id, 2, 0, Some(1))
+        .unwrap();
+    assert!(
+        !repository
+            .accept_scheduler_event(project_input.id, 1, AiInputStatus::Validating, None,)
+            .unwrap()
+    );
+    assert!(
+        repository
+            .accept_scheduler_event(project_input.id, 2, AiInputStatus::Validating, None,)
+            .unwrap()
+    );
+    assert_eq!(
+        repository.get_input(project_input.id).unwrap().status,
+        AiInputStatus::Validating
     );
 }

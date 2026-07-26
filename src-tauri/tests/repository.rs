@@ -112,7 +112,13 @@ fn migration_is_idempotent_and_creates_defaults() {
     assert_eq!(settings.protocol, "flv");
     assert_eq!(settings.segment_seconds, 900);
     assert_eq!(settings.max_concurrent_recordings, 4);
+    assert!(settings.asr_during_recording);
     assert!(settings.output_root.ends_with("Downloads/dy-screen"));
+
+    let mut updated = settings.clone();
+    updated.asr_during_recording = false;
+    database.save_settings(&updated).unwrap();
+    assert!(!database.get_settings().unwrap().asr_during_recording);
 }
 
 #[test]

@@ -126,6 +126,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       protocol: "flv",
       segmentSeconds: 900,
       maxConcurrentRecordings: 4,
+      asrDuringRecording: true,
       ffmpegPath: "ffmpeg",
       ffprobePath: "ffprobe",
       notificationsEnabled: true,

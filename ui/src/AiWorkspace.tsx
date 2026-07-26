@@ -25,6 +25,8 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AiEnvironmentDiagnostic,
+  AiHighlightCandidate,
+  AiHighlightRun,
   AiInputStatus,
   AiJobEvent,
   AiProject,
@@ -36,6 +38,7 @@ import type {
   AiTranscriptProjection,
   AiTranscriptSegment,
   ClientApi,
+  LlmProviderSettings,
   PreviewSnapshot,
 } from "./types";
 
@@ -45,6 +48,7 @@ const projectStatusLabels: Record<AiProjectStatus, string> = {
   draft: "草稿",
   queued: "排队中",
   running: "分析中",
+  deleting: "删除中",
   completed: "已完成",
   completed_with_errors: "部分完成",
   cancelled: "已取消",
@@ -165,6 +169,12 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [latestEvent, setLatestEvent] = useState<AiJobEvent | null>(null);
+  const [llmSettings, setLlmSettings] = useState<LlmProviderSettings | null>(null);
+  const [analysisRun, setAnalysisRun] = useState<AiHighlightRun | null>(null);
+  const [highlightCandidates, setHighlightCandidates] = useState<AiHighlightCandidate[]>([]);
+  const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [projectTags, setProjectTags] = useState("");
+  const [analysisGoal, setAnalysisGoal] = useState("");
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const selectedProjectRef = useRef<number | null>(null);
   const currentSegmentRef = useRef<string | null>(null);
@@ -223,6 +233,11 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
       disposed = true;
     };
   }, [api, refreshEnvironment, refreshProjects]);
+
+  useEffect(() => {
+    if (!api.getAiLlmSettings) return;
+    void api.getAiLlmSettings().then(setLlmSettings).catch(() => setLlmSettings(null));
+  }, [api]);
 
   useEffect(() => {
     let disposed = false;
@@ -420,6 +435,53 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
     if (detail) await loadProject(detail.project.id);
   }, "失败输入已重新加入队列");
 
+  const promoteInput = (inputId: number) => {
+    if (!api.promoteAiNextInput) return;
+    void run(async () => {
+      const next = await api.promoteAiNextInput!(inputId);
+      setDetail(next);
+    }, "已设为下一个处理");
+  };
+
+  const preemptInput = (inputId: number) => {
+    if (!api.preemptAiWithInput || !window.confirm("立即切换会取消当前识别并将其以新代次重新排队，确认继续？")) return;
+    void run(async () => {
+      const next = await api.preemptAiWithInput!(inputId, true);
+      setDetail(next);
+    }, "已请求立即切换，当前任务会在释放执行许可后重新排队");
+  };
+
+  const startHighlightAnalysis = async () => {
+    if (!detail || !api.startAiHighlightAnalysis) return;
+    if (!llmSettings?.keyConfigured) {
+      setMessage("请先在设置中配置 DeepSeek API Key");
+      return;
+    }
+    if (!window.confirm("将只发送规范化转写、稳定句段时间和标签到 DeepSeek，确认开始高光分析？")) return;
+    setAnalysisBusy(true);
+    try {
+      const run = await api.startAiHighlightAnalysis(detail.project.id, true);
+      setAnalysisRun(run);
+      if (api.listAiHighlightCandidates) setHighlightCandidates(await api.listAiHighlightCandidates(run.id));
+      setMessage("高光分析已完成，候选结果可人工选择");
+    } catch (error) {
+      setMessage(safeError(error, "高光分析失败，ASR 结果已保留"));
+    } finally {
+      setAnalysisBusy(false);
+    }
+  };
+
+  const saveHighlightSelection = async () => {
+    if (!analysisRun || !api.selectAiHighlightCandidates) return;
+    const selected = highlightCandidates.filter((candidate) => candidate.selected).map((candidate) => candidate.id);
+    try {
+      setHighlightCandidates(await api.selectAiHighlightCandidates(analysisRun.id, selected));
+      setMessage("高光候选选择已保存，当前版本不会生成视频文件");
+    } catch (error) {
+      setMessage(safeError(error, "保存高光选择失败"));
+    }
+  };
+
   const seekSegment = (segment: AiTranscriptSegment) => {
     if (preview?.state !== "ready" || !preview.media || !videoRef.current) return;
     videoRef.current.currentTime = segment.sourceStartMs / 1_000;
@@ -454,6 +516,21 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
     (safePage + 1) * segmentPageSize,
   );
   const previewReady = preview?.state === "ready" && Boolean(preview.media);
+
+  useEffect(() => {
+    setProjectTags(detail?.project.projectTags?.join("、") ?? "");
+    setAnalysisGoal(detail?.project.analysisGoal ?? "");
+  }, [detail?.project.id, detail?.project.projectTags, detail?.project.analysisGoal]);
+
+  const saveProjectContext = () => {
+    if (!detail || !api.setAiProjectContext) return;
+    void api.setAiProjectContext(
+      detail.project.id,
+      projectTags.split(/[、,，\n]/).map((tag) => tag.trim()).filter(Boolean),
+      analysisGoal.trim() || null,
+    ).then((project) => setDetail((current) => current ? { ...current, project } : current))
+      .catch((error) => setMessage(safeError(error, "保存项目标签失败")));
+  };
 
   if (loading) {
     return <div className="page-content ai-page"><div className="ai-loading"><LoaderCircle className="spin" />正在恢复本地 AI 项目状态</div></div>;
@@ -518,6 +595,7 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
               {draft && (
                 <section className="panel ai-input-builder">
                   <header><div><p className="section-kicker">INPUTS</p><h3>有序视频输入</h3></div><span>识别只在点击开始后执行</span></header>
+                  <div className="ai-project-context"><label>项目标签<input aria-label="项目标签" value={projectTags} onChange={(event) => setProjectTags(event.target.value)} onBlur={saveProjectContext} placeholder="例如：带货、搞笑、知识" /></label><label>分析目标<input aria-label="分析目标" value={analysisGoal} onChange={(event) => setAnalysisGoal(event.target.value)} onBlur={saveProjectContext} placeholder="可选：重点找出价格对比和反转" /></label></div>
                   <div className="ai-input-source-actions">
                     <button className="secondary-button" disabled={busy} onClick={addLocalVideos}><FolderPlus size={16} />添加本地视频</button>
                     <label className="ai-session-picker"><span className="sr-only">选择已结束直播</span><select aria-label="选择已结束直播" value={selectedSessionId} onChange={(event) => setSelectedSessionId(event.target.value)}><option value="">选择已结束直播</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.streamerName} · {formatSessionTime(session.startedAt)}–{formatSessionTime(session.endedAt)} · {formatDuration(session.totalDurationMs)} · {session.videoCount} 段{session.unavailableVideoCount > 0 ? ` · ${session.unavailableVideoCount} 个不可用` : ""}</option>)}</select>{selectedSession && <small aria-label="已选历史直播详情">{formatSessionTime(selectedSession.startedAt)}–{formatSessionTime(selectedSession.endedAt)} · {selectedSession.videoCount} 个分片 · {formatDuration(selectedSession.totalDurationMs)}{selectedSession.unavailableVideoCount > 0 ? ` · ${selectedSession.unavailableVideoCount} 个不可用` : ""}</small>}</label>
@@ -535,15 +613,23 @@ export function AiWorkspace({ api }: { api: ClientApi }) {
                       ))}
                     </div>
                   )}
-                  <footer><div><strong>{environment?.engineId} {environment?.engineVersion}</strong><small>{environment?.modelId} · 8 GB 内存基线 · 全局单任务 · 录制优先</small></div><button className="primary-button" disabled={!canStart || busy} onClick={startProject}><Play size={16} />开始分析</button></footer>
+                  <footer><div><strong>{environment?.engineId} {environment?.engineVersion}</strong><small>{environment?.modelId} · 8 GB 内存基线 · 全局单任务 · 可与录制并行</small></div><button className="primary-button" disabled={!canStart || busy} onClick={startProject}><Play size={16} />开始分析</button></footer>
                 </section>
               )}
 
               {!draft && (
                 <section className="ai-result-workspace">
+                  {detail.project.status === "completed" || detail.project.status === "completed_with_errors" ? (
+                    <section className="panel ai-highlight-panel">
+                      <header><div><p className="section-kicker">HIGHLIGHT AGENT</p><h3>高光候选</h3></div><span>{llmSettings?.keyConfigured ? `${llmSettings.modelId} · 仅发送文本` : "未配置 DeepSeek"}</span></header>
+                      <div className="ai-highlight-consent"><div><strong>独立于本地 ASR</strong><p>需要显式授权后，候选 Agent 和评分 Agent 才会读取规范化转写。视频、音频、本地路径和 Key 不会发送。</p></div><button className="primary-button" disabled={analysisBusy || !llmSettings?.keyConfigured || !api.startAiHighlightAnalysis} onClick={() => void startHighlightAnalysis()}><Sparkles size={15} />{analysisBusy ? "分析中…" : "开始高光分析"}</button></div>
+                      {analysisRun && <div className="ai-highlight-run-meta"><span>状态：{analysisRun.status}</span><span>Skills：{analysisRun.skillsSnapshot.join("、") || "通用"}</span><span>Token：{analysisRun.totalTokens}</span></div>}
+                      {highlightCandidates.length > 0 ? <><div className="ai-highlight-candidate-list">{highlightCandidates.map((candidate) => <label key={candidate.id} className="ai-highlight-candidate"><input type="checkbox" checked={candidate.selected} onChange={(event) => setHighlightCandidates((items) => items.map((item) => item.id === candidate.id ? { ...item, selected: event.target.checked } : item))} /><div><strong>{candidate.title}</strong><small>{formatTimestamp(candidate.startMs)}–{formatTimestamp(candidate.endMs)} · {candidate.totalScore.toFixed(0)} 分 · {candidate.matchedTags.join("、") || "通用爆点"}</small><p>{candidate.reason}</p></div></label>)}</div><button className="secondary-button" onClick={() => void saveHighlightSelection()}>保存候选选择</button></> : <div className="ai-highlight-empty">完成分析后，这里会列出默认分数不低于 70 的前 10 个候选。</div>}
+                    </section>
+                  ) : null}
                   <aside className="panel ai-result-inputs">
                     <header><p className="section-kicker">VIDEOS</p><h3>视频与状态</h3></header>
-                    <div className="ai-result-input-list">{detail.inputs.map((input, index) => <div key={input.id} className={`ai-result-input-row ${input.id === currentInputId ? "active" : ""}`}><button className="ai-result-input-select" onClick={() => setCurrentInputId(input.id)}><span>{index + 1}</span><div><strong title={input.displayName}>{input.displayName}</strong><small>{inputStatusLabels[input.status]} · {input.progressPercent}%</small>{input.lastErrorMessage && <em title={input.lastErrorMessage}>{input.lastErrorMessage}</em>}</div></button>{input.status === "failed" && <button className="ai-retry" aria-label={`重试 ${input.displayName}`} onClick={() => void retryInput(input.id)}><RotateCcw size={14} /></button>}</div>)}</div>
+                    <div className="ai-result-input-list">{detail.inputs.map((input, index) => <div key={input.id} className={`ai-result-input-row ${input.id === currentInputId ? "active" : ""}`}><button className="ai-result-input-select" onClick={() => setCurrentInputId(input.id)}><span>{index + 1}</span><div><strong title={input.displayName}>{input.displayName}</strong><small>{inputStatusLabels[input.status]} · {input.progressPercent}%</small>{input.lastErrorMessage && <em title={input.lastErrorMessage}>{input.lastErrorMessage}</em>}</div></button><div className="ai-queue-actions">{input.status === "pending" && <><button aria-label={`下一个处理 ${input.displayName}`} onClick={() => promoteInput(input.id)}>下一个</button><button aria-label={`立即切换 ${input.displayName}`} onClick={() => preemptInput(input.id)}>立即切换</button></>}{input.status === "failed" && <button className="ai-retry" aria-label={`重试 ${input.displayName}`} onClick={() => void retryInput(input.id)}><RotateCcw size={14} /></button>}</div></div>)}</div>
                   </aside>
 
                   <div className="ai-result-main">

@@ -193,6 +193,7 @@ impl Database {
             migrate_streamer_tags_v3(&mut connection)?;
         }
         crate::ai::migrate_ai_v4(&mut connection)?;
+        crate::ai::migrate_ai_v7(&mut connection)?;
 
         let applied = connection
             .query_row(
@@ -219,6 +220,10 @@ impl Database {
             (
                 "max_concurrent_recordings",
                 defaults.max_concurrent_recordings.to_string(),
+            ),
+            (
+                "asr_during_recording",
+                defaults.asr_during_recording.to_string(),
             ),
             ("ffmpeg_path", defaults.ffmpeg_path),
             ("ffprobe_path", defaults.ffprobe_path),
@@ -896,6 +901,11 @@ impl Database {
                 "max_concurrent_recordings",
                 defaults.max_concurrent_recordings,
             ),
+            asr_during_recording: parse_or(
+                &values,
+                "asr_during_recording",
+                defaults.asr_during_recording,
+            ),
             ffmpeg_path: value_or(&values, "ffmpeg_path", defaults.ffmpeg_path),
             ffprobe_path: value_or(&values, "ffprobe_path", defaults.ffprobe_path),
             notifications_enabled: parse_or(
@@ -917,6 +927,10 @@ impl Database {
             (
                 "max_concurrent_recordings",
                 settings.max_concurrent_recordings.to_string(),
+            ),
+            (
+                "asr_during_recording",
+                settings.asr_during_recording.to_string(),
             ),
             ("ffmpeg_path", settings.ffmpeg_path.clone()),
             ("ffprobe_path", settings.ffprobe_path.clone()),

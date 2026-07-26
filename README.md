@@ -2,7 +2,7 @@
 
 直播管家是一个基于 Tauri 2.0、React、TypeScript、Rust 和 SQLite 的本地桌面客户端，用于通过公开抖音个人主页或直播间入口同时监听多个主播，在开播后自动保存包含视频和声音的 MKV 分片，并允许用户主动把多个视频转换为带时间戳的本地语音转写。
 
-当前版本交付“可靠录制 + 用户触发的本地 ASR”能力。AI 剪辑工作区已经支持视频与只读文本时间轴联动；NLP/LLM 高光判断、自动切片和成品视频导出仍属于后续独立能力。
+当前版本交付“可靠录制 + 用户触发的本地 ASR + 可选高光候选分析”能力。高光分析通过 Rust 中的受限 Agent 工作流调用 DeepSeek，只发送用户授权的规范化转写、时间戳、标签和分析目标；自动切片、字幕烧录和成品视频导出仍属于后续独立能力。
 
 ## 已实现功能
 
@@ -38,8 +38,11 @@
 - AI 剪辑工作区支持创建项目、通过系统文件选择器导入多个本地视频，或选择一场已结束直播并按稳定顺序展开全部登记分片；
 - 只有用户点击“开始分析”后才运行 ASR，打开页面、应用启动和新录像完成都不会自动识别；
 - 本地流水线使用 FFprobe、FFmpeg、Silero VAD 和 `whisper.cpp small-q5_1`，macOS arm64 使用 Metal，Windows x64 使用 CPU；
-- ASR 全局单并发并等待活动录制结束，不占用录制并发许可；相同源版本与识别配置可以跨项目复用稳定转写产物；
+- ASR 全局单并发，默认允许已完成视频在录制期间识别，不占用录制并发许可；设置中关闭并行后可恢复录制优先；相同源版本与识别配置可以跨项目复用稳定转写产物；
 - 项目结果提供播放器、点击句段跳转、当前句段高亮、可关闭的跟随播放、仅存在于 WebView 的临时字幕、复制及 TXT/JSON 导出；
+- AI 工作区支持标签/分析目标快照、队列中的“下一个处理”和“立即切换”，并在 ASR 完成后按用户授权运行候选发现 Agent 与评分 Agent；默认展示总分不低于 70 的前 10 个高光候选供勾选保存；
+- 设置页支持 DeepSeek 模型、超时和系统凭据状态；API Key 只保存到操作系统凭据库，连接诊断使用固定提示，不保存原始响应；
+- 高光分析使用版本化通用、带货、搞笑、知识和故事 Skills，未知标签只作为数据，不可改变 Agent 工具边界；
 - 第一版转写不可编辑，不生成 SRT/ASS，不修改或烧录原视频，也不提供波形、多轨、裁剪或视频渲染入口；
 - 所有主播、设置、视频元数据均保存在本机，不包含云同步和遥测。
 
@@ -173,8 +176,8 @@ FFprobe → FFmpeg → Silero VAD → AsrEngine
                      WhisperCppEngine Adapter
                                   ↓
          稳定句段 ID + 源内/项目时间戳 + 文本
-                                  ↓
-         播放器联动浏览、复制、TXT/JSON 导出
+                                  ├─→ 播放器联动浏览、复制、TXT/JSON 导出
+                                  └─→ 用户授权 → Candidate Agent → Ranking Agent → 高光候选
 ```
 
 使用步骤：
@@ -187,9 +190,11 @@ FFprobe → FFmpeg → Silero VAD → AsrEngine
 6. 点击句段可跳转到源视频时间；“跟随播放”只控制列表滚动，“显示字幕”只在当前 WebView 临时覆盖；
 7. 可复制单句、当前视频或整个项目，也可导出包含稳定定位信息的 TXT/JSON。
 
+ASR 完成后，打开设置页填写 DeepSeek 模型和 API Key，点击“测试连接”验证凭据；回到已完成项目，确认发送范围后点击“开始高光分析”。分析只发送规范化文本和相对时间，不发送视频、音频、本地路径、Cookie 或签名流地址。候选结果的时间和句段 ID由 Rust 本地校验，选择保存只写入 SQLite，不触发 FFmpeg。
+
 “添加本地视频”和“添加整场直播”是两个独立入口：前者用于外部文件多选；后者以录制会话为单位，一次加入该场直播的全部登记分片，不再打开文件或分片选择器。整场导入后，每个分片仍在统一输入列表中单独展示，用户可在开始分析前删除或调整顺序；重复分片会跳过，缺失、损坏、未完成、不可读取或无音轨的分片会保留为不可用项并计入反馈。
 
-历史会话是否可选只取决于该会话是否已经结束。即使主播当前正在进行一场新直播，其以前已经结束的回放仍可选择；当前仍在录制、写入中的会话不可选择，也不能通过陈旧界面状态导入。导入和整理历史输入不会自动启动 ASR；只有用户点击“开始分析”才会创建任务，并且只要任一直播仍在录制，ASR 就继续等待录制结束。
+历史会话是否可选只取决于该会话是否已经结束。即使主播当前正在进行一场新直播，其以前已经结束的回放仍可选择；当前仍在录制、写入中的会话不可选择，也不能通过陈旧界面状态导入。导入和整理历史输入不会自动启动 ASR；只有用户点击“开始分析”才会创建任务。默认情况下，已完成视频可以和其他直播录制并行识别；关闭设置中的并行开关后，才会恢复录制优先。
 
 本地导入不会把文件上传到网络，也不会复制原视频。项目只保存受信路径引用、源指纹、状态和转写产物；外部视频被移动、删除或修改后，对应输入会独立失败。移除直播分片也只会删除项目输入，不会删除视频库记录或原始录像文件。
 
@@ -199,7 +204,7 @@ FFprobe → FFmpeg → Silero VAD → AsrEngine
 
 - 最低基线为 8 GB 物理内存，任务前还会检查当前可用内存和至少 2 GB 临时磁盘余量；
 - 默认模型是约 181 MiB 的多语言 `small-q5_1`，实际运行还需要模型工作区、音频缓冲和系统资源；
-- ASR 全局最多运行一个输入，并限制为最多 4 个线程；存在活动录制时，新 ASR 输入保持等待；
+- ASR 全局最多运行一个输入，并限制为最多 4 个线程；默认不因其他直播处于录制状态而等待，低配置设备可以在设置中关闭并行处理；
 - 每个输入结束后退出 `whisper.cpp` 子进程并释放模型资源，因此多视频之间会重复加载模型，但取消和故障隔离更清晰；
 - VAD 用于排除静音、挂机和纯音乐，不能保证所有背景音乐场景都被正确过滤；
 - 中文商品名、主播名和金额仍可能识别错误，可以在项目中配置热词。未经真实样本核验的转写不应被当作事实记录。
@@ -241,6 +246,8 @@ src-tauri/target/release/bundle/macos/直播管家.app
 
 正式 ASR 安装包必须先准备一个符合 `resources/asr/manifest.json` 结构的可信资源目录。该目录包含公共模型、VAD、规范化字典和至少一个目标平台的 `whisper.cpp`、VAD、FFmpeg、FFprobe；Windows 还包含官方 `vc_redist.x64.exe`。构建工具不会联网，也拒绝把指向 Homebrew 或开发机路径的符号链接放进安装包。
 
+本机已经准备好的资源会持久保存在 `resources/asr-source/`：其中包含模型、sidecar、FFmpeg 动态库、源码归档和 `SHA256SUMS`。该目录中的大型二进制按 `.gitignore` 保存在本机，不会提交到 Git；后续直接执行 `make asr-stage-macos` 或 `make asr-build-macos` 即可复用，不依赖 `/private/tmp`，也不会重复下载。没有本地资源时，再通过 `ASR_SOURCE` 指定可信资源目录。
+
 仓库中的 manifest 是跨平台模板；`asr-bundle stage` 会为所选平台生成只包含一个平台且完整封存全部原生文件哈希的发行 manifest。模板目录不能直接作为正式运行资源。
 
 macOS 的 ASR 专用 FFmpeg 应从锁定的官方 `ffmpeg-8.1.2.tar.xz` 构建：
@@ -266,8 +273,10 @@ make asr-whisper-macos \
 macOS arm64：
 
 ```bash
-make asr-build-macos ASR_SOURCE=/absolute/path/to/asr-resources
+make asr-build-macos
 ```
+
+该命令默认从 `resources/asr-source/` 重新封存 `resources/asr-stage/`，再将同一份资源复制进 `.app` 的 `Contents/Resources/resources/asr/`。如需使用其他资源目录，可显式传入 `ASR_SOURCE=/absolute/path/to/asr-resources`。
 
 Windows x64（在 Windows x64 构建机运行）：
 
@@ -282,7 +291,7 @@ Windows x64 构建机可在 Visual Studio 2022 Developer PowerShell 中运行
 `make asr-whisper-windows`，生成静态 CPU sidecar。脚本固定 SSE4.2 最低指令集并显式关闭
 AVX/AVX2/BMI2，避免构建机 CPU 自动优化导致安装后非法指令崩溃。
 
-两个命令先调用 Rust `asr-bundle` 工具校验并生成 `resources/asr-stage/`，再使用对应 Tauri 配置覆盖构建。macOS 覆盖生成 `.app` 与 `.dmg`；Windows 覆盖生成 NSIS 安装器并使用离线 WebView2 安装模式。正式发行仍必须在各自目标机完成签名、公证或 Authenticode、安装、卸载和离线 ASR 验收，不能用开发构建代替发行证据。
+两个命令先调用 Rust `asr-bundle` 工具校验并生成 `resources/asr-stage/`，再使用对应 Tauri 配置覆盖构建。macOS 默认生成可直接运行的 `.app`；在有 Finder 会话的构建机上设置 `ASR_BUNDLES=app,dmg` 可同时生成 `.dmg`。Windows 覆盖生成 NSIS 安装器并使用离线 WebView2 安装模式。正式发行仍必须在各自目标机完成签名、公证或 Authenticode、安装、卸载和离线 ASR 验收，不能用开发构建代替发行证据。
 
 ## 自动监听与录制逻辑
 
@@ -371,6 +380,8 @@ macOS 默认位于 Tauri 应用数据目录：
 - `ai_project_inputs`：有序本地视频或直播分片引用、源指纹、源内时长和项目时间偏移；
 - `asr_artifacts`：按源指纹和识别配置指纹发布、复用和失效的 ASR 产物；
 - `transcript_segments`：稳定句段 ID、源内时间戳、原始/规范化文本和可选置信信息；
+- `llm_provider_settings`：Provider、模型、超时、Prompt 版本等非敏感设置；API Key 不在 SQLite 中；
+- `ai_highlight_runs`、`ai_highlight_chunks`、`ai_highlight_candidates`：高光运行快照、分块状态、结构化评分和用户选择；
 - `settings`：录像目录、质量、协议、并发、FFmpeg 和桌面设置；
 - `schema_migrations`：数据库迁移版本。
 
@@ -553,6 +564,8 @@ make help
 | `make test-migration` | 执行三层身份 SQLite 迁移与唯一性测试 |
 | `make test-supervisor-profile` | 执行个人主页/直播间双阶段状态机测试 |
 | `make test-tags` | 执行主播标签 migration、repository、服务和前端测试 |
+| `make test-ai` | 执行 ASR 调度、高光 repository、凭据 fake 和 Skills 单测 |
+| `make accept-deepseek` | 启动桌面端，通过设置页系统凭据和“测试连接”执行显式真实 DeepSeek 验收；不会从命令行读取 Key |
 | `make test-tag-migration` | 执行主播标签 SQLite migration 测试 |
 | `make test-tag-repository` | 执行标签持久化、合并、重启和上下文测试 |
 | `make test-tag-service` | 执行标签校验及主播创建、编辑服务测试 |

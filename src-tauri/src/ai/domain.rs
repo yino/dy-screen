@@ -7,10 +7,53 @@ use super::repository::{AiRepositoryError, Result};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AiHighlightRunStatus {
+    Pending,
+    Running,
+    Candidates,
+    Ranking,
+    Completed,
+    Partial,
+    Cancelled,
+    Failed,
+}
+
+impl AiHighlightRunStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Candidates => "candidates",
+            Self::Ranking => "ranking",
+            Self::Completed => "completed",
+            Self::Partial => "partial",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "candidates" => Ok(Self::Candidates),
+            "ranking" => Ok(Self::Ranking),
+            "completed" => Ok(Self::Completed),
+            "partial" => Ok(Self::Partial),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            _ => Err(AiRepositoryError::Integrity("高光运行状态无效".to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AiProjectStatus {
     Draft,
     Queued,
     Running,
+    Deleting,
     Completed,
     CompletedWithErrors,
     Cancelled,
@@ -23,6 +66,7 @@ impl AiProjectStatus {
             Self::Draft => "draft",
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Deleting => "deleting",
             Self::Completed => "completed",
             Self::CompletedWithErrors => "completed_with_errors",
             Self::Cancelled => "cancelled",
@@ -35,6 +79,7 @@ impl AiProjectStatus {
             "draft" => Ok(Self::Draft),
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
+            "deleting" => Ok(Self::Deleting),
             "completed" => Ok(Self::Completed),
             "completed_with_errors" => Ok(Self::CompletedWithErrors),
             "cancelled" => Ok(Self::Cancelled),
@@ -47,10 +92,17 @@ impl AiProjectStatus {
         matches!(
             (self, next),
             (Self::Draft, Self::Queued)
-                | (Self::Queued, Self::Running | Self::Cancelled | Self::Failed)
+                | (
+                    Self::Queued,
+                    Self::Running | Self::Cancelled | Self::Failed | Self::Deleting
+                )
                 | (
                     Self::Running,
-                    Self::Completed | Self::CompletedWithErrors | Self::Cancelled | Self::Failed
+                    Self::Completed
+                        | Self::CompletedWithErrors
+                        | Self::Cancelled
+                        | Self::Failed
+                        | Self::Deleting
                 )
         )
     }
@@ -247,6 +299,9 @@ pub struct AiProject {
     pub progress_percent: u8,
     pub last_error_code: Option<String>,
     pub last_error_message: Option<String>,
+    pub project_tags: Vec<String>,
+    pub analysis_goal: Option<String>,
+    pub deleting_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -272,6 +327,9 @@ pub struct AiProjectInput {
     pub artifact_id: Option<i64>,
     pub last_error_code: Option<String>,
     pub last_error_message: Option<String>,
+    pub scheduler_generation: u64,
+    pub queue_priority: u32,
+    pub queue_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -345,6 +403,95 @@ pub struct TranscriptSegment {
     pub raw_text: String,
     pub normalized_text: String,
     pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiHighlightRun {
+    pub id: i64,
+    pub project_id: i64,
+    pub status: AiHighlightRunStatus,
+    pub model_id: String,
+    pub prompt_version: String,
+    pub tags_snapshot: Vec<String>,
+    pub skills_snapshot: Vec<String>,
+    pub analysis_goal: Option<String>,
+    pub analysis_fingerprint: String,
+    pub user_authorized: bool,
+    pub total_segments: u64,
+    pub total_chars: u64,
+    pub estimated_batches: u64,
+    pub total_tokens: u64,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiHighlightChunk {
+    pub id: i64,
+    pub run_id: i64,
+    pub ordinal: i64,
+    pub input_id: i64,
+    pub segment_ids: Vec<String>,
+    pub context_segment_ids: Vec<String>,
+    pub status: String,
+    pub candidate_count: u64,
+    pub token_usage: u64,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiHighlightCandidate {
+    pub id: i64,
+    pub run_id: i64,
+    pub chunk_id: Option<i64>,
+    pub candidate_key: String,
+    pub title: String,
+    pub input_id: i64,
+    pub segment_ids: Vec<String>,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub total_score: f32,
+    pub hook_score: f32,
+    pub information_score: f32,
+    pub emotion_score: f32,
+    pub tag_relevance_score: f32,
+    pub completeness_score: f32,
+    pub shareability_score: f32,
+    pub reason: String,
+    pub matched_tags: Vec<String>,
+    pub rank: Option<u32>,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAiHighlightRun {
+    pub project_id: i64,
+    pub model_id: String,
+    pub prompt_version: String,
+    pub tags_snapshot: Vec<String>,
+    pub skills_snapshot: Vec<String>,
+    pub analysis_goal: Option<String>,
+    pub analysis_fingerprint: String,
+    pub total_segments: u64,
+    pub total_chars: u64,
+    pub estimated_batches: u64,
+    pub user_authorized: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAiHighlightChunk {
+    pub ordinal: i64,
+    pub input_id: i64,
+    pub segment_ids: Vec<String>,
+    pub context_segment_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

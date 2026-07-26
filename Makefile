@@ -27,9 +27,9 @@ ACCEPT_ROOM_URL ?= https://live.douyin.com/703940802949
 ACCEPT_ROOM_URLS ?= https://live.douyin.com/703940802949 https://live.douyin.com/168376497175 https://live.douyin.com/452086788686
 ACCEPT_MINUTES ?= 30
 APP_LOG_DIR ?= $(HOME)/Library/Logs/com.yino.dyscreen
-ASR_SOURCE ?=
+ASR_SOURCE ?= $(if $(wildcard resources/asr-source/manifest.json),resources/asr-source,)
 ASR_STAGE ?= resources/asr-stage
-ASR_RESOURCE_ROOT ?=
+ASR_RESOURCE_ROOT ?= $(if $(wildcard resources/asr-stage/manifest.json),resources/asr-stage,)
 ASR_VIDEO ?=
 ASR_TEST_VIDEO ?= $(CURDIR)/tests/fixtures/asr/short_zh.mp4
 ASR_TRANSCRIBE_VIDEO ?= $(ASR_TEST_VIDEO)
@@ -39,6 +39,7 @@ ASR_TARGET_EVIDENCE ?=
 ASR_APP ?=
 ASR_DMG ?=
 ASR_RELEASE_EVIDENCE ?=
+ASR_BUNDLES ?= app
 EXECUTABLE_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
 ASR_BUNDLE_BINARY ?= target/release/asr-bundle$(EXECUTABLE_SUFFIX)
 ASR_INSTALLER ?=
@@ -55,10 +56,10 @@ ASR_COMPLETION_MACOS_RELEASE ?=
 ASR_COMPLETION_WINDOWS_RELEASE ?=
 ASR_COMPLETION_MACOS_PERFORMANCE ?=
 ASR_COMPLETION_WINDOWS_PERFORMANCE ?=
-FFMPEG_SOURCE ?=
-FFMPEG_ASR_OUTPUT ?= /private/tmp/dy-screen-asr-ffmpeg
-WHISPER_SOURCE ?=
-WHISPER_ASR_OUTPUT ?= /private/tmp/dy-screen-asr-whisper
+FFMPEG_SOURCE ?= $(if $(wildcard resources/asr-source/sources/ffmpeg-8.1.2.tar.xz),resources/asr-source/sources/ffmpeg-8.1.2.tar.xz,)
+FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg
+WHISPER_SOURCE ?= $(if $(wildcard resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz),resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz,)
+WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper
 POWERSHELL ?= powershell.exe
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
@@ -73,7 +74,9 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
+	test-ai-scheduler test-ai-repository test-ai-credentials test-ai-workflow test-ai \
 	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
+	accept-deepseek \
 	diagnose-real-room tail-access-log accept-real-room accept-real-multi \
 	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
@@ -98,7 +101,9 @@ help:
 		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
 		'  make asr-whisper-windows WHISPER_SOURCE=C:/whisper.cpp-v1.9.1.tar.gz 构建 SSE4.2 CPU sidecar' \
 		'  make asr-stage-macos ASR_SOURCE=/可信资源目录  准备 macOS ASR 随包资源' \
-		'  make asr-build-macos ASR_SOURCE=/可信资源目录  构建含本地 ASR 的 macOS 安装包' \
+		'  make asr-build-macos ASR_SOURCE=/可信资源目录  构建含本地 ASR 的 macOS .app' \
+		'  本机已准备资源时可直接运行 make asr-build-macos；默认复用 resources/asr-source/' \
+		'  make asr-build-macos ASR_BUNDLES=app,dmg  同时生成 DMG（需要可用 Finder 会话）' \
 		'  make asr-stage-windows ASR_SOURCE=/可信资源目录 准备 Windows ASR 随包资源' \
 		'  make asr-build-windows ASR_SOURCE=/可信资源目录 构建 Windows NSIS 安装包' \
 		'  make asr-check-windows 交叉检查 Windows x64 根/Tauri crate 与严格 Clippy' \
@@ -127,6 +132,8 @@ help:
 		'  make test-migration  执行三层身份数据库迁移测试' \
 		'  make test-supervisor-profile 执行主页/直播间双阶段状态机测试' \
 		'  make test-tags       执行主播标签后端、迁移和前端测试' \
+		'  make test-ai         执行 AI 调度、SQLite、高光工作流和凭据 fake 测试' \
+		'  make accept-deepseek 启动桌面端，使用设置页的系统凭据和“测试连接”进行显式真实验收' \
 		'  make test-tag-migration 执行主播标签 SQLite migration 测试' \
 		'  make test-tag-repository 执行主播标签 repository 与生命周期测试' \
 		'  make test-tag-service 执行主播创建、编辑和标签校验服务测试' \
@@ -221,7 +228,7 @@ asr-stage-windows:
 	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(ASR_SOURCE)" --target "$(ASR_STAGE)" --platform windows-x86-64
 
 asr-build-macos: asr-stage-macos
-	"$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json
+	"$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
 
 asr-build-windows: asr-stage-windows
 	"$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
@@ -422,6 +429,27 @@ test-tag-ui:
 	"$(NPM)" test -- --run ui/src/App.test.tsx ui/src/api.test.ts
 
 test-tags: test-tag-migration test-tag-repository test-tag-service test-tag-ui
+
+test-ai-scheduler:
+	"$(CARGO)" test --offline --test asr_scheduler -- --nocapture
+
+test-ai-repository:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --offline --test ai_repository -- --nocapture
+
+test-ai-credentials:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --offline --test ai_llm -- --nocapture
+
+test-ai-workflow:
+	"$(CARGO)" test --manifest-path src-tauri/Cargo.toml --offline ai::highlight::tests -- --nocapture
+
+test-ai: test-ai-scheduler test-ai-repository test-ai-credentials test-ai-workflow
+
+accept-deepseek: doctor
+	@printf '%s\n' \
+		'真实 DeepSeek 验收只通过桌面端设置页执行，不把 Key 放入命令行、日志或 SQLite。' \
+		'启动后进入“设置 → 高光分析 Provider”，保存模型和系统凭据，再点击“测试连接”。' \
+		'连接诊断只发送固定提示；确认成功后再在已完成 ASR 项目中显式点击“开始高光分析”。'
+	"$(NPM)" run tauri:dev
 
 test-access-core:
 	"$(CARGO)" test --test browser_snapshot

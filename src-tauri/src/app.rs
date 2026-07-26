@@ -15,8 +15,9 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::ai::tauri_commands::*;
 use crate::ai::{
-    AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService, AiRepository, LocalAsrRuntime,
-    SourceFingerprint,
+    AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService, AiRepository,
+    HighlightWorkflow, LocalAsrRuntime, RigDeepSeekProvider, SourceFingerprint,
+    SystemCredentialStore,
 };
 use crate::app_lifecycle::{
     InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, log_lifecycle,
@@ -699,6 +700,7 @@ pub fn run() {
             ai_get_project,
             ai_create_project,
             ai_rename_project,
+            ai_set_project_context,
             ai_delete_project,
             ai_pick_local_videos,
             ai_import_local_grants,
@@ -709,6 +711,8 @@ pub fn run() {
             ai_project_summary,
             ai_start_project,
             ai_cancel_project,
+            ai_promote_next_input,
+            ai_preempt_with_input,
             ai_retry_input,
             ai_query_transcript,
             ai_copy_segment_text,
@@ -717,6 +721,13 @@ pub fn run() {
             ai_export_txt,
             ai_export_json,
             ai_diagnose_environment,
+            ai_get_llm_settings,
+            ai_save_llm_settings,
+            ai_clear_llm_key,
+            ai_diagnose_llm_provider,
+            ai_start_highlight_analysis,
+            ai_list_highlight_candidates,
+            ai_select_highlight_candidates,
             request_exit
         ])
         .setup(|app| {
@@ -758,20 +769,27 @@ pub fn run() {
                     }),
                 )
             });
-            ai_components
-                .runtime
-                .recover_startup()
+            tauri::async_runtime::block_on(ai_components.runtime.recover_startup_and_requeue())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             let ai_project_service = AiProjectService::new(
                 database.clone(),
                 ai_components.inspector,
                 ai_components.preflight,
             );
+            let credential_store: Arc<dyn crate::ai::CredentialStore> =
+                Arc::new(SystemCredentialStore::default());
+            let highlight_workflow = Arc::new(HighlightWorkflow::new(
+                AiRepository::new(database.clone()),
+                Arc::new(RigDeepSeekProvider),
+                credential_store.clone(),
+            ));
             let ai_commands = AiCommandService::new(
                 ai_project_service,
                 crate::ai::AiRepository::new(database.clone()),
                 ai_components.runtime.clone(),
-            );
+            )
+            .with_highlight_workflow(highlight_workflow)
+            .with_credential_store(credential_store);
             app.manage(AiDesktopState::new(ai_commands));
 
             let tray_status_item = MenuItemBuilder::with_id("recording_status", "正在录制：0 路")

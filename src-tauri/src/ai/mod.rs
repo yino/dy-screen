@@ -6,7 +6,9 @@
 mod commands;
 mod desktop_runtime;
 mod domain;
+mod highlight;
 mod lifecycle;
+mod llm;
 mod processor;
 mod projection;
 mod repository;
@@ -20,11 +22,25 @@ pub use commands::{
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
-    AiArtifactStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput,
-    AiProjectStatus, AsrArtifact, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
-    RecoverySummary, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
+    AiArtifactStatus, AiHighlightCandidate, AiHighlightChunk, AiHighlightRun, AiHighlightRunStatus,
+    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
+    AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact,
+    RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
+    TranscriptSegmentDraft,
+};
+pub use highlight::{
+    AnalysisChunk, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION, GENERIC_HOOK,
+    HighlightSkill, HighlightWorkflow, KNOWLEDGE_DENSITY, STORY_EMOTION, analysis_fingerprint,
+    chunk_segments, select_skills,
 };
 pub use lifecycle::{AiLifecycle, AiLifecycleError, AiRecoveryReport};
+pub use llm::{
+    CandidateAgentOutput, CandidateAgentRequest, CredentialError, CredentialStore,
+    DEEPSEEK_BASE_URL, DEFAULT_MODEL_ID, FakeHighlightProvider, HighlightAgentProvider,
+    HighlightCandidateDraft, HighlightCandidateScore, LlmError, LlmProviderSettings,
+    MAX_AGENT_TURNS, MemoryCredentialStore, PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput,
+    RankingAgentRequest, RigDeepSeekProvider, SystemCredentialStore,
+};
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
 };
@@ -38,4 +54,4 @@ pub use service::{
     ImportRejection, PreflightReport, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
-pub(crate) use repository::migrate_ai_v4;
+pub(crate) use repository::{migrate_ai_v4, migrate_ai_v7};

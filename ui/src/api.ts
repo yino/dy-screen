@@ -4,6 +4,8 @@ import type {
   AiEnvironmentDiagnostic,
   AiExportResult,
   AiImportBatch,
+  AiHighlightCandidate,
+  AiHighlightRun,
   AiJobEvent,
   AiProject,
   AiProjectDetail,
@@ -18,8 +20,10 @@ import type {
   CreateStreamerInput,
   Dashboard,
   EnvironmentStatus,
+  LlmProviderSettings,
   MonitorEvent,
   PreviewSnapshot,
+  ProviderDiagnostic,
   Streamer,
   StreamerPromptContext,
   StreamerTag,
@@ -36,6 +40,7 @@ const defaultSettings: AppSettings = {
   protocol: "flv",
   segmentSeconds: 900,
   maxConcurrentRecordings: 4,
+  asrDuringRecording: true,
   ffmpegPath: "ffmpeg",
   ffprobePath: "ffprobe",
   notificationsEnabled: true,
@@ -93,6 +98,8 @@ const tauriApi: ClientApi = {
   getAiProject: (projectId) => invoke<AiProjectDetail>("ai_get_project", { projectId }),
   createAiProject: (input) => invoke<AiProject>("ai_create_project", { input }),
   renameAiProject: (projectId, name) => invoke<AiProject>("ai_rename_project", { projectId, name }),
+  setAiProjectContext: (projectId, tags, analysisGoal) =>
+    invoke<AiProject>("ai_set_project_context", { projectId, tags, analysisGoal }),
   deleteAiProject: (projectId) => invoke<void>("ai_delete_project", { projectId }),
   pickAiLocalVideos: () => invoke<AiTrustedFileGrant[]>("ai_pick_local_videos"),
   importAiLocalGrants: (projectId, grantIds) =>
@@ -109,6 +116,9 @@ const tauriApi: ClientApi = {
     invoke<AiProjectSummary>("ai_project_summary", { projectId }),
   startAiProject: (projectId) => invoke<AiProject>("ai_start_project", { projectId }),
   cancelAiProject: (projectId) => invoke<AiProject>("ai_cancel_project", { projectId }),
+  promoteAiNextInput: (inputId) => invoke<AiProjectDetail>("ai_promote_next_input", { inputId }),
+  preemptAiWithInput: (inputId, confirmed) =>
+    invoke<AiProjectDetail>("ai_preempt_with_input", { inputId, confirmed }),
   retryAiInput: (inputId) => invoke<AiProjectDetail>("ai_retry_input", { inputId }),
   queryAiTranscript: (projectId) =>
     invoke<AiTranscriptProjection>("ai_query_transcript", { projectId }),
@@ -122,6 +132,17 @@ const tauriApi: ClientApi = {
   exportAiJson: (projectId) => invoke<AiExportResult>("ai_export_json", { projectId }),
   diagnoseAiEnvironment: () =>
     invoke<AiEnvironmentDiagnostic>("ai_diagnose_environment"),
+  getAiLlmSettings: () => invoke<LlmProviderSettings>("ai_get_llm_settings"),
+  saveAiLlmSettings: (settings, apiKey) =>
+    invoke<LlmProviderSettings>("ai_save_llm_settings", { settings, apiKey: apiKey ?? null }),
+  clearAiLlmKey: () => invoke<void>("ai_clear_llm_key"),
+  diagnoseAiLlmProvider: () => invoke<ProviderDiagnostic>("ai_diagnose_llm_provider"),
+  startAiHighlightAnalysis: (projectId, confirmed) =>
+    invoke<AiHighlightRun>("ai_start_highlight_analysis", { projectId, confirmed }),
+  listAiHighlightCandidates: (runId) =>
+    invoke<AiHighlightCandidate[]>("ai_list_highlight_candidates", { runId }),
+  selectAiHighlightCandidates: (runId, candidateIds) =>
+    invoke<AiHighlightCandidate[]>("ai_select_highlight_candidates", { runId, candidateIds }),
   requestAiInputPreview: (projectId, inputId) =>
     invoke<PreviewSnapshot>("request_ai_input_preview", { projectId, inputId }),
   retryAiInputPreview: (projectId, inputId) =>
@@ -194,9 +215,12 @@ export function createBrowserApi(): ClientApi {
             })).filter((tag) => tag.name)
           : [],
       }));
-    settings = JSON.parse(
-      window.localStorage.getItem("dy-screen-settings") || JSON.stringify(defaultSettings),
-    ) as AppSettings;
+    settings = {
+      ...defaultSettings,
+      ...(JSON.parse(
+        window.localStorage.getItem("dy-screen-settings") || "{}",
+      ) as Partial<AppSettings>),
+    };
   } catch {
     streamers = [];
   }
@@ -474,6 +498,9 @@ export function createBrowserApi(): ClientApi {
     renameAiProject: async () => {
       throw new Error("浏览器演示模式不能修改本地 AI 项目");
     },
+    setAiProjectContext: async () => {
+      throw new Error("浏览器演示模式不能修改本地 AI 项目");
+    },
     deleteAiProject: async () => undefined,
     pickAiLocalVideos: async () => [],
     importAiLocalGrants: async () => ({ added: [], rejected: [] }),
@@ -495,6 +522,12 @@ export function createBrowserApi(): ClientApi {
     },
     cancelAiProject: async () => {
       throw new Error("浏览器演示模式没有运行中的 ASR");
+    },
+    promoteAiNextInput: async () => {
+      throw new Error("浏览器演示模式没有本地 ASR 队列");
+    },
+    preemptAiWithInput: async () => {
+      throw new Error("浏览器演示模式没有本地 ASR 队列");
     },
     retryAiInput: async () => {
       throw new Error("浏览器演示模式不能执行本地 ASR");
@@ -521,6 +554,24 @@ export function createBrowserApi(): ClientApi {
       }],
       message: "请在 Tauri 桌面客户端中使用本地语音识别",
     }),
+    getAiLlmSettings: async (): Promise<LlmProviderSettings> => ({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      keyConfigured: false,
+      updatedAt: null,
+    }),
+    saveAiLlmSettings: async () => {
+      throw new Error("浏览器演示模式不会保存 API Key");
+    },
+  clearAiLlmKey: async () => undefined,
+  diagnoseAiLlmProvider: async () => ({ ok: false, category: "browser_demo", message: "浏览器演示模式不会调用 DeepSeek" }),
+    startAiHighlightAnalysis: async () => {
+      throw new Error("浏览器演示模式不会调用 DeepSeek");
+    },
+    listAiHighlightCandidates: async () => [],
+    selectAiHighlightCandidates: async () => [],
     requestAiInputPreview: async (_projectId, inputId): Promise<PreviewSnapshot> => ({
       requestId: `browser-ai-preview-${inputId}`,
       videoId: -inputId,
