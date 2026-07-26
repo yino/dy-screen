@@ -151,6 +151,17 @@ impl ActivationService {
                 let _ = self.save_record(record);
                 HeartbeatOutcome::Active
             }
+            Err(error) if api_error_is_revocation(&error) => {
+                let now = Utc::now();
+                record.token = None;
+                record.state = "revoked".to_owned();
+                record.last_error = Some(error.safe_message());
+                record.last_heartbeat_at = Some(now.to_rfc3339());
+                record.next_heartbeat_at = None;
+                record.updated_at = now.to_rfc3339();
+                let _ = self.save_record(record);
+                HeartbeatOutcome::Revoked
+            }
             Err(error) => {
                 let now = Utc::now();
                 record.state = "retrying".to_owned();
@@ -335,7 +346,7 @@ async fn flush_telemetry(service: &ActivationService, batch: &mut Vec<TelemetryE
 }
 
 pub fn api_error_is_revocation(error: &ApiError) -> bool {
-    matches!(error.code(), Some(1004 | 1005 | 2003 | 2004))
+    matches!(error.code(), Some(1003..=1006 | 2003 | 2004))
 }
 
 #[cfg(test)]

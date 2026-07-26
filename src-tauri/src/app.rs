@@ -108,6 +108,8 @@ fn should_notify_verification(notified: &AtomicBool, status: BrowserAccessStatus
 fn spawn_access_recovery_checks(
     room_resolution: Arc<RoomResolutionService>,
     supervisor: Supervisor,
+    activation: ActivationService,
+    runtime_resources: RuntimeResourceState,
 ) {
     let mut recovered = room_resolution.subscribe_access_recovered();
     let shutdown = room_resolution.shutdown_token();
@@ -119,7 +121,12 @@ fn spawn_access_recovery_checks(
                     Ok(_) => {
                         // 等价于用户在主界面点击“检查访问状态”：唤醒所有仍启用的
                         // 主播 worker，但不重新导航已经确认成功的验证页。
-                        let _ = supervisor.check_all_now();
+                        if should_run_background_tasks(
+                            activation.is_active(),
+                            runtime_resources.view().ready,
+                        ) {
+                            let _ = supervisor.check_all_now();
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -300,6 +307,10 @@ fn require_runtime_ready(state: &AppState) -> Result<(), String> {
         return Err("客户端尚未激活，请先输入有效激活码".to_owned());
     }
     require_runtime_ready_flag(state.runtime_resources.view().ready)
+}
+
+fn should_run_background_tasks(activation_active: bool, runtime_ready: bool) -> bool {
+    activation_active && runtime_ready
 }
 
 #[tauri::command]
@@ -503,6 +514,7 @@ fn get_browser_access_state(state: State<'_, AppState>) -> BrowserAccessState {
 
 #[tauri::command]
 async fn show_douyin_verification(state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     state
         .room_resolution
         .show_verification()
@@ -512,6 +524,7 @@ async fn show_douyin_verification(state: State<'_, AppState>) -> Result<(), Stri
 
 #[tauri::command]
 async fn recheck_douyin_access(state: State<'_, AppState>) -> Result<BrowserAccessState, String> {
+    require_runtime_ready(state.inner())?;
     let access = state
         .room_resolution
         .recheck()
@@ -1191,7 +1204,12 @@ pub fn run() {
             .map_err(std::io::Error::other)?;
             let shutdown_gate = ShutdownGate::default();
 
-            spawn_access_recovery_checks(room_resolution.clone(), supervisor.clone());
+            spawn_access_recovery_checks(
+                room_resolution.clone(),
+                supervisor.clone(),
+                activation.clone(),
+                app.state::<RuntimeResourceState>().inner().clone(),
+            );
             spawn_activation_lifecycle(
                 app.handle().clone(),
                 activation.clone(),
@@ -1285,6 +1303,10 @@ pub fn run() {
         RunEvent::Resumed => {
             if let Some(state) = app.try_state::<AppState>()
                 && !state.shutdown_gate.is_started()
+                && should_run_background_tasks(
+                    state.activation.is_active(),
+                    state.runtime_resources.view().ready,
+                )
             {
                 let _ = state.supervisor.check_all_now();
             }
@@ -1305,10 +1327,18 @@ fn handle_tray_event(app: &AppHandle, id: &str) {
             });
         }
         "resume_all" => {
-            let supervisor = app.state::<AppState>().supervisor.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = supervisor.resume_all().await;
-            });
+            let state = app.state::<AppState>();
+            if should_run_background_tasks(
+                state.activation.is_active(),
+                state.runtime_resources.view().ready,
+            ) {
+                let supervisor = state.supervisor.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = supervisor.resume_all().await;
+                });
+            } else {
+                show_main_window(app);
+            }
         }
         "quit" => {
             let state = app.state::<AppState>();
@@ -1647,5 +1677,13 @@ mod tests {
         let error = require_runtime_ready_flag(false).expect_err("资源未就绪必须锁定业务命令");
         assert!(error.contains("资源尚未准备完成"));
         assert!(require_runtime_ready_flag(true).is_ok());
+    }
+
+    #[test]
+    fn background_resume_requires_both_authorization_and_runtime_resources() {
+        assert!(should_run_background_tasks(true, true));
+        assert!(!should_run_background_tasks(false, true));
+        assert!(!should_run_background_tasks(true, false));
+        assert!(!should_run_background_tasks(false, false));
     }
 }
