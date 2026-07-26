@@ -553,7 +553,7 @@ make help
 | `make frontend-build` | 类型检查并构建 React 前端 |
 | `make app-dev` | 启动 Tauri 桌面开发客户端；保留 Vite 前端热更新并禁用会强制结束录制进程的 Rust watcher |
 | `make app-build` | 构建桌面应用 |
-| `make asr-ffmpeg-macos FFMPEG_SOURCE=...` | 从锁定官方源码构建 LGPL、无网络、可相对定位的 macOS ASR FFmpeg |
+| `make asr-ffmpeg-macos FFMPEG_SOURCE=...` | 从锁定官方源码构建 LGPL、支持直播录制与本地媒体处理、可相对定位的 macOS 运行时 FFmpeg |
 | `make asr-stage-macos ASR_SOURCE=...` | 校验并准备单平台 macOS arm64 ASR 随包目录 |
 | `make asr-build-macos ASR_SOURCE=...` | 构建包含本地 ASR 资源的 macOS `.app`/`.dmg` |
 | `make asr-stage-windows ASR_SOURCE=...` | 校验并准备单平台 Windows x64 ASR 随包目录 |

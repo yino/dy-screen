@@ -4,16 +4,23 @@ use std::path::Path;
 use dy_screen::asr::{AsrBundleManifest, AsrQualityDataset};
 
 #[test]
-fn macos_ffmpeg_build_is_locked_lgpl_offline_and_relocatable() {
+fn macos_ffmpeg_build_is_locked_lgpl_media_capable_and_relocatable() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = fs::read_to_string(root.join("scripts/build-asr-ffmpeg-macos.sh")).unwrap();
     for required in [
         "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
-        "--disable-network",
         "--disable-everything",
         "--enable-shared",
         "--disable-static",
+        "--enable-network",
+        "--enable-securetransport",
+        "--enable-protocol=file,pipe,http,https,tcp,tls,crypto,httpproxy",
+        "--enable-demuxer=mov,matroska,flv,hls,mpegts",
+        "--enable-muxer=wav,segment,matroska,mov,image2",
+        "--enable-encoder=pcm_s16le,aac,h264_videotoolbox,mjpeg",
         "--enable-decoder=",
+        "PROTOCOLS_OUTPUT",
+        "MUXERS_OUTPUT",
         "@loader_path",
         "@executable_path/../../lib/macos-aarch64",
         "--enable-(gpl|nonfree)",
@@ -21,7 +28,7 @@ fn macos_ffmpeg_build_is_locked_lgpl_offline_and_relocatable() {
     ] {
         assert!(script.contains(required), "FFmpeg 构建脚本缺少 {required}");
     }
-    assert!(!script.contains("--enable-network"));
+    assert!(!script.contains("--disable-network"));
     assert!(!script.contains("--enable-gpl "));
     assert!(!script.contains("--enable-nonfree "));
 }

@@ -105,7 +105,7 @@ help:
 		'  make app-build       构建 macOS .app 安装产物' \
 		'  make app-build-resources ASR_SOURCE=... 构建强制携带运行资源的发行包（缺资源直接失败）' \
 		'  make app-build-resources-windows ASR_SOURCE=... 构建 Windows x64 强制资源发行包' \
-		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL ASR FFmpeg' \
+		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL 应用运行时 FFmpeg' \
 		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
 		'  make asr-whisper-windows WHISPER_SOURCE=C:/whisper.cpp-v1.9.1.tar.gz 构建 SSE4.2 CPU sidecar' \
 		'  make asr-stage-macos ASR_SOURCE=/可信资源目录  准备 macOS ASR 随包资源' \
