@@ -240,12 +240,12 @@ impl AiRepository {
         self.get_project_row(project_id)
     }
 
-    /// 将用户明确选择的失败输入恢复为待执行；不会自动无限重试。
+    /// 将用户明确选择的失败或已取消输入恢复为待执行；不会自动无限重试。
     pub fn prepare_input_retry(&self, input_id: i64) -> Result<AiProjectInput> {
         let input = self.get_input(input_id)?;
-        if input.status != AiInputStatus::Failed {
+        if !matches!(input.status, AiInputStatus::Failed | AiInputStatus::Cancelled) {
             return Err(AiRepositoryError::InvalidState(
-                "只有失败输入可以重试".to_owned(),
+                "只有失败或已取消输入可以重试".to_owned(),
             ));
         }
         let project = self.get_project_row(input.project_id)?;
@@ -262,7 +262,7 @@ impl AiRepository {
             SET status = 'pending', scheduler_generation = scheduler_generation + 1,
                 queue_priority = 0, queue_sequence = NULL, artifact_id = NULL, last_error_code = NULL,
                 last_error_message = NULL, updated_at = ?1
-            WHERE id = ?2 AND status = 'failed'
+            WHERE id = ?2 AND status IN ('failed', 'cancelled')
             "#,
             params![Utc::now().to_rfc3339(), input_id],
         )?;

@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
+use crate::runtime_resource_state::RuntimeResourceState;
 use crate::domain::{DiscoveryBinding, MonitorEvent, NewVideo, Streamer, StreamerSourceKind};
 pub use crate::room_resolution::RoomDiscovery;
 use crate::room_resolution::{
@@ -451,6 +452,7 @@ pub struct Supervisor {
     monitor_logger: MonitorLogger,
     shutdown: CancellationToken,
     changes: broadcast::Sender<MonitorEvent>,
+    runtime_resources: Arc<Mutex<Option<RuntimeResourceState>>>,
 }
 
 impl Supervisor {
@@ -537,6 +539,13 @@ impl Supervisor {
             monitor_logger: MonitorLogger::default(),
             shutdown: CancellationToken::new(),
             changes,
+            runtime_resources: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set_runtime_resources(&mut self, resources: RuntimeResourceState) {
+        if let Ok(mut current) = self.runtime_resources.lock() {
+            *current = Some(resources);
         }
     }
 
@@ -1271,6 +1280,24 @@ impl Supervisor {
         let selected = room
             .select(Some(&settings.quality), Some(protocol))
             .map_err(|error| error.safe_message())?;
+        let trusted_media_tools = self
+            .runtime_resources
+            .lock()
+            .ok()
+            .and_then(|resources| resources.as_ref().and_then(|resources| resources.media_tools().ok()));
+        let (ffmpeg_executable, ffprobe_executable) = match trusted_media_tools {
+            Some((ffmpeg, ffprobe)) => (ffmpeg, ffprobe),
+            None => {
+                #[cfg(debug_assertions)]
+                {
+                    (PathBuf::from(&settings.ffmpeg_path), PathBuf::from(&settings.ffprobe_path))
+                }
+                #[cfg(not(debug_assertions))]
+                {
+                    return Err("受控媒体资源尚未准备完成，无法启动录制".to_owned());
+                }
+            }
+        };
         let session = self
             .database
             .start_session(streamer.id, &settings.output_root)
@@ -1301,11 +1328,11 @@ impl Supervisor {
         });
         let recorder = FfmpegRecorder::new(RecordingConfig {
             ffmpeg: FfmpegConfig {
-                executable: PathBuf::from(settings.ffmpeg_path),
+                executable: ffmpeg_executable,
                 segment_seconds: settings.segment_seconds,
                 ..FfmpegConfig::default()
             },
-            ffprobe_executable: PathBuf::from(settings.ffprobe_path),
+            ffprobe_executable,
             output_root: PathBuf::from(settings.output_root),
             ..RecordingConfig::default()
         });

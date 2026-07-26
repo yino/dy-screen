@@ -1,9 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AiWorkspace } from "./AiWorkspace";
 import type {
   AiEnvironmentDiagnostic,
+  AiHighlightCandidate,
+  AiHighlightRun,
   AiProject,
   AiProjectDetail,
   AiTranscriptProjection,
@@ -116,6 +118,71 @@ const environment: AiEnvironmentDiagnostic = {
   ],
   message: "本地 ASR 环境就绪，识别过程不会上传视频",
 };
+
+const completedHighlightRun: AiHighlightRun = {
+  id: 801,
+  projectId: project.id,
+  status: "completed",
+  modelId: "deepseek-chat",
+  promptVersion: "highlight-v1",
+  tagsSnapshot: [],
+  skillsSnapshot: ["generic-hook@1.0.0"],
+  analysisGoal: null,
+  analysisFingerprint: "highlight-run-801",
+  userAuthorized: true,
+  totalSegments: 2,
+  totalChars: 18,
+  estimatedBatches: 1,
+  totalTokens: 320,
+  lastErrorCode: null,
+  lastErrorMessage: null,
+  createdAt: "2026-07-22T00:00:00Z",
+  updatedAt: "2026-07-22T00:00:05Z",
+};
+
+const highlightCandidates: AiHighlightCandidate[] = [{
+  id: 901,
+  runId: completedHighlightRun.id,
+  chunkId: 1,
+  candidateKey: "candidate-qualified",
+  title: "价格反转",
+  inputId: completedInput.id,
+  segmentIds: ["seg-a", "seg-b"],
+  startMs: 1_000,
+  endMs: 18_000,
+  totalScore: 82,
+  hookScore: 86,
+  informationScore: 78,
+  emotionScore: 73,
+  tagRelevanceScore: 91,
+  completenessScore: 80,
+  shareabilityScore: 84,
+  reason: "价格信息完整，并且有明确反转。",
+  matchedTags: ["带货"],
+  rank: 1,
+  selected: false,
+}, {
+  id: 902,
+  runId: completedHighlightRun.id,
+  chunkId: 1,
+  candidateKey: "candidate-reference",
+  title: "普通互动",
+  inputId: completedInput.id,
+  segmentIds: ["seg-a", "seg-b"],
+  startMs: 20_000,
+  endMs: 38_000,
+  totalScore: 64,
+  hookScore: 61,
+  informationScore: 58,
+  emotionScore: 69,
+  tagRelevanceScore: 55,
+  completenessScore: 72,
+  shareabilityScore: 65,
+  reason: "内容完整，但吸引力和标签相关性较弱。",
+  matchedTags: [],
+  rank: 2,
+  selected: false,
+}];
 
 const readyPreview: PreviewSnapshot = {
   requestId: "ai-preview-ready",
@@ -383,6 +450,137 @@ describe("AiWorkspace", () => {
     expect(api.exportAiTxt).not.toHaveBeenCalled();
   });
 
+  it("高光分析等待 LLM 返回时显示专用进度并在完成后收起", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    let completeAnalysis!: (run: AiHighlightRun) => void;
+    const pendingAnalysis = new Promise<AiHighlightRun>((resolve) => {
+      completeAnalysis = resolve;
+    });
+    const api = createAiApi();
+    api.getAiLlmSettings = vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      keyConfigured: true,
+      updatedAt: "2026-07-22T00:00:00Z",
+    });
+    api.startAiHighlightAnalysis = vi.fn(() => pendingAnalysis);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue([]);
+    render(<AiWorkspace api={api} />);
+
+    const startButton = await screen.findByRole("button", { name: "开始高光分析" });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    await user.click(startButton);
+
+    expect(await screen.findByRole("progressbar", { name: "高光分析进行中" })).toBeInTheDocument();
+    expect(screen.getByText("1 个视频 · 2 个句段")).toBeInTheDocument();
+    expect(screen.getByText(/按视频分批生成候选/)).toBeInTheDocument();
+    expect(screen.queryByText(/完成分析后/)).not.toBeInTheDocument();
+
+    completeAnalysis(completedHighlightRun);
+
+    await waitFor(() => expect(screen.queryByRole("progressbar", { name: "高光分析进行中" })).not.toBeInTheDocument());
+    expect(screen.getByText("状态：已完成")).toBeInTheDocument();
+    expect(screen.getByText("范围：1 批 · 2 句")).toBeInTheDocument();
+    expect(screen.getByText("模型消耗：320 Token")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新分析结果" })).toBeEnabled();
+    expect(screen.getByText("分析已完成，但模型没有返回可用候选。")).toBeInTheDocument();
+  });
+
+  it("相同内容命中历史高光结果时不闪烁运行进度", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const api = createAiApi();
+    api.getAiLlmSettings = vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      keyConfigured: true,
+      updatedAt: "2026-07-22T00:00:00Z",
+    });
+    api.startAiHighlightAnalysis = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue([]);
+    render(<AiWorkspace api={api} />);
+
+    const startButton = await screen.findByRole("button", { name: "开始高光分析" });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    await user.click(startButton);
+
+    expect(await screen.findByRole("button", { name: "刷新分析结果" })).toBeEnabled();
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+    expect(screen.queryByRole("progressbar", { name: "高光分析进行中" })).not.toBeInTheDocument();
+    expect(screen.getByText("已读取相同内容的历史高光分析结果")).toBeInTheDocument();
+  });
+
+  it("同时展示达标和参考候选的总分与六项评分", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const api = createAiApi();
+    api.getAiLlmSettings = vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      keyConfigured: true,
+      updatedAt: "2026-07-22T00:00:00Z",
+    });
+    api.startAiHighlightAnalysis = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
+    render(<AiWorkspace api={api} />);
+
+    const startButton = await screen.findByRole("button", { name: "开始高光分析" });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    await user.click(startButton);
+
+    expect(await screen.findByText("2 个评分候选")).toBeInTheDocument();
+    expect(screen.getByText("1 个达到 70 分 · 1 个参考候选")).toBeInTheDocument();
+    expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("86吸引力");
+    expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("91标签相关");
+    expect(screen.getByLabelText("普通互动 评分明细")).toHaveTextContent("65传播性");
+    expect(screen.getByText("82 分")).toBeInTheDocument();
+    expect(screen.getByText("64 分")).toBeInTheDocument();
+  });
+
+  it("允许审计高光分析的请求、步骤、输入范围和结构化结果", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const api = createAiApi();
+    api.getAiLlmSettings = vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      keyConfigured: true,
+      updatedAt: "2026-07-22T00:00:00Z",
+    });
+    api.startAiHighlightAnalysis = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
+    render(<AiWorkspace api={api} />);
+
+    const startButton = await screen.findByRole("button", { name: "开始高光分析" });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    await user.click(startButton);
+    await user.click(await screen.findByText("分析详情"));
+
+    expect(screen.getByText("候选发现 Agent")).toBeInTheDocument();
+    expect(screen.getByText("全局评分 Agent")).toBeInTheDocument();
+    expect(screen.getByLabelText("LLM 请求摘要")).toHaveTextContent("受限的只读高光分析 Agent");
+    expect(screen.getByLabelText("LLM 请求摘要")).toHaveTextContent("15 到 90 秒的高光候选");
+    expect(screen.getByLabelText("LLM 结构化结果")).toHaveTextContent('"totalScore": 82');
+    expect(screen.getByLabelText("LLM 结构化结果")).toHaveTextContent("价格信息完整，并且有明确反转。");
+    expect(screen.getByText(/模型未返回的内部推理过程不可读取/)).toBeInTheDocument();
+
+    await user.click(screen.getByText("本次运行使用的规范化文本"));
+    const inputRange = screen.getByLabelText("高光分析输入范围");
+    expect(within(inputRange).getByText("欢迎来到直播间。")).toBeInTheDocument();
+    expect(within(inputRange).getByText("今天价格99元。")).toBeInTheDocument();
+    expect(within(inputRange).getAllByLabelText("价格反转 候选整体评分 82 分")).toHaveLength(2);
+    expect(within(inputRange).getAllByLabelText("普通互动 候选整体评分 64 分")).toHaveLength(2);
+  });
+
   it("播放器不可定位时仍允许复制文本，并提供 TXT 与 JSON 只读导出", async () => {
     const user = userEvent.setup();
     const api = createAiApi();
@@ -427,7 +625,7 @@ describe("AiWorkspace", () => {
     expect(screen.getByText("2 / 3 · 共 401 句")).toBeInTheDocument();
   });
 
-  it("运行项目支持取消，部分完成项目支持失败项重试和只删除 AI 数据", async () => {
+  it("运行项目支持取消，失败或取消项都可以重新识别，且只删除 AI 数据", async () => {
     const user = userEvent.setup();
     vi.spyOn(window, "confirm").mockReturnValue(true);
     const runningProject = { ...project, status: "running" as const, progressPercent: 75 };
@@ -450,11 +648,36 @@ describe("AiWorkspace", () => {
 
     await user.click(await screen.findByRole("button", { name: "取消分析" }));
     expect(api.cancelAiProject).toHaveBeenCalledWith(project.id);
-    await user.click(screen.getByRole("button", { name: `重试 ${failedInput.displayName}` }));
+    await user.click(screen.getByRole("button", { name: `重新识别 ${failedInput.displayName}` }));
     expect(api.retryAiInput).toHaveBeenCalledWith(failedInput.id);
     await user.click(screen.getByRole("button", { name: "删除 AI 项目" }));
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("绝不会删除原始视频"));
     expect(api.deleteAiProject).toHaveBeenCalledWith(project.id);
+  });
+
+  it("已取消的输入显示重新识别入口", async () => {
+    const cancelledProject = { ...project, status: "cancelled" as const, progressPercent: 100 };
+    const cancelledInput = {
+      ...completedInput,
+      id: 303,
+      status: "cancelled" as const,
+      lastErrorCode: "user_cancelled",
+      lastErrorMessage: "用户已取消语音识别",
+    };
+    const detail: AiProjectDetail = {
+      project: cancelledProject,
+      inputs: [cancelledInput],
+    };
+    const api = createAiApi(detail, {
+      project: cancelledProject,
+      inputs: [{ ...transcript.inputs[0], inputId: cancelledInput.id, status: "cancelled", segments: [], errorMessage: cancelledInput.lastErrorMessage }],
+    });
+    const user = userEvent.setup();
+    render(<AiWorkspace api={api} />);
+
+    const retry = await screen.findByRole("button", { name: `重新识别 ${cancelledInput.displayName}` });
+    await user.click(retry);
+    expect(api.retryAiInput).toHaveBeenCalledWith(cancelledInput.id);
   });
 
   it("状态事件丢失后使用主动查询恢复，且第一版不出现编辑与视频渲染入口", async () => {

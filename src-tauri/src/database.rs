@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use chrono::Utc;
+use dy_screen::runtime_resources::{ResourceStatus, ResourceStatusSnapshot};
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params, params_from_iter};
 use thiserror::Error;
 
@@ -37,6 +38,22 @@ pub enum DatabaseError {
 }
 
 pub type Result<T> = std::result::Result<T, DatabaseError>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeResourceRecord {
+    pub platform: String,
+    pub app_min_version: String,
+    pub bundle_version: Option<String>,
+    pub status: ResourceStatus,
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
+    pub manifest_sha256: Option<String>,
+    pub current_component: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub updated_at: String,
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -206,8 +223,108 @@ impl Database {
         if !applied {
             migrate_streamer_diagnostics_v5(&mut connection)?;
         }
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = 8",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            migrate_runtime_resources_v8(&mut connection)?;
+        }
         drop(connection);
         self.ensure_default_settings()
+    }
+
+    pub fn runtime_resource_status(&self) -> Result<RuntimeResourceRecord> {
+        let connection = self.connection()?;
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        connection
+            .query_row(
+                r#"SELECT platform, app_min_version, bundle_version, status,
+                          progress_bytes, total_bytes, manifest_sha256, current_component,
+                          error_code, error_message, updated_at
+                   FROM runtime_resources WHERE platform = ?1"#,
+                [platform.clone()],
+                |row| {
+                    let status: String = row.get(3)?;
+                    let status = serde_json::from_str::<ResourceStatus>(&format!("\"{status}\""))
+                        .unwrap_or(ResourceStatus::Failed);
+                    Ok(RuntimeResourceRecord {
+                        platform: row.get(0)?,
+                        app_min_version: row.get(1)?,
+                        bundle_version: row.get(2)?,
+                        status,
+                        progress_bytes: row.get::<_, i64>(4)?.max(0) as u64,
+                        total_bytes: row.get::<_, i64>(5)?.max(0) as u64,
+                        manifest_sha256: row.get(6)?,
+                        current_component: row.get(7)?,
+                        error_code: row.get(8)?,
+                        error_message: row.get(9)?,
+                        updated_at: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?
+            .map_or_else(
+                || Ok(RuntimeResourceRecord {
+                    platform,
+                    app_min_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    bundle_version: None,
+                    status: ResourceStatus::Failed,
+                    progress_bytes: 0,
+                    total_bytes: 0,
+                    manifest_sha256: None,
+                    current_component: None,
+                    error_code: Some("resource_not_checked".to_owned()),
+                    error_message: Some("尚未检查本地运行资源".to_owned()),
+                    updated_at: Utc::now().to_rfc3339(),
+                }),
+                Ok,
+            )
+    }
+
+    pub fn save_runtime_resource_status(&self, snapshot: &ResourceStatusSnapshot) -> Result<()> {
+        let connection = self.connection()?;
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let status = serde_json::to_string(&snapshot.status)
+            .map_err(|error| DatabaseError::MigrationIntegrity(error.to_string()))?
+            .trim_matches('"')
+            .to_owned();
+        connection.execute(
+            r#"INSERT INTO runtime_resources(
+                platform, app_min_version, bundle_version, status, progress_bytes,
+                total_bytes, manifest_sha256, current_component, error_code,
+                error_message, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(platform) DO UPDATE SET
+                app_min_version=excluded.app_min_version,
+                bundle_version=excluded.bundle_version,
+                status=excluded.status,
+                progress_bytes=excluded.progress_bytes,
+                total_bytes=excluded.total_bytes,
+                manifest_sha256=excluded.manifest_sha256,
+                current_component=excluded.current_component,
+                error_code=excluded.error_code,
+                error_message=excluded.error_message,
+                updated_at=excluded.updated_at"#,
+            params![
+                platform,
+                env!("CARGO_PKG_VERSION"),
+                snapshot.bundle_version,
+                status,
+                snapshot.downloaded_bytes as i64,
+                snapshot.total_bytes as i64,
+                snapshot.manifest_sha256,
+                snapshot.current_component,
+                snapshot.error_code,
+                snapshot.error_message,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
     }
 
     fn ensure_default_settings(&self) -> Result<()> {
@@ -1466,6 +1583,47 @@ fn migrate_streamer_diagnostics_v5(connection: &mut Connection) -> Result<()> {
     }
     transaction.execute(
         "INSERT INTO schema_migrations(version, applied_at) VALUES(5, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_runtime_resources_v8(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS runtime_resources (
+            platform TEXT PRIMARY KEY,
+            app_min_version TEXT NOT NULL,
+            bundle_version TEXT,
+            status TEXT NOT NULL,
+            progress_bytes INTEGER NOT NULL DEFAULT 0 CHECK(progress_bytes >= 0),
+            total_bytes INTEGER NOT NULL DEFAULT 0 CHECK(total_bytes >= 0),
+            manifest_sha256 TEXT,
+            current_component TEXT,
+            error_code TEXT,
+            error_message TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS runtime_downloads (
+            platform TEXT NOT NULL,
+            bundle_version TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            part_path TEXT NOT NULL,
+            etag TEXT,
+            last_modified TEXT,
+            downloaded_bytes INTEGER NOT NULL DEFAULT 0 CHECK(downloaded_bytes >= 0),
+            total_bytes INTEGER NOT NULL DEFAULT 0 CHECK(total_bytes >= 0),
+            status TEXT NOT NULL DEFAULT 'pending',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(platform, bundle_version, relative_path)
+        );
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

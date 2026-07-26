@@ -9,8 +9,11 @@ use tokio_util::sync::CancellationToken;
 use super::{
     AiHighlightCandidate, AiHighlightRun, AiHighlightRunStatus, AiRepository,
     CandidateAgentRequest, CredentialStore, HighlightAgentProvider, HighlightCandidateDraft,
-    LlmError, NewAiHighlightChunk, NewAiHighlightRun, ProviderDiagnostic, RankingAgentRequest,
+    HighlightCandidateScore, LlmError, NewAiHighlightChunk, NewAiHighlightRun, ProviderDiagnostic,
+    RankingAgentRequest,
 };
+
+const RESULT_POLICY_VERSION: &str = "top-10-with-reference-candidates-v2";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightSkill {
@@ -176,6 +179,7 @@ pub fn analysis_fingerprint(
     hasher.update(model_id.as_bytes());
     hasher.update(prompt_version.as_bytes());
     hasher.update(goal.unwrap_or_default().as_bytes());
+    hasher.update(RESULT_POLICY_VERSION.as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -342,23 +346,11 @@ impl HighlightWorkflow {
             )
             .await?;
         let ranking_tokens = ranked.token_usage;
-        let mut seen_scores = HashSet::new();
-        let mut scores = ranked
-            .scores
-            .into_iter()
-            .filter(|score| {
-                score.total_score >= 70.0 && seen_scores.insert(score.candidate_key.clone())
-            })
-            .collect::<Vec<_>>();
-        scores.sort_by(|left, right| {
-            right
-                .total_score
-                .partial_cmp(&left.total_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.rank.cmp(&right.rank))
-                .then_with(|| left.candidate_key.cmp(&right.candidate_key))
-        });
-        scores.truncate(10);
+        let candidate_keys = all_drafts
+            .iter()
+            .map(|draft| draft.candidate_key.clone())
+            .collect::<HashSet<_>>();
+        let scores = select_top_scores(ranked.scores, &candidate_keys);
         self.repository
             .add_highlight_run_tokens(run.id, ranking_tokens)?;
         for (ordinal, drafts, tokens) in drafts_by_chunk {
@@ -409,6 +401,28 @@ impl HighlightWorkflow {
     pub fn candidates(&self, run_id: i64) -> Result<Vec<AiHighlightCandidate>, LlmError> {
         Ok(self.repository.list_highlight_candidates(run_id)?)
     }
+}
+
+fn select_top_scores(
+    scores: Vec<HighlightCandidateScore>,
+    candidate_keys: &HashSet<String>,
+) -> Vec<HighlightCandidateScore> {
+    let mut seen_scores = HashSet::new();
+    let mut scores = scores
+        .into_iter()
+        .filter(|score| candidate_keys.contains(&score.candidate_key))
+        .filter(|score| seen_scores.insert(score.candidate_key.clone()))
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| {
+        right
+            .total_score
+            .partial_cmp(&left.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.rank.cmp(&right.rank))
+            .then_with(|| left.candidate_key.cmp(&right.candidate_key))
+    });
+    scores.truncate(10);
+    scores
 }
 
 fn build_candidate_prompt(
@@ -537,5 +551,65 @@ mod tests {
                 .iter()
                 .all(|segment| segment.input_id == chunk.input_id)
         }));
+    }
+
+    #[test]
+    fn analysis_fingerprint_changes_when_result_policy_changes() {
+        let segments = vec![AnalysisSegment {
+            stable_id: "s1".to_owned(),
+            input_id: 1,
+            start_ms: 0,
+            end_ms: 20_000,
+            text: "测试文本".to_owned(),
+        }];
+        let current = analysis_fingerprint(
+            1,
+            &segments,
+            &[],
+            &[GENERIC_HOOK],
+            "deepseek-chat",
+            "highlight-v1",
+            None,
+        );
+        let mut legacy = Sha256::new();
+        legacy.update(1_i64.to_le_bytes());
+        legacy.update(serde_json::to_vec(&segments).unwrap());
+        legacy.update(serde_json::to_vec(&Vec::<String>::new()).unwrap());
+        legacy.update(b"generic-hook|1.0.0");
+        legacy.update(b"deepseek-chat");
+        legacy.update(b"highlight-v1");
+        legacy.update(b"");
+        assert_ne!(current, hex::encode(legacy.finalize()));
+    }
+
+    #[test]
+    fn top_scores_keep_reference_candidates_below_threshold() {
+        let candidate_keys = ["qualified".to_owned(), "reference".to_owned()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let score = |candidate_key: &str, total_score: f32, rank: u32| HighlightCandidateScore {
+            candidate_key: candidate_key.to_owned(),
+            total_score,
+            hook_score: total_score,
+            information_score: total_score,
+            emotion_score: total_score,
+            tag_relevance_score: total_score,
+            completeness_score: total_score,
+            shareability_score: total_score,
+            rank,
+            reason: "测试评分".to_owned(),
+        };
+        let selected = select_top_scores(
+            vec![
+                score("reference", 64.0, 2),
+                score("qualified", 82.0, 1),
+                score("unknown", 99.0, 1),
+            ],
+            &candidate_keys,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].candidate_key, "qualified");
+        assert_eq!(selected[1].candidate_key, "reference");
+        assert_eq!(selected[1].total_score, 64.0);
     }
 }

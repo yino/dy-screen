@@ -209,7 +209,7 @@ ASR 完成后，打开设置页填写 DeepSeek 模型和 API Key，点击“测�
 - VAD 用于排除静音、挂机和纯音乐，不能保证所有背景音乐场景都被正确过滤；
 - 中文商品名、主播名和金额仍可能识别错误，可以在项目中配置热词。未经真实样本核验的转写不应被当作事实记录。
 
-环境诊断失败时不会创建运行任务。模型或 sidecar 缺失、损坏时，第一版不在线下载，也不允许用户指定任意可执行路径；请使用完整安装包修复或重新安装。
+环境诊断失败时不会创建运行任务。正式客户端启动前会先进入“准备运行资源”页面：优先使用安装包内资源，缺失或损坏时只从构建期固定的 HTTPS 资源服务器下载并逐文件校验；下载完成后无需重新安装即可重新检测。资源服务器地址、manifest 签名公钥和组件版本不是用户设置，前端也不能指定任意可执行路径。
 正式暂存时会为 Whisper、VAD、FFmpeg、FFprobe、动态库和 Windows VC++ 安装器封存文件大小与 SHA-256；运行时要求单平台 manifest 完整覆盖全部文件，任一文件被替换都会在启动任务前失败。
 
 真实中文直播质量与 8 GB 双平台性能使用独立证据工具验收：`asr-quality collect/evaluate` 记录至少 10 个授权样本的召回率、时间误差、静音幻觉、失败率和 RTF；macOS/Windows 性能脚本记录峰值内存、线程、热状态和子进程释放。完整字段、隐私边界和命令见 [`docs/wiki/ASR-真实样本与性能验收.md`](docs/wiki/ASR-真实样本与性能验收.md)。模板或开发机数据不能替代真实目标设备证据。
@@ -249,6 +249,31 @@ src-tauri/target/release/bundle/macos/直播管家.app
 本机已经准备好的资源会持久保存在 `resources/asr-source/`：其中包含模型、sidecar、FFmpeg 动态库、源码归档和 `SHA256SUMS`。该目录中的大型二进制按 `.gitignore` 保存在本机，不会提交到 Git；后续直接执行 `make asr-stage-macos` 或 `make asr-build-macos` 即可复用，不依赖 `/private/tmp`，也不会重复下载。没有本地资源时，再通过 `ASR_SOURCE` 指定可信资源目录。
 
 仓库中的 manifest 是跨平台模板；`asr-bundle stage` 会为所选平台生成只包含一个平台且完整封存全部原生文件哈希的发行 manifest。模板目录不能直接作为正式运行资源。
+
+### Runtime Resource Pack 发行与首次启动
+
+资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证。`asr-bundle stage` 会同时生成 `runtime-manifest.json`，清单采用 v2 结构，记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。
+
+```bash
+# 生成并校验 macOS arm64 随包资源
+make asr-stage-macos ASR_SOURCE=/absolute/path/to/resources
+make runtime-resource-verify ASR_STAGE=resources/asr-stage
+
+# 构建正式的资源发行包；缺少资源时直接失败
+make app-build-resources ASR_SOURCE=/absolute/path/to/resources
+
+# 生成自有 HTTPS 静态托管目录（上传前必须用正式 Ed25519 私钥签署清单）
+make runtime-resource-publish \
+  ASR_STAGE=resources/asr-stage \
+  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.2/ \
+  RESOURCE_RELEASE_DIR=dist/runtime-resources
+```
+
+托管目录约定为 `channel/appVersion/platform/arch/bundleVersion/`，并在同一固定地址提供 `runtime-manifest.json` 及清单声明的资源文件。服务器应支持 HTTPS、Range 和大文件缓存；应用不会上传视频、音频、转写、主播信息、Cookie 或本地数据库。用户安装后如果资源未就绪，只能在资源页查看版本/大小/组件、下载、取消、重试或重新检测，监控、录制、视频库和 AI 剪辑保持锁定。
+
+当前 macOS arm64 发行构建使用的固定资源基地址为：
+`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.2/`。
+`index.json` 仅用于发布目录索引，不能直接作为下载基地址。
 
 macOS 的 ASR 专用 FFmpeg 应从锁定的官方 `ffmpeg-8.1.2.tar.xz` 构建：
 

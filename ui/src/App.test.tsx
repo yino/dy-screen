@@ -215,6 +215,48 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
 }
 
 describe("App", () => {
+  it("资源未就绪时只显示准备页，下载完成后解锁监控导航", async () => {
+    const user = userEvent.setup();
+    const readyStatus = {
+      status: "ready" as const,
+      ready: true,
+      bundleVersion: "2026.07.26",
+      platform: "macos-aarch64",
+      appMinVersion: "0.2.0",
+      manifestSha256: "manifest-hash",
+      components: [],
+      totalSizeBytes: 1024,
+      minimumFreeDiskBytes: 2048,
+      minimumMemoryBytes: 4096,
+      source: "固定 HTTPS 资源服务器",
+      downloadedBytes: 1024,
+      errorCode: null,
+      errorMessage: null,
+      updatedAt: "2026-07-26T00:00:00Z",
+    };
+    const api = createApi([streamer]);
+    api.runtimeResourceStatus = vi.fn().mockResolvedValue({
+      ...readyStatus,
+      status: "failed" as const,
+      ready: false,
+      downloadedBytes: 0,
+      errorCode: "resource_not_checked",
+      errorMessage: "正在检查本地运行资源",
+    });
+    api.runtimeResourceDownload = vi.fn().mockResolvedValue(readyStatus);
+    api.runtimeResourceRecheck = vi.fn().mockResolvedValue(readyStatus);
+    api.runtimeResourceCancel = vi.fn().mockResolvedValue(undefined);
+    api.subscribeRuntimeResources = vi.fn().mockResolvedValue(() => undefined);
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "准备本地运行资源" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "监控中心" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "下载并安装资源" }));
+    expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "监控中心" })).not.toBeDisabled();
+  });
+
   it("需要访问验证时显示全局横幅并由用户主动打开窗口", async () => {
     const user = userEvent.setup();
     const api = createApi([{
@@ -647,6 +689,25 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "监控中心" }));
 
     expect(api.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("AI 工作区切换菜单后保留状态且不会重新加载", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "创建项目" }));
+    const projectName = screen.getByLabelText("项目名称");
+    await user.type(projectName, "保留中的项目");
+    await waitFor(() => expect(api.listAiProjects).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "监控中心" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+
+    expect(await screen.findByLabelText("项目名称")).toHaveValue("保留中的项目");
+    expect(api.listAiProjects).toHaveBeenCalledTimes(1);
   });
 
   it("历史视频库按每页 50 条翻页", async () => {

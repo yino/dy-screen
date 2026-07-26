@@ -48,6 +48,8 @@ import type {
   LlmProviderSettings,
   MonitorStatus,
   PreviewSnapshot,
+  RuntimeResourceView,
+  RuntimeResourceEvent,
   Streamer,
   StreamerTagInput,
   ThumbnailBatch,
@@ -57,7 +59,7 @@ import type {
 } from "./types";
 import { AiWorkspace } from "./AiWorkspace";
 
-type Page = "monitor" | "library" | "ai" | "settings";
+type Page = "monitor" | "library" | "ai" | "settings" | "resources";
 type HistoryFilters = { search: string; status: string; date: string };
 type ActivePreview = { video: VideoItem; snapshot: PreviewSnapshot };
 
@@ -210,6 +212,7 @@ interface AppProps {
 
 export function App({ api }: AppProps) {
   const [page, setPage] = useState<Page>("monitor");
+  const [aiWorkspaceMounted, setAiWorkspaceMounted] = useState(false);
   const [dashboard, setDashboard] = useState<Dashboard>(emptyDashboard);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [currentVideos, setCurrentVideos] = useState<VideoItem[]>([]);
@@ -220,6 +223,8 @@ export function App({ api }: AppProps) {
   const [historyFilters, setHistoryFilters] = useState<HistoryFilters>({ search: "", status: "all", date: "all" });
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
+  const [resourceStatus, setResourceStatus] = useState<RuntimeResourceView | null>(null);
+  const [resourceBusy, setResourceBusy] = useState<"download" | "cancel" | "recheck" | null>(null);
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -292,7 +297,23 @@ export function App({ api }: AppProps) {
   useEffect(() => {
     void refreshDashboard();
     void api.getSettings().then(setSettings).catch(() => undefined);
+    if (api.runtimeResourceStatus) {
+      void api.runtimeResourceStatus().then((status) => {
+        setResourceStatus(status);
+        if (!status.ready) setPage("resources");
+      }).catch(() => undefined);
+    }
     let disposed = false;
+    let resourceUnsubscribe: (() => void) | undefined;
+    if (api.subscribeRuntimeResources) {
+      void api.subscribeRuntimeResources((event: RuntimeResourceEvent) => {
+        if (disposed) return;
+        setResourceStatus(event.status);
+      }).then((handler) => {
+        if (disposed) handler();
+        else resourceUnsubscribe = handler;
+      });
+    }
     let unsubscribe: (() => void) | undefined;
     void api.subscribe((event) => {
       if (event.kind === "exit_confirmation_requested") {
@@ -323,8 +344,49 @@ export function App({ api }: AppProps) {
     return () => {
       disposed = true;
       unsubscribe?.();
+      resourceUnsubscribe?.();
     };
   }, [api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
+
+  const refreshResources = async () => {
+    if (!api.runtimeResourceRecheck) return;
+    setResourceBusy("recheck");
+    try {
+      const status = await api.runtimeResourceRecheck();
+      setResourceStatus(status);
+      if (status.ready) setPage("monitor");
+    } catch (error) {
+      setNotice(errorMessage(error, "资源检查失败"));
+    } finally {
+      setResourceBusy(null);
+    }
+  };
+
+  const downloadResources = async () => {
+    if (!api.runtimeResourceDownload) return;
+    setResourceBusy("download");
+    try {
+      const status = await api.runtimeResourceDownload();
+      setResourceStatus(status);
+      if (status.ready) setPage("monitor");
+    } catch (error) {
+      setNotice(errorMessage(error, "资源下载失败"));
+      await refreshResources();
+    } finally {
+      setResourceBusy(null);
+    }
+  };
+
+  const cancelResourceDownload = async () => {
+    if (!api.runtimeResourceCancel) return;
+    setResourceBusy("cancel");
+    try {
+      await api.runtimeResourceCancel();
+      await refreshResources();
+    } finally {
+      setResourceBusy(null);
+    }
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -467,6 +529,11 @@ export function App({ api }: AppProps) {
   const selectedStreamer = dashboard.streamers.find((item) => item.id === selectedId) ?? null;
 
   const navigate = (nextPage: Page) => {
+    if (resourceStatus && !resourceStatus.ready && nextPage !== "resources" && nextPage !== "settings") {
+      setNotice("运行资源尚未准备完成，主功能暂不可用");
+      return;
+    }
+    if (nextPage === "ai") setAiWorkspaceMounted(true);
     setPage(nextPage);
     setMobileNavOpen(false);
   };
@@ -571,7 +638,8 @@ export function App({ api }: AppProps) {
       <Sidebar
         page={page}
         open={mobileNavOpen}
-        activeRecordings={dashboard.activeRecordings}
+          activeRecordings={dashboard.activeRecordings}
+        resourceReady={resourceStatus?.ready ?? true}
         onNavigate={navigate}
         onClose={() => setMobileNavOpen(false)}
       />
@@ -600,6 +668,16 @@ export function App({ api }: AppProps) {
             <span>{notice}</span>
             <button onClick={() => setNotice(null)} aria-label="关闭提示"><X size={16} /></button>
           </div>
+        )}
+
+        {page === "resources" && resourceStatus && (
+          <ResourcePreparationPage
+            status={resourceStatus}
+            busy={resourceBusy}
+            onDownload={() => void downloadResources()}
+            onCancel={() => void cancelResourceDownload()}
+            onRecheck={() => void refreshResources()}
+          />
         )}
 
         {page === "monitor" && (
@@ -680,7 +758,11 @@ export function App({ api }: AppProps) {
           />
         )}
 
-        {page === "ai" && <AiWorkspace api={api} />}
+        {(page === "ai" || aiWorkspaceMounted) && (
+          <div hidden={page !== "ai"}>
+            <AiWorkspace api={api} active={page === "ai"} />
+          </div>
+        )}
 
         {page === "settings" && settings && (
           <SettingsPage
@@ -739,6 +821,7 @@ function pageTitle(page: Page): string {
   if (page === "monitor") return "监控中心";
   if (page === "library") return "视频资料库";
   if (page === "ai") return "AI 剪辑";
+  if (page === "resources") return "准备运行资源";
   return "应用设置";
 }
 
@@ -746,16 +829,19 @@ function Sidebar({
   page,
   open,
   activeRecordings,
+  resourceReady,
   onNavigate,
   onClose,
 }: {
   page: Page;
   open: boolean;
   activeRecordings: number;
+  resourceReady: boolean;
   onNavigate: (page: Page) => void;
   onClose: () => void;
 }) {
   const items: Array<{ key: Page; label: string; icon: typeof LayoutDashboard }> = [
+    ...(!resourceReady ? [{ key: "resources" as Page, label: "准备运行资源", icon: Download as typeof LayoutDashboard }] : []),
     { key: "monitor", label: "监控中心", icon: LayoutDashboard },
     { key: "library", label: "视频库", icon: FileVideo2 },
     { key: "ai", label: "AI 剪辑", icon: Sparkles },
@@ -777,6 +863,7 @@ function Sidebar({
               <button
                 key={item.key}
                 className={page === item.key ? "nav-item active" : "nav-item"}
+                disabled={!resourceReady && item.key !== "resources" && item.key !== "settings"}
                 onClick={() => onNavigate(item.key)}
               >
                 <Icon size={19} />{item.label}
@@ -797,6 +884,66 @@ function Sidebar({
         </div>
       </aside>
     </>
+  );
+}
+
+function ResourcePreparationPage({
+  status,
+  busy,
+  onDownload,
+  onCancel,
+  onRecheck,
+}: {
+  status: RuntimeResourceView;
+  busy: "download" | "cancel" | "recheck" | null;
+  onDownload: () => void;
+  onCancel: () => void;
+  onRecheck: () => void;
+}) {
+  const progress = status.totalSizeBytes > 0
+    ? Math.min(100, Math.round(status.downloadedBytes / status.totalSizeBytes * 100))
+    : 0;
+  const downloading = status.status === "downloading" || busy === "download";
+  return (
+    <div className="page-content resource-page">
+      <section className="panel resource-card" aria-labelledby="resource-title">
+        <div className="resource-card-icon"><HardDrive size={28} /></div>
+        <p className="section-kicker">RUNTIME RESOURCE PACK</p>
+        <h2 id="resource-title">准备本地运行资源</h2>
+        <p className="muted-copy">首次使用前必须完成 FFmpeg、Whisper、VAD 和模型校验。资源只保存到本机应用数据目录，不会上传录像或转写内容。</p>
+        <div className="resource-facts">
+          <span>平台 <b>{status.platform}</b></span>
+          <span>版本 <b>{status.bundleVersion ?? "待下载"}</b></span>
+          <span>大小 <b>{formatBytes(status.totalSizeBytes)}</b></span>
+          <span>来源 <b>{status.source}</b></span>
+        </div>
+        {status.components.length > 0 && (
+          <div className="resource-component-list">
+            {status.components.map((component) => (
+              <div key={component.id} className="resource-component">
+                <span>{component.id}</span><small>{component.version} · {formatBytes(component.sizeBytes)}</small>
+              </div>
+            ))}
+          </div>
+        )}
+        {downloading && (
+          <div className="resource-progress" aria-live="polite">
+            <div className="progress-header"><span>下载与校验进行中</span><b>{progress}%</b></div>
+            <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
+          </div>
+        )}
+        {status.errorMessage && <div className="resource-error" role="alert"><ShieldAlert size={17} /><span>{status.errorMessage}</span></div>}
+        <div className="resource-actions">
+          {downloading ? (
+            <button className="secondary-button" onClick={onCancel} disabled={busy === "cancel"}><Square size={15} />取消下载</button>
+          ) : (
+            <button className="primary-button" onClick={onDownload} disabled={busy !== null}><Download size={16} />下载并安装资源</button>
+          )}
+          <button className="secondary-button" onClick={onRecheck} disabled={busy !== null}><RefreshCw size={15} />重新检测</button>
+        </div>
+        <p className="resource-lock-note"><ShieldCheck size={15} />资源就绪后自动解锁监控、录制、视频库和 AI 剪辑。</p>
+      </section>
+    </div>
   );
 }
 
@@ -1304,7 +1451,7 @@ function SettingsPage({ api, settings, environment, browserAccess, accessBusy, o
     <form className="page-content settings-page" onSubmit={submit}>
       <div className="settings-layout">
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div><HardDrive size={22} /></div><label>录像保存目录<input value={form.outputRoot} onChange={(event) => setForm({ ...form, outputRoot: event.target.value })} /><small>默认位于下载目录，修改后只影响新录制。</small></label><div className="form-grid"><label>清晰度<select value={form.quality} onChange={(event) => setForm({ ...form, quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label><label>分片时长（秒）<input type="number" min="60" value={form.segmentSeconds} onChange={(event) => setForm({ ...form, segmentSeconds: Number(event.target.value) })} /></label><label>最大并发录制<input type="number" min="1" max="16" value={form.maxConcurrentRecordings} onChange={(event) => setForm({ ...form, maxConcurrentRecordings: Number(event.target.value) })} /></label></div></section>
-        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div><button type="button" className="secondary-button" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button></div><label>FFmpeg 路径<input value={form.ffmpegPath} onChange={(event) => setForm({ ...form, ffmpegPath: event.target.value })} /></label><label>FFprobe 路径<input value={form.ffprobePath} onChange={(event) => setForm({ ...form, ffprobePath: event.target.value })} /></label><div className="diagnostic-list"><div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未检测到"}</b></div><div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未检测到"}</b></div></div></section>
+        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div><button type="button" className="secondary-button" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button></div><p className="muted-copy">FFmpeg 和 FFprobe 由已校验的运行资源包管理，不能从设置中替换为任意程序。</p><div className="diagnostic-list"><div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未就绪"}</b></div><div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未就绪"}</b></div></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DESKTOP</p><h2>桌面行为</h2></div><Settings size={22} /></div><label className="switch-row"><div><strong>录制时并行处理 ASR</strong><small>已完成且文件稳定的视频可在直播录制期间进行识别。关闭后恢复录制优先。</small></div><input type="checkbox" checked={form.asrDuringRecording} onChange={(event) => setForm({ ...form, asrDuringRecording: event.target.checked })} /></label><label className="switch-row"><div><strong>系统通知</strong><small>开播、录制结束、失败和磁盘不足时提醒。</small></div><input type="checkbox" checked={form.notificationsEnabled} onChange={(event) => setForm({ ...form, notificationsEnabled: event.target.checked })} /></label><label className="switch-row"><div><strong>开机自动启动</strong><small>登录系统后恢复已启用的监听任务。</small></div><input type="checkbox" checked={form.autostartEnabled} onChange={(event) => setForm({ ...form, autostartEnabled: event.target.checked })} /></label><button type="button" className="secondary-button full" onClick={onOpenLogs}><FolderOpen size={16} />打开日志目录</button><p className="tray-note">关闭主窗口后应用会驻留系统托盘；请通过托盘菜单显式退出。</p></section>
         <section className="panel settings-card access-settings-card"><div className="panel-header"><div><p className="section-kicker">DOUYIN ACCESS</p><h2>抖音访问会话</h2></div><ShieldCheck size={22} /></div><div className="access-session-summary"><StatusBadge kind={browserAccess?.status === "verification_required" || browserAccess?.status === "session_expired" ? "error" : "neutral"}>{browserAccess ? accessStatusLabel(browserAccess) : "正在读取"}</StatusBadge>{browserAccess?.lastReason && <p>{browserAccess.lastReason}</p>}<small>会话仅保存在系统 WebView 中；清除操作不会影响主播和录像。</small></div><div className="access-settings-actions"><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onRecheckAccess}>{accessBusy === "check" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}检查访问状态</button><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onVerifyAccess}>{accessBusy === "verify" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重新验证</button><button type="button" className="danger-button" disabled={accessBusy !== null} onClick={onClearAccess}>{accessBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}清除抖音会话</button></div></section>
         {llm && <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DEEPSEEK</p><h2>高光分析 Provider</h2></div><Sparkles size={22} /></div><label>模型 ID<input value={llm.modelId} onChange={(event) => setLlm({ ...llm, modelId: event.target.value })} /></label><label>API Key（留空表示不替换）<input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label><label>请求超时（毫秒）<input type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => setLlm({ ...llm, timeoutMs: Number(event.target.value) })} /></label><div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>{llmMessage && <p className="form-error">{llmMessage}</p>}<div className="settings-inline-actions"><button type="button" className="secondary-button" onClick={() => void saveLlm()}>保存 Provider</button><button type="button" className="secondary-button" disabled={!llm.keyConfigured || llmDiagnosing} onClick={() => void diagnoseLlm()}>{llmDiagnosing ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}测试连接</button><button type="button" className="ghost-button" disabled={!llm.keyConfigured} onClick={() => void api.clearAiLlmKey?.().then(() => { setLlm({ ...llm, keyConfigured: false }); setLlmMessage("Key 已从系统凭据库清除"); })}>清除 Key</button></div><small>测试只发送固定诊断提示；分析时仅发送规范化转写与标签，不发送视频、音频、本地路径或 Cookie。</small></section>}

@@ -114,6 +114,26 @@ pub struct AiEnvironmentDiagnostic {
     pub model_version: String,
     pub checks: Vec<AiEnvironmentCheckView>,
     pub message: String,
+    pub runtime: Option<AiRuntimeResourceDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRuntimeResourceDiagnostic {
+    pub bundle_version: String,
+    pub manifest_sha256: String,
+    pub signature_valid: bool,
+    pub components: Vec<AiRuntimeComponentDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiRuntimeComponentDiagnostic {
+    pub id: String,
+    pub version: String,
+    pub required: bool,
+    pub file_count: usize,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

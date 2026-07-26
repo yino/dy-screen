@@ -108,8 +108,9 @@ export interface AppSettings {
   segmentSeconds: number;
   maxConcurrentRecordings: number;
   asrDuringRecording: boolean;
-  ffmpegPath: string;
-  ffprobePath: string;
+  /** 旧版本字段，生产界面不提供修改入口。 */
+  ffmpegPath?: string;
+  ffprobePath?: string;
   notificationsEnabled: boolean;
   autostartEnabled: boolean;
 }
@@ -117,6 +118,53 @@ export interface AppSettings {
 export interface EnvironmentStatus {
   ffmpeg: boolean;
   ffprobe: boolean;
+}
+
+export type RuntimeResourceStatus =
+  | "ready"
+  | "downloading"
+  | "verifying"
+  | "failed"
+  | "cancelled"
+  | "unsupported"
+  | "rollback";
+
+export interface RuntimeResourceComponent {
+  id: string;
+  version: string;
+  required: boolean;
+  fileCount: number;
+  sizeBytes: number;
+}
+
+export interface RuntimeResourceView {
+  status: RuntimeResourceStatus;
+  ready: boolean;
+  bundleVersion: string | null;
+  platform: string;
+  appMinVersion: string;
+  manifestSha256: string | null;
+  components: RuntimeResourceComponent[];
+  totalSizeBytes: number;
+  minimumFreeDiskBytes: number;
+  minimumMemoryBytes: number;
+  source: string;
+  downloadedBytes: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+  updatedAt: string;
+}
+
+export interface RuntimeResourceProgress {
+  phase: string;
+  componentId: string | null;
+  downloadedBytes: number;
+  totalBytes: number;
+}
+
+export interface RuntimeResourceEvent {
+  status: RuntimeResourceView;
+  progress: RuntimeResourceProgress;
 }
 
 export interface MonitorEvent {
@@ -265,6 +313,22 @@ export interface AiEnvironmentDiagnostic {
   modelVersion: string;
   checks: AiEnvironmentCheck[];
   message: string;
+  runtime?: AiRuntimeResourceDiagnostic | null;
+}
+
+export interface AiRuntimeResourceDiagnostic {
+  bundleVersion: string;
+  manifestSha256: string;
+  signatureValid: boolean;
+  components: AiRuntimeComponentDiagnostic[];
+}
+
+export interface AiRuntimeComponentDiagnostic {
+  id: string;
+  version: string;
+  required: boolean;
+  fileCount: number;
+  sizeBytes: number;
 }
 
 export interface AiProjectSummary {
@@ -471,6 +535,13 @@ export interface ClientApi {
   deleteSession(sessionId: number): Promise<void>;
   openLogs(): Promise<void>;
   diagnoseEnvironment(): Promise<EnvironmentStatus>;
+  runtimeResourceStatus?(): Promise<RuntimeResourceView>;
+  runtimeResourceManifest?(): Promise<RuntimeResourceView>;
+  runtimeResourceDownload?(): Promise<RuntimeResourceView>;
+  runtimeResourceCancel?(): Promise<void>;
+  runtimeResourceRecheck?(): Promise<RuntimeResourceView>;
+  runtimeResourceSource?(): Promise<string>;
+  subscribeRuntimeResources?(listener: (event: RuntimeResourceEvent) => void): Promise<() => void>;
   getBrowserAccessState(): Promise<BrowserAccessState>;
   showDouyinVerification(): Promise<void>;
   recheckDouyinAccess(): Promise<BrowserAccessState>;

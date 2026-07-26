@@ -18,6 +18,7 @@ pub(crate) mod tauri_commands;
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiProjectDetailView,
+    AiRuntimeComponentDiagnostic, AiRuntimeResourceDiagnostic,
     AiProjectInputView, AiSessionImportView, AiTrustedFileGrant,
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};

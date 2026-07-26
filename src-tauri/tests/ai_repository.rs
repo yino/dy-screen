@@ -274,6 +274,14 @@ fn freezing_persists_offsets_retry_requeues_failed_input_and_cancel_is_project_s
     assert_eq!(cancelled.project.progress_percent, 100);
     assert_eq!(cancelled.inputs[0].status, AiInputStatus::Cancelled);
     assert_eq!(cancelled.inputs[1].status, AiInputStatus::Completed);
+
+    let retried_cancelled = repository.prepare_input_retry(first.id).unwrap();
+    assert_eq!(retried_cancelled.status, AiInputStatus::Pending);
+    assert_eq!(retried_cancelled.last_error_code, None);
+    assert_eq!(
+        repository.get_project(project.id).unwrap().project.status,
+        AiProjectStatus::Queued
+    );
 }
 
 #[test]

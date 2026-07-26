@@ -229,8 +229,7 @@ pub fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     ) {
         return Err("请选择受支持的录制清晰度".to_owned());
     }
-    if settings.ffmpeg_path.trim().is_empty() || settings.ffprobe_path.trim().is_empty() {
-        return Err("FFmpeg 和 FFprobe 路径不能为空".to_owned());
-    }
+    // ffmpeg_path/ffprobe_path 保留在 SQLite 中仅用于旧版本迁移和 Debug 测试。
+    // 生产录制、预览、封面和 ASR 一律从已校验 Runtime Resource Pack 解析路径。
     Ok(())
 }

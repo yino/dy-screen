@@ -116,6 +116,7 @@ impl AiJobController for FakeController {
                 message: "测试资源完整".to_owned(),
             }],
             message: "本地 ASR 环境就绪".to_owned(),
+            runtime: None,
         })
     }
 }
@@ -313,5 +314,11 @@ async fn typed_commands_create_start_cancel_retry_query_and_diagnose_projects() 
     assert_eq!(
         commands.get_project(project.id).unwrap().inputs[0].status,
         AiInputStatus::Cancelled
+    );
+    let retried_cancelled = commands.retry_input(input_id).await.unwrap();
+    assert_eq!(retried_cancelled.project.status, AiProjectStatus::Queued);
+    assert_eq!(
+        retried_cancelled.inputs[0].status,
+        AiInputStatus::Pending
     );
 }

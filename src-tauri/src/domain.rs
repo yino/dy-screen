@@ -295,10 +295,22 @@ pub struct AppSettings {
     pub segment_seconds: u64,
     pub max_concurrent_recordings: usize,
     pub asr_during_recording: bool,
+    /// 旧版本数据库字段，仅供迁移和 Debug 测试；不序列化到生产前端。
+    #[serde(default = "default_ffmpeg_path", skip_serializing)]
     pub ffmpeg_path: String,
+    /// 旧版本数据库字段，仅供迁移和 Debug 测试；不序列化到生产前端。
+    #[serde(default = "default_ffprobe_path", skip_serializing)]
     pub ffprobe_path: String,
     pub notifications_enabled: bool,
     pub autostart_enabled: bool,
+}
+
+fn default_ffmpeg_path() -> String {
+    "ffmpeg".to_owned()
+}
+
+fn default_ffprobe_path() -> String {
+    "ffprobe".to_owned()
 }
 
 impl AppSettings {

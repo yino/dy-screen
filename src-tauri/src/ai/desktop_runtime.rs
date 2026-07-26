@@ -1,7 +1,7 @@
 //! 桌面进程中的真实 FFprobe、FFmpeg、VAD、ASR 和调度器装配。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use dy_screen::asr::{
     SchedulerEventSink, SchedulerJob, TextNormalizer, TranscriptionScheduler, VadConfig,
     WhisperCppEngine, WhisperCppVadEngine,
 };
+use dy_screen::runtime_resources::RuntimeManifest;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
@@ -20,41 +21,51 @@ use super::processor::build_job_event;
 use super::{
     AiCommandError, AiEnvironmentCheckView, AiEnvironmentDiagnostic, AiInputProcessor,
     AiInputStatus, AiJobController, AiJobPublisher, AiLifecycle, AiPreflight, AiProcessorError,
-    AiProjectStatus, AiRecoveryReport, AiRepository, PreflightReport, RecognitionProfile,
+    AiProjectStatus, AiRecoveryReport, AiRepository, AiRuntimeComponentDiagnostic,
+    AiRuntimeResourceDiagnostic, PreflightReport, RecognitionProfile,
 };
 
 const BUNDLED_MANIFEST: &str = include_str!("../../../resources/asr/manifest.json");
 
 #[derive(Clone)]
+struct ReloadableMediaInspector {
+    current: Arc<Mutex<Arc<dyn MediaInspector>>>,
+}
+
+#[async_trait]
+impl MediaInspector for ReloadableMediaInspector {
+    async fn inspect(
+        &self,
+        source: &dy_screen::asr::FrozenMediaSource,
+        cancellation: CancellationToken,
+    ) -> EngineResult<dy_screen::asr::MediaInspection> {
+        let inspector = self
+            .current
+            .lock()
+            .map(|inspector| inspector.clone())
+            .map_err(|_| {
+                AsrError::new(
+                    AsrErrorKind::Internal,
+                    "media_inspector_unavailable",
+                    "本地媒体探测器状态不可用",
+                    true,
+                )
+            })?;
+        inspector.inspect(source, cancellation).await
+    }
+}
+
+#[derive(Clone)]
 pub struct LocalAsrEnvironment {
     resource_root: PathBuf,
-    resources: Result<ResolvedAsrResources, AsrError>,
-    manifest: Result<AsrBundleManifest, AsrError>,
+    active_resource_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl LocalAsrEnvironment {
     pub fn load(resource_root: PathBuf) -> Self {
-        let manifest_text =
-            std::fs::read_to_string(resource_root.join("manifest.json")).map_err(|_| {
-                AsrError::new(
-                    AsrErrorKind::EnvironmentUnavailable,
-                    "asr_manifest_missing",
-                    "本地 ASR 资源清单缺失，请重新安装应用",
-                    false,
-                )
-            });
-        let manifest = manifest_text
-            .as_deref()
-            .map_err(Clone::clone)
-            .and_then(AsrBundleManifest::from_json);
-        let resources = manifest_text
-            .as_deref()
-            .map_err(Clone::clone)
-            .and_then(|text| AsrResourceResolver::resolve(&resource_root, text));
         Self {
             resource_root,
-            resources,
-            manifest,
+            active_resource_root: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -63,15 +74,60 @@ impl LocalAsrEnvironment {
     }
 
     pub fn resources(&self) -> Result<ResolvedAsrResources, AsrError> {
-        self.resources.clone()
+        let root = self.active_root();
+        let manifest_text = load_asr_manifest_text(&root)?;
+        AsrResourceResolver::resolve(&root, &manifest_text)
+    }
+
+    fn active_root(&self) -> PathBuf {
+        self.active_resource_root
+            .lock()
+            .ok()
+            .and_then(|root| root.clone())
+            .unwrap_or_else(|| self.resource_root.clone())
+    }
+
+    pub fn activate_resource_root(&self, root: PathBuf) -> Result<(), AsrError> {
+        let manifest_text = load_asr_manifest_text(&root)?;
+        let _ = AsrResourceResolver::resolve(&root, &manifest_text)?;
+        let mut active = self.active_resource_root.lock().map_err(|_| {
+            AsrError::new(
+                AsrErrorKind::Internal,
+                "asr_resource_state_unavailable",
+                "本地 ASR 资源状态不可用",
+                true,
+            )
+        })?;
+        *active = Some(root);
+        Ok(())
+    }
+
+    fn runtime_diagnostic(&self) -> Option<AiRuntimeResourceDiagnostic> {
+        let text = std::fs::read_to_string(self.active_root().join("runtime-manifest.json")).ok()?;
+        let manifest = RuntimeManifest::from_json(&text).ok()?;
+        Some(AiRuntimeResourceDiagnostic {
+            bundle_version: manifest.bundle_version.clone(),
+            manifest_sha256: manifest.manifest_sha256().ok()?,
+            signature_valid: manifest.verify_signature().is_ok(),
+            components: manifest
+                .components
+                .iter()
+                .map(|component| AiRuntimeComponentDiagnostic {
+                    id: component.id.clone(),
+                    version: component.version.clone(),
+                    required: component.required,
+                    file_count: component.files.len(),
+                    size_bytes: component.files.iter().map(|file| file.size_bytes).sum(),
+                })
+                .collect(),
+        })
     }
 
     fn default_recognition_profile(&self) -> Result<RecognitionProfile, AiCommandError> {
-        let manifest = self
-            .manifest
-            .clone()
-            .or_else(|_| AsrBundleManifest::from_json(BUNDLED_MANIFEST))
+        let manifest_text = load_asr_manifest_text(&self.active_root())
+            .or_else(|_| Ok(BUNDLED_MANIFEST.to_owned()))
             .map_err(command_asr_error)?;
+        let manifest = AsrBundleManifest::from_json(&manifest_text).map_err(command_asr_error)?;
         let vad = VadConfig::default();
         Ok(RecognitionProfile {
             engine_id: manifest.engine.id,
@@ -117,6 +173,7 @@ impl LocalAsrEnvironment {
                         message: error.safe_message.clone(),
                     }],
                     message: error.safe_message,
+                    runtime: self.runtime_diagnostic(),
                 };
             }
         };
@@ -153,6 +210,7 @@ impl LocalAsrEnvironment {
                     model_version: report.identity.model_version,
                     checks,
                     message,
+                    runtime: self.runtime_diagnostic(),
                 }
             }
             None => AiEnvironmentDiagnostic {
@@ -168,9 +226,78 @@ impl LocalAsrEnvironment {
                     message: "本地 ASR 环境检查异常退出，请重新检测".to_owned(),
                 }],
                 message: "本地 ASR 环境检查异常退出，请重新检测".to_owned(),
+                runtime: self.runtime_diagnostic(),
             },
         }
     }
+}
+
+fn load_asr_manifest_text(resource_root: &Path) -> Result<String, AsrError> {
+    if let Ok(text) = std::fs::read_to_string(resource_root.join("manifest.json")) {
+        return Ok(text);
+    }
+    let runtime_text = std::fs::read_to_string(resource_root.join("runtime-manifest.json"))
+        .map_err(|_| AsrError::new(
+            AsrErrorKind::EnvironmentUnavailable,
+            "asr_manifest_missing",
+            "本地 ASR 资源清单缺失，请重新安装应用",
+            false,
+        ))?;
+    let runtime = RuntimeManifest::from_json(&runtime_text).map_err(|_| AsrError::new(
+        AsrErrorKind::EnvironmentUnavailable,
+        "asr_manifest_invalid",
+        "本地运行资源清单无效，请重新安装应用",
+        false,
+    ))?;
+    let platform = runtime.for_current_platform().map_err(|_| AsrError::new(
+        AsrErrorKind::UnsupportedPlatform,
+        "unsupported_asr_platform",
+        "当前系统不支持本地语音识别",
+        false,
+    ))?;
+    let component_file = |id: &str| -> Result<(&str, u64, &str), AsrError> {
+        runtime
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .and_then(|component| component.files.first().map(|file| (file.path.as_str(), file.size_bytes, file.sha256.as_str())))
+            .ok_or_else(|| AsrError::new(AsrErrorKind::EnvironmentUnavailable, "asr_manifest_invalid", "运行资源缺少 ASR 组件", false))
+    };
+    let (model_file, model_size, model_sha) = component_file("asr.model")?;
+    let (vad_model_file, vad_size, vad_sha) = component_file("asr.vad-model")?;
+    let (normalization_file, normalization_size, normalization_sha) = component_file("asr.normalization")?;
+    let (_, _, engine_version) = runtime
+        .components
+        .iter()
+        .find(|component| component.id == "asr.whisper")
+        .map(|component| (component.id.as_str(), component.version.as_str(), component.version.as_str()))
+        .ok_or_else(|| AsrError::new(AsrErrorKind::EnvironmentUnavailable, "asr_manifest_invalid", "运行资源缺少 Whisper 组件", false))?;
+    let whisper = component_file("asr.whisper")?;
+    let vad_sidecar = component_file("asr.vad-sidecar")?;
+    let ffmpeg = component_file("media.ffmpeg")?;
+    let ffprobe = component_file("media.ffprobe")?;
+    let mut integrity = vec![
+        serde_json::json!({"file": whisper.0, "sizeBytes": whisper.1, "sha256": whisper.2}),
+        serde_json::json!({"file": vad_sidecar.0, "sizeBytes": vad_sidecar.1, "sha256": vad_sidecar.2}),
+        serde_json::json!({"file": ffmpeg.0, "sizeBytes": ffmpeg.1, "sha256": ffmpeg.2}),
+        serde_json::json!({"file": ffprobe.0, "sizeBytes": ffprobe.1, "sha256": ffprobe.2}),
+    ];
+    for component in runtime.components.iter().filter(|component| component.id.starts_with("platform.library.")) {
+        if let Some(file) = component.files.first() {
+            integrity.push(serde_json::json!({"file": file.path, "sizeBytes": file.size_bytes, "sha256": file.sha256}));
+        }
+    }
+    let legacy = serde_json::json!({
+        "schemaVersion": 1,
+        "bundleVersion": runtime.bundle_version,
+        "engine": {"id": "whisper.cpp", "version": engine_version, "sourceCommit": "runtime-pack"},
+        "model": {"logicalId": "whisper-small-multilingual-q5_1", "version": "runtime-pack", "file": model_file, "sizeBytes": model_size, "sha256": model_sha, "source": "runtime-pack", "license": "MIT"},
+        "vad": {"logicalId": "silero-vad", "version": "runtime-pack", "file": vad_model_file, "sizeBytes": vad_size, "sha256": vad_sha, "source": "runtime-pack", "license": "MIT"},
+        "normalization": {"logicalId": "opencc", "version": "runtime-pack", "file": normalization_file, "sizeBytes": normalization_size, "sha256": normalization_sha, "source": "runtime-pack", "license": "Apache-2.0"},
+        "licenseFiles": runtime.licenses.iter().map(|license| license.path.clone()).collect::<Vec<_>>(),
+        "platforms": [{"os": platform.os, "arch": platform.arch, "accelerator": if platform.os == "macos" { "metal" } else { "cpu" }, "sidecar": whisper.0, "vadSidecar": vad_sidecar.0, "ffmpeg": ffmpeg.0, "ffprobe": ffprobe.0, "libraries": runtime.components.iter().filter(|component| component.id.starts_with("platform.library.")).filter_map(|component| component.files.first().map(|file| file.path.clone())).collect::<Vec<_>>(), "minimumMemoryBytes": platform.minimum_memory_bytes, "minimumFreeDiskBytes": platform.minimum_free_disk_bytes, "maximumThreads": 4, "minimumCpuFeatures": [], "runtime": null, "runtimeFile": null, "resourceIntegrity": integrity}]
+    });
+    serde_json::to_string_pretty(&legacy).map_err(|_| AsrError::new(AsrErrorKind::EnvironmentUnavailable, "asr_manifest_invalid", "无法生成兼容的 ASR 资源清单", false))
 }
 
 #[async_trait]
@@ -192,7 +319,7 @@ impl AiPreflight for LocalAsrEnvironment {
             engine_version: diagnostic.engine_version,
             model_id: diagnostic.model_id,
             model_version: diagnostic.model_version,
-            platform_supported: self.resources.is_ok(),
+            platform_supported: self.resources().is_ok(),
             sidecars_ready: passed(&[
                 "whisper_sidecar",
                 "vad_sidecar",
@@ -218,7 +345,11 @@ pub struct LocalAsrComponents {
 pub struct LocalAsrRuntime {
     repository: AiRepository,
     environment: Arc<LocalAsrEnvironment>,
-    scheduler: Option<Arc<TranscriptionScheduler>>,
+    scheduler: Arc<Mutex<Option<Arc<TranscriptionScheduler>>>>,
+    database: Database,
+    temporary_root: PathBuf,
+    publisher: Arc<dyn AiJobPublisher>,
+    inspector_switch: Arc<Mutex<Arc<dyn MediaInspector>>>,
     lifecycle: AiLifecycle,
 }
 
@@ -238,21 +369,25 @@ impl LocalAsrRuntime {
             .as_ref()
             .map(|resources| resources.ffprobe.clone())
             .unwrap_or(fallback_ffprobe);
-        let inspector: Arc<dyn MediaInspector> = Arc::new(FfprobeMediaInspector::new(
+        let initial_inspector: Arc<dyn MediaInspector> = Arc::new(FfprobeMediaInspector::new(
             inspector_path,
             Duration::from_secs(10),
         ));
+        let inspector_switch = Arc::new(Mutex::new(initial_inspector));
+        let inspector: Arc<dyn MediaInspector> = Arc::new(ReloadableMediaInspector {
+            current: inspector_switch.clone(),
+        });
         let normalization_version = environment
             .default_recognition_profile()
             .map(|profile| profile.normalization_version)
             .unwrap_or_else(|_| "OpenCC ver.1.4.1".to_owned());
         let scheduler = resources.ok().and_then(|resources| {
             build_scheduler(
-                database,
+                database.clone(),
                 repository.clone(),
                 resources,
                 temporary_root.clone(),
-                publisher,
+                publisher.clone(),
                 inspector.clone(),
                 &normalization_version,
             )
@@ -262,7 +397,11 @@ impl LocalAsrRuntime {
         let runtime = Arc::new(Self {
             repository: repository.clone(),
             environment: environment.clone(),
-            scheduler,
+            scheduler: Arc::new(Mutex::new(scheduler)),
+            database,
+            temporary_root: temporary_root.clone(),
+            publisher,
+            inspector_switch,
             lifecycle: AiLifecycle::new(repository, temporary_root),
         });
         LocalAsrComponents {
@@ -270,6 +409,53 @@ impl LocalAsrRuntime {
             inspector,
             preflight: environment,
         }
+    }
+
+    /// 下载并校验 Runtime Resource Pack 后，在当前进程热激活 ASR 调度器。
+    pub fn activate_resource_root(&self, root: PathBuf) -> Result<(), AiCommandError> {
+        self.environment
+            .activate_resource_root(root)
+            .map_err(command_asr_error)?;
+        let resources = self.environment.resources().map_err(command_asr_error)?;
+        let ffprobe = resources.ffprobe.clone();
+        if let Ok(mut inspector) = self.inspector_switch.lock() {
+            *inspector = Arc::new(FfprobeMediaInspector::new(ffprobe, Duration::from_secs(10)));
+        }
+        let normalization_version = self
+            .environment
+            .default_recognition_profile()?
+            .normalization_version;
+        let scheduler = build_scheduler(
+            self.database.clone(),
+            self.repository.clone(),
+            resources,
+            self.temporary_root.clone(),
+            self.publisher.clone(),
+            Arc::new(ReloadableMediaInspector {
+                current: self.inspector_switch.clone(),
+            }),
+            &normalization_version,
+        )
+        .map_err(command_asr_error)
+        .map(Arc::new)?;
+        let mut current = self.scheduler.lock().map_err(|_| {
+            AiCommandError::new(
+                "asr_scheduler_unavailable",
+                "本地 ASR 调度器状态不可用",
+                true,
+            )
+        })?;
+        if current.is_none() {
+            *current = Some(scheduler);
+        }
+        Ok(())
+    }
+
+    pub fn scheduler_ready(&self) -> bool {
+        self.scheduler
+            .lock()
+            .map(|scheduler| scheduler.is_some())
+            .unwrap_or(false)
     }
 
     pub fn recover_startup(&self) -> Result<AiRecoveryReport, AiCommandError> {
@@ -281,7 +467,12 @@ impl LocalAsrRuntime {
     /// 启动恢复后从 SQLite 重建待处理队列；进程内 token 不跨重启持久化。
     pub async fn recover_startup_and_requeue(&self) -> Result<AiRecoveryReport, AiCommandError> {
         let report = self.recover_startup()?;
-        let Some(scheduler) = &self.scheduler else {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .ok()
+            .and_then(|scheduler| scheduler.clone());
+        let Some(scheduler) = scheduler else {
             return Ok(report);
         };
         for project in self
@@ -318,9 +509,14 @@ impl LocalAsrRuntime {
     }
 
     pub async fn shutdown(&self) -> Result<AiRecoveryReport, AiCommandError> {
-        if let Some(scheduler) = &self.scheduler {
+        if let Some(scheduler) = self
+            .scheduler
+            .lock()
+            .ok()
+            .and_then(|scheduler| scheduler.clone())
+        {
             self.lifecycle
-                .shutdown(scheduler)
+                .shutdown(&scheduler)
                 .await
                 .map_err(|error| AiCommandError::new("ai_shutdown_failed", error.to_string(), true))
         } else {
@@ -328,14 +524,18 @@ impl LocalAsrRuntime {
         }
     }
 
-    fn scheduler(&self) -> Result<&Arc<TranscriptionScheduler>, AiCommandError> {
-        self.scheduler.as_ref().ok_or_else(|| {
-            AiCommandError::new(
-                "asr_environment_not_ready",
-                "本地 ASR 环境未就绪，请重新检测或修复安装",
-                true,
-            )
-        })
+    fn scheduler(&self) -> Result<Arc<TranscriptionScheduler>, AiCommandError> {
+        self.scheduler
+            .lock()
+            .ok()
+            .and_then(|scheduler| scheduler.clone())
+            .ok_or_else(|| {
+                AiCommandError::new(
+                    "asr_environment_not_ready",
+                    "本地 ASR 环境未就绪，请重新检测或修复安装",
+                    true,
+                )
+            })
     }
 }
 
@@ -393,7 +593,12 @@ impl AiJobController for LocalAsrRuntime {
             .get_project(project_id)
             .map(|detail| detail.project.status == AiProjectStatus::Deleting)
             .map_err(repository_command_error)?;
-        if let Some(scheduler) = &self.scheduler {
+        if let Some(scheduler) = self
+            .scheduler
+            .lock()
+            .ok()
+            .and_then(|scheduler| scheduler.clone())
+        {
             scheduler
                 .cancel_project_and_wait(project_id, Duration::from_secs(15))
                 .await
@@ -686,6 +891,7 @@ fn mark_scheduler_terminal(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::DatabaseRecordingGate;
     use crate::database::Database;

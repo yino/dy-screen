@@ -5,6 +5,9 @@ set -eu
 # 使用静态 Whisper/GGML 链接并嵌入 Metal shader，最终产物只允许依赖 macOS 系统库。
 
 EXPECTED_SHA256='279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3'
+# Windows x64 uses the separately audited archive lock; keep both platform locks
+# visible in the release script audit so a platform cannot silently drift.
+WINDOWS_ARCHIVE_SHA256='d8cd961352377b1cc612224016a9ebdfe0ae508dc2b2f9ef514b341d672e3fdc'
 EXPECTED_VERSION='1.9.1'
 EXPECTED_COMMIT='f049fff95a089aa9969deb009cdd4892b3e74916'
 

@@ -8,5 +8,6 @@ pub mod model;
 pub mod profile_resolver;
 pub mod recorder;
 pub mod resolver;
+pub mod runtime_resources;
 
 pub use error::{RecorderError, Result};

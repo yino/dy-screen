@@ -61,6 +61,12 @@ FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg
 WHISPER_SOURCE ?= $(if $(wildcard resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz),resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz,)
 WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper
 POWERSHELL ?= powershell.exe
+RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.2/
+RESOURCE_RELEASE_DIR ?= dist/runtime-resources
+RESOURCE_CHANNEL ?= stable
+RESOURCE_APP_VERSION ?= 0.2.0
+# 必须与 resources/asr-source/manifest.json 中的 bundleVersion 一致。
+RESOURCE_BUNDLE_VERSION ?= 2026.07.2
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
 
@@ -78,7 +84,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
 	accept-deepseek \
 	diagnose-real-room tail-access-log accept-real-room accept-real-multi \
-	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows \
+	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows runtime-resource-verify runtime-resource-publish \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
 	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
 	inspect-profile inspect-room resolve record record-multi clean
@@ -97,6 +103,8 @@ help:
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端（禁用强制结束录制的 Rust watcher）' \
 		'  make app-build       构建 macOS .app 安装产物' \
+		'  make app-build-resources ASR_SOURCE=... 构建强制携带运行资源的发行包（缺资源直接失败）' \
+		'  make app-build-resources-windows ASR_SOURCE=... 构建 Windows x64 强制资源发行包' \
 		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL ASR FFmpeg' \
 		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
 		'  make asr-whisper-windows WHISPER_SOURCE=C:/whisper.cpp-v1.9.1.tar.gz 构建 SSE4.2 CPU sidecar' \
@@ -106,6 +114,8 @@ help:
 		'  make asr-build-macos ASR_BUNDLES=app,dmg  同时生成 DMG（需要可用 Finder 会话）' \
 		'  make asr-stage-windows ASR_SOURCE=/可信资源目录 准备 Windows ASR 随包资源' \
 		'  make asr-build-windows ASR_SOURCE=/可信资源目录 构建 Windows NSIS 安装包' \
+		'  make runtime-resource-verify ASR_STAGE=... 校验 Runtime Resource Pack 清单和逐文件哈希' \
+		'  make runtime-resource-publish ASR_STAGE=... RESOURCE_RELEASE_DIR=... 输出自有 HTTPS 静态托管目录' \
 		'  make asr-check-windows 交叉检查 Windows x64 根/Tauri crate 与严格 Clippy' \
 		'  make asr-test-contract 只测试中立契约、资源、错误、取消和调度边界' \
 		'  make asr-test-media 只测试 FFprobe、FFmpeg、临时音频和原视频不变' \
@@ -205,7 +215,29 @@ app-dev:
 	"$(NPM)" run tauri:dev
 
 app-build:
+	@printf '%s\n' '普通开发构建：不携带发行运行资源；正式发布请使用 make app-build-resources。'
 	"$(NPM)" run tauri:build
+
+app-build-resources: asr-stage-macos
+	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
+	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
+	DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
+
+app-build-resources-windows: asr-stage-windows
+	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
+	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
+	DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
+
+runtime-resource-verify:
+	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- verify --root "$(ASR_STAGE)" --platform macos-aarch64
+
+runtime-resource-publish: runtime-resource-verify
+	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：必须设置 RESOURCE_BASE_URL（仅用于发布说明，应用地址由构建期注入）。' >&2; exit 2; }
+	@mkdir -p "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/aarch64/$(RESOURCE_BUNDLE_VERSION)"
+	cp -R "$(ASR_STAGE)/." "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/aarch64/$(RESOURCE_BUNDLE_VERSION)/"
+	@printf '{"channel":"%s","appVersion":"%s","platform":"macos","arch":"aarch64","bundleVersion":"%s","manifest":"runtime-manifest.json"}\n' "$(RESOURCE_CHANNEL)" "$(RESOURCE_APP_VERSION)" "$(RESOURCE_BUNDLE_VERSION)" > "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/index.json"
+	@printf '%s\n' '资源发布目录已生成。请在上传前使用正式 Ed25519 私钥签署 runtime-manifest.json，并将 RESOURCE_BASE_URL 配置到构建环境。'
 
 asr-ffmpeg-macos:
 	@test -n "$(FFMPEG_SOURCE)" || { printf '%s\n' '错误：必须通过 FFMPEG_SOURCE 指定 ffmpeg-8.1.2.tar.xz。' >&2; exit 2; }

@@ -72,6 +72,7 @@ async fn missing_resource_diagnostic_is_pathless_and_keeps_locked_default_profil
     );
     let diagnostic = components.runtime.diagnose().await.unwrap();
     assert!(!diagnostic.ready);
+    assert!(!components.runtime.scheduler_ready());
     assert_eq!(diagnostic.engine_id, "whisper.cpp");
     assert!(
         !diagnostic

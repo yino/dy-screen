@@ -8,6 +8,10 @@ use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use dy_screen::asr::{AsrBundleManifest, AsrFileIntegrityManifest, AsrPlatformManifest};
+use dy_screen::runtime_resources::{
+    RuntimeArchive, RuntimeComponent, RuntimeFile, RuntimeLicense, RuntimeManifest,
+    RuntimeManifestSignature, RuntimePlatformManifest,
+};
 use sha2::{Digest, Sha256};
 
 const STAGE_MARKER: &str = ".dy-screen-asr-stage";
@@ -98,11 +102,19 @@ fn stage_bundle(source: &Path, target: &Path, platform: BundlePlatform) -> Resul
         copy_and_verify_common_resources(source, &temporary, &manifest)?;
         copy_plain_resources(source, &temporary, &manifest.license_files)?;
         copy_platform_resources(source, &temporary, &selected)?;
+        let runtime_manifest = build_runtime_manifest(&manifest, &selected)?;
         manifest.platforms = vec![selected];
         let json = serde_json::to_string_pretty(&manifest)
             .map_err(|error| format!("无法序列化资源清单：{error}"))?;
         fs::write(temporary.join("manifest.json"), format!("{json}\n"))
             .map_err(|error| format!("无法写入资源清单：{error}"))?;
+        let runtime_json = serde_json::to_string_pretty(&runtime_manifest)
+            .map_err(|error| format!("无法序列化 Runtime Resource Pack 清单：{error}"))?;
+        fs::write(
+            temporary.join("runtime-manifest.json"),
+            format!("{runtime_json}\n"),
+        )
+        .map_err(|error| format!("无法写入 runtime-manifest.json：{error}"))?;
         verify_bundle(&temporary, platform)
     })();
     stage_result?;
@@ -119,6 +131,132 @@ fn stage_bundle(source: &Path, target: &Path, platform: BundlePlatform) -> Resul
     Ok(())
 }
 
+fn build_runtime_manifest(
+    manifest: &AsrBundleManifest,
+    platform: &AsrPlatformManifest,
+) -> Result<RuntimeManifest, String> {
+    let mut components = Vec::new();
+    let file_for = |path: &str| -> Result<RuntimeFile, String> {
+        let integrity = platform
+            .resource_integrity
+            .iter()
+            .find(|item| item.file == path)
+            .ok_or_else(|| format!("缺少平台资源哈希：{path}"))?;
+        Ok(RuntimeFile {
+            path: path.to_owned(),
+            size_bytes: integrity.size_bytes,
+            sha256: integrity.sha256.clone(),
+            executable: path == platform.sidecar
+                || path == platform.vad_sidecar
+                || path == platform.ffmpeg
+                || path == platform.ffprobe,
+        })
+    };
+    for (id, path) in [
+        ("media.ffmpeg", platform.ffmpeg.as_str()),
+        ("media.ffprobe", platform.ffprobe.as_str()),
+        ("asr.whisper", platform.sidecar.as_str()),
+        ("asr.vad-sidecar", platform.vad_sidecar.as_str()),
+    ] {
+        components.push(RuntimeComponent {
+            id: id.to_owned(),
+            version: manifest.engine.version.clone(),
+            required: true,
+            files: vec![file_for(path)?],
+        });
+    }
+    let common = [
+        (
+            "asr.model",
+            &manifest.model.file,
+            manifest.model.size_bytes,
+            &manifest.model.sha256,
+            manifest.model.version.clone(),
+        ),
+        (
+            "asr.vad-model",
+            &manifest.vad.file,
+            manifest.vad.size_bytes,
+            &manifest.vad.sha256,
+            manifest.vad.version.clone(),
+        ),
+        (
+            "asr.normalization",
+            &manifest.normalization.file,
+            manifest.normalization.size_bytes,
+            &manifest.normalization.sha256,
+            manifest.normalization.version.clone(),
+        ),
+    ];
+    for (id, path, size_bytes, sha256, version) in common {
+        components.push(RuntimeComponent {
+            id: id.to_owned(),
+            version,
+            required: true,
+            files: vec![RuntimeFile {
+                path: path.clone(),
+                size_bytes,
+                sha256: sha256.clone(),
+                executable: false,
+            }],
+        });
+    }
+    for library in &platform.libraries {
+        components.push(RuntimeComponent {
+            id: format!("platform.library.{}", components.len()),
+            version: manifest.engine.version.clone(),
+            required: true,
+            files: vec![file_for(library)?],
+        });
+    }
+    if let Some(runtime_file) = &platform.runtime_file {
+        components.push(RuntimeComponent {
+            id: "platform.windows.vc-runtime".to_owned(),
+            version: manifest.engine.version.clone(),
+            required: platform.os == "windows",
+            files: vec![file_for(runtime_file)?],
+        });
+    }
+    Ok(RuntimeManifest {
+        schema_version: 2,
+        app_min_version: env!("CARGO_PKG_VERSION").to_owned(),
+        bundle_version: manifest.bundle_version.clone(),
+        channel: "stable".to_owned(),
+        platforms: vec![RuntimePlatformManifest {
+            os: platform.os.clone(),
+            arch: platform.arch.clone(),
+            minimum_free_disk_bytes: platform.minimum_free_disk_bytes,
+            minimum_memory_bytes: platform.minimum_memory_bytes,
+        }],
+        components,
+        archive: RuntimeArchive {
+            path: "runtime-bundle.tar.zst".to_owned(),
+            size_bytes: 1,
+            sha256: "00".repeat(32),
+            download_url: "runtime-bundle.tar.zst".to_owned(),
+        },
+        licenses: manifest
+            .license_files
+            .iter()
+            .map(|path| RuntimeLicense {
+                id: Path::new(path)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("license")
+                    .to_owned(),
+                path: path.clone(),
+                license: "see-file".to_owned(),
+                source: "resources/asr-source".to_owned(),
+            })
+            .collect(),
+        signature: RuntimeManifestSignature {
+            algorithm: "ed25519".to_owned(),
+            key_id: "release-key-placeholder".to_owned(),
+            value: String::new(),
+        },
+    })
+}
+
 fn verify_bundle(root: &Path, platform: BundlePlatform) -> Result<(), String> {
     let manifest = load_manifest(root)?;
     if manifest.platforms.len() != 1 {
@@ -128,6 +266,11 @@ fn verify_bundle(root: &Path, platform: BundlePlatform) -> Result<(), String> {
     verify_common_resources(root, &manifest)?;
     verify_plain_resources(root, &manifest.license_files)?;
     verify_platform_resources(root, selected)?;
+    let runtime_manifest_path = root.join("runtime-manifest.json");
+    let runtime_manifest = fs::read_to_string(&runtime_manifest_path)
+        .map_err(|error| format!("无法读取 runtime-manifest.json：{error}"))?;
+    RuntimeManifest::from_json(&runtime_manifest)
+        .map_err(|error| format!("Runtime Resource Pack 清单无效：{error}"))?;
     verify_macos_relocatability_when_applicable(root, selected)?;
     verify_engine_version_when_runnable(root, &manifest, selected)?;
     println!(

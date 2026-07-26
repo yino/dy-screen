@@ -32,6 +32,9 @@ use crate::domain::{
 use crate::preview::{
     PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
 };
+use crate::runtime_resource_state::{
+    RuntimeResourceEvent, RuntimeResourceState, RuntimeResourceView,
+};
 use crate::room_resolution::{RoomResolutionPublisher, RoomResolutionService};
 use crate::streamer_service::{PublicSourceInspector, create_streamer_with, update_streamer_with};
 use crate::supervisor::{MonitorLogger, MonitorPublisher, Supervisor};
@@ -52,6 +55,7 @@ struct AppState {
     preview: PreviewService,
     thumbnail: ThumbnailService,
     ai_runtime: Arc<LocalAsrRuntime>,
+    runtime_resources: RuntimeResourceState,
     log_dir: PathBuf,
     shutdown_gate: ShutdownGate,
 }
@@ -178,6 +182,82 @@ fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
         .map_err(|error| error.to_string())
 }
 
+fn require_runtime_ready(state: &AppState) -> Result<(), String> {
+    require_runtime_ready_flag(state.runtime_resources.view().ready)
+}
+
+fn require_runtime_ready_flag(ready: bool) -> Result<(), String> {
+    ready
+        .then_some(())
+        .ok_or_else(|| "运行资源尚未准备完成，请先完成资源下载和校验".to_owned())
+}
+
+#[tauri::command]
+fn runtime_resource_status(state: State<'_, RuntimeResourceState>) -> RuntimeResourceView {
+    state.view()
+}
+
+#[tauri::command]
+fn runtime_resource_manifest(state: State<'_, RuntimeResourceState>) -> RuntimeResourceView {
+    state.view()
+}
+
+#[tauri::command]
+async fn runtime_resource_download(
+    app: AppHandle,
+    state: State<'_, RuntimeResourceState>,
+    app_state: State<'_, AppState>,
+) -> Result<RuntimeResourceView, String> {
+    let runtime = state.inner().clone();
+    let ai_runtime = app_state.ai_runtime.clone();
+    let supervisor = app_state.supervisor.clone();
+    let event_app = app.clone();
+    let result = runtime
+        .download(move |view, progress| {
+            let _ = event_app.emit(
+                "runtime-resource-event",
+                RuntimeResourceEvent {
+                    status: view,
+                    progress,
+                },
+            );
+        })
+        .await;
+    if let Err(error) = &result {
+        runtime.fail_download(error);
+    }
+    runtime.finish_download();
+    let result = result.map_err(|error| error.to_string())?;
+    let resource_root = runtime
+        .current_root()
+        .ok_or_else(|| "资源已下载但未找到原子安装目录".to_owned())?;
+    ai_runtime
+        .activate_resource_root(resource_root)
+        .map_err(|error| error.to_string())?;
+    ai_runtime
+        .recover_startup_and_requeue()
+        .await
+        .map_err(|error| error.to_string())?;
+    supervisor.restore().await?;
+    let _ = app.emit("runtime-resource-event", &result);
+    Ok(result)
+}
+
+#[tauri::command]
+fn runtime_resource_cancel(state: State<'_, RuntimeResourceState>) {
+    state.cancel();
+}
+
+#[tauri::command]
+fn runtime_resource_recheck(state: State<'_, RuntimeResourceState>) -> RuntimeResourceView {
+    state.refresh()
+}
+
+#[tauri::command]
+fn runtime_resource_source(state: State<'_, RuntimeResourceState>) -> String {
+    state.fixed_source()
+}
+
 #[tauri::command]
 fn list_streamer_tag_name_suggestions(
     limit: Option<usize>,
@@ -205,6 +285,7 @@ async fn create_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
 ) -> Result<Streamer, CommandError> {
+    require_runtime_ready(state.inner()).map_err(|message| CommandError::new("resource_not_ready", message))?;
     let inspector = PublicSourceInspector::new(
         state.room_resolution.clone(),
         state.room_resolution.public_request_gate(),
@@ -218,6 +299,7 @@ async fn update_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
 ) -> Result<Streamer, CommandError> {
+    require_runtime_ready(state.inner()).map_err(|message| CommandError::new("resource_not_ready", message))?;
     let inspector = PublicSourceInspector::new(
         state.room_resolution.clone(),
         state.room_resolution.public_request_gate(),
@@ -231,6 +313,7 @@ async fn set_monitor_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     if enabled {
         state.supervisor.resume(id).await
     } else {
@@ -240,6 +323,7 @@ async fn set_monitor_enabled(
 
 #[tauri::command]
 fn check_streamer_now(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     state.supervisor.check_now(id)
 }
 
@@ -286,6 +370,7 @@ async fn clear_douyin_session(
 
 #[tauri::command]
 async fn archive_streamer(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     state.supervisor.stop(id).await?;
     state
         .database
@@ -295,6 +380,7 @@ async fn archive_streamer(id: i64, state: State<'_, AppState>) -> Result<(), Str
 
 #[tauri::command]
 async fn stop_recording(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     state.supervisor.stop_recording(id).await;
     Ok(())
 }
@@ -307,6 +393,7 @@ fn list_videos(
     filter: Option<VideoFilter>,
     state: State<'_, AppState>,
 ) -> Result<VideoPage, String> {
+    require_runtime_ready(state.inner())?;
     let page = state
         .database
         .query_videos(streamer_id, page, page_size, &filter.unwrap_or_default())
@@ -316,6 +403,7 @@ fn list_videos(
 
 #[tauri::command]
 fn list_current_videos(streamer_id: i64, state: State<'_, AppState>) -> Result<VideoPage, String> {
+    require_runtime_ready(state.inner())?;
     let page = state
         .database
         .query_videos(
@@ -387,6 +475,8 @@ async fn request_video_preview(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PreviewSnapshot, PreviewFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| PreviewFailure::new("resource_not_ready", message))?;
     let snapshot = state.preview.request(preview_request(id, &state)?).await?;
     authorize_preview_media(&app, &snapshot);
     Ok(snapshot)
@@ -398,6 +488,8 @@ async fn retry_video_preview(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PreviewSnapshot, PreviewFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| PreviewFailure::new("resource_not_ready", message))?;
     let snapshot = state.preview.retry(preview_request(id, &state)?).await?;
     authorize_preview_media(&app, &snapshot);
     Ok(snapshot)
@@ -410,6 +502,8 @@ async fn request_ai_input_preview(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PreviewSnapshot, PreviewFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| PreviewFailure::new("resource_not_ready", message))?;
     let snapshot = state
         .preview
         .request(ai_input_preview_request(project_id, input_id, &state)?)
@@ -425,6 +519,8 @@ async fn retry_ai_input_preview(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PreviewSnapshot, PreviewFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| PreviewFailure::new("resource_not_ready", message))?;
     let snapshot = state
         .preview
         .retry(ai_input_preview_request(project_id, input_id, &state)?)
@@ -439,6 +535,8 @@ fn get_video_preview(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<PreviewSnapshot, PreviewFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| PreviewFailure::new("resource_not_ready", message))?;
     let snapshot = state
         .preview
         .get(&request_id)
@@ -463,23 +561,25 @@ async fn request_video_thumbnails(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ThumbnailBatch, ThumbnailFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| ThumbnailFailure::new("resource_not_ready", message))?;
     if video_ids.len() > crate::thumbnail::THUMBNAIL_MAX_BATCH_SIZE {
         return Err(ThumbnailFailure::new(
             "batch_too_large",
             "单次最多请求 50 个视频封面",
         ));
     }
-    let settings = state
-        .database
-        .get_settings()
-        .map_err(|_| ThumbnailFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    let (ffmpeg_path, ffprobe_path) = state
+        .runtime_resources
+        .media_tools()
+        .map_err(|_| ThumbnailFailure::new("resource_not_ready", "受控媒体资源尚未准备完成"))?;
     let mut requests = Vec::with_capacity(video_ids.len());
     for video_id in video_ids {
         requests.push(thumbnail_request(
             video_id,
             &state,
-            &settings.ffmpeg_path,
-            &settings.ffprobe_path,
+            &ffmpeg_path.to_string_lossy(),
+            &ffprobe_path.to_string_lossy(),
         )?);
     }
     let batch = state.thumbnail.request_batch(requests).await?;
@@ -493,6 +593,8 @@ fn get_video_thumbnails(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ThumbnailBatch, ThumbnailFailure> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| ThumbnailFailure::new("resource_not_ready", message))?;
     let batch = state.thumbnail.get_batch(&batch_id)?;
     authorize_thumbnail_batch(&app, &state.thumbnail, &batch)?;
     Ok(batch)
@@ -510,15 +612,17 @@ async fn retry_video_thumbnail(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ThumbnailSnapshot, ThumbnailFailure> {
-    let settings = state
-        .database
-        .get_settings()
-        .map_err(|_| ThumbnailFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    require_runtime_ready(state.inner())
+        .map_err(|message| ThumbnailFailure::new("resource_not_ready", message))?;
+    let (ffmpeg_path, ffprobe_path) = state
+        .runtime_resources
+        .media_tools()
+        .map_err(|_| ThumbnailFailure::new("resource_not_ready", "受控媒体资源尚未准备完成"))?;
     let request = thumbnail_request(
         video_id,
         &state,
-        &settings.ffmpeg_path,
-        &settings.ffprobe_path,
+        &ffmpeg_path.to_string_lossy(),
+        &ffprobe_path.to_string_lossy(),
     )?;
     let snapshot = state.thumbnail.retry(&batch_id, request).await?;
     authorize_thumbnail_item(&app, &state.thumbnail, &snapshot)?;
@@ -527,6 +631,7 @@ async fn retry_video_thumbnail(
 
 #[tauri::command]
 fn open_video(id: i64, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     let video = state
         .database
         .get_video(id)
@@ -542,6 +647,7 @@ fn open_video(id: i64, app: AppHandle, state: State<'_, AppState>) -> Result<(),
 
 #[tauri::command]
 fn reveal_video(id: i64, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     let video = state
         .database
         .get_video(id)
@@ -557,6 +663,7 @@ fn reveal_video(id: i64, app: AppHandle, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 fn delete_video(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     state
         .database
         .get_video(id)
@@ -584,6 +691,7 @@ fn delete_video(id: i64, state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_session(session_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    require_runtime_ready(state.inner())?;
     let video_ids = state
         .database
         .list_session_videos(session_id)
@@ -627,13 +735,15 @@ fn open_logs(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn diagnose_environment(state: State<'_, AppState>) -> Result<EnvironmentStatus, String> {
-    let settings = state
-        .database
-        .get_settings()
-        .map_err(|error| error.to_string())?;
+    let Some((ffmpeg_path, ffprobe_path)) = state.runtime_resources.media_tools().ok() else {
+        return Ok(EnvironmentStatus {
+            ffmpeg: false,
+            ffprobe: false,
+        });
+    };
     let (ffmpeg, ffprobe) = tokio::join!(
-        executable_works(settings.ffmpeg_path),
-        executable_works(settings.ffprobe_path)
+        executable_works(ffmpeg_path),
+        executable_works(ffprobe_path)
     );
     Ok(EnvironmentStatus { ffmpeg, ffprobe })
 }
@@ -662,6 +772,12 @@ pub fn run() {
             None,
         ))
         .invoke_handler(tauri::generate_handler![
+            runtime_resource_status,
+            runtime_resource_manifest,
+            runtime_resource_download,
+            runtime_resource_cancel,
+            runtime_resource_recheck,
+            runtime_resource_source,
             get_dashboard,
             list_streamer_tag_name_suggestions,
             get_streamer_prompt_context,
@@ -753,16 +869,42 @@ pub fn run() {
             let database = Database::open(&app_data_dir.join("dy-screen.sqlite3"))?;
             database.migrate()?;
             database.reconcile_startup()?;
+            let runtime_resource_state = RuntimeResourceState::new(
+                database.clone(),
+                app_data_dir.clone(),
+                desktop_asr_resource_root(app.path().resource_dir()?),
+            );
+            let _ = runtime_resource_state.refresh();
+            app.manage(runtime_resource_state);
             let settings = database.get_settings()?;
 
             let asr_temporary_root = app_cache_dir.join("asr-audio");
             std::fs::create_dir_all(&asr_temporary_root)?;
-            let asr_resource_root = desktop_asr_resource_root(app.path().resource_dir()?);
+            let packaged_asr_root = desktop_asr_resource_root(app.path().resource_dir()?);
+            let asr_resource_root = app
+                .state::<RuntimeResourceState>()
+                .current_root()
+                .unwrap_or(packaged_asr_root);
+            let asr_ffprobe = app
+                .state::<RuntimeResourceState>()
+                .media_tools()
+                .ok()
+                .map(|(_, ffprobe)| ffprobe)
+                .unwrap_or_else(|| {
+                    #[cfg(debug_assertions)]
+                    {
+                        PathBuf::from(settings.ffprobe_path.clone())
+                    }
+                    #[cfg(not(debug_assertions))]
+                    {
+                        PathBuf::new()
+                    }
+                });
             let ai_components = tauri::async_runtime::block_on(async {
                 LocalAsrRuntime::build(
                     database.clone(),
                     asr_resource_root,
-                    PathBuf::from(settings.ffprobe_path.clone()),
+                    asr_ffprobe,
                     asr_temporary_root,
                     Arc::new(DesktopAiPublisher {
                         app: app.handle().clone(),
@@ -825,7 +967,7 @@ pub fn run() {
                 browser_driver,
                 room_resolution_publisher,
             ));
-            let supervisor = Supervisor::new_with_room_discovery(
+            let mut supervisor = Supervisor::new_with_room_discovery(
                 database.clone(),
                 publisher,
                 max_concurrent,
@@ -834,6 +976,9 @@ pub fn run() {
                 monitor_logger,
             )
             .map_err(std::io::Error::other)?;
+            supervisor.set_runtime_resources(
+                app.state::<RuntimeResourceState>().inner().clone(),
+            );
             let preview_cache_dir = app_cache_dir.join("video-preview");
             std::fs::create_dir_all(&preview_cache_dir)?;
             app.asset_protocol_scope()
@@ -866,6 +1011,7 @@ pub fn run() {
                 preview,
                 thumbnail,
                 ai_runtime: ai_components.runtime,
+                runtime_resources: app.state::<RuntimeResourceState>().inner().clone(),
                 log_dir,
                 shutdown_gate,
             });
@@ -890,9 +1036,15 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
-            tauri::async_runtime::spawn(async move {
-                let _ = supervisor.restore().await;
-            });
+            if app
+                .state::<RuntimeResourceState>()
+                .view()
+                .ready
+            {
+                tauri::async_runtime::spawn(async move {
+                    let _ = supervisor.restore().await;
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1077,16 +1229,16 @@ fn preview_request(id: i64, state: &State<'_, AppState>) -> Result<PreviewReques
         let _ = state.database.mark_video_status(id, "missing");
         video.status = "missing".to_owned();
     }
-    let settings = state
-        .database
-        .get_settings()
-        .map_err(|_| PreviewFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    let (ffmpeg_path, ffprobe_path) = state
+        .runtime_resources
+        .media_tools()
+        .map_err(|_| PreviewFailure::new("resource_not_ready", "受控媒体资源尚未准备完成"))?;
     Ok(PreviewRequest {
         video_id: video.id,
         source_path: video.path,
         source_status: video.status,
-        ffmpeg_path: settings.ffmpeg_path,
-        ffprobe_path: settings.ffprobe_path,
+        ffmpeg_path: ffmpeg_path.to_string_lossy().into_owned(),
+        ffprobe_path: ffprobe_path.to_string_lossy().into_owned(),
     })
 }
 
@@ -1142,17 +1294,17 @@ fn ai_input_preview_request(
             "视频文件在项目创建后发生变化，无法可靠联动时间戳",
         ));
     }
-    let settings = state
-        .database
-        .get_settings()
-        .map_err(|_| PreviewFailure::new("settings_unavailable", "无法读取 FFmpeg 设置"))?;
+    let (ffmpeg_path, ffprobe_path) = state
+        .runtime_resources
+        .media_tools()
+        .map_err(|_| PreviewFailure::new("resource_not_ready", "受控媒体资源尚未准备完成"))?;
     Ok(PreviewRequest {
         // AI 输入使用负数命名空间，避免和视频库正整数 ID 的预览缓存冲突。
         video_id: input_id.saturating_neg(),
         source_path: input.source_path,
         source_status: "complete".to_owned(),
-        ffmpeg_path: settings.ffmpeg_path,
-        ffprobe_path: settings.ffprobe_path,
+        ffmpeg_path: ffmpeg_path.to_string_lossy().into_owned(),
+        ffprobe_path: ffprobe_path.to_string_lossy().into_owned(),
     })
 }
 
@@ -1236,7 +1388,7 @@ fn ensure_writable_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn executable_works(executable: String) -> bool {
+async fn executable_works(executable: PathBuf) -> bool {
     tokio::process::Command::new(executable)
         .arg("-version")
         .kill_on_drop(true)
@@ -1286,5 +1438,12 @@ mod tests {
             &notified,
             BrowserAccessStatus::VerificationRequired
         ));
+    }
+
+    #[test]
+    fn runtime_gate_blocks_business_commands_until_resources_are_ready() {
+        let error = require_runtime_ready_flag(false).expect_err("资源未就绪必须锁定业务命令");
+        assert!(error.contains("资源尚未准备完成"));
+        assert!(require_runtime_ready_flag(true).is_ok());
     }
 }

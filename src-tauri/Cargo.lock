@@ -1109,12 +1109,14 @@ name = "dy-screen"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "csv",
  "fs2",
  "hex",
  "reqwest 0.12.28",
+ "ring",
  "scraper",
  "serde",
  "serde_json",
