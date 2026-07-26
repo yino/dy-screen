@@ -688,6 +688,34 @@ impl Supervisor {
         Ok(())
     }
 
+    /// 授权失效时只停止运行中的 worker 和录制，不修改用户持久化的
+    /// `monitor_enabled` 选择。重新激活后 `restore` 可以据此恢复原配置。
+    pub async fn pause_for_authorization(&self) -> Result<(), String> {
+        let recording_tokens = self
+            .recording_tokens
+            .lock()
+            .map(|mut tokens| tokens.drain().map(|(_, token)| token).collect::<Vec<_>>())
+            .map_err(|_| "录制锁已损坏".to_owned())?;
+        for token in recording_tokens {
+            token.cancel();
+        }
+        let workers = self
+            .workers
+            .lock()
+            .map(|mut workers| workers.drain().collect::<Vec<_>>())
+            .map_err(|_| "监听锁已损坏".to_owned())?;
+        for (streamer_id, worker) in workers {
+            worker.cancellation.cancel();
+            if wait_for_worker(worker).await {
+                self.database
+                    .reconcile_streamer_sessions(streamer_id)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        self.emit("authorization_paused", None).await;
+        Ok(())
+    }
+
     pub async fn resume_all(&self) -> Result<(), String> {
         let streamers = self
             .database

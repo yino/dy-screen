@@ -1,4 +1,6 @@
 pub mod ai;
+pub mod activation;
+pub mod api;
 pub mod app_lifecycle;
 pub mod app_support;
 pub mod database;

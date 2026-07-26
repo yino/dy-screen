@@ -58,6 +58,29 @@ const BROWSER_SNAPSHOT_SCRIPT: &str = r##"
 })()
 "##;
 
+const MUTE_MEDIA_SCRIPT: &str = r##"
+(() => {
+  const mute = (node) => {
+    if (!(node instanceof HTMLMediaElement)) return;
+    node.muted = true;
+    node.volume = 0;
+    node.setAttribute("muted", "");
+  };
+  document.querySelectorAll("audio,video").forEach(mute);
+  if (!window.__dyScreenMuteObserver) {
+    window.__dyScreenMuteObserver = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          mute(node);
+          if (node instanceof Element) node.querySelectorAll("audio,video").forEach(mute);
+        }
+      }
+    });
+    window.__dyScreenMuteObserver.observe(document.documentElement, { childList: true, subtree: true });
+  }
+})()
+"##;
+
 pub struct BrowserWindowPolicy;
 
 impl BrowserWindowPolicy {
@@ -124,7 +147,7 @@ impl TauriBrowserPageDriver {
     }
 
     fn create_window(&self, target: Url) -> Result<WebviewWindow> {
-        WebviewWindowBuilder::new(
+        let window = WebviewWindowBuilder::new(
             &self.app,
             DOUYIN_ACCESS_WINDOW_LABEL,
             WebviewUrl::External(target),
@@ -135,6 +158,7 @@ impl TauriBrowserPageDriver {
         .focused(false)
         .incognito(false)
         .data_directory(self.data_directory.as_ref().clone())
+        .initialization_script(MUTE_MEDIA_SCRIPT)
         .on_navigation(BrowserWindowPolicy::allows_navigation)
         .on_new_window(|_, _| {
             debug_assert!(!BrowserWindowPolicy::allows_new_window());
@@ -142,7 +166,11 @@ impl TauriBrowserPageDriver {
         })
         .on_download(|_, _| BrowserWindowPolicy::allows_download())
         .build()
-        .map_err(|_| RecorderError::BrowserSessionUnavailable)
+        .map_err(|_| RecorderError::BrowserSessionUnavailable)?;
+        // 页面可能尚未完成加载，后续 navigate/snapshot 仍会重复执行；这里的
+        // best-effort 调用用于尽早抑制首个自动播放媒体。
+        let _ = window.eval(MUTE_MEDIA_SCRIPT);
+        Ok(window)
     }
 
     fn target_url(room_url: &str) -> Result<Url> {
@@ -162,9 +190,11 @@ impl BrowserPageDriver for TauriBrowserPageDriver {
         let target = Self::target_url(room_url)?;
         self.tracker.activate(request_generation);
         if let Some(window) = self.window() {
-            window
+            let result = window
                 .navigate(target)
-                .map_err(|_| RecorderError::BrowserSessionUnavailable)
+                .map_err(|_| RecorderError::BrowserSessionUnavailable);
+            let _ = window.eval(MUTE_MEDIA_SCRIPT);
+            result
         } else {
             self.create_window(target).map(|_| ())
         }
@@ -177,6 +207,7 @@ impl BrowserPageDriver for TauriBrowserPageDriver {
         let window = self
             .window()
             .ok_or(RecorderError::BrowserSessionUnavailable)?;
+        let _ = window.eval(MUTE_MEDIA_SCRIPT);
         let tracker = self.tracker.clone();
         let (sender, receiver) = oneshot::channel();
         let sender = Arc::new(Mutex::new(Some(sender)));
@@ -203,6 +234,7 @@ impl BrowserPageDriver for TauriBrowserPageDriver {
         let window = self
             .window()
             .ok_or(RecorderError::BrowserSessionUnavailable)?;
+        let _ = window.eval(MUTE_MEDIA_SCRIPT);
         window
             .show()
             .and_then(|_| window.set_focus())
@@ -306,6 +338,17 @@ mod tests {
         assert!(!BROWSER_SNAPSHOT_SCRIPT.contains("outerHTML"));
         assert!(!BROWSER_SNAPSHOT_SCRIPT.contains("__TAURI__"));
         assert!(!BROWSER_SNAPSHOT_SCRIPT.contains("invoke("));
+    }
+
+    #[test]
+    fn media_muting_script_is_bounded_to_dom_media_elements() {
+        assert!(MUTE_MEDIA_SCRIPT.contains("HTMLMediaElement"));
+        assert!(MUTE_MEDIA_SCRIPT.contains("node.muted = true"));
+        assert!(MUTE_MEDIA_SCRIPT.contains("node.volume = 0"));
+        assert!(MUTE_MEDIA_SCRIPT.contains("MutationObserver"));
+        assert!(!MUTE_MEDIA_SCRIPT.contains("document.cookie"));
+        assert!(!MUTE_MEDIA_SCRIPT.contains("localStorage"));
+        assert!(!MUTE_MEDIA_SCRIPT.contains("invoke("));
     }
 
     #[test]

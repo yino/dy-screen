@@ -458,6 +458,43 @@ impl LocalAsrRuntime {
             .unwrap_or(false)
     }
 
+    /// 授权恢复后重新创建已经停止的本地调度器。资源仍从受控 Runtime
+    /// Resource Pack 解析，不接受前端传入可执行路径。
+    pub fn resume_after_authorization(&self) -> Result<(), AiCommandError> {
+        if self.scheduler_ready() {
+            return Ok(());
+        }
+        let resources = self.environment.resources().map_err(command_asr_error)?;
+        let ffprobe = resources.ffprobe.clone();
+        if let Ok(mut inspector) = self.inspector_switch.lock() {
+            *inspector = Arc::new(FfprobeMediaInspector::new(ffprobe, Duration::from_secs(10)));
+        }
+        let normalization_version = self
+            .environment
+            .default_recognition_profile()?
+            .normalization_version;
+        let scheduler = Arc::new(build_scheduler(
+            self.database.clone(),
+            self.repository.clone(),
+            resources,
+            self.temporary_root.clone(),
+            self.publisher.clone(),
+            Arc::new(ReloadableMediaInspector {
+                current: self.inspector_switch.clone(),
+            }),
+            &normalization_version,
+        )
+        .map_err(command_asr_error)?);
+        *self.scheduler.lock().map_err(|_| {
+            AiCommandError::new(
+                "asr_scheduler_unavailable",
+                "本地 ASR 调度器状态不可用",
+                true,
+            )
+        })? = Some(scheduler);
+        Ok(())
+    }
+
     pub fn recover_startup(&self) -> Result<AiRecoveryReport, AiCommandError> {
         self.lifecycle
             .recover_startup()
@@ -519,6 +556,24 @@ impl LocalAsrRuntime {
                 .shutdown(&scheduler)
                 .await
                 .map_err(|error| AiCommandError::new("ai_shutdown_failed", error.to_string(), true))
+        } else {
+            self.recover_startup()
+        }
+    }
+
+    /// 授权失效时停止当前 ASR 并取走调度器；SQLite 项目状态由生命周期
+    /// 对账，重新激活后可通过 `resume_after_authorization` 重建并恢复队列。
+    pub async fn pause_for_authorization(&self) -> Result<AiRecoveryReport, AiCommandError> {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .ok()
+            .and_then(|mut scheduler| scheduler.take());
+        if let Some(scheduler) = scheduler {
+            self.lifecycle
+                .shutdown(&scheduler)
+                .await
+                .map_err(|error| AiCommandError::new("ai_authorization_pause_failed", error.to_string(), true))
         } else {
             self.recover_startup()
         }

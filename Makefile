@@ -1,6 +1,8 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/sh
 
+-include .env
+
 CARGO_CANDIDATES := $(wildcard $(HOME)/.cargo/bin/cargo /opt/homebrew/opt/rustup/bin/cargo)
 CARGO ?= $(if $(strip $(CARGO_CANDIDATES)),$(firstword $(CARGO_CANDIDATES)),cargo)
 NODE ?= node
@@ -67,6 +69,7 @@ RESOURCE_CHANNEL ?= stable
 RESOURCE_APP_VERSION ?= 0.2.0
 # 必须与 resources/asr-source/manifest.json 中的 bundleVersion 一致。
 RESOURCE_BUNDLE_VERSION ?= 2026.07.3
+DY_SCREEN_API_BASE_URL ?= http://localhost/api/
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
 
@@ -212,21 +215,21 @@ frontend-build:
 	"$(NPM)" run build
 
 app-dev:
-	"$(NPM)" run tauri:dev
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" "$(NPM)" run tauri:dev
 
 app-build:
 	@printf '%s\n' '普通开发构建：不携带发行运行资源；正式发布请使用 make app-build-resources。'
-	"$(NPM)" run tauri:build
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" "$(NPM)" run tauri:build
 
 app-build-resources: asr-stage-macos
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
-	DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
 
 app-build-resources-windows: asr-stage-windows
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
-	DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
 
 runtime-resource-verify:
 	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }

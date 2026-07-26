@@ -16,7 +16,7 @@ use dy_screen::error::{RecorderError, Result};
 use dy_screen::resolver::{
     RoomDiagnostic, RoomInspection, RoomInspectionAttempt, StreamResolver, validate_room_url,
 };
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::{BrowserAccessState, BrowserAccessStatus};
@@ -224,6 +224,7 @@ pub struct RoomResolutionService {
     access_notify: Arc<Notify>,
     request_generation: Arc<AtomicU64>,
     verification_watch_active: Arc<AtomicBool>,
+    access_recovered: broadcast::Sender<u64>,
     session_cancellation: Arc<Mutex<CancellationToken>>,
     shutdown: CancellationToken,
 }
@@ -267,6 +268,7 @@ impl RoomResolutionService {
         policy: RoomResolutionPolicy,
         public_request_gate: Arc<PublicPageRequestGate>,
     ) -> Self {
+        let (access_recovered, _) = broadcast::channel(8);
         Self {
             native,
             browser,
@@ -284,6 +286,7 @@ impl RoomResolutionService {
             access_notify: Arc::new(Notify::new()),
             request_generation: Arc::new(AtomicU64::new(0)),
             verification_watch_active: Arc::new(AtomicBool::new(false)),
+            access_recovered,
             session_cancellation: Arc::new(Mutex::new(CancellationToken::new())),
             shutdown: CancellationToken::new(),
         }
@@ -291,6 +294,14 @@ impl RoomResolutionService {
 
     pub fn public_request_gate(&self) -> Arc<PublicPageRequestGate> {
         self.public_request_gate.clone()
+    }
+
+    pub fn subscribe_access_recovered(&self) -> broadcast::Receiver<u64> {
+        self.access_recovered.subscribe()
+    }
+
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     pub fn access_state(&self) -> BrowserAccessState {
@@ -766,6 +777,7 @@ impl RoomResolutionService {
     }
 
     async fn complete_verification(&self, request_generation: u64) -> Result<()> {
+        let mut completed = false;
         if let Ok(mut runtime) = self.runtime.lock()
             && runtime
                 .verification_target
@@ -780,11 +792,15 @@ impl RoomResolutionService {
             runtime.access.last_reason = None;
             runtime.access.updated_at = Utc::now().to_rfc3339();
             let state = runtime.access.clone();
+            completed = true;
             drop(runtime);
             self.publisher.publish_access_state(&state);
         }
         let _ = self.browser.hide_verification().await;
         self.access_notify.notify_waiters();
+        if completed {
+            let _ = self.access_recovered.send(request_generation);
+        }
         Ok(())
     }
 

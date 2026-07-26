@@ -23,6 +23,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible { outline: 3px solid rgba(7, 152, 121, 0.2); outline-offset: 2px; }
 
 .app-shell { min-height: 100vh; display: flex; }
+.activation-locked > .sidebar, .activation-locked > .main-area { pointer-events: none; user-select: none; }
 .sidebar {
   position: fixed;
   inset: 0 auto 0 0;
@@ -63,6 +64,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .topbar-actions { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .health-pill { height: 38px; display: flex; align-items: center; gap: 8px; padding: 0 13px; border-radius: 12px; color: #5e6d66; font-size: 11px; background: #f3f7f5; border: 1px solid var(--line); }
 .health-dot { width: 8px; height: 8px; border-radius: 50%; background: #20b787; box-shadow: 0 0 0 4px rgba(32, 183, 135, 0.13); }
+.health-pill.inactive { color: #8a5a23; background: #fff8e8; border-color: #efd7a7; }
+.health-pill.inactive .health-dot { background: #d49535; box-shadow: 0 0 0 4px rgba(212, 149, 53, 0.14); }
 .mobile-menu { display: none !important; }
 .primary-button, .secondary-button, .ghost-button { border: 0; border-radius: 11px; min-height: 40px; padding: 0 15px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 12px; font-weight: 700; cursor: pointer; transition: 0.18s ease; }
 .primary-button { color: #fff; background: linear-gradient(105deg, #078d70, #0ba681); box-shadow: 0 9px 22px rgba(7, 152, 121, 0.2); }
@@ -387,6 +390,12 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .save-bar button { margin-left: auto; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 100; padding: 22px; display: grid; place-items: center; background: rgba(18, 34, 28, 0.48); backdrop-filter: blur(8px); }
+.activation-backdrop { z-index: 200; background: rgba(15, 27, 22, .68); }
+.activation-modal { width: min(480px, 100%); }
+.activation-modal .modal-body { min-height: 132px; }
+.activation-modal .form-error { margin: 0; }
+.activation-footer { justify-content: space-between; }
+.activation-footer > span { max-width: 210px; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .preview-backdrop { z-index: 110; }
 .preview-modal { width: min(960px, 100%); max-height: calc(100vh - 44px); overflow: hidden; display: flex; flex-direction: column; border-radius: 20px; background: #111915; box-shadow: 0 34px 90px rgba(5, 18, 13, 0.42); }
 .preview-header { min-height: 78px; padding: 17px 20px; display: flex; align-items: center; gap: 16px; color: #edf4f0; background: #18221d; border-bottom: 1px solid #2b3932; }

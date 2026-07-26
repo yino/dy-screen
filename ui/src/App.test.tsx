@@ -6,6 +6,7 @@ import type {
   AiEnvironmentDiagnostic,
   AiProject,
   AiProjectDetail,
+  ActivationState,
   BrowserAccessState,
   ClientApi,
   Streamer,
@@ -96,8 +97,26 @@ const nativeAccessState: BrowserAccessState = {
   updatedAt: "2026-07-24T00:00:00Z",
 };
 
+const activeActivation: ActivationState = {
+  configured: true,
+  active: true,
+  status: "active",
+  message: null,
+  deviceIdHint: "…12345678",
+  lastHeartbeatAt: "2026-07-27T00:00:00Z",
+  nextHeartbeatAt: "2026-07-27T00:01:30Z",
+};
+
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
   return {
+    getActivationState: vi.fn().mockResolvedValue(activeActivation),
+    activateClient: vi.fn().mockResolvedValue(activeActivation),
+    clearActivation: vi.fn().mockResolvedValue({
+      ...activeActivation,
+      configured: false,
+      active: false,
+      status: "missing",
+    }),
     getDashboard: vi.fn().mockResolvedValue({
       streamers,
       activeRecordings: 0,
@@ -211,10 +230,36 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     subscribePreview: vi.fn().mockResolvedValue(() => undefined),
     subscribeThumbnail: vi.fn().mockResolvedValue(() => undefined),
     subscribeAi: vi.fn().mockResolvedValue(() => undefined),
+    subscribeActivation: vi.fn().mockResolvedValue(() => undefined),
   };
 }
 
 describe("App", () => {
+  it("未激活时显示不可关闭的门禁，激活成功后进入主界面", async () => {
+    const user = userEvent.setup();
+    const api = createApi([streamer]);
+    api.getActivationState = vi.fn().mockResolvedValue({
+      ...activeActivation,
+      configured: false,
+      active: false,
+      status: "missing",
+      message: "请输入激活码后继续使用",
+      lastHeartbeatAt: null,
+      nextHeartbeatAt: null,
+    });
+    api.activateClient = vi.fn().mockResolvedValue(activeActivation);
+
+    render(<App api={api} />);
+
+    const dialog = await screen.findByRole("dialog", { name: "客户端激活" });
+    expect(dialog).toHaveTextContent("未激活前不会启动监听或录制任务");
+    expect(screen.queryByRole("button", { name: "关闭" })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("激活码"), "TEST-CODE-1234");
+    await user.click(screen.getByRole("button", { name: "激活并进入" }));
+    await waitFor(() => expect(api.activateClient).toHaveBeenCalledWith("TEST-CODE-1234"));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "客户端激活" })).not.toBeInTheDocument());
+  });
+
   it("资源未就绪时只显示准备页，下载完成后解锁监控导航", async () => {
     const user = userEvent.setup();
     const readyStatus = {

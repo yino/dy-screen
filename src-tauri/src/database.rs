@@ -55,6 +55,24 @@ pub struct RuntimeResourceRecord {
     pub updated_at: String,
 }
 
+/// 仅供 Rust 授权服务使用的本地记录。该类型不实现 Serialize，避免激活码或
+/// 令牌被 Tauri command、事件或日志意外输出到前端。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientActivationRecord {
+    pub device_id: String,
+    pub activate_code: String,
+    pub token: Option<String>,
+    pub expire_at: Option<i64>,
+    pub grace_sec: Option<i64>,
+    pub server_time_offset_sec: i64,
+    pub state: String,
+    pub allow_custom_api_key: bool,
+    pub last_heartbeat_at: Option<String>,
+    pub next_heartbeat_at: Option<String>,
+    pub last_error: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Clone)]
 pub struct Database {
     connection: Arc<Mutex<Connection>>,
@@ -235,8 +253,92 @@ impl Database {
         if !applied {
             migrate_runtime_resources_v8(&mut connection)?;
         }
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = 10",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            migrate_client_activation_v10(&mut connection)?;
+        }
         drop(connection);
         self.ensure_default_settings()
+    }
+
+    pub fn client_activation(&self) -> Result<Option<ClientActivationRecord>> {
+        self.connection()?
+            .query_row(
+                r#"SELECT device_id, activate_code, token, expire_at, grace_sec,
+                          server_time_offset_sec, state, allow_custom_api_key,
+                          last_heartbeat_at, next_heartbeat_at, last_error, updated_at
+                   FROM client_activation WHERE id = 1"#,
+                [],
+                |row| {
+                    Ok(ClientActivationRecord {
+                        device_id: row.get(0)?,
+                        activate_code: row.get(1)?,
+                        token: row.get(2)?,
+                        expire_at: row.get(3)?,
+                        grace_sec: row.get(4)?,
+                        server_time_offset_sec: row.get(5)?,
+                        state: row.get(6)?,
+                        allow_custom_api_key: row.get::<_, i64>(7)? == 1,
+                        last_heartbeat_at: row.get(8)?,
+                        next_heartbeat_at: row.get(9)?,
+                        last_error: row.get(10)?,
+                        updated_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn save_client_activation(&self, record: &ClientActivationRecord) -> Result<()> {
+        self.connection()?.execute(
+            r#"INSERT INTO client_activation(
+                    id, device_id, activate_code, token, expire_at, grace_sec,
+                    server_time_offset_sec, state, allow_custom_api_key,
+                    last_heartbeat_at, next_heartbeat_at, last_error, updated_at
+                ) VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ON CONFLICT(id) DO UPDATE SET
+                    device_id=excluded.device_id,
+                    activate_code=excluded.activate_code,
+                    token=excluded.token,
+                    expire_at=excluded.expire_at,
+                    grace_sec=excluded.grace_sec,
+                    server_time_offset_sec=excluded.server_time_offset_sec,
+                    state=excluded.state,
+                    allow_custom_api_key=excluded.allow_custom_api_key,
+                    last_heartbeat_at=excluded.last_heartbeat_at,
+                    next_heartbeat_at=excluded.next_heartbeat_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at"#,
+            params![
+                record.device_id,
+                record.activate_code,
+                record.token,
+                record.expire_at,
+                record.grace_sec,
+                record.server_time_offset_sec,
+                record.state,
+                i64::from(record.allow_custom_api_key),
+                record.last_heartbeat_at,
+                record.next_heartbeat_at,
+                record.last_error,
+                record.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_client_activation(&self) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM client_activation WHERE id = 1", [])?;
+        Ok(())
     }
 
     pub fn runtime_resource_status(&self) -> Result<RuntimeResourceRecord> {
@@ -1625,6 +1727,35 @@ fn migrate_runtime_resources_v8(connection: &mut Connection) -> Result<()> {
     )?;
     transaction.execute(
         "INSERT INTO schema_migrations(version, applied_at) VALUES(8, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_client_activation_v10(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS client_activation (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            device_id TEXT NOT NULL,
+            activate_code TEXT NOT NULL,
+            token TEXT,
+            expire_at INTEGER,
+            grace_sec INTEGER,
+            server_time_offset_sec INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL,
+            allow_custom_api_key INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_api_key IN (0, 1)),
+            last_heartbeat_at TEXT,
+            next_heartbeat_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(10, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

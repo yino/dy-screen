@@ -25,6 +25,7 @@ dy-screen = { path = ".." }
 fs2 = "0.4"
 hex = "0.4"
 rusqlite = { version = "0.40.1", features = ["bundled", "chrono"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "json"] }
 rig-core = "0.40"
 schemars = "1.0"
 serde = { version = "1", features = ["derive"] }

@@ -1137,6 +1137,7 @@ dependencies = [
  "dy-screen",
  "fs2",
  "hex",
+ "reqwest 0.12.28",
  "rig-core",
  "rusqlite",
  "schemars 1.2.1",

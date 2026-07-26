@@ -19,6 +19,8 @@ use crate::ai::{
     HighlightWorkflow, LocalAsrRuntime, RigDeepSeekProvider, SourceFingerprint,
     SystemCredentialStore,
 };
+use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome, TelemetryQueue};
+use crate::api::ApiClient;
 use crate::app_lifecycle::{
     InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, log_lifecycle,
 };
@@ -58,6 +60,8 @@ struct AppState {
     runtime_resources: RuntimeResourceState,
     log_dir: PathBuf,
     shutdown_gate: ShutdownGate,
+    activation: ActivationService,
+    _telemetry: TelemetryQueue,
 }
 
 #[derive(Clone)]
@@ -100,6 +104,115 @@ fn should_notify_verification(notified: &AtomicBool, status: BrowserAccessStatus
         false
     }
 }
+
+fn spawn_access_recovery_checks(
+    room_resolution: Arc<RoomResolutionService>,
+    supervisor: Supervisor,
+) {
+    let mut recovered = room_resolution.subscribe_access_recovered();
+    let shutdown = room_resolution.shutdown_token();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                event = recovered.recv() => match event {
+                    Ok(_) => {
+                        // 等价于用户在主界面点击“检查访问状态”：唤醒所有仍启用的
+                        // 主播 worker，但不重新导航已经确认成功的验证页。
+                        let _ = supervisor.check_all_now();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    });
+}
+
+fn spawn_activation_lifecycle(
+    app: AppHandle,
+    activation: ActivationService,
+    supervisor: Supervisor,
+    ai_runtime: Arc<LocalAsrRuntime>,
+    telemetry: TelemetryQueue,
+) {
+    if activation.is_active() {
+        telemetry.track(
+            "app_open",
+            serde_json::json!({ "platform": std::env::consts::OS })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    let api = activation.api().clone();
+    tauri::async_runtime::spawn(async move {
+        // AppStart 是免鉴权、best-effort 请求。只记录安全的版本决策摘要，
+        // 不输出下载 URL、签名或原始响应正文。
+        match api.app_start().await {
+            Ok(Some(result)) => eprintln!(
+                "{}",
+                serde_json::json!({
+                    "component": "client_api",
+                    "event": "app_start",
+                    "version": result.version,
+                    "force": result.force,
+                })
+            ),
+            Ok(None) => eprintln!(
+                "{}",
+                serde_json::json!({
+                    "component": "client_api",
+                    "event": "app_start",
+                    "result": "no_release",
+                })
+            ),
+            Err(error) => eprintln!(
+                "{}",
+                serde_json::json!({
+                    "component": "client_api",
+                    "event": "app_start_failed",
+                    "message": error.safe_message(),
+                })
+            ),
+        }
+
+        let cancellation = activation.cancellation();
+        let mut wait = if activation.is_active() {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(2)
+        };
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+            if !activation.is_active() {
+                wait = Duration::from_secs(2);
+                continue;
+            }
+            let outcome = activation.heartbeat_once().await;
+            let view = activation.state();
+            let _ = app.emit("activation-event", &view);
+            wait = match outcome {
+                HeartbeatOutcome::Active => HEARTBEAT_INTERVAL_FOR_APP,
+                HeartbeatOutcome::Retrying => HEARTBEAT_RETRY_INTERVAL_FOR_APP,
+                HeartbeatOutcome::Revoked => {
+                    let _ = tokio::join!(
+                        supervisor.pause_for_authorization(),
+                        ai_runtime.pause_for_authorization()
+                    );
+                    Duration::from_secs(2)
+                }
+                HeartbeatOutcome::Missing => Duration::from_secs(2),
+            };
+        }
+    });
+}
+
+const HEARTBEAT_INTERVAL_FOR_APP: Duration = crate::activation::HEARTBEAT_INTERVAL;
+const HEARTBEAT_RETRY_INTERVAL_FOR_APP: Duration = crate::activation::HEARTBEAT_RETRY_INTERVAL;
 
 #[derive(Clone)]
 struct DesktopAiPublisher {
@@ -183,7 +296,61 @@ fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
 }
 
 fn require_runtime_ready(state: &AppState) -> Result<(), String> {
+    if !state.activation.is_active() {
+        return Err("客户端尚未激活，请先输入有效激活码".to_owned());
+    }
     require_runtime_ready_flag(state.runtime_resources.view().ready)
+}
+
+#[tauri::command]
+fn get_activation_state(state: State<'_, AppState>) -> ActivationStateView {
+    state.activation.state()
+}
+
+#[tauri::command]
+async fn activate_client(
+    activation_code: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ActivationStateView, String> {
+    let view = state.activation.activate(&activation_code).await?;
+    if state.runtime_resources.view().ready {
+        state
+            .ai_runtime
+            .resume_after_authorization()
+            .map_err(|error| error.to_string())?;
+        state
+            .ai_runtime
+            .recover_startup_and_requeue()
+            .await
+            .map_err(|error| error.to_string())?;
+        state.supervisor.restore().await?;
+    }
+    state._telemetry.track(
+        "app_open",
+        serde_json::json!({ "platform": std::env::consts::OS })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let _ = app.emit("activation-event", &view);
+    Ok(view)
+}
+
+#[tauri::command]
+async fn clear_activation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ActivationStateView, String> {
+    let (monitor_result, ai_result) = tokio::join!(
+        state.supervisor.pause_for_authorization(),
+        state.ai_runtime.pause_for_authorization()
+    );
+    monitor_result?;
+    ai_result.map_err(|error| error.to_string())?;
+    let view = state.activation.clear()?;
+    let _ = app.emit("activation-event", &view);
+    Ok(view)
 }
 
 fn require_runtime_ready_flag(ready: bool) -> Result<(), String> {
@@ -234,11 +401,13 @@ async fn runtime_resource_download(
     ai_runtime
         .activate_resource_root(resource_root)
         .map_err(|error| error.to_string())?;
-    ai_runtime
-        .recover_startup_and_requeue()
-        .await
-        .map_err(|error| error.to_string())?;
-    supervisor.restore().await?;
+    if app_state.activation.is_active() {
+        ai_runtime
+            .recover_startup_and_requeue()
+            .await
+            .map_err(|error| error.to_string())?;
+        supervisor.restore().await?;
+    }
     let _ = app.emit("runtime-resource-event", &result);
     Ok(result)
 }
@@ -772,6 +941,9 @@ pub fn run() {
             None,
         ))
         .invoke_handler(tauri::generate_handler![
+            get_activation_state,
+            activate_client,
+            clear_activation,
             runtime_resource_status,
             runtime_resource_manifest,
             runtime_resource_download,
@@ -872,6 +1044,15 @@ pub fn run() {
             let database = Database::open(&app_data_dir.join("dy-screen.sqlite3"))?;
             database.migrate()?;
             database.reconcile_startup()?;
+            let api_client = ApiClient::from_env()
+                .map_err(|error| std::io::Error::other(error.safe_message()))?;
+            let activation = ActivationService::new(
+                database.clone(),
+                api_client,
+                &app_data_dir,
+            )
+            .map_err(std::io::Error::other)?;
+            let telemetry = TelemetryQueue::spawn(activation.clone());
             let runtime_resource_state = RuntimeResourceState::new(
                 database.clone(),
                 app_data_dir.clone(),
@@ -914,8 +1095,12 @@ pub fn run() {
                     }),
                 )
             });
-            tauri::async_runtime::block_on(ai_components.runtime.recover_startup_and_requeue())
+            if activation.is_active() {
+                tauri::async_runtime::block_on(
+                    ai_components.runtime.recover_startup_and_requeue(),
+                )
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
+            }
             let ai_project_service = AiProjectService::new(
                 database.clone(),
                 ai_components.inspector,
@@ -1006,6 +1191,15 @@ pub fn run() {
             .map_err(std::io::Error::other)?;
             let shutdown_gate = ShutdownGate::default();
 
+            spawn_access_recovery_checks(room_resolution.clone(), supervisor.clone());
+            spawn_activation_lifecycle(
+                app.handle().clone(),
+                activation.clone(),
+                supervisor.clone(),
+                ai_components.runtime.clone(),
+                telemetry.clone(),
+            );
+
             app.manage(AppState {
                 _instance_lock: instance_lock,
                 database,
@@ -1017,6 +1211,8 @@ pub fn run() {
                 runtime_resources: app.state::<RuntimeResourceState>().inner().clone(),
                 log_dir,
                 shutdown_gate,
+                activation: activation.clone(),
+                _telemetry: telemetry,
             });
             install_shutdown_signal_handlers(app.handle().clone());
 
@@ -1039,7 +1235,8 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
-            if app
+            if activation.is_active()
+                && app
                 .state::<RuntimeResourceState>()
                 .view()
                 .ready
@@ -1156,7 +1353,9 @@ fn begin_shutdown(app: &AppHandle, state: &AppState, reason: ShutdownReason) {
     let preview = state.preview.clone();
     let thumbnail = state.thumbnail.clone();
     let ai_runtime = state.ai_runtime.clone();
+    let activation = state.activation.clone();
     tauri::async_runtime::spawn(async move {
+        activation.shutdown();
         let shutdown = async {
             let (_, _, _, _, _) = tokio::join!(
                 preview.shutdown(),

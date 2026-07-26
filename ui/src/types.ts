@@ -188,6 +188,18 @@ export interface BrowserAccessState {
   updatedAt: string;
 }
 
+export type ActivationStatus = "missing" | "active" | "retrying" | "revoked" | "invalid";
+
+export interface ActivationState {
+  configured: boolean;
+  active: boolean;
+  status: ActivationStatus;
+  message: string | null;
+  deviceIdHint: string;
+  lastHeartbeatAt: string | null;
+  nextHeartbeatAt: string | null;
+}
+
 export type AiProjectStatus =
   | "draft"
   | "queued"
@@ -517,6 +529,9 @@ export interface ThumbnailEvent {
 }
 
 export interface ClientApi {
+  getActivationState(): Promise<ActivationState>;
+  activateClient(activationCode: string): Promise<ActivationState>;
+  clearActivation(): Promise<ActivationState>;
   getDashboard(): Promise<Dashboard>;
   createStreamer(input: CreateStreamerInput): Promise<Streamer>;
   updateStreamer(id: number, input: CreateStreamerInput): Promise<Streamer>;
@@ -599,6 +614,7 @@ export interface ClientApi {
   subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
   subscribeThumbnail(listener: (event: ThumbnailEvent) => void): Promise<() => void>;
   subscribeAi(listener: (event: AiJobEvent) => void): Promise<() => void>;
+  subscribeActivation(listener: (state: ActivationState) => void): Promise<() => void>;
 }
 
 export interface ProviderDiagnostic {

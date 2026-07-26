@@ -16,3 +16,4 @@
 !/resources/asr-source/SHA256SUMS
 *.sqlite
 *.sqlite3
+.env

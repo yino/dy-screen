@@ -12,6 +12,7 @@ import {
   FolderOpen,
   HardDrive,
   ImageOff,
+  KeyRound,
   LayoutDashboard,
   LoaderCircle,
   Maximize2,
@@ -39,6 +40,7 @@ import {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  ActivationState,
   AppSettings,
   BrowserAccessState,
   ClientApi,
@@ -211,6 +213,7 @@ interface AppProps {
 }
 
 export function App({ api }: AppProps) {
+  const [activation, setActivation] = useState<ActivationState | null>(null);
   const [page, setPage] = useState<Page>("monitor");
   const [aiWorkspaceMounted, setAiWorkspaceMounted] = useState(false);
   const [dashboard, setDashboard] = useState<Dashboard>(emptyDashboard);
@@ -347,6 +350,33 @@ export function App({ api }: AppProps) {
       resourceUnsubscribe?.();
     };
   }, [api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    const updateActivation = (state: ActivationState) => {
+      if (!disposed) setActivation(state);
+    };
+    void api.getActivationState()
+      .then(updateActivation)
+      .catch((error) => updateActivation({
+        configured: false,
+        active: false,
+        status: "invalid",
+        message: errorMessage(error, "无法读取客户端激活状态"),
+        deviceIdHint: "…unknown",
+        lastHeartbeatAt: null,
+        nextHeartbeatAt: null,
+      }));
+    void api.subscribeActivation(updateActivation).then((handler) => {
+      if (disposed) handler();
+      else unsubscribe = handler;
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, [api]);
 
   const refreshResources = async () => {
     if (!api.runtimeResourceRecheck) return;
@@ -529,6 +559,10 @@ export function App({ api }: AppProps) {
   const selectedStreamer = dashboard.streamers.find((item) => item.id === selectedId) ?? null;
 
   const navigate = (nextPage: Page) => {
+    if (activation?.active !== true) {
+      setNotice("客户端激活后才能使用主功能");
+      return;
+    }
     if (resourceStatus && !resourceStatus.ready && nextPage !== "resources" && nextPage !== "settings") {
       setNotice("运行资源尚未准备完成，主功能暂不可用");
       return;
@@ -634,7 +668,7 @@ export function App({ api }: AppProps) {
   };
 
   return (
-    <div className="app-shell">
+    <div className={activation?.active === true ? "app-shell" : "app-shell activation-locked"}>
       <Sidebar
         page={page}
         open={mobileNavOpen}
@@ -654,7 +688,7 @@ export function App({ api }: AppProps) {
             <h1>{pageTitle(page)}</h1>
           </div>
           <div className="topbar-actions">
-            <div className="health-pill"><span className="health-dot" />后台服务运行中</div>
+            <div className={activation?.active ? "health-pill" : "health-pill inactive"}><span className="health-dot" />{activationStatusLabel(activation)}</div>
             {page === "monitor" && dashboard.streamers.length > 0 && (
               <button className="primary-button" onClick={() => { setEditingStreamer(null); setAddOpen(true); }}>
                 <Plus size={18} />添加主播
@@ -771,11 +805,18 @@ export function App({ api }: AppProps) {
             environment={environment}
             browserAccess={browserAccess}
             accessBusy={accessBusy}
+            activation={activation}
             onOpenLogs={() => void action(() => api.openLogs())}
             onDiagnose={() => void api.diagnoseEnvironment().then(setEnvironment)}
             onVerifyAccess={() => void showVerification()}
             onRecheckAccess={() => void recheckAccess()}
             onClearAccess={() => void clearAccessSession()}
+            onClearActivation={() => {
+              if (!window.confirm("重新激活会暂停当前监听和录制，确认继续？")) return;
+              void api.clearActivation()
+                .then(setActivation)
+                .catch((error) => setNotice(errorMessage(error, "无法清除客户端激活状态")));
+            }}
             onSave={(next) => void action(async () => {
               await api.saveSettings(next);
               setSettings(next);
@@ -813,8 +854,27 @@ export function App({ api }: AppProps) {
           onClose={() => setPreview(null)}
         />
       )}
+
+      {activation?.active !== true && (
+        <ActivationModal
+          state={activation}
+          onActivate={(activationCode) => api.activateClient(activationCode).then((state) => {
+            setActivation(state);
+            void refreshDashboard();
+            return state;
+          })}
+        />
+      )}
     </div>
   );
+}
+
+function activationStatusLabel(state: ActivationState | null): string {
+  if (!state) return "正在检查授权";
+  if (state.status === "active") return "客户端已激活";
+  if (state.status === "retrying") return "授权心跳重试中";
+  if (state.status === "revoked") return "授权已失效";
+  return "等待客户端激活";
 }
 
 function pageTitle(page: Page): string {
@@ -1422,7 +1482,58 @@ function VideoPreviewDialog({ api, video, snapshot, onSnapshot, onRetry, onOpenS
   );
 }
 
-function SettingsPage({ api, settings, environment, browserAccess, accessBusy, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onSave }: { api: ClientApi; settings: AppSettings; environment: EnvironmentStatus | null; browserAccess: BrowserAccessState | null; accessBusy: "verify" | "check" | "clear" | null; onOpenLogs: () => void; onDiagnose: () => void; onVerifyAccess: () => void; onRecheckAccess: () => void; onClearAccess: () => void; onSave: (settings: AppSettings) => void }) {
+function ActivationModal({ state, onActivate }: { state: ActivationState | null; onActivate: (activationCode: string) => Promise<ActivationState> }) {
+  const [activationCode, setActivationCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const code = activationCode.trim();
+    if (code.length < 4) {
+      setError("请输入有效的激活码");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onActivate(code);
+      setActivationCode("");
+    } catch (reason) {
+      setError(errorMessage(reason, "激活失败，请检查激活码后重试"));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop activation-backdrop" role="presentation">
+      <form className="modal activation-modal" role="dialog" aria-modal="true" aria-label="客户端激活" onSubmit={submit}>
+        <div className="modal-header"><div className="modal-title-icon"><KeyRound size={21} /></div><div><h2>激活直播管家</h2><p>当前设备 {state?.deviceIdHint ?? "正在识别"}</p></div></div>
+        <div className="modal-body">
+          <label htmlFor="activation-code">激活码<input id="activation-code" type="password" autoComplete="off" autoFocus value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="请输入激活码" disabled={!state || submitting} /></label>
+          {(error || state?.message) && <p className="form-error" role="alert">{error || state?.message}</p>}
+          {state?.status === "retrying" && <small>服务端连接正在重试，您也可以重新提交激活码。</small>}
+        </div>
+        <div className="modal-footer activation-footer"><span>未激活前不会启动监听或录制任务</span><button type="submit" className="primary-button" disabled={!state || submitting || activationCode.trim().length < 4}>{submitting ? <LoaderCircle className="spin" size={17} /> : <KeyRound size={17} />}{submitting ? "正在激活" : "激活并进入"}</button></div>
+      </form>
+    </div>
+  );
+}
+
+function SettingsPage({ api, settings, environment, browserAccess, accessBusy, activation, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onClearActivation, onSave }: {
+  api: ClientApi;
+  settings: AppSettings;
+  environment: EnvironmentStatus | null;
+  browserAccess: BrowserAccessState | null;
+  accessBusy: "verify" | "check" | "clear" | null;
+  activation: ActivationState | null;
+  onOpenLogs: () => void;
+  onDiagnose: () => void;
+  onVerifyAccess: () => void;
+  onRecheckAccess: () => void;
+  onClearAccess: () => void;
+  onClearActivation: () => void;
+  onSave: (settings: AppSettings) => void;
+}) {
   const [form, setForm] = useState(settings);
   const [llm, setLlm] = useState<LlmProviderSettings | null>(null);
   const [apiKey, setApiKey] = useState("");
@@ -1453,6 +1564,7 @@ function SettingsPage({ api, settings, environment, browserAccess, accessBusy, o
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div><HardDrive size={22} /></div><label>录像保存目录<input value={form.outputRoot} onChange={(event) => setForm({ ...form, outputRoot: event.target.value })} /><small>默认位于下载目录，修改后只影响新录制。</small></label><div className="form-grid"><label>清晰度<select value={form.quality} onChange={(event) => setForm({ ...form, quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label><label>分片时长（秒）<input type="number" min="60" value={form.segmentSeconds} onChange={(event) => setForm({ ...form, segmentSeconds: Number(event.target.value) })} /></label><label>最大并发录制<input type="number" min="1" max="16" value={form.maxConcurrentRecordings} onChange={(event) => setForm({ ...form, maxConcurrentRecordings: Number(event.target.value) })} /></label></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div><button type="button" className="secondary-button" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button></div><p className="muted-copy">FFmpeg 和 FFprobe 由已校验的运行资源包管理，不能从设置中替换为任意程序。</p><div className="diagnostic-list"><div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未就绪"}</b></div><div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未就绪"}</b></div></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DESKTOP</p><h2>桌面行为</h2></div><Settings size={22} /></div><label className="switch-row"><div><strong>录制时并行处理 ASR</strong><small>已完成且文件稳定的视频可在直播录制期间进行识别。关闭后恢复录制优先。</small></div><input type="checkbox" checked={form.asrDuringRecording} onChange={(event) => setForm({ ...form, asrDuringRecording: event.target.checked })} /></label><label className="switch-row"><div><strong>系统通知</strong><small>开播、录制结束、失败和磁盘不足时提醒。</small></div><input type="checkbox" checked={form.notificationsEnabled} onChange={(event) => setForm({ ...form, notificationsEnabled: event.target.checked })} /></label><label className="switch-row"><div><strong>开机自动启动</strong><small>登录系统后恢复已启用的监听任务。</small></div><input type="checkbox" checked={form.autostartEnabled} onChange={(event) => setForm({ ...form, autostartEnabled: event.target.checked })} /></label><button type="button" className="secondary-button full" onClick={onOpenLogs}><FolderOpen size={16} />打开日志目录</button><p className="tray-note">关闭主窗口后应用会驻留系统托盘；请通过托盘菜单显式退出。</p></section>
+        <section className="panel settings-card activation-settings-card"><div className="panel-header"><div><p className="section-kicker">LICENSE</p><h2>客户端授权</h2></div><KeyRound size={22} /></div><div className="access-session-summary"><StatusBadge kind={activation?.active ? "live" : "error"}>{activationStatusLabel(activation)}</StatusBadge>{activation?.message && <p>{activation.message}</p>}<small>设备 {activation?.deviceIdHint ?? "正在识别"} · 最近心跳 {formatDate(activation?.lastHeartbeatAt ?? null)}</small></div><div className="access-settings-actions"><button type="button" className="danger-button" onClick={onClearActivation}>重新激活</button></div></section>
         <section className="panel settings-card access-settings-card"><div className="panel-header"><div><p className="section-kicker">DOUYIN ACCESS</p><h2>抖音访问会话</h2></div><ShieldCheck size={22} /></div><div className="access-session-summary"><StatusBadge kind={browserAccess?.status === "verification_required" || browserAccess?.status === "session_expired" ? "error" : "neutral"}>{browserAccess ? accessStatusLabel(browserAccess) : "正在读取"}</StatusBadge>{browserAccess?.lastReason && <p>{browserAccess.lastReason}</p>}<small>会话仅保存在系统 WebView 中；清除操作不会影响主播和录像。</small></div><div className="access-settings-actions"><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onRecheckAccess}>{accessBusy === "check" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}检查访问状态</button><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onVerifyAccess}>{accessBusy === "verify" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重新验证</button><button type="button" className="danger-button" disabled={accessBusy !== null} onClick={onClearAccess}>{accessBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}清除抖音会话</button></div></section>
         {llm && <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DEEPSEEK</p><h2>高光分析 Provider</h2></div><Sparkles size={22} /></div><label>模型 ID<input value={llm.modelId} onChange={(event) => setLlm({ ...llm, modelId: event.target.value })} /></label><label>API Key（留空表示不替换）<input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label><label>请求超时（毫秒）<input type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => setLlm({ ...llm, timeoutMs: Number(event.target.value) })} /></label><div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>{llmMessage && <p className="form-error">{llmMessage}</p>}<div className="settings-inline-actions"><button type="button" className="secondary-button" onClick={() => void saveLlm()}>保存 Provider</button><button type="button" className="secondary-button" disabled={!llm.keyConfigured || llmDiagnosing} onClick={() => void diagnoseLlm()}>{llmDiagnosing ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}测试连接</button><button type="button" className="ghost-button" disabled={!llm.keyConfigured} onClick={() => void api.clearAiLlmKey?.().then(() => { setLlm({ ...llm, keyConfigured: false }); setLlmMessage("Key 已从系统凭据库清除"); })}>清除 Key</button></div><small>测试只发送固定诊断提示；分析时仅发送规范化转写与标签，不发送视频、音频、本地路径或 Cookie。</small></section>}
       </div>

@@ -611,7 +611,6 @@ async fn browser_retries_a_snapshot_failure_while_the_webview_is_starting() {
         Arc::new(NoopRoomResolutionPublisher),
         short_policy(),
     );
-
     let result = service
         .inspect_with_context("https://live.douyin.com/292895634635", context())
         .await
@@ -673,7 +672,6 @@ async fn manual_recheck_uses_recovered_native_channel_before_reloading_verificat
         Arc::new(NoopRoomResolutionPublisher),
         short_policy(),
     );
-
     assert!(matches!(
         service
             .inspect_with_context(
@@ -833,6 +831,7 @@ async fn verification_window_watches_current_page_and_recovers_without_reloading
         Arc::new(NoopRoomResolutionPublisher),
         short_policy(),
     );
+    let mut recovered = service.subscribe_access_recovered();
 
     assert!(matches!(
         service
@@ -856,6 +855,14 @@ async fn verification_window_watches_current_page_and_recovers_without_reloading
     })
     .await
     .expect("automatic verification recovery");
+    let generation = tokio::time::timeout(Duration::from_millis(50), recovered.recv())
+        .await
+        .expect("access recovery notification")
+        .expect("access recovery channel");
+    assert!(generation > 0);
+    assert!(tokio::time::timeout(Duration::from_millis(10), recovered.recv())
+        .await
+        .is_err());
     assert_eq!(browser.navigations.lock().unwrap().len(), 1);
 }
 

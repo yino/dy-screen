@@ -15,6 +15,7 @@ import type {
   AiSessionImportResult,
   AiTranscriptProjection,
   AiTrustedFileGrant,
+  ActivationState,
   AppSettings,
   BrowserAccessState,
   ClientApi,
@@ -53,6 +54,10 @@ function isTauriRuntime(): boolean {
 }
 
 const tauriApi: ClientApi = {
+  getActivationState: () => invoke<ActivationState>("get_activation_state"),
+  activateClient: (activationCode) =>
+    invoke<ActivationState>("activate_client", { activationCode }),
+  clearActivation: () => invoke<ActivationState>("clear_activation"),
   getDashboard: () => invoke<Dashboard>("get_dashboard"),
   createStreamer: (input) => invoke<Streamer>("create_streamer", { input }),
   updateStreamer: (id, input) => invoke<Streamer>("update_streamer", { id, input }),
@@ -195,6 +200,12 @@ const tauriApi: ClientApi = {
     });
     return unlisten;
   },
+  subscribeActivation: async (listener) => {
+    const unlisten = await listen<ActivationState>("activation-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
 };
 
 export function createBrowserApi(): ClientApi {
@@ -211,6 +222,15 @@ export function createBrowserApi(): ClientApi {
   });
   const rejectDesktopAccess = (): Promise<never> =>
     Promise.reject(new Error("真实访问验证仅桌面端可用"));
+  const demoActivation = (): ActivationState => ({
+    configured: false,
+    active: false,
+    status: "missing",
+    message: "激活功能仅在 Tauri 桌面客户端中可用",
+    deviceIdHint: "…browser",
+    lastHeartbeatAt: null,
+    nextHeartbeatAt: null,
+  });
   try {
     streamers = (JSON.parse(window.localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
       .map((item) => ({
@@ -277,6 +297,11 @@ export function createBrowserApi(): ClientApi {
   };
 
   return {
+    getActivationState: async () => demoActivation(),
+    activateClient: async () => {
+      throw new Error("请在 Tauri 桌面客户端中完成激活");
+    },
+    clearActivation: async () => demoActivation(),
     getDashboard: async () => dashboard(),
     createStreamer: async (input: CreateStreamerInput) => {
       const sourceUrl = input.sourceUrl.trim();
@@ -651,6 +676,7 @@ export function createBrowserApi(): ClientApi {
     subscribePreview: async () => () => undefined,
     subscribeThumbnail: async () => () => undefined,
     subscribeAi: async () => () => undefined,
+    subscribeActivation: async () => () => undefined,
   };
 }
 

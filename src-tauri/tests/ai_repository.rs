@@ -619,7 +619,7 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
         .mark_highlight_chunk_running(run.id, chunks[0].id)
         .unwrap();
     repository
-        .complete_highlight_chunk(run.id, chunks[0].id, &[persisted_draft.clone()], 7)
+        .complete_highlight_chunk(run.id, chunks[0].id, std::slice::from_ref(&persisted_draft), 7)
         .unwrap();
     let progress = repository.highlight_progress(run.id).unwrap();
     assert_eq!(progress.total_batches, 1);
@@ -646,8 +646,8 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
         .publish_highlight_results(
             run.id,
             chunks[0].id,
-            &[persisted_draft.clone()],
-            &[persisted_score.clone()],
+            std::slice::from_ref(&persisted_draft),
+            std::slice::from_ref(&persisted_score),
             12,
         )
         .unwrap();
