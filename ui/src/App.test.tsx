@@ -332,6 +332,47 @@ describe("App", () => {
     expect(api.showDouyinVerification).toHaveBeenCalledTimes(1);
   });
 
+  it("主播表格分别展示未开播、直播中和需要访问验证", async () => {
+    const statusStreamers = [
+      {
+        ...streamer,
+        id: 41,
+        name: "未开播主播",
+        liveStatus: "offline",
+        monitorStatus: "waiting",
+      },
+      {
+        ...streamer,
+        id: 42,
+        name: "直播中主播",
+        liveStatus: "live",
+        monitorStatus: "waiting_resource",
+      },
+      {
+        ...streamer,
+        id: 43,
+        name: "风控主播",
+        liveStatus: "error",
+        monitorStatus: "verification_required",
+        lastError: "抖音公开页需要完成访问验证",
+      },
+    ] as Streamer[];
+
+    render(<App api={createApi(statusStreamers)} />);
+
+    const rows = await screen.findAllByTestId("streamer-row");
+    const rowFor = (name: string) => rows.find((row) => row.textContent?.includes(name));
+    const offlineRow = rowFor("未开播主播");
+    const liveRow = rowFor("直播中主播");
+    const verificationRow = rowFor("风控主播");
+    expect(offlineRow).toHaveTextContent("未开播");
+    expect(offlineRow).toHaveTextContent("等待开播");
+    expect(offlineRow).not.toHaveTextContent("需要访问验证");
+    expect(liveRow).toHaveTextContent("直播中");
+    expect(liveRow).not.toHaveTextContent("需要访问验证");
+    expect(verificationRow).toHaveTextContent("需要访问验证");
+  });
+
   it("浏览器解析状态展示排队数量和当前主播且会话恢复后刷新", async () => {
     let accessListener: ((state: BrowserAccessState) => void) | undefined;
     const api = createApi([streamer]);

@@ -343,7 +343,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .ai-transcript-panel { min-height: 420px; }
 .ai-transcript-panel > header { flex-wrap: wrap; gap: 8px; }
 .ai-result-actions { margin-left: auto; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
-.ai-segment-list { max-height: 510px; overflow: auto; }
+.ai-segment-list { max-height: 510px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .ai-segment-row { position: relative; min-height: 62px; display: flex; align-items: stretch; border-bottom: 1px solid var(--line); }
 .ai-segment-row.active { background: #e9f7f1; box-shadow: inset 3px 0 var(--green); }
 .ai-segment-main { min-width: 0; min-height: 61px; padding: 10px 6px 10px 12px; flex: 1; display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: start; gap: 10px; text-align: left; border: 0; color: var(--ink); background: transparent; cursor: pointer; }

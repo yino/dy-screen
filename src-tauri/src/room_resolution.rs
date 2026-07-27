@@ -16,7 +16,7 @@ use dy_screen::error::{RecorderError, Result};
 use dy_screen::resolver::{
     RoomDiagnostic, RoomInspection, RoomInspectionAttempt, StreamResolver, validate_room_url,
 };
-use tokio::sync::{broadcast, Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::{BrowserAccessState, BrowserAccessStatus};
@@ -319,6 +319,15 @@ impl RoomResolutionService {
     }
 
     pub async fn show_verification(&self) -> Result<()> {
+        if self.verification_target().is_some() {
+            match self.check_pending_verification().await {
+                Ok(()) | Err(RecorderError::BrowserSessionUnavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if self.verification_target().is_none() {
+            return Ok(());
+        }
         self.browser.show_verification().await?;
         self.start_verification_watch();
         Ok(())
@@ -723,6 +732,9 @@ impl RoomResolutionService {
                 AccessClassification::VerificationRequired,
                 AccessNextAction::WaitForUser,
             ),
+            Some(Err(RecorderError::UnsupportedPageLayout)) if !markers.access_restricted => {
+                (AccessClassification::LayoutChanged, AccessNextAction::Retry)
+            }
             Some(Err(RecorderError::UnsupportedPageLayout)) => {
                 (AccessClassification::Pending, AccessNextAction::WaitForUser)
             }
@@ -758,6 +770,13 @@ impl RoomResolutionService {
 
         match parsed {
             Some(Ok(_)) => {
+                self.complete_verification(target.request_generation)
+                    .await?;
+            }
+            Some(Err(RecorderError::UnsupportedPageLayout)) if !markers.access_restricted => {
+                // A completed target document without a visible challenge cannot be
+                // repaired in the verification window. Clear the stale target so
+                // monitoring can classify or retry the room normally.
                 self.complete_verification(target.request_generation)
                     .await?;
             }

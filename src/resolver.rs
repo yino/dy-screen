@@ -174,7 +174,7 @@ pub fn diagnose_room_response(
         .unwrap_or_else(|_| "<invalid>".to_owned());
     let access_restricted = is_access_restricted_page(page);
     let pace_payload = page.contains("self.__pace_f.push");
-    let parsed = if status.is_success() && !access_restricted {
+    let parsed = if status.is_success() {
         Url::parse(&room_url)
             .ok()
             .and_then(|url| room_web_rid(&url))
@@ -186,8 +186,9 @@ pub fn diagnose_room_response(
     } else {
         None
     };
+    let effective_access_restriction = access_restricted && parsed.is_none();
     let markers = RoomDiagnosticMarkers {
-        access_restricted,
+        access_restricted: effective_access_restriction,
         pace_payload,
         supported_room: parsed.is_some(),
     };
@@ -205,13 +206,13 @@ pub fn diagnose_room_response(
             RoomDiagnosticClassification::RetryableError,
             Some(error.safe_message()),
         ),
-        Ok(()) if access_restricted => (
-            RoomDiagnosticClassification::AccessRestricted,
-            Some(RecorderError::RoomAccessRestricted.safe_message()),
-        ),
         Ok(()) => match parsed {
             Some(RoomInspection::Live(_)) => (RoomDiagnosticClassification::Live, None),
             Some(RoomInspection::Offline { .. }) => (RoomDiagnosticClassification::Offline, None),
+            None if effective_access_restriction => (
+                RoomDiagnosticClassification::AccessRestricted,
+                Some(RecorderError::RoomAccessRestricted.safe_message()),
+            ),
             None => (
                 RoomDiagnosticClassification::LayoutChanged,
                 Some(RecorderError::UnsupportedPageLayout.safe_message()),
@@ -309,16 +310,38 @@ fn parse_room_inspection_with_identity(
     page: &str,
     expected_web_rid: Option<&str>,
 ) -> Result<RoomInspection> {
-    if is_access_restricted_page(page) {
-        return Err(RecorderError::RoomAccessRestricted);
-    }
     let document = Html::parse_document(page);
+    let active_challenge = has_explicit_room_access_challenge(page, &document);
     let selector = Selector::parse("script").expect("static script selector");
     let scripts = document.select(&selector).filter_map(|script| {
         let text = script.text().collect::<String>();
         text.contains("self.__pace_f.push").then_some(text)
     });
-    parse_room_scripts_with_identity(scripts, expected_web_rid)
+    match parse_room_scripts_with_identity(scripts, expected_web_rid) {
+        Ok(inspection @ RoomInspection::Offline { .. }) => Ok(inspection),
+        Ok(RoomInspection::Live(_)) if active_challenge => Err(RecorderError::RoomAccessRestricted),
+        Ok(inspection) => Ok(inspection),
+        Err(RecorderError::UnsupportedPageLayout) if is_access_restricted_page(page) => {
+            Err(RecorderError::RoomAccessRestricted)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn has_explicit_room_access_challenge(page: &str, document: &Html) -> bool {
+    let challenge_selector = Selector::parse(
+        "#verify-center, #captcha-interstitial, [class*='captcha_verify'], [id*='captcha-verify']",
+    )
+    .expect("static access challenge selector");
+    let title_selector = Selector::parse("title").expect("static title selector");
+    let challenge_title = document
+        .select(&title_selector)
+        .any(|title| title.text().collect::<String>().contains("验证码中间页"));
+    let challenge_script = (page.contains("byted_acrawler")
+        && (page.contains("__ac_nonce") || page.contains("__ac_signature")))
+        || page.contains("captchaBody");
+
+    document.select(&challenge_selector).next().is_some() || challenge_title || challenge_script
 }
 
 pub fn parse_room_scripts<I, S>(scripts: I) -> Result<RoomInspection>

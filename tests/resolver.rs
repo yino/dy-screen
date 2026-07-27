@@ -56,6 +56,98 @@ fn inspects_canonical_identity_for_offline_room() {
 }
 
 #[test]
+fn offline_room_data_takes_precedence_over_passive_captcha_assets() {
+    let page = format!(
+        r#"{OFFLINE_PAGE}<script src="https://lf-cdn/sec_sdk_build/captcha/index.js"></script>"#
+    );
+
+    assert_eq!(
+        parse_room_inspection(&page).expect("带通用验证码资源的下播页"),
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned(),
+        }
+    );
+
+    let diagnostic = diagnose_room_response(
+        "https://live.douyin.com/offline-room",
+        StatusCode::OK,
+        Some("text/html"),
+        &page,
+    );
+    assert_eq!(
+        diagnostic.classification,
+        RoomDiagnosticClassification::Offline
+    );
+    assert!(!diagnostic.markers.access_restricted);
+    assert!(diagnostic.markers.supported_room);
+}
+
+#[test]
+fn passive_captcha_assets_do_not_hide_a_live_room() {
+    let page = format!(
+        r#"{LIVE_PAGE}<script src="https://lf-cdn/sec_sdk_build/captcha/index.js"></script>"#
+    );
+
+    assert!(matches!(
+        parse_room_inspection(&page).expect("带通用验证码资源的直播页"),
+        RoomInspection::Live(_)
+    ));
+    let diagnostic = diagnose_room_response(
+        "https://live.douyin.com/292895634635",
+        StatusCode::OK,
+        Some("text/html"),
+        &page,
+    );
+    assert_eq!(
+        diagnostic.classification,
+        RoomDiagnosticClassification::Live
+    );
+    assert!(!diagnostic.markers.access_restricted);
+    assert!(diagnostic.markers.supported_room);
+}
+
+#[test]
+fn explicit_challenge_blocks_live_room_but_not_known_offline_room() {
+    let challenged_live = format!(r#"{LIVE_PAGE}<div id="verify-center">请完成验证</div>"#);
+    assert!(matches!(
+        parse_room_inspection(&challenged_live),
+        Err(RecorderError::RoomAccessRestricted)
+    ));
+    let live_diagnostic = diagnose_room_response(
+        "https://live.douyin.com/292895634635",
+        StatusCode::OK,
+        Some("text/html"),
+        &challenged_live,
+    );
+    assert_eq!(
+        live_diagnostic.classification,
+        RoomDiagnosticClassification::AccessRestricted
+    );
+    assert!(live_diagnostic.markers.access_restricted);
+    assert!(!live_diagnostic.markers.supported_room);
+
+    let challenged_offline = format!(r#"{OFFLINE_PAGE}<div id="verify-center">请完成验证</div>"#);
+    assert_eq!(
+        parse_room_inspection(&challenged_offline).expect("风控页仍能确定已经下播"),
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned(),
+        }
+    );
+    let offline_diagnostic = diagnose_room_response(
+        "https://live.douyin.com/offline-room",
+        StatusCode::OK,
+        Some("text/html"),
+        &challenged_offline,
+    );
+    assert_eq!(
+        offline_diagnostic.classification,
+        RoomDiagnosticClassification::Offline
+    );
+    assert!(!offline_diagnostic.markers.access_restricted);
+    assert!(offline_diagnostic.markers.supported_room);
+}
+
+#[test]
 fn target_identity_ignores_an_unrelated_live_room_before_the_requested_room() {
     let live_script = LIVE_PAGE
         .split("<script>")

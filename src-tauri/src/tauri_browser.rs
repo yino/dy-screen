@@ -37,20 +37,49 @@ const BROWSER_SNAPSHOT_SCRIPT: &str = r##"
     totalBytes += bytes;
   }
   const title = String(document.title || "");
-  const hasChallengeNode = Boolean(document.querySelector(
-    "#verify-center, #captcha-interstitial, [class*='captcha_verify'], [id*='captcha-verify']"
-  ));
-  const hasChallengeScript = pageScripts.some((script) => {
-    const source = String(script.src || "");
-    return source.includes("sec_sdk_build") && source.includes("/captcha/");
-  });
+  const isVisible = (element) => {
+    if (!(element instanceof Element)) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && style.opacity !== "0"
+      && rect.width > 0
+      && rect.height > 0;
+  };
+  const challengeSelector = [
+    "#verify-center",
+    "#captcha-interstitial",
+    "[class*='captcha_verify']",
+    "[id*='captcha-verify']",
+    "iframe[src*='/verifycenter/captcha/']"
+  ].join(",");
+  const hasChallengeNode = Array.from(document.querySelectorAll(challengeSelector)).some(isVisible);
+  const challengeVisible = hasChallengeNode || title.includes("验证码中间页");
+  const offlineLabels = new Set(["直播已结束", "当前直播已结束"]);
+  const textWalker = document.body
+    ? document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+    : null;
+  let roomOffline = false;
+  let checkedTextNodes = 0;
+  while (!challengeVisible && textWalker && checkedTextNodes < 5000) {
+    const textNode = textWalker.nextNode();
+    if (!textNode) break;
+    checkedTextNodes += 1;
+    const text = String(textNode.textContent || "").replace(/\s+/g, " ").trim();
+    if (offlineLabels.has(text) && isVisible(textNode.parentElement)) {
+      roomOffline = true;
+      break;
+    }
+  }
   return {
     url: String(location.href || ""),
     title: title.slice(0, 512),
     readyState: String(document.readyState || "loading"),
     markers: {
-      accessRestricted: hasChallengeNode || hasChallengeScript || title.includes("验证码中间页"),
+      accessRestricted: challengeVisible,
       pacePayload,
+      roomOffline,
       snapshotOverflow
     },
     scripts
@@ -333,6 +362,9 @@ mod tests {
         assert!(BROWSER_SNAPSHOT_SCRIPT.contains("maxScripts = 32"));
         assert!(BROWSER_SNAPSHOT_SCRIPT.contains("maxBytes = 2097152"));
         assert!(BROWSER_SNAPSHOT_SCRIPT.contains("snapshotOverflow"));
+        assert!(BROWSER_SNAPSHOT_SCRIPT.contains("roomOffline"));
+        assert!(BROWSER_SNAPSHOT_SCRIPT.contains("challengeVisible"));
+        assert!(BROWSER_SNAPSHOT_SCRIPT.contains("checkedTextNodes < 5000"));
         assert!(!BROWSER_SNAPSHOT_SCRIPT.contains("document.cookie"));
         assert!(!BROWSER_SNAPSHOT_SCRIPT.contains("localStorage"));
         assert!(!BROWSER_SNAPSHOT_SCRIPT.contains("outerHTML"));

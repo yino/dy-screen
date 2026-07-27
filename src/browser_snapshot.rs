@@ -25,6 +25,8 @@ pub struct BrowserSnapshotMarkers {
     pub access_restricted: bool,
     pub pace_payload: bool,
     #[serde(default)]
+    pub room_offline: bool,
+    #[serde(default)]
     pub snapshot_overflow: bool,
 }
 
@@ -129,23 +131,58 @@ impl fmt::Debug for BrowserPageSnapshot {
 }
 
 pub fn parse_browser_snapshot(snapshot: &BrowserPageSnapshot) -> Result<RoomInspection> {
-    if snapshot.markers.access_restricted {
-        return Err(RecorderError::RoomAccessVerificationRequired);
+    match parse_room_scripts(snapshot.scripts.iter().map(String::as_str)) {
+        Ok(inspection @ RoomInspection::Offline { .. }) => Ok(inspection),
+        Ok(RoomInspection::Live(_)) if snapshot.markers.access_restricted => {
+            Err(RecorderError::RoomAccessVerificationRequired)
+        }
+        Ok(inspection) => Ok(inspection),
+        Err(RecorderError::UnsupportedPageLayout) if snapshot.markers.room_offline => {
+            Ok(RoomInspection::Offline {
+                room_id: snapshot_room_id(snapshot)?,
+            })
+        }
+        Err(RecorderError::UnsupportedPageLayout) if snapshot.markers.access_restricted => {
+            Err(RecorderError::RoomAccessVerificationRequired)
+        }
+        Err(error) => Err(error),
     }
-    parse_room_scripts(snapshot.scripts.iter().map(String::as_str))
 }
 
 pub fn parse_browser_snapshot_for_web_rid(
     snapshot: &BrowserPageSnapshot,
     expected_web_rid: &str,
 ) -> Result<RoomInspection> {
-    if snapshot.markers.access_restricted {
-        return Err(RecorderError::RoomAccessVerificationRequired);
-    }
-    parse_room_scripts_for_web_rid(
+    match parse_room_scripts_for_web_rid(
         snapshot.scripts.iter().map(String::as_str),
         expected_web_rid,
-    )
+    ) {
+        Ok(inspection @ RoomInspection::Offline { .. }) => Ok(inspection),
+        Ok(RoomInspection::Live(_)) if snapshot.markers.access_restricted => {
+            Err(RecorderError::RoomAccessVerificationRequired)
+        }
+        Ok(inspection) => Ok(inspection),
+        Err(RecorderError::UnsupportedPageLayout) if snapshot.markers.room_offline => {
+            Ok(RoomInspection::Offline {
+                room_id: expected_web_rid.to_owned(),
+            })
+        }
+        Err(RecorderError::UnsupportedPageLayout) if snapshot.markers.access_restricted => {
+            Err(RecorderError::RoomAccessVerificationRequired)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn snapshot_room_id(snapshot: &BrowserPageSnapshot) -> Result<String> {
+    Url::parse(snapshot.url())
+        .ok()
+        .and_then(|url| {
+            url.path_segments()?
+                .find(|segment| !segment.is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or(RecorderError::InvalidBrowserSnapshot)
 }
 
 pub fn is_allowed_douyin_page_url(input: &str) -> bool {

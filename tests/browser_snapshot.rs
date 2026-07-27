@@ -113,6 +113,67 @@ fn browser_challenge_requires_manual_verification_without_leaking_page_data() {
 }
 
 #[test]
+fn visible_challenge_blocks_live_but_not_structurally_known_offline_room() {
+    let live_snapshot = BrowserPageSnapshot::from_json(&snapshot_json(
+        "https://live.douyin.com/292895634635",
+        "直播间",
+        true,
+        &[pace_script(LIVE_PAGE)],
+    ))
+    .expect("valid challenged live snapshot");
+    assert!(matches!(
+        parse_browser_snapshot_for_web_rid(&live_snapshot, "292895634635"),
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+
+    let offline_snapshot = BrowserPageSnapshot::from_json(&snapshot_json(
+        "https://live.douyin.com/offline-room",
+        "直播间",
+        true,
+        &[pace_script(OFFLINE_PAGE)],
+    ))
+    .expect("valid challenged offline snapshot");
+    assert_eq!(
+        parse_browser_snapshot_for_web_rid(&offline_snapshot, "offline-room")
+            .expect("challenge does not hide known offline state"),
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn visible_offline_state_takes_precedence_over_passive_challenge_assets() {
+    let json = serde_json::json!({
+        "url": "https://live.douyin.com/offline-room",
+        "title": "直播间",
+        "readyState": "complete",
+        "markers": {
+            "accessRestricted": false,
+            "pacePayload": false,
+            "roomOffline": true
+        },
+        "scripts": []
+    })
+    .to_string();
+    let snapshot = BrowserPageSnapshot::from_json(&json).expect("valid offline snapshot");
+
+    assert_eq!(
+        parse_browser_snapshot(&snapshot).expect("visible offline state"),
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned(),
+        }
+    );
+    assert_eq!(
+        parse_browser_snapshot_for_web_rid(&snapshot, "offline-room")
+            .expect("target visible offline state"),
+        RoomInspection::Offline {
+            room_id: "offline-room".to_owned(),
+        }
+    );
+}
+
+#[test]
 fn browser_snapshot_rejects_unknown_layout_and_untrusted_or_oversized_input() {
     let unknown = BrowserPageSnapshot::from_json(&snapshot_json(
         "https://live.douyin.com/703940802949",

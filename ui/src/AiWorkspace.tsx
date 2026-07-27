@@ -170,6 +170,20 @@ function currentSegmentAt(
   return candidate && currentTimeMs < candidate.sourceEndMs ? candidate : null;
 }
 
+function scrollRowInsideContainer(container: HTMLElement, row: HTMLElement): void {
+  const containerRect = container.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  let nextScrollTop = container.scrollTop;
+  if (rowRect.top < containerRect.top) {
+    nextScrollTop -= containerRect.top - rowRect.top;
+  } else if (rowRect.bottom > containerRect.bottom) {
+    nextScrollTop += rowRect.bottom - containerRect.bottom;
+  }
+  if (nextScrollTop !== container.scrollTop) {
+    container.scrollTop = Math.max(0, nextScrollTop);
+  }
+}
+
 async function copyText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -339,6 +353,7 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const [projectTags, setProjectTags] = useState("");
   const [analysisGoal, setAnalysisGoal] = useState("");
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const segmentListRef = useRef<HTMLDivElement | null>(null);
   const previewInputRef = useRef<number | null>(null);
   const highlightPlaybackRef = useRef<HighlightPlaybackRange | null>(null);
   const selectedProjectRef = useRef<number | null>(null);
@@ -641,10 +656,15 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   useEffect(() => {
     if (!followPlayback || !currentSegmentId) return;
     const index = segments.findIndex((segment) => segment.stableSegmentId === currentSegmentId);
-    if (index >= 0) setSegmentPage(Math.floor(index / segmentPageSize));
+    const targetPage = index >= 0 ? Math.floor(index / segmentPageSize) : -1;
+    if (targetPage >= 0 && targetPage !== segmentPage) {
+      setSegmentPage(targetPage);
+      return;
+    }
+    const list = segmentListRef.current;
     const row = document.getElementById(`ai-segment-${currentSegmentId}`);
-    if (row && "scrollIntoView" in row) row.scrollIntoView({ block: "nearest" });
-  }, [currentSegmentId, followPlayback, segments]);
+    if (list && row && list.contains(row)) scrollRowInsideContainer(list, row);
+  }, [currentSegmentId, followPlayback, segmentPage, segments]);
 
   useEffect(() => {
     if (!pendingHighlightSeek || currentInputId !== pendingHighlightSeek.inputId) return;
@@ -669,8 +689,9 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     if (highlightView === "transcript" || !activeHighlightCandidate) return;
     const segmentId = activeHighlightSegments[0]?.stableSegmentId;
     if (!segmentId || activeHighlightCandidate.inputId !== currentInputId) return;
+    const list = segmentListRef.current;
     const row = document.getElementById(`ai-segment-${segmentId}`);
-    if (row && "scrollIntoView" in row) row.scrollIntoView({ block: "nearest" });
+    if (list && row && list.contains(row)) scrollRowInsideContainer(list, row);
   }, [activeHighlightCandidate, activeHighlightSegments, currentInputId, highlightView]);
 
   const run = async (operation: () => Promise<void>, success?: string) => {
@@ -1113,7 +1134,7 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
                           </article>}
                         </>}
                       </div>}
-                      {segments.length === 0 ? <div className="ai-transcript-empty">{currentTranscript?.errorMessage ?? "当前视频还没有可用转写文本"}</div> : highlightView !== "transcript" && !activeHighlightCandidate ? null : displayedSegments.length === 0 ? <div className="ai-transcript-empty">当前候选没有可用的稳定 ASR 句段</div> : <><div className="ai-segment-list" aria-label="转写句段列表">{displayedSegments.map((segment) => {
+                      {segments.length === 0 ? <div className="ai-transcript-empty">{currentTranscript?.errorMessage ?? "当前视频还没有可用转写文本"}</div> : highlightView !== "transcript" && !activeHighlightCandidate ? null : displayedSegments.length === 0 ? <div className="ai-transcript-empty">当前候选没有可用的稳定 ASR 句段</div> : <><div ref={segmentListRef} className="ai-segment-list" aria-label="转写句段列表">{displayedSegments.map((segment) => {
                         const segmentCandidates = highlightCandidatesBySegment.get(segment.stableSegmentId) ?? [];
                         const currentHighlight = activeHighlightSegmentIds.has(segment.stableSegmentId);
                         return <div id={`ai-segment-${segment.stableSegmentId}`} key={segment.stableSegmentId} className={`ai-segment-row ${segment.stableSegmentId === currentSegmentId ? "active" : ""} ${currentHighlight ? "highlight-current" : segmentCandidates.length > 0 ? "highlight-related" : ""}`}><button className="ai-segment-main" disabled={!previewReady} onClick={() => seekSegment(segment)}><time>{formatTimestamp(segment.sourceStartMs)}<span>– {formatTimestamp(segment.sourceEndMs)}</span></time><p>{segment.normalizedText}</p>{segment.confidence !== null && segment.confidence < 0.55 && <em>低置信</em>}</button>{segmentCandidates.length > 0 && <span className="ai-segment-highlight-marker" aria-label={`句段包含 ${segmentCandidates.length} 个高光候选`} title={segmentCandidates.map((candidate) => `${candidate.title} ${candidate.totalScore.toFixed(0)} 分`).join("；")}>{segmentCandidates.length > 1 ? `${segmentCandidates.length} 个候选` : `${segmentCandidates[0].totalScore.toFixed(0)} 分`}</span>}<button className="ai-segment-copy" aria-label={`复制句段 ${formatTimestamp(segment.sourceStartMs)}`} onClick={() => void copy(() => api.copyAiSegmentText(detail.project.id, segment.stableSegmentId), "已复制句段")}><Clipboard size={13} /></button></div>;

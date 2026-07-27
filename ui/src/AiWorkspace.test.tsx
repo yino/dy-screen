@@ -433,7 +433,10 @@ describe("AiWorkspace", () => {
 
     expect(await screen.findByText("欢迎来到直播间。")).toBeInTheDocument();
     expect(screen.getAllByText(/Windows 中文目录/).length).toBeGreaterThan(0);
-    expect(api.requestAiInputPreview).toHaveBeenCalledWith(project.id, completedInput.id);
+    await waitFor(() => expect(api.requestAiInputPreview).toHaveBeenCalledWith(
+      project.id,
+      completedInput.id,
+    ));
     const video = await screen.findByLabelText("AI 视频播放器") as HTMLVideoElement;
     Object.defineProperty(video, "videoWidth", { configurable: true, value: 720 });
     Object.defineProperty(video, "videoHeight", { configurable: true, value: 1270 });
@@ -448,6 +451,51 @@ describe("AiWorkspace", () => {
     expect(await screen.findByText("欢迎来到直播间。", { selector: ".ai-subtitle-overlay" })).toBeInTheDocument();
     expect(screen.getByText("欢迎来到直播间。", { selector: ".ai-segment-main p" }).closest(".ai-segment-row")).toHaveClass("active");
     expect(api.exportAiTxt).not.toHaveBeenCalled();
+  });
+
+  it("跟随播放只滚动转写列表而不推动整个页面", async () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(window.HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const api = createAiApi();
+    render(<AiWorkspace api={api} />);
+
+    const video = await screen.findByLabelText("AI 视频播放器") as HTMLVideoElement;
+    const segmentList = screen.getByLabelText("转写句段列表");
+    const targetRow = screen.getByText("今天价格99元。", { selector: ".ai-segment-main p" })
+      .closest(".ai-segment-row") as HTMLElement;
+    segmentList.scrollTop = 10;
+    vi.spyOn(segmentList, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 100,
+      top: 100,
+      right: 500,
+      bottom: 200,
+      left: 0,
+      width: 500,
+      height: 100,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(targetRow, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 220,
+      top: 220,
+      right: 500,
+      bottom: 260,
+      left: 0,
+      width: 500,
+      height: 40,
+      toJSON: () => ({}),
+    });
+
+    Object.defineProperty(video, "currentTime", { configurable: true, value: 3.2, writable: true });
+    fireEvent.timeUpdate(video);
+
+    await waitFor(() => expect(targetRow).toHaveClass("active"));
+    expect(segmentList.scrollTop).toBe(70);
+    expect(scrollIntoView).not.toHaveBeenCalled();
   });
 
   it("高光分析等待 LLM 返回时显示专用进度并在完成后收起", async () => {

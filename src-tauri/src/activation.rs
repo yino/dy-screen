@@ -301,7 +301,9 @@ impl TelemetryQueue {
     pub fn spawn(service: ActivationService) -> Self {
         let (sender, mut receiver) = mpsc::channel(TELEMETRY_QUEUE_CAPACITY);
         let cancellation = service.cancellation();
-        tokio::spawn(async move {
+        // Tauri 的 setup 回调在 macOS UI 主线程执行，那里没有当前 Tokio
+        // reactor；使用 Tauri 全局运行时可安全地从同步初始化路径启动队列。
+        tauri::async_runtime::spawn(async move {
             let mut batch = Vec::with_capacity(TELEMETRY_BATCH_SIZE);
             let mut interval = tokio::time::interval(TELEMETRY_FLUSH_INTERVAL);
             loop {
@@ -352,6 +354,7 @@ pub fn api_error_is_revocation(error: &ApiError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{ApiConfig, PlainJsonCodec};
 
     #[test]
     fn device_id_is_stable_and_frontend_only_gets_hint() {
@@ -392,5 +395,28 @@ mod tests {
         assert!(!view.active);
         let json = serde_json::to_string(&view).unwrap();
         assert!(!json.contains("SECRET"));
+    }
+
+    #[test]
+    fn telemetry_queue_can_start_without_a_current_tokio_reactor() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let api = ApiClient::new(
+            ApiConfig {
+                base_url: "http://127.0.0.1/api".to_owned(),
+                timeout: Duration::from_millis(50),
+                client_version: "test".to_owned(),
+                platform: "mac".to_owned(),
+            },
+            Arc::new(PlainJsonCodec),
+        )
+        .unwrap();
+        let service = ActivationService::new(database, api, Path::new("/tmp/dy-screen-test"))
+            .unwrap();
+
+        let queue = TelemetryQueue::spawn(service.clone());
+        queue.track("app_open", Map::new());
+        service.shutdown();
     }
 }

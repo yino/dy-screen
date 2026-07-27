@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 const LIVE_PAGE: &str = include_str!("../../tests/fixtures/live_room.html");
+const OFFLINE_PAGE: &str = include_str!("../../tests/fixtures/offline_room.html");
 
 fn pace_script(page: &str) -> String {
     let start = page.find("self.__pace_f.push").unwrap();
@@ -46,6 +47,61 @@ fn browser_snapshot_for(web_rid: &str, access_restricted: bool) -> BrowserPageSn
             "markers": {
                 "accessRestricted": access_restricted,
                 "pacePayload": !scripts.is_empty()
+            },
+            "scripts": scripts
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn offline_browser_snapshot_for(web_rid: &str) -> BrowserPageSnapshot {
+    BrowserPageSnapshot::from_json(
+        &serde_json::json!({
+            "url": format!("https://live.douyin.com/{web_rid}"),
+            "title": "直播间",
+            "readyState": "complete",
+            "markers": {
+                "accessRestricted": false,
+                "pacePayload": false,
+                "roomOffline": true
+            },
+            "scripts": []
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn plain_unknown_browser_snapshot_for(web_rid: &str) -> BrowserPageSnapshot {
+    BrowserPageSnapshot::from_json(
+        &serde_json::json!({
+            "url": format!("https://live.douyin.com/{web_rid}"),
+            "title": "直播间",
+            "readyState": "complete",
+            "markers": {
+                "accessRestricted": false,
+                "pacePayload": false,
+                "roomOffline": false
+            },
+            "scripts": []
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn challenged_offline_browser_snapshot_for(web_rid: &str) -> BrowserPageSnapshot {
+    let scripts = vec![pace_script(OFFLINE_PAGE).replace("offline-room", web_rid)];
+    BrowserPageSnapshot::from_json(
+        &serde_json::json!({
+            "url": format!("https://live.douyin.com/{web_rid}"),
+            "title": "直播间",
+            "readyState": "complete",
+            "markers": {
+                "accessRestricted": true,
+                "pacePayload": true,
+                "roomOffline": false
             },
             "scripts": scripts
         })
@@ -183,6 +239,7 @@ struct FakeBrowserDriver {
     active_snapshots: AtomicUsize,
     max_active_snapshots: AtomicUsize,
     clear_count: AtomicUsize,
+    show_count: AtomicUsize,
 }
 
 impl FakeBrowserDriver {
@@ -196,6 +253,7 @@ impl FakeBrowserDriver {
             active_snapshots: AtomicUsize::new(0),
             max_active_snapshots: AtomicUsize::new(0),
             clear_count: AtomicUsize::new(0),
+            show_count: AtomicUsize::new(0),
         }
     }
 
@@ -218,6 +276,7 @@ impl FakeBrowserDriver {
             active_snapshots: AtomicUsize::new(0),
             max_active_snapshots: AtomicUsize::new(0),
             clear_count: AtomicUsize::new(0),
+            show_count: AtomicUsize::new(0),
         }
     }
 
@@ -270,6 +329,7 @@ impl BrowserPageDriver for FakeBrowserDriver {
     }
 
     async fn show_verification(&self) -> dy_screen::Result<()> {
+        self.show_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -787,8 +847,12 @@ async fn verification_watcher_deduplicates_unchanged_probe_diagnostics() {
     let native = Arc::new(FakeNativeResolver::new([NativeReply::AccessRestricted]));
     let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
     let publisher = Arc::new(CapturingPublisher::default());
-    let service =
-        RoomResolutionService::with_policy(native, browser, publisher.clone(), short_policy());
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        publisher.clone(),
+        short_policy(),
+    );
 
     assert!(matches!(
         service
@@ -819,6 +883,7 @@ async fn verification_watcher_deduplicates_unchanged_probe_diagnostics() {
     tokio::time::sleep(Duration::from_millis(25)).await;
 
     assert_eq!(verification_probe_count(), before_watch);
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -860,10 +925,136 @@ async fn verification_window_watches_current_page_and_recovers_without_reloading
         .expect("access recovery notification")
         .expect("access recovery channel");
     assert!(generation > 0);
-    assert!(tokio::time::timeout(Duration::from_millis(10), recovered.recv())
-        .await
-        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), recovered.recv())
+            .await
+            .is_err()
+    );
     assert_eq!(browser.navigations.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn verification_button_does_not_show_a_room_that_became_offline() {
+    let native = Arc::new(FakeNativeResolver::new([NativeReply::AccessRestricted]));
+    let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        Arc::new(NoopRoomResolutionPublisher),
+        short_policy(),
+    );
+
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+    browser.replace_snapshot(offline_browser_snapshot_for("292895634635"));
+
+    service
+        .show_verification()
+        .await
+        .expect("下播目标在显示前自动跳过");
+
+    assert_eq!(
+        service.access_state().status,
+        BrowserAccessStatus::SessionReady
+    );
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn verification_button_does_not_show_a_plain_page_without_a_visible_challenge() {
+    let native = Arc::new(FakeNativeResolver::new([NativeReply::AccessRestricted]));
+    let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        Arc::new(NoopRoomResolutionPublisher),
+        short_policy(),
+    );
+
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+    browser.replace_snapshot(plain_unknown_browser_snapshot_for("292895634635"));
+
+    service
+        .show_verification()
+        .await
+        .expect("没有可见验证码的普通页面不应打开验证窗口");
+
+    assert_eq!(
+        service.access_state().status,
+        BrowserAccessStatus::SessionReady
+    );
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn hidden_browser_probe_classifies_offline_before_requesting_verification() {
+    let native = Arc::new(FakeNativeResolver::new([NativeReply::AccessRestricted]));
+    let browser = Arc::new(FakeBrowserDriver::new(offline_browser_snapshot_for(
+        "292895634635",
+    )));
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        Arc::new(NoopRoomResolutionPublisher),
+        short_policy(),
+    );
+
+    let inspection = service
+        .inspect_with_context("https://live.douyin.com/292895634635", context())
+        .await
+        .expect("隐藏浏览器检查识别下播页");
+
+    assert_eq!(
+        inspection,
+        RoomInspection::Offline {
+            room_id: "292895634635".to_owned(),
+        }
+    );
+    assert_eq!(
+        service.access_state().status,
+        BrowserAccessStatus::SessionReady
+    );
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn challenged_browser_probe_uses_reliable_offline_state_without_requesting_verification() {
+    let native = Arc::new(FakeNativeResolver::new([NativeReply::AccessRestricted]));
+    let browser = Arc::new(FakeBrowserDriver::new(
+        challenged_offline_browser_snapshot_for("292895634635"),
+    ));
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        Arc::new(NoopRoomResolutionPublisher),
+        short_policy(),
+    );
+
+    let inspection = service
+        .inspect_with_context("https://live.douyin.com/292895634635", context())
+        .await
+        .expect("风控不覆盖可靠的下播状态");
+
+    assert_eq!(
+        inspection,
+        RoomInspection::Offline {
+            room_id: "292895634635".to_owned(),
+        }
+    );
+    assert_eq!(
+        service.access_state().status,
+        BrowserAccessStatus::SessionReady
+    );
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
