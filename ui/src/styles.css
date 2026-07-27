@@ -577,6 +577,7 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .resource-component { padding-bottom: 8px; border-bottom: 1px solid var(--line); }
 .resource-progress { margin: 22px 0; }
 .progress-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
+.progress-header > span { display: flex; align-items: center; gap: 6px; }
 .progress-track { height: 8px; overflow: hidden; background: var(--line); border-radius: 999px; }
 .progress-track span { display: block; height: 100%; background: var(--green); transition: width 180ms ease; }
 .resource-error { display: flex; gap: 8px; align-items: flex-start; padding: 12px; margin: 16px 0; color: #9b4339; background: #fff4f1; border: 1px solid #f1c7c0; border-radius: 8px; }

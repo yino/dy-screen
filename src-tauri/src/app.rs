@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use dy_screen::asr::FrozenMediaSource;
 use dy_screen::resolver::StreamResolver;
+use dy_screen::runtime_resources::ResourceProgress;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
@@ -218,6 +219,94 @@ fn spawn_activation_lifecycle(
     });
 }
 
+fn emit_runtime_resource_status(
+    app: &AppHandle,
+    status: RuntimeResourceView,
+    phase: &str,
+) {
+    let total_bytes = status.total_size_bytes;
+    let downloaded_bytes = if status.ready {
+        total_bytes
+    } else {
+        status.downloaded_bytes
+    };
+    let _ = app.emit(
+        "runtime-resource-event",
+        RuntimeResourceEvent {
+            status,
+            progress: ResourceProgress {
+                phase: phase.to_owned(),
+                component_id: None,
+                downloaded_bytes,
+                total_bytes,
+            },
+        },
+    );
+}
+
+async fn ensure_verified_runtime_active(
+    runtime: &RuntimeResourceState,
+    ai_runtime: &Arc<LocalAsrRuntime>,
+    supervisor: &Supervisor,
+    activation: &ActivationService,
+) -> Result<(), String> {
+    if !ai_runtime.scheduler_ready() {
+        let resource_root = runtime
+            .current_root()
+            .ok_or_else(|| "资源已校验但未找到受控资源目录".to_owned())?;
+        ai_runtime
+            .activate_resource_root(resource_root)
+            .map_err(|error| error.to_string())?;
+    }
+    if activation.is_active() {
+        ai_runtime
+            .recover_startup_and_requeue()
+            .await
+            .map_err(|error| error.to_string())?;
+        supervisor.restore().await?;
+    }
+    Ok(())
+}
+
+fn spawn_runtime_resource_initialization(
+    app: AppHandle,
+    runtime: RuntimeResourceState,
+    ai_runtime: Arc<LocalAsrRuntime>,
+    supervisor: Supervisor,
+    activation: ActivationService,
+) {
+    tauri::async_runtime::spawn(async move {
+        let verifier = runtime.clone();
+        let view = match tokio::task::spawn_blocking(move || verifier.refresh()).await {
+            Ok(view) => view,
+            Err(_) => runtime.fail_verification(),
+        };
+        if view.ready
+            && let Err(error) = ensure_verified_runtime_active(
+                &runtime,
+                &ai_runtime,
+                &supervisor,
+                &activation,
+            )
+            .await
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "component": "runtime_resources",
+                    "event": "activation_failed",
+                    "message": error,
+                })
+            );
+        }
+        emit_runtime_resource_status(
+            &app,
+            view.clone(),
+            if view.ready { "ready" } else { "failed" },
+        );
+    });
+}
+
 const HEARTBEAT_INTERVAL_FOR_APP: Duration = crate::activation::HEARTBEAT_INTERVAL;
 const HEARTBEAT_RETRY_INTERVAL_FOR_APP: Duration = crate::activation::HEARTBEAT_RETRY_INTERVAL;
 
@@ -419,7 +508,7 @@ async fn runtime_resource_download(
             .map_err(|error| error.to_string())?;
         supervisor.restore().await?;
     }
-    let _ = app.emit("runtime-resource-event", &result);
+    emit_runtime_resource_status(&app, result.clone(), "ready");
     Ok(result)
 }
 
@@ -429,8 +518,31 @@ fn runtime_resource_cancel(state: State<'_, RuntimeResourceState>) {
 }
 
 #[tauri::command]
-fn runtime_resource_recheck(state: State<'_, RuntimeResourceState>) -> RuntimeResourceView {
-    state.refresh()
+async fn runtime_resource_recheck(
+    app: AppHandle,
+    state: State<'_, RuntimeResourceState>,
+    app_state: State<'_, AppState>,
+) -> Result<RuntimeResourceView, String> {
+    let runtime = state.inner().clone();
+    let verifier = runtime.clone();
+    let view = tokio::task::spawn_blocking(move || verifier.refresh())
+        .await
+        .map_err(|_| "运行资源校验任务异常退出".to_owned())?;
+    if view.ready {
+        ensure_verified_runtime_active(
+            &runtime,
+            &app_state.ai_runtime,
+            &app_state.supervisor,
+            &app_state.activation,
+        )
+        .await?;
+    }
+    emit_runtime_resource_status(
+        &app,
+        view.clone(),
+        if view.ready { "ready" } else { "failed" },
+    );
+    Ok(view)
 }
 
 #[tauri::command]
@@ -1071,49 +1183,19 @@ pub fn run() {
                 app_data_dir.clone(),
                 desktop_asr_resource_root(app.path().resource_dir()?),
             );
-            let _ = runtime_resource_state.refresh();
             app.manage(runtime_resource_state);
-            let settings = database.get_settings()?;
 
             let asr_temporary_root = app_cache_dir.join("asr-audio");
             std::fs::create_dir_all(&asr_temporary_root)?;
-            let packaged_asr_root = desktop_asr_resource_root(app.path().resource_dir()?);
-            let asr_resource_root = app
-                .state::<RuntimeResourceState>()
-                .current_root()
-                .unwrap_or(packaged_asr_root);
-            let asr_ffprobe = app
-                .state::<RuntimeResourceState>()
-                .media_tools()
-                .ok()
-                .map(|(_, ffprobe)| ffprobe)
-                .unwrap_or_else(|| {
-                    #[cfg(debug_assertions)]
-                    {
-                        PathBuf::from(settings.ffprobe_path.clone())
-                    }
-                    #[cfg(not(debug_assertions))]
-                    {
-                        PathBuf::new()
-                    }
-                });
-            let ai_components = tauri::async_runtime::block_on(async {
-                LocalAsrRuntime::build(
-                    database.clone(),
-                    asr_resource_root,
-                    asr_ffprobe,
-                    asr_temporary_root,
-                    Arc::new(DesktopAiPublisher {
-                        app: app.handle().clone(),
-                    }),
-                )
-            });
-            if activation.is_active() {
-                tauri::async_runtime::block_on(
-                    ai_components.runtime.recover_startup_and_requeue(),
-                )
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            }
+            let ai_components = LocalAsrRuntime::build(
+                database.clone(),
+                app_cache_dir.join("runtime-resources-pending"),
+                PathBuf::new(),
+                asr_temporary_root,
+                Arc::new(DesktopAiPublisher {
+                    app: app.handle().clone(),
+                }),
+            );
             let ai_project_service = AiProjectService::new(
                 database.clone(),
                 ai_components.inspector,
@@ -1253,16 +1335,13 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
-            if activation.is_active()
-                && app
-                .state::<RuntimeResourceState>()
-                .view()
-                .ready
-            {
-                tauri::async_runtime::spawn(async move {
-                    let _ = supervisor.restore().await;
-                });
-            }
+            spawn_runtime_resource_initialization(
+                app.handle().clone(),
+                app.state::<RuntimeResourceState>().inner().clone(),
+                app.state::<AppState>().ai_runtime.clone(),
+                supervisor,
+                activation,
+            );
             Ok(())
         })
         .on_window_event(|window, event| {

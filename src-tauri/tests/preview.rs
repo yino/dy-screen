@@ -52,6 +52,10 @@ fn remux_plan_maps_optional_audio_without_shell_joining() {
             "-progress",
             "pipe:1",
             "-nostats",
+            "-f",
+            "mov",
+            "-brand",
+            "mp42",
             "/tmp/cache output.part.mp4",
         ]
     );
@@ -68,6 +72,8 @@ fn transcode_plan_targets_h264_and_optional_aac() {
     assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
     assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
     assert!(args.windows(2).any(|pair| pair == ["-map", "0:a:0?"]));
+    assert!(args.windows(2).any(|pair| pair == ["-f", "mov"]));
+    assert!(args.windows(2).any(|pair| pair == ["-brand", "mp42"]));
     assert_eq!(args.last().map(String::as_str), Some("preview.part.mp4"));
 }
 

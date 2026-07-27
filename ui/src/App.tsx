@@ -300,23 +300,30 @@ export function App({ api }: AppProps) {
   useEffect(() => {
     void refreshDashboard();
     void api.getSettings().then(setSettings).catch(() => undefined);
-    if (api.runtimeResourceStatus) {
-      void api.runtimeResourceStatus().then((status) => {
-        setResourceStatus(status);
-        if (!status.ready) setPage("resources");
-      }).catch(() => undefined);
-    }
     let disposed = false;
     let resourceUnsubscribe: (() => void) | undefined;
-    if (api.subscribeRuntimeResources) {
-      void api.subscribeRuntimeResources((event: RuntimeResourceEvent) => {
-        if (disposed) return;
-        setResourceStatus(event.status);
-      }).then((handler) => {
-        if (disposed) handler();
-        else resourceUnsubscribe = handler;
-      });
-    }
+    void (async () => {
+      if (api.subscribeRuntimeResources) {
+        const handler = await api.subscribeRuntimeResources((event: RuntimeResourceEvent) => {
+          if (disposed) return;
+          setResourceStatus(event.status);
+          if (event.status.ready) {
+            setPage((current) => current === "resources" ? "monitor" : current);
+          }
+        });
+        if (disposed) {
+          handler();
+          return;
+        }
+        resourceUnsubscribe = handler;
+      }
+      if (api.runtimeResourceStatus) {
+        const status = await api.runtimeResourceStatus().catch(() => null);
+        if (disposed || !status) return;
+        setResourceStatus(status);
+        if (!status.ready) setPage("resources");
+      }
+    })();
     let unsubscribe: (() => void) | undefined;
     void api.subscribe((event) => {
       if (event.kind === "exit_confirmation_requested") {
@@ -964,12 +971,13 @@ function ResourcePreparationPage({
     ? Math.min(100, Math.round(status.downloadedBytes / status.totalSizeBytes * 100))
     : 0;
   const downloading = status.status === "downloading" || busy === "download";
+  const verifying = status.status === "verifying";
   return (
     <div className="page-content resource-page">
       <section className="panel resource-card" aria-labelledby="resource-title">
         <div className="resource-card-icon"><HardDrive size={28} /></div>
         <p className="section-kicker">RUNTIME RESOURCE PACK</p>
-        <h2 id="resource-title">准备本地运行资源</h2>
+        <h2 id="resource-title">{verifying ? "正在校验本地运行资源" : "准备本地运行资源"}</h2>
         <p className="muted-copy">首次使用前必须完成 FFmpeg、Whisper、VAD 和模型校验。资源只保存到本机应用数据目录，不会上传录像或转写内容。</p>
         <div className="resource-facts">
           <span>平台 <b>{status.platform}</b></span>
@@ -992,14 +1000,19 @@ function ResourcePreparationPage({
             <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
           </div>
         )}
+        {verifying && (
+          <div className="resource-progress" role="status" aria-live="polite">
+            <div className="progress-header"><span><LoaderCircle className="spin" size={15} />正在后台校验随包资源</span><b>请稍候</b></div>
+          </div>
+        )}
         {status.errorMessage && <div className="resource-error" role="alert"><ShieldAlert size={17} /><span>{status.errorMessage}</span></div>}
         <div className="resource-actions">
           {downloading ? (
             <button className="secondary-button" onClick={onCancel} disabled={busy === "cancel"}><Square size={15} />取消下载</button>
           ) : (
-            <button className="primary-button" onClick={onDownload} disabled={busy !== null}><Download size={16} />下载并安装资源</button>
+            <button className="primary-button" onClick={onDownload} disabled={busy !== null || verifying}><Download size={16} />下载并安装资源</button>
           )}
-          <button className="secondary-button" onClick={onRecheck} disabled={busy !== null}><RefreshCw size={15} />重新检测</button>
+          <button className="secondary-button" onClick={onRecheck} disabled={busy !== null || verifying}><RefreshCw size={15} />重新检测</button>
         </div>
         <p className="resource-lock-note"><ShieldCheck size={15} />资源就绪后自动解锁监控、录制、视频库和 AI 剪辑。</p>
       </section>

@@ -9,6 +9,8 @@ import type {
   ActivationState,
   BrowserAccessState,
   ClientApi,
+  RuntimeResourceEvent,
+  RuntimeResourceView,
   Streamer,
   Video,
 } from "./types";
@@ -105,6 +107,24 @@ const activeActivation: ActivationState = {
   deviceIdHint: "…12345678",
   lastHeartbeatAt: "2026-07-27T00:00:00Z",
   nextHeartbeatAt: "2026-07-27T00:01:30Z",
+};
+
+const readyRuntimeStatus: RuntimeResourceView = {
+  status: "ready",
+  ready: true,
+  bundleVersion: "2026.07.26",
+  platform: "macos-aarch64",
+  appMinVersion: "0.2.0",
+  manifestSha256: "manifest-hash",
+  components: [],
+  totalSizeBytes: 1024,
+  minimumFreeDiskBytes: 2048,
+  minimumMemoryBytes: 4096,
+  source: "固定 HTTPS 资源服务器",
+  downloadedBytes: 1024,
+  errorCode: null,
+  errorMessage: null,
+  updatedAt: "2026-07-26T00:00:00Z",
 };
 
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
@@ -262,34 +282,17 @@ describe("App", () => {
 
   it("资源未就绪时只显示准备页，下载完成后解锁监控导航", async () => {
     const user = userEvent.setup();
-    const readyStatus = {
-      status: "ready" as const,
-      ready: true,
-      bundleVersion: "2026.07.26",
-      platform: "macos-aarch64",
-      appMinVersion: "0.2.0",
-      manifestSha256: "manifest-hash",
-      components: [],
-      totalSizeBytes: 1024,
-      minimumFreeDiskBytes: 2048,
-      minimumMemoryBytes: 4096,
-      source: "固定 HTTPS 资源服务器",
-      downloadedBytes: 1024,
-      errorCode: null,
-      errorMessage: null,
-      updatedAt: "2026-07-26T00:00:00Z",
-    };
     const api = createApi([streamer]);
     api.runtimeResourceStatus = vi.fn().mockResolvedValue({
-      ...readyStatus,
+      ...readyRuntimeStatus,
       status: "failed" as const,
       ready: false,
       downloadedBytes: 0,
       errorCode: "resource_not_checked",
       errorMessage: "正在检查本地运行资源",
     });
-    api.runtimeResourceDownload = vi.fn().mockResolvedValue(readyStatus);
-    api.runtimeResourceRecheck = vi.fn().mockResolvedValue(readyStatus);
+    api.runtimeResourceDownload = vi.fn().mockResolvedValue(readyRuntimeStatus);
+    api.runtimeResourceRecheck = vi.fn().mockResolvedValue(readyRuntimeStatus);
     api.runtimeResourceCancel = vi.fn().mockResolvedValue(undefined);
     api.subscribeRuntimeResources = vi.fn().mockResolvedValue(() => undefined);
 
@@ -300,6 +303,49 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "下载并安装资源" }));
     expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "监控中心" })).not.toBeDisabled();
+  });
+
+  it("后台校验期间先显示可响应的状态页，完成后自动进入监控中心", async () => {
+    const api = createApi([streamer]);
+    let publishResource: ((event: RuntimeResourceEvent) => void) | null = null;
+    api.runtimeResourceStatus = vi.fn().mockResolvedValue({
+      ...readyRuntimeStatus,
+      status: "verifying",
+      ready: false,
+    });
+    api.subscribeRuntimeResources = vi.fn().mockImplementation(async (listener) => {
+      publishResource = listener;
+      return () => undefined;
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "正在校验本地运行资源" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "下载并安装资源" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重新检测" })).toBeDisabled();
+    act(() => publishResource?.({
+      status: readyRuntimeStatus,
+      progress: {
+        phase: "ready",
+        componentId: null,
+        downloadedBytes: readyRuntimeStatus.totalSizeBytes,
+        totalBytes: readyRuntimeStatus.totalSizeBytes,
+      },
+    }));
+
+    expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
+  });
+
+  it("先监听资源事件再读取初始状态，避免遗漏后台校验完成事件", async () => {
+    const api = createApi([streamer]);
+    api.runtimeResourceStatus = vi.fn().mockResolvedValue(readyRuntimeStatus);
+    api.subscribeRuntimeResources = vi.fn().mockResolvedValue(() => undefined);
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
+    expect(vi.mocked(api.subscribeRuntimeResources).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(api.runtimeResourceStatus).mock.invocationCallOrder[0]);
   });
 
   it("需要访问验证时显示全局横幅并由用户主动打开窗口", async () => {

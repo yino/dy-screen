@@ -1126,6 +1126,10 @@ pub fn build_remux_args(input: &Path, output: &Path) -> Vec<String> {
         "-progress".to_owned(),
         "pipe:1".to_owned(),
         "-nostats".to_owned(),
+        "-f".to_owned(),
+        "mov".to_owned(),
+        "-brand".to_owned(),
+        "mp42".to_owned(),
         output.to_string_lossy().into_owned(),
     ]
 }
@@ -1154,6 +1158,10 @@ pub fn build_transcode_args(input: &Path, output: &Path, encoder: &str) -> Vec<S
         "-progress".to_owned(),
         "pipe:1".to_owned(),
         "-nostats".to_owned(),
+        "-f".to_owned(),
+        "mov".to_owned(),
+        "-brand".to_owned(),
+        "mp42".to_owned(),
         output.to_string_lossy().into_owned(),
     ]
 }

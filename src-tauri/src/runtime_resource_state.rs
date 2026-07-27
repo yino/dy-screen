@@ -3,8 +3,10 @@
 //! 资源服务器地址来自构建期 `DY_SCREEN_RESOURCE_BASE_URL`，不作为用户设置暴露。
 //! 前端只收到组件名、版本、大小和状态，不收到本地路径、请求头或命令行。
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use chrono::Utc;
 use dy_screen::runtime_resources::{
@@ -53,6 +55,57 @@ pub struct RuntimeResourceEvent {
     pub progress: ResourceProgress,
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedFileMetadata {
+    path: PathBuf,
+    size_bytes: u64,
+    modified_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRuntimeResources {
+    resolved: ResolvedRuntimeResources,
+    files: Vec<VerifiedFileMetadata>,
+}
+
+impl CachedRuntimeResources {
+    fn capture(resolved: ResolvedRuntimeResources) -> Result<Self, RuntimeResourceError> {
+        let mut paths = resolved
+            .components
+            .values()
+            .flat_map(|paths| paths.iter().cloned())
+            .collect::<Vec<_>>();
+        paths.push(resolved.root.join("runtime-manifest.json"));
+        let files = paths
+            .into_iter()
+            .map(|path| {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|_| RuntimeResourceError::MissingFile(path.display().to_string()))?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(RuntimeResourceError::Integrity(path.display().to_string()));
+                }
+                Ok(VerifiedFileMetadata {
+                    path,
+                    size_bytes: metadata.len(),
+                    modified_at: metadata.modified().ok(),
+                })
+            })
+            .collect::<Result<Vec<_>, RuntimeResourceError>>()?;
+        Ok(Self { resolved, files })
+    }
+
+    fn metadata_is_current(&self) -> bool {
+        self.files.iter().all(|verified| {
+            fs::symlink_metadata(&verified.path).is_ok_and(|metadata| {
+                !metadata.file_type().is_symlink()
+                    && metadata.is_file()
+                    && metadata.len() == verified.size_bytes
+                    && metadata.modified().ok() == verified.modified_at
+            })
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeResourceState {
     database: Database,
@@ -60,6 +113,7 @@ pub struct RuntimeResourceState {
     bundled_root: PathBuf,
     fixed_base_url: Option<String>,
     snapshot: Arc<Mutex<RuntimeResourceView>>,
+    resolved: Arc<Mutex<Option<CachedRuntimeResources>>>,
     cancellation: Arc<Mutex<Option<CancellationToken>>>,
 }
 
@@ -70,8 +124,8 @@ impl RuntimeResourceState {
         let initial = persisted
             .as_ref()
             .map(|record| RuntimeResourceView {
-                status: record.status,
-                ready: record.status == ResourceStatus::Ready,
+                status: ResourceStatus::Verifying,
+                ready: false,
                 bundle_version: record.bundle_version.clone(),
                 platform: record.platform.clone(),
                 app_min_version: record.app_min_version.clone(),
@@ -82,12 +136,12 @@ impl RuntimeResourceState {
                 minimum_memory_bytes: 0,
                 source: "随包资源或固定 HTTPS 资源服务器".to_owned(),
                 downloaded_bytes: record.progress_bytes,
-                error_code: record.error_code.clone(),
-                error_message: record.error_message.clone(),
-                updated_at: record.updated_at.clone(),
+                error_code: None,
+                error_message: None,
+                updated_at: Utc::now().to_rfc3339(),
             })
             .unwrap_or(RuntimeResourceView {
-                status: ResourceStatus::Failed,
+                status: ResourceStatus::Verifying,
                 ready: false,
                 bundle_version: None,
                 platform,
@@ -99,8 +153,8 @@ impl RuntimeResourceState {
                 minimum_memory_bytes: 0,
                 source: "随包资源或固定 HTTPS 资源服务器".to_owned(),
                 downloaded_bytes: 0,
-                error_code: Some("resource_not_checked".to_owned()),
-                error_message: Some("正在检查本地运行资源".to_owned()),
+                error_code: None,
+                error_message: None,
                 updated_at: Utc::now().to_rfc3339(),
             });
         Self {
@@ -109,6 +163,7 @@ impl RuntimeResourceState {
             bundled_root,
             fixed_base_url: option_env!("DY_SCREEN_RESOURCE_BASE_URL").map(str::to_owned),
             snapshot: Arc::new(Mutex::new(initial)),
+            resolved: Arc::new(Mutex::new(None)),
             cancellation: Arc::new(Mutex::new(None)),
         }
     }
@@ -137,8 +192,26 @@ impl RuntimeResourceState {
         self.fixed_base_url.clone().unwrap_or_else(|| "发行构建未配置资源服务器".to_owned())
     }
 
+    fn resolved_resources(&self) -> Result<ResolvedRuntimeResources, RuntimeResourceError> {
+        let stale = self
+            .resolved
+            .lock()
+            .map_err(|_| RuntimeResourceError::Install("运行资源缓存状态不可用".to_owned()))?
+            .as_ref()
+            .is_some_and(|resources| !resources.metadata_is_current());
+        if stale {
+            let _ = self.refresh();
+        }
+        self.resolved
+            .lock()
+            .map_err(|_| RuntimeResourceError::Install("运行资源缓存状态不可用".to_owned()))?
+            .as_ref()
+            .map(|resources| resources.resolved.clone())
+            .ok_or_else(|| RuntimeResourceError::MissingFile("已验证的运行资源".to_owned()))
+    }
+
     pub fn media_tools(&self) -> Result<(PathBuf, PathBuf), RuntimeResourceError> {
-        let (_, resolved, _) = self.find_and_resolve()?;
+        let resolved = self.resolved_resources()?;
         let ffmpeg = resolved
             .components
             .get("media.ffmpeg")
@@ -155,16 +228,29 @@ impl RuntimeResourceState {
     }
 
     pub fn current_root(&self) -> Option<PathBuf> {
-        self.find_and_resolve()
+        self.resolved_resources()
             .ok()
-            .map(|(_, resources, _)| resources.root)
+            .map(|resources| resources.root)
     }
 
     pub fn refresh(&self) -> RuntimeResourceView {
         let result = self.find_and_resolve();
         let view = match result {
-            Ok((manifest, _resources, source)) => self.view_for_manifest(&manifest, ResourceStatus::Ready, source, None),
+            Ok((manifest, resources, source)) => {
+                let cached = CachedRuntimeResources::capture(resources);
+                if let Ok(mut current) = self.resolved.lock() {
+                    *current = cached.ok();
+                }
+                if self.resolved.lock().is_ok_and(|current| current.is_some()) {
+                    self.view_for_manifest(&manifest, ResourceStatus::Ready, source, None)
+                } else {
+                    self.fail_verification()
+                }
+            }
             Err(error) => {
+                if let Ok(mut current) = self.resolved.lock() {
+                    *current = None;
+                }
                 let previous = self.view();
                 RuntimeResourceView {
                     status: if previous.status == ResourceStatus::Ready { ResourceStatus::Rollback } else { ResourceStatus::Failed },
@@ -187,6 +273,32 @@ impl RuntimeResourceState {
         };
         self.persist_view(&view);
         if let Ok(mut current) = self.snapshot.lock() { *current = view.clone(); }
+        view
+    }
+
+    pub fn fail_verification(&self) -> RuntimeResourceView {
+        if let Ok(mut current) = self.resolved.lock() {
+            *current = None;
+        }
+        let previous = self.view();
+        let view = RuntimeResourceView {
+            status: ResourceStatus::Failed,
+            ready: false,
+            bundle_version: previous.bundle_version,
+            platform: previous.platform,
+            app_min_version: previous.app_min_version,
+            manifest_sha256: previous.manifest_sha256,
+            components: previous.components,
+            total_size_bytes: previous.total_size_bytes,
+            minimum_free_disk_bytes: previous.minimum_free_disk_bytes,
+            minimum_memory_bytes: previous.minimum_memory_bytes,
+            source: previous.source,
+            downloaded_bytes: previous.downloaded_bytes,
+            error_code: Some("resource_verification_failed".to_owned()),
+            error_message: Some("运行资源校验任务异常退出，请重新检测".to_owned()),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        self.set_view(view.clone());
         view
     }
 
@@ -257,6 +369,10 @@ impl RuntimeResourceState {
         let installer = RuntimeInstaller::new(self.install_root.clone())?;
         let resolved = installer.install_directory(&source, &manifest)?;
         let _ = tokio::fs::remove_dir_all(&source).await;
+        let cached = CachedRuntimeResources::capture(resolved.clone())?;
+        if let Ok(mut current) = self.resolved.lock() {
+            *current = Some(cached);
+        }
         let view = self.view_for_resolved(&manifest, &resolved, base_url);
         self.set_view(view.clone());
         if let Ok(mut guard) = self.cancellation.lock() { *guard = None; }
