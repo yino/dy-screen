@@ -1,6 +1,7 @@
 # AI ASR 变更验收记录
 
-对应 OpenSpec 变更：`add-user-triggered-ai-asr`。
+对应已归档 OpenSpec 变更：
+`openspec/changes/archive/2026-07-23-add-user-triggered-ai-asr/`。
 
 逐 Requirement/Scenario 的证据映射见
 [`AI-ASR-需求测试追踪矩阵.md`](AI-ASR-需求测试追踪矩阵.md)。该矩阵由
@@ -26,6 +27,30 @@
 | 播放器与只读文本 UI | 点击定位、高亮、跟随、临时字幕、分页、响应式、复制和 TXT/JSON | 通过 |
 | 第一版非目标 | 约束测试确认不存在编辑、SRT/ASS、波形、多轨、裁剪或视频渲染入口 | 通过 |
 | 随包资源 | 单平台 Rust 暂存工具、模型及全部平台文件哈希、权限/符号链接门禁、macOS/Windows Tauri 覆盖与许可证清单 | macOS `.app` 资源与 ad-hoc 签名通过，Windows 及正式发行签名待目标环境 |
+
+## 后续工作区集成回归
+
+本变更归档后的高光、激活、访问恢复和预览提交没有改变本地 ASR 的源保护、稳定句段或缓存契约。
+它们通过下列集成回归把 ASR 结果接入当前桌面工作区：
+
+| 集成能力 | 主要证据 | 当前结论 |
+| --- | --- | --- |
+| 高光分析恢复 | `src-tauri/tests/ai_commands.rs`、`ai_repository.rs` 和 `ui/src/AiWorkspace.test.tsx` 覆盖分块进度、主动查询、重进页面、候选恢复与选择持久化 | 自动化通过 |
+| 高光与 ASR 联动 | 候选只引用稳定句段；跨视频定位、范围播放、六维评分、重叠句段和预览不可用降级由 AI 工作区测试覆盖 | 自动化通过 |
+| 客户端激活门禁 | `activation_repository.rs`、`client_api_contract.rs` 和 App 测试覆盖 missing/active/retrying/revoked、恢复门禁和脱敏 DTO | 自动化通过 |
+| 抖音访问会话恢复 | `room_resolution.rs`、`browser_snapshot.rs`、`resolver.rs` 及对应测试覆盖共享 WebView、旧页面拒绝、恢复通知去重和人工验证 | 自动化通过；真实房间仍需当场验收 |
+| 后台运行资源校验 | `runtime_resource_state.rs` 和 App 测试覆盖启动 `verifying`、后台完成事件、元数据缓存失效和导航自动解锁 | 自动化通过 |
+| WebView 兼容预览 | `preview.rs`、`tests/preview.rs` 和 AI 工作区测试覆盖 MOV/`mp42` 输出、H.264/AAC 回退、竖屏完整显示和联动失败降级 | 自动化通过；打包后播放仍需发行验收 |
+
+高光分析是用户单独授权的云端文本步骤，不属于本地 ASR 的自动回退。发送字段、凭据边界和恢复
+行为见 [AI 高光分析与候选](AI-高光分析与候选.md)；启动与预览见
+[运行资源与视频预览](运行资源与视频预览.md)。
+
+2026-07-28 Wiki 维护复核执行了 AI 命令/repository、激活 repository、访问解析、运行资源、预览、
+App 和 AI 工作区测试：Tauri 侧 56 个通过、1 个真实 FFmpeg 环境测试 ignored，根 crate 24 个
+通过，前端 67 个通过。`client_api_contract` 的两个用例需要绑定本机临时 HTTP 监听器，当前受限
+沙箱返回 `Operation not permitted`，没有进入业务断言；应在允许 loopback 监听的开发环境重新
+执行，不能把本次环境阻断记为通过或产品回归。
 
 ## 阶段测试命令
 
