@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,16 +12,19 @@ use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
+use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome, TelemetryQueue};
 use crate::ai::tauri_commands::*;
 use crate::ai::{
-    AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService, AiRepository,
-    HighlightWorkflow, LocalAsrRuntime, RigDeepSeekProvider, SourceFingerprint,
-    SystemCredentialStore,
+    AiClipExportStatus, AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService,
+    AiRepository, ClipExportFailure, ClipOutputDimensions, HighlightWorkflow, LocalAsrRuntime,
+    RigDeepSeekProvider, SourceFingerprint, SystemCredentialStore, build_export_plan,
+    execute_export, probe_output_dimensions, render_clip_subtitle_assets,
+    select_clip_video_encoder, validate_export_sources, validate_export_subtitles,
 };
-use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome, TelemetryQueue};
 use crate::api::ApiClient;
 use crate::app_lifecycle::{
     InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, log_lifecycle,
@@ -35,10 +39,10 @@ use crate::domain::{
 use crate::preview::{
     PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
 };
+use crate::room_resolution::{RoomResolutionPublisher, RoomResolutionService};
 use crate::runtime_resource_state::{
     RuntimeResourceEvent, RuntimeResourceState, RuntimeResourceView,
 };
-use crate::room_resolution::{RoomResolutionPublisher, RoomResolutionService};
 use crate::streamer_service::{PublicSourceInspector, create_streamer_with, update_streamer_with};
 use crate::supervisor::{MonitorLogger, MonitorPublisher, Supervisor};
 use crate::tauri_browser::TauriBrowserPageDriver;
@@ -62,6 +66,7 @@ struct AppState {
     log_dir: PathBuf,
     shutdown_gate: ShutdownGate,
     activation: ActivationService,
+    clip_export_tasks: Arc<Mutex<HashMap<i64, tokio_util::sync::CancellationToken>>>,
     _telemetry: TelemetryQueue,
 }
 
@@ -219,11 +224,7 @@ fn spawn_activation_lifecycle(
     });
 }
 
-fn emit_runtime_resource_status(
-    app: &AppHandle,
-    status: RuntimeResourceView,
-    phase: &str,
-) {
+fn emit_runtime_resource_status(app: &AppHandle, status: RuntimeResourceView, phase: &str) {
     let total_bytes = status.total_size_bytes;
     let downloaded_bytes = if status.ready {
         total_bytes
@@ -282,13 +283,9 @@ fn spawn_runtime_resource_initialization(
             Err(_) => runtime.fail_verification(),
         };
         if view.ready
-            && let Err(error) = ensure_verified_runtime_active(
-                &runtime,
-                &ai_runtime,
-                &supervisor,
-                &activation,
-            )
-            .await
+            && let Err(error) =
+                ensure_verified_runtime_active(&runtime, &ai_runtime, &supervisor, &activation)
+                    .await
         {
             eprintln!(
                 "{}",
@@ -442,6 +439,9 @@ async fn clear_activation(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ActivationStateView, String> {
+    if state.activation.is_development_bypass() {
+        return Ok(state.activation.state());
+    }
     let (monitor_result, ai_result) = tokio::join!(
         state.supervisor.pause_for_authorization(),
         state.ai_runtime.pause_for_authorization()
@@ -577,7 +577,8 @@ async fn create_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
 ) -> Result<Streamer, CommandError> {
-    require_runtime_ready(state.inner()).map_err(|message| CommandError::new("resource_not_ready", message))?;
+    require_runtime_ready(state.inner())
+        .map_err(|message| CommandError::new("resource_not_ready", message))?;
     let inspector = PublicSourceInspector::new(
         state.room_resolution.clone(),
         state.room_resolution.public_request_gate(),
@@ -591,7 +592,8 @@ async fn update_streamer(
     input: CreateStreamerRequest,
     state: State<'_, AppState>,
 ) -> Result<Streamer, CommandError> {
-    require_runtime_ready(state.inner()).map_err(|message| CommandError::new("resource_not_ready", message))?;
+    require_runtime_ready(state.inner())
+        .map_err(|message| CommandError::new("resource_not_ready", message))?;
     let inspector = PublicSourceInspector::new(
         state.room_resolution.clone(),
         state.room_resolution.public_request_gate(),
@@ -1043,6 +1045,233 @@ async fn diagnose_environment(state: State<'_, AppState>) -> Result<EnvironmentS
 }
 
 #[tauri::command]
+async fn ai_start_clip_export(
+    clip_project_id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::ai::AiClipProject, String> {
+    let repository = AiRepository::new(state.database.clone());
+    let detail = repository
+        .get_clip_project(clip_project_id)
+        .map_err(|error| error.to_string())?;
+    let project = detail.project;
+    if project.export_status == AiClipExportStatus::Exporting {
+        return Err("该剪辑工程正在导出".to_owned());
+    }
+    if !detail.subtitles_complete {
+        return Err("剪辑片段缺少 ASR 字幕，请先完成识别或移除该片段".to_owned());
+    }
+    let sources = repository
+        .clip_export_sources(clip_project_id)
+        .map_err(|error| error.to_string())?;
+    validate_export_subtitles(&sources).map_err(|error| error.message)?;
+    validate_export_sources(&sources).map_err(|error| error.message)?;
+    let (ffmpeg_path, ffprobe_path) = state
+        .runtime_resources
+        .media_tools()
+        .map_err(|_| "受控 FFmpeg 资源尚未准备完成".to_owned())?;
+    let video_encoder = select_clip_video_encoder(&ffmpeg_path)
+        .await
+        .map_err(|error| error.message)?;
+    let output_dimensions = match (project.output_width, project.output_height) {
+        (Some(width), Some(height)) => ClipOutputDimensions { width, height },
+        (None, None) => {
+            let dimensions =
+                probe_output_dimensions(&ffprobe_path, Path::new(&sources[0].source_path))
+                    .await
+                    .map_err(|error| error.message)?;
+            repository
+                .set_clip_output_dimensions(clip_project_id, dimensions.width, dimensions.height)
+                .map_err(|error| error.to_string())?;
+            dimensions
+        }
+        _ => return Err("剪辑工程的输出规格不完整".to_owned()),
+    };
+    let file_name = safe_clip_export_name(&project.name);
+    let dialog_app = app.clone();
+    let destination = tokio::task::spawn_blocking(move || {
+        dialog_app
+            .dialog()
+            .file()
+            .set_title("导出高光剪辑 MP4")
+            .set_file_name(file_name)
+            .add_filter("MP4 视频", &["mp4"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|_| "系统保存对话框异常退出，请重试".to_owned())?;
+    let Some(mut destination) = destination.and_then(|path| path.into_path().ok()) else {
+        return Ok(project);
+    };
+    if destination
+        .extension()
+        .is_none_or(|extension| extension != "mp4")
+    {
+        destination.set_extension("mp4");
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "导出目录无效".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|_| "无法创建导出目录".to_owned())?;
+    let token = tokio_util::sync::CancellationToken::new();
+    {
+        let mut tasks = state
+            .clip_export_tasks
+            .lock()
+            .map_err(|_| "导出任务状态不可用".to_owned())?;
+        if tasks.contains_key(&clip_project_id) {
+            return Err("该剪辑工程正在导出".to_owned());
+        }
+        tasks.insert(clip_project_id, token.clone());
+    }
+    repository
+        .set_clip_export_state(
+            clip_project_id,
+            AiClipExportStatus::Exporting,
+            0,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    let temporary = destination.with_file_name(format!(
+        ".{}.part.mp4",
+        destination
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("高光剪辑")
+    ));
+    let database = state.database.clone();
+    let tasks = state.clip_export_tasks.clone();
+    tauri::async_runtime::spawn(async move {
+        let repository = AiRepository::new(database);
+        let total_duration_ms = sources.iter().fold(0_u64, |total, source| {
+            total.saturating_add(
+                source
+                    .segment
+                    .source_end_ms
+                    .saturating_sub(source.segment.source_start_ms),
+            )
+        });
+        let subtitles = sources
+            .iter()
+            .flat_map(|source| source.subtitles.iter().cloned())
+            .collect::<Vec<_>>();
+        let rendered = tokio::task::spawn_blocking(move || {
+            render_clip_subtitle_assets(&subtitles, output_dimensions, total_duration_ms)
+        })
+        .await;
+        let result = match rendered {
+            Ok(Ok(subtitle_assets)) => match build_export_plan(
+                &sources,
+                temporary.clone(),
+                output_dimensions,
+                subtitle_assets.manifest_path(),
+                video_encoder,
+            ) {
+                Ok(plan) => {
+                    execute_export(&ffmpeg_path, plan, token.clone(), |progress| {
+                        let _ = repository.set_clip_export_state(
+                            clip_project_id,
+                            AiClipExportStatus::Exporting,
+                            progress,
+                            None,
+                            None,
+                        );
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            },
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(ClipExportFailure {
+                code: "subtitle_render_failed",
+                message: "字幕渲染任务异常退出，请重试".to_owned(),
+            }),
+        };
+        match result {
+            Ok(temporary_path) => {
+                let published = tokio::fs::rename(&temporary_path, &destination).await;
+                match published {
+                    Ok(()) => {
+                        let _ = repository.set_clip_export_state(
+                            clip_project_id,
+                            AiClipExportStatus::Completed,
+                            100,
+                            Some(&destination.to_string_lossy()),
+                            None,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = tokio::fs::remove_file(&temporary_path).await;
+                        let _ = repository.set_clip_export_state(
+                            clip_project_id,
+                            AiClipExportStatus::Failed,
+                            0,
+                            None,
+                            Some(("publish_failed", "无法发布导出的 MP4 文件")),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                let status = if error.code == "cancelled" {
+                    AiClipExportStatus::Cancelled
+                } else {
+                    AiClipExportStatus::Failed
+                };
+                let _ = repository.set_clip_export_state(
+                    clip_project_id,
+                    status,
+                    0,
+                    None,
+                    Some((error.code, &error.message)),
+                );
+            }
+        }
+        if let Ok(mut current) = tasks.lock() {
+            current.remove(&clip_project_id);
+        }
+    });
+    repository
+        .get_clip_project(clip_project_id)
+        .map(|detail| detail.project)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn ai_cancel_clip_export(
+    clip_project_id: i64,
+    state: State<'_, AppState>,
+) -> Result<crate::ai::AiClipProject, String> {
+    let token = state
+        .clip_export_tasks
+        .lock()
+        .map_err(|_| "导出任务状态不可用".to_owned())?
+        .get(&clip_project_id)
+        .cloned()
+        .ok_or_else(|| "当前没有可取消的导出任务".to_owned())?;
+    token.cancel();
+    Ok(AiRepository::new(state.database.clone())
+        .get_clip_project(clip_project_id)
+        .map_err(|error| error.to_string())?
+        .project)
+}
+
+fn safe_clip_export_name(name: &str) -> String {
+    let safe = name
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, ' ' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{}.mp4", safe.trim().trim_end_matches('.'))
+}
+
+#[tauri::command]
 fn request_exit(force: bool, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let active_recordings = state
         .database
@@ -1143,7 +1372,18 @@ pub fn run() {
             ai_get_highlight_progress,
             ai_resume_highlight_analysis,
             ai_list_highlight_candidates,
+            ai_list_qualified_highlight_candidates,
+            ai_list_selected_highlight_candidates,
             ai_select_highlight_candidates,
+            ai_set_highlight_candidate_selected,
+            ai_open_clip_project,
+            ai_get_clip_project,
+            ai_update_clip_segment,
+            ai_insert_clip_candidate,
+            ai_reorder_clip_segments,
+            ai_remove_clip_segment,
+            ai_start_clip_export,
+            ai_cancel_clip_export,
             request_exit
         ])
         .setup(|app| {
@@ -1169,14 +1409,14 @@ pub fn run() {
             let database = Database::open(&app_data_dir.join("dy-screen.sqlite3"))?;
             database.migrate()?;
             database.reconcile_startup()?;
+            AiRepository::new(database.clone())
+                .recover_interrupted_clip_exports()
+                .map_err(std::io::Error::other)?;
             let api_client = ApiClient::from_env()
                 .map_err(|error| std::io::Error::other(error.safe_message()))?;
-            let activation = ActivationService::new(
-                database.clone(),
-                api_client,
-                &app_data_dir,
-            )
-            .map_err(std::io::Error::other)?;
+            let activation = ActivationService::new(database.clone(), api_client, &app_data_dir)
+                .map_err(std::io::Error::other)?
+                .with_development_bypass();
             let telemetry = TelemetryQueue::spawn(activation.clone());
             let runtime_resource_state = RuntimeResourceState::new(
                 database.clone(),
@@ -1259,9 +1499,7 @@ pub fn run() {
                 monitor_logger,
             )
             .map_err(std::io::Error::other)?;
-            supervisor.set_runtime_resources(
-                app.state::<RuntimeResourceState>().inner().clone(),
-            );
+            supervisor.set_runtime_resources(app.state::<RuntimeResourceState>().inner().clone());
             let preview_cache_dir = app_cache_dir.join("video-preview");
             std::fs::create_dir_all(&preview_cache_dir)?;
             app.asset_protocol_scope()
@@ -1312,6 +1550,7 @@ pub fn run() {
                 log_dir,
                 shutdown_gate,
                 activation: activation.clone(),
+                clip_export_tasks: Arc::new(Mutex::new(HashMap::new())),
                 _telemetry: telemetry,
             });
             install_shutdown_signal_handlers(app.handle().clone());
@@ -1463,8 +1702,14 @@ fn begin_shutdown(app: &AppHandle, state: &AppState, reason: ShutdownReason) {
     let thumbnail = state.thumbnail.clone();
     let ai_runtime = state.ai_runtime.clone();
     let activation = state.activation.clone();
+    let clip_export_tasks = state.clip_export_tasks.clone();
     tauri::async_runtime::spawn(async move {
         activation.shutdown();
+        if let Ok(tasks) = clip_export_tasks.lock() {
+            for cancellation in tasks.values() {
+                cancellation.cancel();
+            }
+        }
         let shutdown = async {
             let (_, _, _, _, _) = tokio::join!(
                 preview.shutdown(),

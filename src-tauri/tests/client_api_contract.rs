@@ -130,25 +130,44 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
 
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 4);
-    assert!(requests[0].request_line.starts_with("POST /api/client/activate "));
+    assert!(
+        requests[0]
+            .request_line
+            .starts_with("POST /api/client/activate ")
+    );
     assert_eq!(
         serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
         json!({"device_id": "DY-DEVICE", "activate_code": "ACTIVATE-CODE"})
     );
 
-    assert!(requests[1].request_line.starts_with("POST /api/client/heartbeat "));
+    assert!(
+        requests[1]
+            .request_line
+            .starts_with("POST /api/client/heartbeat ")
+    );
     assert_eq!(requests[1].headers.get("device_id").unwrap(), "DY-DEVICE");
     assert_eq!(
         requests[1].headers.get("activate_code").unwrap(),
         "ACTIVATE-CODE"
     );
-    assert_eq!(serde_json::from_slice::<Value>(&requests[1].body).unwrap(), json!({}));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&requests[1].body).unwrap(),
+        json!({})
+    );
 
-    assert!(requests[2].request_line.starts_with("GET /api/client/app-start "));
+    assert!(
+        requests[2]
+            .request_line
+            .starts_with("GET /api/client/app-start ")
+    );
     assert_eq!(requests[2].headers.get("platform").unwrap(), "mac");
     assert_eq!(requests[2].headers.get("client_version").unwrap(), "0.2.0");
 
-    assert!(requests[3].request_line.starts_with("POST /api/client/telemetry "));
+    assert!(
+        requests[3]
+            .request_line
+            .starts_with("POST /api/client/telemetry ")
+    );
     assert_eq!(requests[3].headers.get("device_id").unwrap(), "DY-DEVICE");
     let events = serde_json::from_slice::<Value>(&requests[3].body).unwrap();
     assert_eq!(events.as_array().unwrap().len(), 1);

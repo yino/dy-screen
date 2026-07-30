@@ -63,13 +63,14 @@ FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg
 WHISPER_SOURCE ?= $(if $(wildcard resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz),resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz,)
 WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper
 POWERSHELL ?= powershell.exe
-RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.3/
+RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/
 RESOURCE_RELEASE_DIR ?= dist/runtime-resources
 RESOURCE_CHANNEL ?= stable
 RESOURCE_APP_VERSION ?= 0.2.0
 # 必须与 resources/asr-source/manifest.json 中的 bundleVersion 一致。
-RESOURCE_BUNDLE_VERSION ?= 2026.07.3
+RESOURCE_BUNDLE_VERSION ?= 2026.07.4
 DY_SCREEN_API_BASE_URL ?= http://localhost/api/
+DEV_REQUIRE_ACTIVATION ?= 0
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
 
@@ -81,13 +82,13 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
-	preview-doctor test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
+	preview-doctor clip-subtitle-doctor test-clip-subtitle test-clip-subtitle-integration test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
 	test-ai-scheduler test-ai-repository test-ai-credentials test-ai-workflow test-ai \
 	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
 	accept-deepseek \
 	diagnose-real-room tail-access-log accept-real-room accept-real-multi \
-	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows runtime-resource-verify runtime-resource-publish \
+	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows runtime-resource-verify runtime-resource-verify-windows runtime-resource-publish \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
 	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
 	inspect-profile inspect-room resolve record record-multi clean
@@ -136,6 +137,9 @@ help:
 		'  make asr-performance-windows ASR_VIDEO=... ASR_RESOURCE_ROOT=... ASR_PERFORMANCE_OUTPUT=... 在 8GB Windows 采集性能' \
 		'  make asr-evidence-audit ASR_COMPLETION_*=... ASR_QUALITY_*=... 汇总六个门禁并输出 readyToComplete' \
 		'  make preview-doctor  检查视频预览所需 FFmpeg 编码能力' \
+		'  make clip-subtitle-doctor 检查带 ASR 字幕剪辑导出所需 FFmpeg 能力' \
+		'  make test-clip-subtitle 执行字幕映射、渲染、导出门禁和编辑器测试' \
+		'  make test-clip-subtitle-integration 使用指定 FFmpeg 验证字幕实际烧录像素' \
 		'  make test-preview    执行预览服务和播放器组件测试' \
 		'  make test-preview-integration 使用真实 FFmpeg 样本验证预览转换' \
 		'  make thumbnail-doctor 检查视频库封面所需 FFmpeg JPEG 编码能力' \
@@ -198,15 +202,27 @@ preview-doctor: doctor
 	@"$(FFMPEG)" -hide_banner -encoders 2>/dev/null | grep -Eq 'h264_videotoolbox|libx264|h264_mf' || { printf '%s\n' '错误：当前 FFmpeg 没有可用的 H.264 预览编码器。' >&2; exit 1; }
 	@printf '%s\n' '视频预览环境检查通过。'
 
+clip-subtitle-doctor: doctor
+	./scripts/verify-clip-ffmpeg-capabilities.sh "$(FFMPEG)"
+
 thumbnail-doctor: doctor
 	@"$(FFMPEG)" -hide_banner -encoders 2>/dev/null | grep -Eq 'mjpeg' || { printf '%s\n' '错误：当前 FFmpeg 没有可用的 JPEG 封面编码器。' >&2; exit 1; }
 	@printf '%s\n' '视频库封面环境检查通过。'
+
+test-clip-subtitle:
+	"$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --test ai_repository clip_subtitle -- --nocapture
+	"$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_subtitle -- --nocapture
+	"$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export -- --nocapture
+	"$(NPM)" test -- --run ui/src/AiWorkspace.test.tsx
+
+test-clip-subtitle-integration: clip-subtitle-doctor
+	DY_SCREEN_CLIP_FFMPEG="$(FFMPEG)" DY_SCREEN_CLIP_FFPROBE="$(FFPROBE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export::tests::exports_mixed_source_dimensions_to_a_playable_mp4 -- --exact --nocapture
 
 install:
 	"$(NPM)" install
 
 web-dev:
-	"$(NPM)" run dev
+	VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION="$(DEV_REQUIRE_ACTIVATION)" "$(NPM)" run dev
 
 typecheck:
 	"$(NPM)" run typecheck
@@ -215,7 +231,7 @@ frontend-build:
 	"$(NPM)" run build
 
 app-dev:
-	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" "$(NPM)" run tauri:dev
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_DEV_REQUIRE_ACTIVATION="$(DEV_REQUIRE_ACTIVATION)" VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION="$(DEV_REQUIRE_ACTIVATION)" "$(NPM)" run tauri:dev
 
 app-build:
 	@printf '%s\n' '普通开发构建：不携带发行运行资源；正式发布请使用 make app-build-resources。'
@@ -224,16 +240,24 @@ app-build:
 app-build-resources: asr-stage-macos
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
+	"$(MAKE)" runtime-resource-verify ASR_STAGE="$(ASR_STAGE)"
 	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
 
 app-build-resources-windows: asr-stage-windows
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
+	"$(MAKE)" runtime-resource-verify-windows ASR_STAGE="$(ASR_STAGE)"
 	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
 
 runtime-resource-verify:
 	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }
 	"$(CARGO)" run --offline --bin asr-bundle -- verify --root "$(ASR_STAGE)" --platform macos-aarch64
+	"$(MAKE)" clip-subtitle-doctor FFMPEG="$(ASR_STAGE)/bin/macos-aarch64/ffmpeg" FFPROBE="$(ASR_STAGE)/bin/macos-aarch64/ffprobe"
+
+runtime-resource-verify-windows:
+	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- verify --root "$(ASR_STAGE)" --platform windows-x86-64
+	"$(POWERSHELL)" -NoProfile -File scripts/verify-clip-ffmpeg-capabilities.ps1 -Ffmpeg "$(ASR_STAGE)/bin/windows-x86_64/ffmpeg.exe"
 
 runtime-resource-publish: runtime-resource-verify
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：必须设置 RESOURCE_BASE_URL（仅用于发布说明，应用地址由构建期注入）。' >&2; exit 2; }

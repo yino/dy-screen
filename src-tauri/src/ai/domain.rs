@@ -417,6 +417,8 @@ pub struct AiHighlightRun {
     pub skills_snapshot: Vec<String>,
     pub analysis_goal: Option<String>,
     pub analysis_fingerprint: String,
+    pub qualified_score: u8,
+    pub excellent_score: u8,
     pub user_authorized: bool,
     pub total_segments: u64,
     pub total_chars: u64,
@@ -481,6 +483,154 @@ pub struct AiHighlightCandidate {
     pub selected: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiHighlightCandidatePage {
+    pub items: Vec<AiHighlightCandidate>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total_candidates: u64,
+    pub qualified_candidates: u64,
+    pub selected_candidates: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiClipEffect {
+    None,
+    FadeIn,
+    FadeOut,
+    FadeInOut,
+    Flash,
+    Black,
+}
+
+impl AiClipEffect {
+    pub const ALL: [Self; 6] = [
+        Self::None,
+        Self::FadeIn,
+        Self::FadeOut,
+        Self::FadeInOut,
+        Self::Flash,
+        Self::Black,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::FadeIn => "fade_in",
+            Self::FadeOut => "fade_out",
+            Self::FadeInOut => "fade_in_out",
+            Self::Flash => "flash",
+            Self::Black => "black",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|effect| effect.as_str() == value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiClipExportStatus {
+    Idle,
+    Exporting,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl AiClipExportStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Exporting => "exporting",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::Idle,
+            Self::Exporting,
+            Self::Completed,
+            Self::Cancelled,
+            Self::Failed,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiClipProject {
+    pub id: i64,
+    pub highlight_run_id: i64,
+    pub name: String,
+    /// 首次导出时冻结，后续重排片段也不会意外改变成品画幅。
+    pub output_width: Option<u32>,
+    pub output_height: Option<u32>,
+    /// 每次工程片段编辑后递增，供恢复和后续编辑能力识别工程快照版本。
+    pub version: u32,
+    pub export_status: AiClipExportStatus,
+    pub export_progress: u8,
+    pub output_path: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiClipSegment {
+    pub id: i64,
+    pub clip_project_id: i64,
+    pub candidate_id: i64,
+    pub input_id: i64,
+    pub position: u32,
+    pub title: String,
+    pub source_start_ms: u64,
+    pub source_end_ms: u64,
+    pub volume_percent: u16,
+    pub effect: AiClipEffect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiClipSubtitle {
+    pub stable_segment_id: String,
+    pub clip_segment_id: i64,
+    pub input_id: i64,
+    pub normalized_text: String,
+    pub source_start_ms: u64,
+    pub source_end_ms: u64,
+    pub project_start_ms: u64,
+    pub project_end_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiClipProjectDetail {
+    pub project: AiClipProject,
+    pub segments: Vec<AiClipSegment>,
+    pub subtitles: Vec<AiClipSubtitle>,
+    pub subtitles_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiClipSegmentUpdate {
+    pub volume_percent: u16,
+    pub effect: AiClipEffect,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NewAiHighlightRun {
@@ -491,6 +641,8 @@ pub struct NewAiHighlightRun {
     pub skills_snapshot: Vec<String>,
     pub analysis_goal: Option<String>,
     pub analysis_fingerprint: String,
+    pub qualified_score: u8,
+    pub excellent_score: u8,
     pub total_segments: u64,
     pub total_chars: u64,
     pub estimated_batches: u64,

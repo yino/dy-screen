@@ -10,9 +10,9 @@ use std::time::SystemTime;
 
 use chrono::Utc;
 use dy_screen::runtime_resources::{
-    ResourceProgress, ResourceStatus, ResourceStatusSnapshot, ResolvedRuntimeResources,
-    RuntimeDownloader, RuntimeInstaller, RuntimeManifest, RuntimeResourceError,
-    compare_versions, resolve_runtime_resources,
+    ResolvedRuntimeResources, ResourceProgress, ResourceStatus, ResourceStatusSnapshot,
+    RuntimeDownloader, RuntimeInstaller, RuntimeManifest, RuntimeResourceError, compare_versions,
+    resolve_runtime_resources,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -169,27 +169,32 @@ impl RuntimeResourceState {
     }
 
     pub fn view(&self) -> RuntimeResourceView {
-        self.snapshot.lock().map(|value| value.clone()).unwrap_or_else(|_| RuntimeResourceView {
-            status: ResourceStatus::Failed,
-            ready: false,
-            bundle_version: None,
-            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            app_min_version: env!("CARGO_PKG_VERSION").to_owned(),
-            manifest_sha256: None,
-            components: Vec::new(),
-            total_size_bytes: 0,
-            minimum_free_disk_bytes: 0,
-            minimum_memory_bytes: 0,
-            source: "固定 HTTPS 资源服务器".to_owned(),
-            downloaded_bytes: 0,
-            error_code: Some("state_unavailable".to_owned()),
-            error_message: Some("资源状态暂时不可用".to_owned()),
-            updated_at: Utc::now().to_rfc3339(),
-        })
+        self.snapshot
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| RuntimeResourceView {
+                status: ResourceStatus::Failed,
+                ready: false,
+                bundle_version: None,
+                platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                app_min_version: env!("CARGO_PKG_VERSION").to_owned(),
+                manifest_sha256: None,
+                components: Vec::new(),
+                total_size_bytes: 0,
+                minimum_free_disk_bytes: 0,
+                minimum_memory_bytes: 0,
+                source: "固定 HTTPS 资源服务器".to_owned(),
+                downloaded_bytes: 0,
+                error_code: Some("state_unavailable".to_owned()),
+                error_message: Some("资源状态暂时不可用".to_owned()),
+                updated_at: Utc::now().to_rfc3339(),
+            })
     }
 
     pub fn fixed_source(&self) -> String {
-        self.fixed_base_url.clone().unwrap_or_else(|| "发行构建未配置资源服务器".to_owned())
+        self.fixed_base_url
+            .clone()
+            .unwrap_or_else(|| "发行构建未配置资源服务器".to_owned())
     }
 
     fn resolved_resources(&self) -> Result<ResolvedRuntimeResources, RuntimeResourceError> {
@@ -253,7 +258,11 @@ impl RuntimeResourceState {
                 }
                 let previous = self.view();
                 RuntimeResourceView {
-                    status: if previous.status == ResourceStatus::Ready { ResourceStatus::Rollback } else { ResourceStatus::Failed },
+                    status: if previous.status == ResourceStatus::Ready {
+                        ResourceStatus::Rollback
+                    } else {
+                        ResourceStatus::Failed
+                    },
                     ready: false,
                     bundle_version: previous.bundle_version,
                     platform: previous.platform,
@@ -272,7 +281,9 @@ impl RuntimeResourceState {
             }
         };
         self.persist_view(&view);
-        if let Ok(mut current) = self.snapshot.lock() { *current = view.clone(); }
+        if let Ok(mut current) = self.snapshot.lock() {
+            *current = view.clone();
+        }
         view
     }
 
@@ -305,7 +316,9 @@ impl RuntimeResourceState {
     pub fn cancel(&self) {
         if let Ok(guard) = self.cancellation.lock()
             && let Some(token) = guard.as_ref()
-        { token.cancel(); }
+        {
+            token.cancel();
+        }
     }
 
     pub fn finish_download(&self) {
@@ -328,11 +341,16 @@ impl RuntimeResourceState {
         self.set_view(view);
     }
 
-    pub async fn download<F>(&self, mut publish: F) -> Result<RuntimeResourceView, RuntimeResourceError>
+    pub async fn download<F>(
+        &self,
+        mut publish: F,
+    ) -> Result<RuntimeResourceView, RuntimeResourceError>
     where
         F: FnMut(RuntimeResourceView, ResourceProgress) + Send,
     {
-        let base_url = self.fixed_base_url.clone().ok_or_else(|| RuntimeResourceError::Download("发行构建未配置固定 HTTPS 资源地址".into()))?;
+        let base_url = self.fixed_base_url.clone().ok_or_else(|| {
+            RuntimeResourceError::Download("发行构建未配置固定 HTTPS 资源地址".into())
+        })?;
         let cancellation = CancellationToken::new();
         if let Ok(mut guard) = self.cancellation.lock() {
             if guard.is_some() {
@@ -341,28 +359,61 @@ impl RuntimeResourceState {
             *guard = Some(cancellation.clone());
         }
         let downloader = RuntimeDownloader::new(&base_url, 10 * 1024 * 1024 * 1024)?;
-        let manifest = downloader.fetch_manifest("runtime-manifest.json", &cancellation).await?;
-        let source = self.install_root.join(format!("{}.download", manifest.bundle_version));
-        if tokio::fs::try_exists(&source).await.unwrap_or(false) { tokio::fs::remove_dir_all(&source).await.ok(); }
-        tokio::fs::create_dir_all(&source).await.map_err(|error| RuntimeResourceError::Download(error.to_string()))?;
-        let total_size = manifest.components.iter().flat_map(|component| component.files.iter()).map(|file| file.size_bytes).sum();
+        let manifest = downloader
+            .fetch_manifest("runtime-manifest.json", &cancellation)
+            .await?;
+        let source = self
+            .install_root
+            .join(format!("{}.download", manifest.bundle_version));
+        if tokio::fs::try_exists(&source).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&source).await.ok();
+        }
+        tokio::fs::create_dir_all(&source)
+            .await
+            .map_err(|error| RuntimeResourceError::Download(error.to_string()))?;
+        let total_size = manifest
+            .components
+            .iter()
+            .flat_map(|component| component.files.iter())
+            .map(|file| file.size_bytes)
+            .sum();
         let mut downloaded = 0u64;
-        let mut view = self.view_for_manifest(&manifest, ResourceStatus::Downloading, base_url.clone(), None);
+        let mut view = self.view_for_manifest(
+            &manifest,
+            ResourceStatus::Downloading,
+            base_url.clone(),
+            None,
+        );
         view.total_size_bytes = total_size;
         self.set_view(view.clone());
         for component in &manifest.components {
             for file in &component.files {
                 let destination = source.join(&file.path);
                 let component_id = component.id.clone();
-                downloader.download_file(&file.path, &destination, file.size_bytes, &file.sha256, &cancellation, |progress| {
-                    let current = ResourceProgress { component_id: Some(component_id.clone()), downloaded_bytes: downloaded.saturating_add(progress.downloaded_bytes), total_bytes: total_size, phase: progress.phase };
-                    let mut next = view.clone();
-                    next.downloaded_bytes = current.downloaded_bytes;
-                    next.error_code = None;
-                    next.error_message = None;
-                    self.set_view(next.clone());
-                    publish(next, current);
-                }).await?;
+                downloader
+                    .download_file(
+                        &file.path,
+                        &destination,
+                        file.size_bytes,
+                        &file.sha256,
+                        &cancellation,
+                        |progress| {
+                            let current = ResourceProgress {
+                                component_id: Some(component_id.clone()),
+                                downloaded_bytes: downloaded
+                                    .saturating_add(progress.downloaded_bytes),
+                                total_bytes: total_size,
+                                phase: progress.phase,
+                            };
+                            let mut next = view.clone();
+                            next.downloaded_bytes = current.downloaded_bytes;
+                            next.error_code = None;
+                            next.error_message = None;
+                            self.set_view(next.clone());
+                            publish(next, current);
+                        },
+                    )
+                    .await?;
                 downloaded = downloaded.saturating_add(file.size_bytes);
             }
         }
@@ -375,11 +426,15 @@ impl RuntimeResourceState {
         }
         let view = self.view_for_resolved(&manifest, &resolved, base_url);
         self.set_view(view.clone());
-        if let Ok(mut guard) = self.cancellation.lock() { *guard = None; }
+        if let Ok(mut guard) = self.cancellation.lock() {
+            *guard = None;
+        }
         Ok(view)
     }
 
-    fn find_and_resolve(&self) -> Result<(RuntimeManifest, ResolvedRuntimeResources, String), RuntimeResourceError> {
+    fn find_and_resolve(
+        &self,
+    ) -> Result<(RuntimeManifest, ResolvedRuntimeResources, String), RuntimeResourceError> {
         let installer = RuntimeInstaller::new(self.install_root.clone())?;
         installer.cleanup_temporary()?;
         let mut candidates = Vec::new();
@@ -389,7 +444,9 @@ impl RuntimeResourceState {
             (Some(self.bundled_root.clone()), "安装包内资源"),
         ] {
             let Some(root) = root else { continue };
-            let Some(found) = self.read_manifest(&root) else { continue };
+            let Some(found) = self.read_manifest(&root) else {
+                continue;
+            };
             match found {
                 Ok((manifest, _)) => {
                     if let Err(error) = manifest.require_app_version(env!("CARGO_PKG_VERSION")) {
@@ -414,34 +471,106 @@ impl RuntimeResourceState {
                 }
             }
         }
-        Err(first_error.unwrap_or_else(|| {
-            RuntimeResourceError::MissingFile("runtime-manifest.json".into())
-        }))
+        Err(first_error
+            .unwrap_or_else(|| RuntimeResourceError::MissingFile("runtime-manifest.json".into())))
     }
 
-    fn read_manifest(&self, root: &Path) -> Option<Result<(RuntimeManifest, String), RuntimeResourceError>> {
+    fn read_manifest(
+        &self,
+        root: &Path,
+    ) -> Option<Result<(RuntimeManifest, String), RuntimeResourceError>> {
         let path = root.join("runtime-manifest.json");
         let text = std::fs::read_to_string(path).ok()?;
         Some(RuntimeManifest::from_json(&text).map(|manifest| (manifest, text)))
     }
 
-    fn view_for_manifest(&self, manifest: &RuntimeManifest, status: ResourceStatus, source: String, error: Option<RuntimeResourceError>) -> RuntimeResourceView {
-        let platform = manifest.platforms.iter().find(|platform| platform.os == std::env::consts::OS && platform.arch == std::env::consts::ARCH);
-        let components = manifest.components.iter().map(|component| RuntimeComponentView { id: component.id.clone(), version: component.version.clone(), required: component.required, file_count: component.files.len(), size_bytes: component.files.iter().map(|file| file.size_bytes).sum() }).collect::<Vec<_>>();
-        RuntimeResourceView { status, ready: status == ResourceStatus::Ready, bundle_version: Some(manifest.bundle_version.clone()), platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH), app_min_version: manifest.app_min_version.clone(), manifest_sha256: manifest.manifest_sha256().ok(), components, total_size_bytes: manifest.components.iter().flat_map(|component| component.files.iter()).map(|file| file.size_bytes).sum(), minimum_free_disk_bytes: platform.map(|value| value.minimum_free_disk_bytes).unwrap_or(0), minimum_memory_bytes: platform.map(|value| value.minimum_memory_bytes).unwrap_or(0), source, downloaded_bytes: if status == ResourceStatus::Ready { manifest.components.iter().flat_map(|component| component.files.iter()).map(|file| file.size_bytes).sum() } else { 0 }, error_code: error.as_ref().map(|value| value.code().to_owned()), error_message: error.as_ref().map(safe_error_message), updated_at: Utc::now().to_rfc3339() }
+    fn view_for_manifest(
+        &self,
+        manifest: &RuntimeManifest,
+        status: ResourceStatus,
+        source: String,
+        error: Option<RuntimeResourceError>,
+    ) -> RuntimeResourceView {
+        let platform = manifest.platforms.iter().find(|platform| {
+            platform.os == std::env::consts::OS && platform.arch == std::env::consts::ARCH
+        });
+        let components = manifest
+            .components
+            .iter()
+            .map(|component| RuntimeComponentView {
+                id: component.id.clone(),
+                version: component.version.clone(),
+                required: component.required,
+                file_count: component.files.len(),
+                size_bytes: component.files.iter().map(|file| file.size_bytes).sum(),
+            })
+            .collect::<Vec<_>>();
+        RuntimeResourceView {
+            status,
+            ready: status == ResourceStatus::Ready,
+            bundle_version: Some(manifest.bundle_version.clone()),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            app_min_version: manifest.app_min_version.clone(),
+            manifest_sha256: manifest.manifest_sha256().ok(),
+            components,
+            total_size_bytes: manifest
+                .components
+                .iter()
+                .flat_map(|component| component.files.iter())
+                .map(|file| file.size_bytes)
+                .sum(),
+            minimum_free_disk_bytes: platform
+                .map(|value| value.minimum_free_disk_bytes)
+                .unwrap_or(0),
+            minimum_memory_bytes: platform
+                .map(|value| value.minimum_memory_bytes)
+                .unwrap_or(0),
+            source,
+            downloaded_bytes: if status == ResourceStatus::Ready {
+                manifest
+                    .components
+                    .iter()
+                    .flat_map(|component| component.files.iter())
+                    .map(|file| file.size_bytes)
+                    .sum()
+            } else {
+                0
+            },
+            error_code: error.as_ref().map(|value| value.code().to_owned()),
+            error_message: error.as_ref().map(safe_error_message),
+            updated_at: Utc::now().to_rfc3339(),
+        }
     }
 
-    fn view_for_resolved(&self, manifest: &RuntimeManifest, _resolved: &ResolvedRuntimeResources, source: String) -> RuntimeResourceView {
+    fn view_for_resolved(
+        &self,
+        manifest: &RuntimeManifest,
+        _resolved: &ResolvedRuntimeResources,
+        source: String,
+    ) -> RuntimeResourceView {
         self.view_for_manifest(manifest, ResourceStatus::Ready, source, None)
     }
 
     fn set_view(&self, view: RuntimeResourceView) {
         self.persist_view(&view);
-        if let Ok(mut current) = self.snapshot.lock() { *current = view; }
+        if let Ok(mut current) = self.snapshot.lock() {
+            *current = view;
+        }
     }
 
     fn persist_view(&self, view: &RuntimeResourceView) {
-        let _ = self.database.save_runtime_resource_status(&ResourceStatusSnapshot { status: view.status, bundle_version: view.bundle_version.clone(), manifest_sha256: view.manifest_sha256.clone(), current_component: None, downloaded_bytes: view.downloaded_bytes, total_bytes: view.total_size_bytes, error_code: view.error_code.clone(), error_message: view.error_message.clone() });
+        let _ = self
+            .database
+            .save_runtime_resource_status(&ResourceStatusSnapshot {
+                status: view.status,
+                bundle_version: view.bundle_version.clone(),
+                manifest_sha256: view.manifest_sha256.clone(),
+                current_component: None,
+                downloaded_bytes: view.downloaded_bytes,
+                total_bytes: view.total_size_bytes,
+                error_code: view.error_code.clone(),
+                error_message: view.error_message.clone(),
+            });
     }
 }
 

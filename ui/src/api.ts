@@ -4,6 +4,7 @@ import type {
   AiEnvironmentDiagnostic,
   AiExportResult,
   AiImportBatch,
+  AiHighlightCandidatePage,
   AiHighlightCandidate,
   AiHighlightProgress,
   AiHighlightRun,
@@ -163,8 +164,26 @@ const tauriApi: ClientApi = {
     invoke<AiHighlightRun>("ai_resume_highlight_analysis", { runId }),
   listAiHighlightCandidates: (runId) =>
     invoke<AiHighlightCandidate[]>("ai_list_highlight_candidates", { runId }),
+  listQualifiedAiHighlightCandidates: (runId, page = 0, pageSize = 50) =>
+    invoke<AiHighlightCandidatePage>("ai_list_qualified_highlight_candidates", { runId, page, pageSize }),
+  listSelectedAiHighlightCandidates: (runId, page = 0, pageSize = 50) =>
+    invoke<AiHighlightCandidatePage>("ai_list_selected_highlight_candidates", { runId, page, pageSize }),
   selectAiHighlightCandidates: (runId, candidateIds) =>
     invoke<AiHighlightCandidate[]>("ai_select_highlight_candidates", { runId, candidateIds }),
+  setAiHighlightCandidateSelected: (runId, candidateId, selected) =>
+    invoke<AiHighlightCandidate>("ai_set_highlight_candidate_selected", { runId, candidateId, selected }),
+  openAiClipProject: (runId) => invoke("ai_open_clip_project", { runId }),
+  getAiClipProject: (clipProjectId) => invoke("ai_get_clip_project", { clipProjectId }),
+  updateAiClipSegment: (clipProjectId, segmentId, update) =>
+    invoke("ai_update_clip_segment", { clipProjectId, segmentId, update }),
+  insertAiClipCandidate: (clipProjectId, candidateId, insertIndex) =>
+    invoke("ai_insert_clip_candidate", { clipProjectId, candidateId, insertIndex }),
+  reorderAiClipSegments: (clipProjectId, orderedIds) =>
+    invoke("ai_reorder_clip_segments", { clipProjectId, orderedIds }),
+  removeAiClipSegment: (clipProjectId, segmentId) =>
+    invoke("ai_remove_clip_segment", { clipProjectId, segmentId }),
+  startAiClipExport: (clipProjectId) => invoke("ai_start_clip_export", { clipProjectId }),
+  cancelAiClipExport: (clipProjectId) => invoke("ai_cancel_clip_export", { clipProjectId }),
   requestAiInputPreview: (projectId, inputId) =>
     invoke<PreviewSnapshot>("request_ai_input_preview", { projectId, inputId }),
   retryAiInputPreview: (projectId, inputId) =>
@@ -211,6 +230,8 @@ const tauriApi: ClientApi = {
 export function createBrowserApi(): ClientApi {
   let streamers: Streamer[] = [];
   let settings = defaultSettings;
+  const developmentActivationBypass = import.meta.env.DEV
+    && import.meta.env.VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION !== "1";
   const thumbnailBatches = new Map<string, ThumbnailBatch>();
   const desktopAccessUnavailable = (): BrowserAccessState => ({
     status: "session_expired",
@@ -223,10 +244,12 @@ export function createBrowserApi(): ClientApi {
   const rejectDesktopAccess = (): Promise<never> =>
     Promise.reject(new Error("真实访问验证仅桌面端可用"));
   const demoActivation = (): ActivationState => ({
-    configured: false,
-    active: false,
-    status: "missing",
-    message: "激活功能仅在 Tauri 桌面客户端中可用",
+    configured: developmentActivationBypass,
+    active: developmentActivationBypass,
+    status: developmentActivationBypass ? "development_bypass" : "missing",
+    message: developmentActivationBypass
+      ? "浏览器开发模式已跳过客户端激活"
+      : "浏览器演示模式已启用激活流程回归",
     deviceIdHint: "…browser",
     lastHeartbeatAt: null,
     nextHeartbeatAt: null,
@@ -299,7 +322,8 @@ export function createBrowserApi(): ClientApi {
   return {
     getActivationState: async () => demoActivation(),
     activateClient: async () => {
-      throw new Error("请在 Tauri 桌面客户端中完成激活");
+      if (developmentActivationBypass) return demoActivation();
+      throw new Error("浏览器演示模式不能连接激活服务");
     },
     clearActivation: async () => demoActivation(),
     getDashboard: async () => dashboard(),
@@ -624,6 +648,8 @@ export function createBrowserApi(): ClientApi {
       modelId: "deepseek-chat",
       timeoutMs: 30_000,
       promptVersion: "highlight-v1",
+      qualifiedScore: 70,
+      excellentScore: 80,
       keyConfigured: false,
       updatedAt: null,
     }),
@@ -649,7 +675,18 @@ export function createBrowserApi(): ClientApi {
       throw new Error("浏览器演示模式不会恢复 DeepSeek 分析");
     },
     listAiHighlightCandidates: async () => [],
+    listQualifiedAiHighlightCandidates: async (): Promise<AiHighlightCandidatePage> => ({ items: [], page: 0, pageSize: 50, totalCandidates: 0, qualifiedCandidates: 0, selectedCandidates: 0 }),
+    listSelectedAiHighlightCandidates: async (): Promise<AiHighlightCandidatePage> => ({ items: [], page: 0, pageSize: 50, totalCandidates: 0, qualifiedCandidates: 0, selectedCandidates: 0 }),
     selectAiHighlightCandidates: async () => [],
+    setAiHighlightCandidateSelected: async () => { throw new Error("浏览器演示模式不能修改本地高光选择"); },
+    openAiClipProject: async () => { throw new Error("浏览器演示模式不能创建本地剪辑工程"); },
+    getAiClipProject: async () => { throw new Error("浏览器演示模式不能读取本地剪辑工程"); },
+    updateAiClipSegment: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },
+    insertAiClipCandidate: async () => { throw new Error("浏览器演示模式不能向本地剪辑工程追加视频"); },
+    reorderAiClipSegments: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },
+    removeAiClipSegment: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },
+    startAiClipExport: async () => { throw new Error("浏览器演示模式不能导出本地视频"); },
+    cancelAiClipExport: async () => { throw new Error("浏览器演示模式没有可取消的导出任务"); },
     requestAiInputPreview: async (_projectId, inputId): Promise<PreviewSnapshot> => ({
       requestId: `browser-ai-preview-${inputId}`,
       videoId: -inputId,

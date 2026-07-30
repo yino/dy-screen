@@ -25,12 +25,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
-use crate::runtime_resource_state::RuntimeResourceState;
 use crate::domain::{DiscoveryBinding, MonitorEvent, NewVideo, Streamer, StreamerSourceKind};
 pub use crate::room_resolution::RoomDiscovery;
 use crate::room_resolution::{
     DEFAULT_PUBLIC_PAGE_REQUEST_INTERVAL, PublicPageRequestGate, RoomResolutionContext,
 };
+use crate::runtime_resource_state::RuntimeResourceState;
 
 const VERIFICATION_WAIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -1308,17 +1308,20 @@ impl Supervisor {
         let selected = room
             .select(Some(&settings.quality), Some(protocol))
             .map_err(|error| error.safe_message())?;
-        let trusted_media_tools = self
-            .runtime_resources
-            .lock()
-            .ok()
-            .and_then(|resources| resources.as_ref().and_then(|resources| resources.media_tools().ok()));
+        let trusted_media_tools = self.runtime_resources.lock().ok().and_then(|resources| {
+            resources
+                .as_ref()
+                .and_then(|resources| resources.media_tools().ok())
+        });
         let (ffmpeg_executable, ffprobe_executable) = match trusted_media_tools {
             Some((ffmpeg, ffprobe)) => (ffmpeg, ffprobe),
             None => {
                 #[cfg(debug_assertions)]
                 {
-                    (PathBuf::from(&settings.ffmpeg_path), PathBuf::from(&settings.ffprobe_path))
+                    (
+                        PathBuf::from(&settings.ffmpeg_path),
+                        PathBuf::from(&settings.ffprobe_path),
+                    )
                 }
                 #[cfg(not(debug_assertions))]
                 {

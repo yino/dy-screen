@@ -23,6 +23,22 @@ fn memory_credentials_support_missing_replace_and_clear_without_exposing_key_in_
     assert_eq!(store.get().unwrap(), None);
 }
 
+#[test]
+fn highlight_thresholds_must_be_ordered_and_within_score_range() {
+    let out_of_order = LlmProviderSettings {
+        qualified_score: 80,
+        excellent_score: 70,
+        ..LlmProviderSettings::default()
+    };
+    assert!(out_of_order.validate().is_err());
+    let out_of_range = LlmProviderSettings {
+        qualified_score: 101,
+        excellent_score: 101,
+        ..LlmProviderSettings::default()
+    };
+    assert!(out_of_range.validate().is_err());
+}
+
 #[tokio::test]
 async fn fake_provider_diagnosis_is_deterministic_and_receives_no_project_text() {
     let provider = FakeHighlightProvider::default();

@@ -319,10 +319,7 @@ async fn typed_commands_create_start_cancel_retry_query_and_diagnose_projects() 
     );
     let retried_cancelled = commands.retry_input(input_id).await.unwrap();
     assert_eq!(retried_cancelled.project.status, AiProjectStatus::Queued);
-    assert_eq!(
-        retried_cancelled.inputs[0].status,
-        AiInputStatus::Pending
-    );
+    assert_eq!(retried_cancelled.inputs[0].status, AiInputStatus::Pending);
 }
 
 #[test]
@@ -375,6 +372,8 @@ fn highlight_resume_from_sync_tauri_command_thread_does_not_require_a_tokio_reac
             skills_snapshot: vec!["generic-hook@1.0.0".to_owned()],
             analysis_goal: None,
             analysis_fingerprint: "sync-resume-no-reactor".to_owned(),
+            qualified_score: 70,
+            excellent_score: 80,
             total_segments: 0,
             total_chars: 0,
             estimated_batches: 0,

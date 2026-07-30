@@ -230,6 +230,9 @@ impl Database {
         crate::ai::migrate_ai_v4(&mut connection)?;
         crate::ai::migrate_ai_v7(&mut connection)?;
         crate::ai::migrate_ai_v9(&mut connection)?;
+        crate::ai::migrate_ai_v12(&mut connection)?;
+        crate::ai::migrate_ai_v13(&mut connection)?;
+        crate::ai::migrate_ai_v14(&mut connection)?;
 
         let applied = connection
             .query_row(
@@ -261,7 +264,15 @@ impl Database {
             )
             .optional()?
             .is_some();
-        if !applied {
+        let activation_table_exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'client_activation'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied || !activation_table_exists {
             migrate_client_activation_v10(&mut connection)?;
         }
         drop(connection);
@@ -372,19 +383,21 @@ impl Database {
             )
             .optional()?
             .map_or_else(
-                || Ok(RuntimeResourceRecord {
-                    platform,
-                    app_min_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    bundle_version: None,
-                    status: ResourceStatus::Failed,
-                    progress_bytes: 0,
-                    total_bytes: 0,
-                    manifest_sha256: None,
-                    current_component: None,
-                    error_code: Some("resource_not_checked".to_owned()),
-                    error_message: Some("尚未检查本地运行资源".to_owned()),
-                    updated_at: Utc::now().to_rfc3339(),
-                }),
+                || {
+                    Ok(RuntimeResourceRecord {
+                        platform,
+                        app_min_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        bundle_version: None,
+                        status: ResourceStatus::Failed,
+                        progress_bytes: 0,
+                        total_bytes: 0,
+                        manifest_sha256: None,
+                        current_component: None,
+                        error_code: Some("resource_not_checked".to_owned()),
+                        error_message: Some("尚未检查本地运行资源".to_owned()),
+                        updated_at: Utc::now().to_rfc3339(),
+                    })
+                },
                 Ok,
             )
     }
@@ -1755,7 +1768,7 @@ fn migrate_client_activation_v10(connection: &mut Connection) -> Result<()> {
         "#,
     )?;
     transaction.execute(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES(10, ?1)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(10, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

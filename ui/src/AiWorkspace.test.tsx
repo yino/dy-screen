@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AiWorkspace } from "./AiWorkspace";
 import type {
   AiEnvironmentDiagnostic,
+  AiClipProjectDetail,
+  AiHighlightCandidatePage,
   AiHighlightCandidate,
   AiHighlightRun,
   AiProject,
@@ -129,6 +131,8 @@ const completedHighlightRun: AiHighlightRun = {
   skillsSnapshot: ["generic-hook@1.0.0"],
   analysisGoal: null,
   analysisFingerprint: "highlight-run-801",
+  qualifiedScore: 70,
+  excellentScore: 80,
   userAuthorized: true,
   totalSegments: 2,
   totalChars: 18,
@@ -230,6 +234,7 @@ function createAiApi(
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
     value: { writeText: vi.fn().mockResolvedValue(undefined) },
@@ -511,6 +516,8 @@ describe("AiWorkspace", () => {
       modelId: "deepseek-chat",
       timeoutMs: 30_000,
       promptVersion: "highlight-v1",
+      qualifiedScore: 70,
+      excellentScore: 80,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });
@@ -534,7 +541,7 @@ describe("AiWorkspace", () => {
     expect(screen.getByText("范围：1 批 · 2 句")).toBeInTheDocument();
     expect(screen.getByText("模型消耗：320 Token")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新分析结果" })).toBeEnabled();
-    expect(screen.getByText("分析已完成，但模型没有返回可用候选。")).toBeInTheDocument();
+    expect(screen.getByText("分析已完成，但没有生成候选。")).toBeInTheDocument();
   });
 
   it("恢复长批次后台分析并展示真实完成数和失败批次", async () => {
@@ -581,6 +588,8 @@ describe("AiWorkspace", () => {
       modelId: "deepseek-chat",
       timeoutMs: 30_000,
       promptVersion: "highlight-v1",
+      qualifiedScore: 70,
+      excellentScore: 80,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });
@@ -598,41 +607,133 @@ describe("AiWorkspace", () => {
     expect(screen.getByText("已读取相同内容的历史高光分析结果")).toBeInTheDocument();
   });
 
+  it("重试接口返回旧的部分完成快照时继续轮询到新候选", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const partialRun: AiHighlightRun = {
+      ...completedHighlightRun,
+      status: "partial",
+      qualifiedScore: 50,
+      totalTokens: 4_400,
+      lastErrorCode: "highlight_ranking_failed",
+      lastErrorMessage: "统一评分失败，已按候选分项分数发布备用排序",
+    };
+    const finishedRun: AiHighlightRun = {
+      ...partialRun,
+      status: "completed",
+      totalTokens: 4_900,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      updatedAt: "2026-07-22T00:00:10Z",
+    };
+    const qualified = [{ ...highlightCandidates[0], totalScore: 85 }];
+    const emptyPage: AiHighlightCandidatePage = {
+      items: [],
+      page: 0,
+      pageSize: 50,
+      totalCandidates: 8,
+      qualifiedCandidates: 0,
+      selectedCandidates: 0,
+    };
+    const finishedPage: AiHighlightCandidatePage = {
+      ...emptyPage,
+      items: qualified,
+      qualifiedCandidates: 5,
+    };
+    const api = createAiApi();
+    api.getAiLlmSettings = vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      qualifiedScore: 50,
+      excellentScore: 80,
+      keyConfigured: true,
+      updatedAt: "2026-07-22T00:00:00Z",
+    });
+    api.getLatestAiHighlightRun = vi.fn()
+      .mockResolvedValueOnce(partialRun)
+      .mockResolvedValue(finishedRun);
+    api.startAiHighlightAnalysis = vi.fn().mockResolvedValue(partialRun);
+    api.getAiHighlightProgress = vi.fn().mockResolvedValue({
+      runId: partialRun.id,
+      totalBatches: 3,
+      pendingBatches: 0,
+      runningBatches: 0,
+      completedBatches: 3,
+      failedBatches: 0,
+      candidateCount: 8,
+    });
+    api.listQualifiedAiHighlightCandidates = vi.fn()
+      .mockResolvedValueOnce(emptyPage)
+      .mockResolvedValueOnce(emptyPage)
+      .mockResolvedValue(finishedPage);
+    api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(emptyPage);
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "重试未完成批次" }, { timeout: 3_000 }));
+    expect(await screen.findByRole("button", { name: "高光候选 1" }, { timeout: 3_000 })).toBeInTheDocument();
+    expect(api.getLatestAiHighlightRun).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("状态：已完成")).toBeInTheDocument();
+    expect(screen.getByText("模型消耗：4900 Token")).toBeInTheDocument();
+  });
+
   it("将高光候选与 ASR 整合，并且一次只展开当前候选详情", async () => {
     const user = userEvent.setup();
     const api = createAiApi();
+    const candidatesWithAutomaticSelection = highlightCandidates.map((candidate) => ({
+      ...candidate,
+      selected: candidate.totalScore >= completedHighlightRun.excellentScore,
+    }));
     api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
-    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(candidatesWithAutomaticSelection);
     render(<AiWorkspace api={api} />);
 
-    expect(await screen.findByText("2 个评分候选")).toBeInTheDocument();
-    expect(screen.getByText("1 个达到 70 分 · 1 个参考候选")).toBeInTheDocument();
+    expect(await screen.findByText("已保存 2 个候选")).toBeInTheDocument();
+    expect(screen.getByText("1 个达到合格阈值 · 已选择 1 个 · 优秀候选已自动选中")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "全文" })).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "高光候选 2" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "已选择 0" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "高光候选 1" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "已选择 1" })).toBeInTheDocument();
     expect(screen.queryByText(highlightCandidates[0].reason)).not.toBeInTheDocument();
     expect(screen.queryByText(highlightCandidates[1].reason)).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "高光候选 2" }));
+    await user.click(screen.getByRole("button", { name: "高光候选 1" }));
 
     const navigation = screen.getByLabelText("高光候选导航");
     expect(within(navigation).getByRole("button", { name: "查看候选 价格反转，82 分" })).toBeInTheDocument();
-    expect(within(navigation).getByRole("button", { name: "查看候选 普通互动，64 分" })).toBeInTheDocument();
     expect(within(navigation).getAllByRole("button")[0]).toHaveAccessibleName("查看候选 价格反转，82 分");
     expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("价格反转");
     expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("86吸引力");
     expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("91标签相关");
     expect(screen.getByText(highlightCandidates[0].reason)).toBeInTheDocument();
     expect(screen.queryByLabelText("普通互动 评分明细")).not.toBeInTheDocument();
-    expect(screen.getAllByLabelText("句段包含 2 个高光候选")).toHaveLength(2);
+    expect(screen.getAllByLabelText("句段包含 1 个高光候选")).toHaveLength(2);
     expect(screen.queryByRole("button", { name: "保存候选选择" })).not.toBeInTheDocument();
 
     await user.selectOptions(screen.getByLabelText("候选排序"), "time");
-    expect(within(navigation).getAllByRole("button")[0]).toHaveAccessibleName("查看候选 普通互动，64 分");
-    await user.click(within(navigation).getByRole("button", { name: "查看候选 普通互动，64 分" }));
-    expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("普通互动");
-    expect(screen.getByLabelText("普通互动 评分明细")).toHaveTextContent("65传播性");
-    expect(screen.queryByText(highlightCandidates[0].reason)).not.toBeInTheDocument();
+    expect(within(navigation).getAllByRole("button")[0]).toHaveAccessibleName("查看候选 价格反转，82 分");
+  });
+
+  it("顶部候选和编辑入口会定位到 ASR 选择区", async () => {
+    const user = userEvent.setup();
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
+    api.openAiClipProject = vi.fn();
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByText("在 ASR 中查看和选择"));
+    expect(screen.getByRole("button", { name: "高光候选 1" })).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "start" }));
+
+    await user.click(screen.getByRole("button", { name: "编辑视频" }));
+    expect(screen.getByText("请先在高光候选中勾选至少一个片段，再进入视频编辑")).toBeInTheDocument();
+    expect(api.openAiClipProject).not.toHaveBeenCalled();
   });
 
   it("重新打开项目时恢复最近一次高光运行和评分候选", async () => {
@@ -641,8 +742,8 @@ describe("AiWorkspace", () => {
     api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
     render(<AiWorkspace api={api} />);
 
-    expect(await screen.findByText("2 个评分候选")).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole("button", { name: "高光候选 2" }));
+    expect(await screen.findByText("已保存 2 个候选")).toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "高光候选 1" }));
     expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("82 分");
     expect(screen.getByLabelText("价格反转 评分明细")).toHaveTextContent("91标签相关");
     expect(api.getLatestAiHighlightRun).toHaveBeenCalledWith(project.id);
@@ -706,7 +807,7 @@ describe("AiWorkspace", () => {
     const pause = vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
     render(<AiWorkspace api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "高光候选 3" }));
+    await user.click(await screen.findByRole("button", { name: "高光候选 2" }));
     await user.click(screen.getByRole("button", { name: "查看候选 跨视频高光，77 分" }));
 
     await waitFor(() => expect(api.requestAiInputPreview).toHaveBeenCalledWith(project.id, secondInput.id));
@@ -722,45 +823,374 @@ describe("AiWorkspace", () => {
     expect(pause).toHaveBeenCalled();
   });
 
-  it("即时保存加入待切片状态，并在失败时保留后端已确认选择", async () => {
+  it("分页候选按单项切换选择，不覆盖其它已选片段", async () => {
     const user = userEvent.setup();
+    const secondQualified = {
+      ...highlightCandidates[1],
+      totalScore: 74,
+      shareabilityScore: 75,
+      selected: true,
+    };
+    const qualified = [highlightCandidates[0], secondQualified];
+    const page = (items: AiHighlightCandidate[], selectedCandidates: number): AiHighlightCandidatePage => ({
+      items,
+      page: 0,
+      pageSize: 50,
+      totalCandidates: 3,
+      qualifiedCandidates: 2,
+      selectedCandidates,
+    });
     const api = createAiApi();
     api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
-    api.listAiHighlightCandidates = vi.fn().mockResolvedValue(highlightCandidates);
-    api.selectAiHighlightCandidates = vi.fn()
-      .mockResolvedValueOnce(highlightCandidates.map((candidate) => ({
-        ...candidate,
-        selected: candidate.id === highlightCandidates[0].id,
-      })))
-      .mockRejectedValueOnce(new Error("选择保存失败"));
+    api.listQualifiedAiHighlightCandidates = vi.fn().mockResolvedValue(page(qualified, 1));
+    api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(page([secondQualified], 1));
+    api.setAiHighlightCandidateSelected = vi.fn().mockResolvedValue({ ...highlightCandidates[0], selected: true });
     render(<AiWorkspace api={api} />);
 
     await user.click(await screen.findByRole("button", { name: "高光候选 2" }));
     const selection = screen.getByRole("checkbox", { name: "加入待切片" });
     await user.click(selection);
 
-    await waitFor(() => expect(api.selectAiHighlightCandidates).toHaveBeenCalledWith(
+    await waitFor(() => expect(api.setAiHighlightCandidateSelected).toHaveBeenCalledWith(
       completedHighlightRun.id,
-      [highlightCandidates[0].id],
+      highlightCandidates[0].id,
+      true,
     ));
     expect(selection).toBeChecked();
-    expect(screen.getByRole("button", { name: "已选择 1" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "已选择 2" })).toBeInTheDocument();
+    expect(api.selectAiHighlightCandidates).toBeUndefined();
+  });
 
-    await user.click(screen.getByRole("button", { name: "已选择 1" }));
-    expect(within(screen.getByLabelText("高光候选导航")).getAllByRole("button")).toHaveLength(1);
-    expect(screen.getByLabelText("当前高光候选")).toHaveTextContent("价格反转");
-    await user.click(screen.getByRole("button", { name: "高光候选 2" }));
-    await user.click(screen.getByRole("button", { name: "查看候选 普通互动，64 分" }));
-    const secondSelection = screen.getByRole("checkbox", { name: "加入待切片" });
-    await user.click(secondSelection);
+  it("候选全部低于阈值时展示真实候选数和冻结阈值", async () => {
+    const partialRun: AiHighlightRun = {
+      ...completedHighlightRun,
+      status: "partial",
+      qualifiedScore: 50,
+      lastErrorCode: "highlight_ranking_failed",
+      lastErrorMessage: "统一评分失败，已按候选分项分数发布备用排序",
+    };
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(partialRun);
+    api.listQualifiedAiHighlightCandidates = vi.fn().mockResolvedValue({
+      items: [],
+      page: 0,
+      pageSize: 50,
+      totalCandidates: 8,
+      qualifiedCandidates: 0,
+      selectedCandidates: 0,
+    });
+    api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue({
+      items: [],
+      page: 0,
+      pageSize: 50,
+      totalCandidates: 8,
+      qualifiedCandidates: 0,
+      selectedCandidates: 0,
+    });
+    render(<AiWorkspace api={api} />);
 
-    await waitFor(() => expect(screen.getByText("选择保存失败")).toBeInTheDocument());
-    expect(secondSelection).not.toBeChecked();
-    expect(screen.getByRole("button", { name: "已选择 1" })).toBeInTheDocument();
-    expect(api.selectAiHighlightCandidates).toHaveBeenLastCalledWith(
-      completedHighlightRun.id,
-      [highlightCandidates[0].id, highlightCandidates[1].id],
-    );
+    expect(await screen.findByText("本次已生成 8 个候选，但没有候选达到 50 分的合格阈值。")).toBeInTheDocument();
+  });
+
+  it("从已选择候选进入独立剪辑页并保存片段、导出和返回", async () => {
+    const user = userEvent.setup();
+    const play = vi.fn().mockResolvedValue(undefined);
+    const pause = vi.fn();
+    Object.defineProperty(HTMLMediaElement.prototype, "play", { configurable: true, value: play });
+    Object.defineProperty(HTMLMediaElement.prototype, "pause", { configurable: true, value: pause });
+    const gain = { gain: { value: 1 }, connect: vi.fn() };
+    class MockAudioContext {
+      state = "running";
+      destination = {};
+      createMediaElementSource = vi.fn().mockReturnValue({ connect: vi.fn().mockReturnValue(gain) });
+      createGain = vi.fn().mockReturnValue(gain);
+      resume = vi.fn().mockResolvedValue(undefined);
+      close = vi.fn().mockResolvedValue(undefined);
+    }
+    vi.stubGlobal("AudioContext", MockAudioContext);
+    const selectedCandidates = highlightCandidates.map((candidate, index) => ({
+      ...candidate,
+      totalScore: index === 0 ? 82 : 74,
+      selected: true,
+    }));
+    const appendableCandidate: AiHighlightCandidate = {
+      ...selectedCandidates[1],
+      id: 503,
+      candidateKey: "candidate-appendable",
+      title: "可追加的视频片段",
+      startMs: 8_000,
+      endMs: 9_500,
+      totalScore: 86,
+      selected: true,
+    };
+    const candidatePage: AiHighlightCandidatePage = {
+      items: selectedCandidates,
+      page: 0,
+      pageSize: 50,
+      totalCandidates: 2,
+      qualifiedCandidates: 2,
+      selectedCandidates: 2,
+    };
+    const selectedCandidatePage: AiHighlightCandidatePage = {
+      ...candidatePage,
+      items: [...selectedCandidates, appendableCandidate],
+      totalCandidates: 3,
+      qualifiedCandidates: 3,
+      selectedCandidates: 3,
+    };
+    const clip: AiClipProjectDetail = {
+      project: {
+        id: 701,
+        highlightRunId: completedHighlightRun.id,
+        name: "整场直播转写 - 高光剪辑",
+        outputWidth: 1920,
+        outputHeight: 1080,
+        version: 1,
+        exportStatus: "idle",
+        exportProgress: 0,
+        outputPath: null,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        createdAt: "2026-07-22T00:20:00Z",
+        updatedAt: "2026-07-22T00:20:00Z",
+      },
+      segments: selectedCandidates.map((candidate, index) => ({
+        id: 711 + index,
+        clipProjectId: 701,
+        candidateId: candidate.id,
+        inputId: candidate.inputId,
+        position: index,
+        title: candidate.title,
+        sourceStartMs: candidate.startMs,
+        sourceEndMs: candidate.endMs,
+        volumePercent: 100,
+        effect: "none" as const,
+      })),
+      subtitles: [{
+        stableSegmentId: "clip-subtitle-first",
+        clipSegmentId: 711,
+        inputId: selectedCandidates[0].inputId,
+        normalizedText: "第一段 ASR 字幕。",
+        sourceStartMs: 1_000,
+        sourceEndMs: 2_000,
+        projectStartMs: 0,
+        projectEndMs: 1_000,
+      }, {
+        stableSegmentId: "clip-subtitle-second",
+        clipSegmentId: 712,
+        inputId: selectedCandidates[1].inputId,
+        normalizedText: "第二段 ASR 字幕。",
+        sourceStartMs: 500,
+        sourceEndMs: 1_500,
+        projectStartMs: 17_000,
+        projectEndMs: 18_000,
+      }],
+      subtitlesComplete: true,
+    };
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listQualifiedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
+    api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(selectedCandidatePage);
+    api.openAiClipProject = vi.fn().mockResolvedValue(clip);
+    let clipState = clip;
+    api.updateAiClipSegment = vi.fn().mockImplementation(async (_projectId, segmentId, update) => {
+      clipState = { ...clipState, segments: clipState.segments.map((segment) => segment.id === segmentId ? { ...segment, ...update } : segment) };
+      return clipState;
+    });
+    api.insertAiClipCandidate = vi.fn().mockImplementation(async (_projectId, candidateId, insertIndex) => {
+      const candidate = selectedCandidatePage.items.find((item) => item.id === candidateId)!;
+      const segments = [...clipState.segments];
+      segments.splice(insertIndex, 0, {
+        id: 713,
+        clipProjectId: 701,
+        candidateId: candidate.id,
+        inputId: candidate.inputId,
+        position: insertIndex,
+        title: candidate.title,
+        sourceStartMs: candidate.startMs,
+        sourceEndMs: candidate.endMs,
+        volumePercent: 100,
+        effect: "none",
+      });
+      clipState = {
+        ...clipState,
+        segments: segments.map((segment, index) => ({ ...segment, position: index })),
+        subtitles: [...clipState.subtitles, {
+          stableSegmentId: "clip-subtitle-appended",
+          clipSegmentId: 713,
+          inputId: candidate.inputId,
+          normalizedText: "追加片段 ASR 字幕。",
+          sourceStartMs: candidate.startMs,
+          sourceEndMs: candidate.endMs,
+          projectStartMs: 34_000,
+          projectEndMs: 35_500,
+        }],
+        subtitlesComplete: true,
+      };
+      return clipState;
+    });
+    api.reorderAiClipSegments = vi.fn().mockImplementation(async (_projectId: number, orderedIds: number[]) => {
+      clipState = { ...clipState, segments: orderedIds.map((id, index) => ({ ...clipState.segments.find((segment) => segment.id === id)!, position: index })) };
+      return clipState;
+    });
+    api.startAiClipExport = vi.fn().mockResolvedValue({ ...clip.project, exportStatus: "exporting", exportProgress: 0 });
+    api.cancelAiClipExport = vi.fn().mockResolvedValue({ ...clip.project, exportStatus: "cancelled", exportProgress: 0 });
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "编辑视频" }));
+    expect(await screen.findByRole("main", { name: "视频剪辑页面" })).toBeInTheDocument();
+    expect(screen.getByText("时间轨道")).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "视频与动画素材库" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "追加视频 1" })).toBeEnabled();
+    expect(screen.getByLabelText("时间轴缩放")).toHaveValue("50");
+    expect(screen.getByRole("button", { name: "播放视频" })).toBeInTheDocument();
+    expect(screen.getByText("第一段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).toBeInTheDocument();
+    expect(screen.getByText("已关联 2 条只读字幕，导出时自动烧录")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` }));
+    expect(screen.getByText("第二段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: `片段 1：${clip.segments[0].title}` }));
+    expect(screen.getByText("输出规格 1920 × 1080 · 工程版本 1")).toBeInTheDocument();
+    await waitFor(() => expect(document.querySelector(".clip-preview-frame video")).not.toBeNull());
+    const clipPreviewVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
+    clipPreviewVideo.currentTime = 3;
+    fireEvent.timeUpdate(clipPreviewVideo);
+    expect(screen.queryByText("第一段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).not.toBeInTheDocument();
+    clipPreviewVideo.currentTime = 1;
+    fireEvent.timeUpdate(clipPreviewVideo);
+    expect(screen.getByText("第一段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).toBeInTheDocument();
+    Object.defineProperties(clipPreviewVideo, {
+      videoWidth: { configurable: true, value: 1080 },
+      videoHeight: { configurable: true, value: 1920 },
+    });
+    fireEvent.loadedMetadata(clipPreviewVideo);
+    expect(clipPreviewVideo.closest(".clip-preview-frame")).toHaveClass("portrait");
+    expect(clipPreviewVideo.closest<HTMLElement>(".clip-preview-frame")?.style.getPropertyValue("--clip-preview-aspect")).toBe("0.5625");
+    await user.click(screen.getByRole("button", { name: "播放视频" }));
+    expect(play).toHaveBeenCalledTimes(1);
+    fireEvent.play(clipPreviewVideo);
+    expect(screen.getByRole("button", { name: "暂停视频" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "静音" }));
+    await waitFor(() => expect(clipPreviewVideo.muted).toBe(true));
+    await user.click(screen.getByRole("button", { name: "下一帧" }));
+    expect(pause).toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("时间轴缩放"), { target: { value: "80" } });
+    expect(screen.getByLabelText("时间轴缩放")).toHaveValue("80");
+
+    fireEvent.change(screen.getByLabelText("片段音量"), { target: { value: "135" } });
+    await waitFor(() => expect(api.updateAiClipSegment).toHaveBeenCalledWith(701, 711, {
+      volumePercent: 135,
+      effect: "none",
+    }));
+    await waitFor(() => expect(gain.gain.value).toBe(1.35));
+    await user.click(screen.getByRole("button", { name: "淡入内置效果" }));
+    await waitFor(() => expect(api.updateAiClipSegment).toHaveBeenLastCalledWith(701, 711, {
+      volumePercent: 135,
+      effect: "fade_in",
+    }));
+    expect(Number(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.style.opacity)).toBeLessThan(0.2);
+
+    await user.click(screen.getByRole("button", { name: "转场" }));
+    expect(screen.queryByRole("button", { name: "淡入内置效果" })).not.toBeInTheDocument();
+    const flashMaterial = screen.getByRole("button", { name: "闪白转场内置效果" });
+    const secondTimelineSegment = screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` });
+    fireEvent.dragStart(flashMaterial, { dataTransfer: { effectAllowed: "copy" } });
+    fireEvent.dragOver(secondTimelineSegment);
+    fireEvent.drop(secondTimelineSegment);
+    await waitFor(() => expect(api.updateAiClipSegment).toHaveBeenLastCalledWith(701, 712, {
+      volumePercent: 100,
+      effect: "flash",
+    }));
+    const firstDropGap = screen.getByRole("button", { name: "拖放到位置 1" });
+    fireEvent.dragStart(flashMaterial, { dataTransfer: { effectAllowed: "copy" } });
+    fireEvent.dragOver(firstDropGap);
+    fireEvent.drop(firstDropGap);
+    await waitFor(() => expect(api.updateAiClipSegment).toHaveBeenLastCalledWith(701, 711, {
+      volumePercent: 135,
+      effect: "flash",
+    }));
+    await user.click(screen.getByRole("button", { name: "全部" }));
+
+    await user.click(screen.getByRole("button", { name: "片段下移" }));
+    expect(api.reorderAiClipSegments).toHaveBeenCalledWith(701, [712, 711]);
+
+    const firstTimelineSegment = screen.getByRole("button", { name: `片段 1：${clip.segments[1].title}` });
+    const finalDropGap = screen.getByRole("button", { name: "拖放到位置 3" });
+    fireEvent.dragStart(firstTimelineSegment, { dataTransfer: { effectAllowed: "move" } });
+    fireEvent.dragOver(finalDropGap);
+    fireEvent.drop(finalDropGap);
+    await waitFor(() => expect(api.reorderAiClipSegments).toHaveBeenLastCalledWith(701, [711, 712]));
+
+    await user.click(screen.getByRole("button", { name: "视频" }));
+    const videoMaterial = await screen.findByRole("button", { name: "追加视频：可追加的视频片段" });
+    await user.click(videoMaterial);
+    await waitFor(() => expect(api.insertAiClipCandidate).toHaveBeenCalledWith(701, 503, 2));
+    expect(await screen.findByRole("button", { name: "片段 3：可追加的视频片段" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "导出 MP4" }));
+    expect(api.startAiClipExport).toHaveBeenCalledWith(701);
+    await user.click(await screen.findByRole("button", { name: "取消导出 0%" }));
+    expect(api.cancelAiClipExport).toHaveBeenCalledWith(701);
+    await user.click(screen.getByRole("button", { name: "返回 AI 剪辑" }));
+    expect(await screen.findByText("高光评分与候选")).toBeInTheDocument();
+  });
+
+  it("任一剪辑片段缺少 ASR 字幕时禁用导出并显示处理方式", async () => {
+    const user = userEvent.setup();
+    const selectedCandidate = { ...highlightCandidates[0], selected: true };
+    const candidatePage: AiHighlightCandidatePage = {
+      items: [selectedCandidate],
+      page: 0,
+      pageSize: 50,
+      totalCandidates: 1,
+      qualifiedCandidates: 1,
+      selectedCandidates: 1,
+    };
+    const incompleteClip: AiClipProjectDetail = {
+      project: {
+        id: 702,
+        highlightRunId: completedHighlightRun.id,
+        name: "缺少字幕的剪辑工程",
+        outputWidth: 1920,
+        outputHeight: 1080,
+        version: 1,
+        exportStatus: "idle",
+        exportProgress: 0,
+        outputPath: null,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        createdAt: "2026-07-22T00:20:00Z",
+        updatedAt: "2026-07-22T00:20:00Z",
+      },
+      segments: [{
+        id: 721,
+        clipProjectId: 702,
+        candidateId: selectedCandidate.id,
+        inputId: selectedCandidate.inputId,
+        position: 0,
+        title: selectedCandidate.title,
+        sourceStartMs: selectedCandidate.startMs,
+        sourceEndMs: selectedCandidate.endMs,
+        volumePercent: 100,
+        effect: "none",
+      }],
+      subtitles: [],
+      subtitlesComplete: false,
+    };
+    const api = createAiApi();
+    api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+    api.listQualifiedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
+    api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
+    api.openAiClipProject = vi.fn().mockResolvedValue(incompleteClip);
+    api.startAiClipExport = vi.fn();
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "编辑视频" }));
+    expect(await screen.findByRole("main", { name: "视频剪辑页面" })).toBeInTheDocument();
+    expect(screen.getByText("部分片段没有 ASR 字幕，请补全识别或移除后再导出")).toBeInTheDocument();
+    const exportButton = screen.getByRole("button", { name: "导出 MP4" });
+    expect(exportButton).toBeDisabled();
+    await user.click(exportButton);
+    expect(api.startAiClipExport).not.toHaveBeenCalled();
   });
 
   it("允许审计高光分析的请求、步骤、输入范围和结构化结果", async () => {
@@ -772,6 +1202,8 @@ describe("AiWorkspace", () => {
       modelId: "deepseek-chat",
       timeoutMs: 30_000,
       promptVersion: "highlight-v1",
+      qualifiedScore: 70,
+      excellentScore: 80,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });
@@ -797,7 +1229,7 @@ describe("AiWorkspace", () => {
     expect(within(inputRange).getByText("欢迎来到直播间。")).toBeInTheDocument();
     expect(within(inputRange).getByText("今天价格99元。")).toBeInTheDocument();
     expect(within(inputRange).getAllByLabelText("价格反转 候选整体评分 82 分")).toHaveLength(2);
-    expect(within(inputRange).getAllByLabelText("普通互动 候选整体评分 64 分")).toHaveLength(2);
+    expect(within(inputRange).queryByLabelText("普通互动 候选整体评分 64 分")).not.toBeInTheDocument();
   });
 
   it("播放器不可定位时仍允许复制文本，并提供 TXT 与 JSON 只读导出", async () => {

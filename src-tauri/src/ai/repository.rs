@@ -2,6 +2,8 @@
 //!
 //! 原子发布、状态迁移和引用清理都在此层维护，且永不删除原始媒体或随包模型。
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -10,7 +12,9 @@ use thiserror::Error;
 use crate::database::{Database, DatabaseError};
 
 use super::domain::{
-    AiArtifactStatus, AiHighlightCandidate, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
+    AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
+    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiHighlightCandidate,
+    AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
     AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail,
     AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun,
     NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint,
@@ -42,6 +46,70 @@ pub enum AiRepositoryError {
 }
 
 pub type Result<T> = std::result::Result<T, AiRepositoryError>;
+
+#[derive(Debug, Clone)]
+pub struct ClipExportSource {
+    pub segment: AiClipSegment,
+    pub source_path: String,
+    pub source_fingerprint: SourceFingerprint,
+    pub subtitles: Vec<AiClipSubtitle>,
+}
+
+pub fn project_clip_subtitles(
+    clip_segments: &[AiClipSegment],
+    transcripts_by_input: &HashMap<i64, Vec<TranscriptSegment>>,
+) -> (Vec<AiClipSubtitle>, bool) {
+    let mut project_cursor_ms = 0_u64;
+    let mut subtitles = Vec::new();
+    let mut complete = !clip_segments.is_empty();
+
+    for clip in clip_segments {
+        let mut clip_subtitle_count = 0_usize;
+        let mut transcript_segments = transcripts_by_input
+            .get(&clip.input_id)
+            .into_iter()
+            .flatten()
+            .filter(|segment| {
+                !segment.normalized_text.trim().is_empty()
+                    && segment.source_start_ms < clip.source_end_ms
+                    && segment.source_end_ms > clip.source_start_ms
+            })
+            .collect::<Vec<_>>();
+        transcript_segments.sort_by(|left, right| {
+            left.source_start_ms
+                .cmp(&right.source_start_ms)
+                .then(left.ordinal.cmp(&right.ordinal))
+                .then(left.id.cmp(&right.id))
+        });
+
+        for transcript in transcript_segments {
+            let source_start_ms = transcript.source_start_ms.max(clip.source_start_ms);
+            let source_end_ms = transcript.source_end_ms.min(clip.source_end_ms);
+            if source_end_ms <= source_start_ms {
+                continue;
+            }
+            subtitles.push(AiClipSubtitle {
+                stable_segment_id: transcript.id.clone(),
+                clip_segment_id: clip.id,
+                input_id: clip.input_id,
+                normalized_text: transcript.normalized_text.trim().to_owned(),
+                source_start_ms,
+                source_end_ms,
+                project_start_ms: project_cursor_ms
+                    .saturating_add(source_start_ms.saturating_sub(clip.source_start_ms)),
+                project_end_ms: project_cursor_ms
+                    .saturating_add(source_end_ms.saturating_sub(clip.source_start_ms)),
+            });
+            clip_subtitle_count += 1;
+        }
+        if clip_subtitle_count == 0 {
+            complete = false;
+        }
+        project_cursor_ms = project_cursor_ms
+            .saturating_add(clip.source_end_ms.saturating_sub(clip.source_start_ms));
+    }
+    (subtitles, complete)
+}
 
 /// AI repository 在一个 SQLite 事务边界内维护项目、输入和识别产物。
 #[derive(Clone)]
@@ -243,7 +311,10 @@ impl AiRepository {
     /// 将用户明确选择的失败或已取消输入恢复为待执行；不会自动无限重试。
     pub fn prepare_input_retry(&self, input_id: i64) -> Result<AiProjectInput> {
         let input = self.get_input(input_id)?;
-        if !matches!(input.status, AiInputStatus::Failed | AiInputStatus::Cancelled) {
+        if !matches!(
+            input.status,
+            AiInputStatus::Failed | AiInputStatus::Cancelled
+        ) {
             return Err(AiRepositoryError::InvalidState(
                 "只有失败或已取消输入可以重试".to_owned(),
             ));
@@ -447,7 +518,7 @@ impl AiRepository {
         let connection = self.database.connection()?;
         let row = connection
             .query_row(
-                "SELECT provider, model_id, timeout_ms, prompt_version, updated_at FROM llm_provider_settings WHERE id = 1",
+                "SELECT provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, updated_at FROM llm_provider_settings WHERE id = 1",
                 [],
                 |row| {
                     Ok((
@@ -455,7 +526,9 @@ impl AiRepository {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
@@ -473,12 +546,13 @@ impl AiRepository {
             .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         let now = Utc::now().to_rfc3339();
         self.database.connection()?.execute(
-            r#"INSERT INTO llm_provider_settings(id, provider, model_id, timeout_ms, prompt_version, updated_at)
-               VALUES(1, ?1, ?2, ?3, ?4, ?5)
+            r#"INSERT INTO llm_provider_settings(id, provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, updated_at)
+               VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
                ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model_id=excluded.model_id,
                    timeout_ms=excluded.timeout_ms, prompt_version=excluded.prompt_version,
+                   qualified_score=excluded.qualified_score, excellent_score=excluded.excellent_score,
                    updated_at=excluded.updated_at"#,
-            params![settings.provider, settings.model_id.trim(), settings.timeout_ms as i64, settings.prompt_version, now],
+            params![settings.provider, settings.model_id.trim(), settings.timeout_ms as i64, settings.prompt_version, settings.qualified_score, settings.excellent_score, now],
         )?;
         self.get_llm_provider_settings(settings.key_configured)
     }
@@ -501,6 +575,14 @@ impl AiRepository {
         if input.analysis_fingerprint.trim().is_empty() {
             return Err(AiRepositoryError::Integrity("分析指纹不能为空".to_owned()));
         }
+        if input.qualified_score > 100
+            || input.excellent_score > 100
+            || input.excellent_score < input.qualified_score
+        {
+            return Err(AiRepositoryError::Integrity(
+                "高光运行阈值必须在 0 到 100 之间，且优秀阈值不能低于合格阈值".to_owned(),
+            ));
+        }
         let tags_json = serde_json::to_string(&input.tags_snapshot)
             .map_err(|_| AiRepositoryError::Serialization("标签快照无法序列化".to_owned()))?;
         let skills_json = serde_json::to_string(&input.skills_snapshot)
@@ -510,10 +592,10 @@ impl AiRepository {
         let inserted = connection.execute(
             r#"INSERT INTO ai_highlight_runs(
                 project_id, status, model_id, prompt_version, tags_snapshot_json,
-                skills_snapshot_json, analysis_goal, analysis_fingerprint,
+                skills_snapshot_json, analysis_goal, analysis_fingerprint, qualified_score, excellent_score,
                 user_authorized, total_segments, total_chars, estimated_batches,
                 created_at, updated_at
-            ) VALUES(?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?11)"#,
+            ) VALUES(?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?13)"#,
             params![
                 input.project_id,
                 input.model_id.trim(),
@@ -522,6 +604,8 @@ impl AiRepository {
                 skills_json,
                 input.analysis_goal,
                 input.analysis_fingerprint,
+                input.qualified_score,
+                input.excellent_score,
                 input.total_segments as i64,
                 input.total_chars as i64,
                 input.estimated_batches as i64,
@@ -553,7 +637,7 @@ impl AiRepository {
         let connection = self.database.connection()?;
         let row = connection
             .query_row(
-                "SELECT id, project_id, status, model_id, prompt_version, tags_snapshot_json, skills_snapshot_json, analysis_goal, analysis_fingerprint, user_authorized, total_segments, total_chars, estimated_batches, total_tokens, last_error_code, last_error_message, created_at, updated_at FROM ai_highlight_runs WHERE id = ?1",
+                "SELECT id, project_id, status, model_id, prompt_version, tags_snapshot_json, skills_snapshot_json, analysis_goal, analysis_fingerprint, qualified_score, excellent_score, user_authorized, total_segments, total_chars, estimated_batches, total_tokens, last_error_code, last_error_message, created_at, updated_at FROM ai_highlight_runs WHERE id = ?1",
                 [run_id],
                 map_highlight_run,
             )
@@ -570,7 +654,7 @@ impl AiRepository {
         let connection = self.database.connection()?;
         let row = connection
             .query_row(
-                "SELECT id, project_id, status, model_id, prompt_version, tags_snapshot_json, skills_snapshot_json, analysis_goal, analysis_fingerprint, user_authorized, total_segments, total_chars, estimated_batches, total_tokens, last_error_code, last_error_message, created_at, updated_at FROM ai_highlight_runs WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id, project_id, status, model_id, prompt_version, tags_snapshot_json, skills_snapshot_json, analysis_goal, analysis_fingerprint, qualified_score, excellent_score, user_authorized, total_segments, total_chars, estimated_batches, total_tokens, last_error_code, last_error_message, created_at, updated_at FROM ai_highlight_runs WHERE project_id = ?1 ORDER BY id DESC LIMIT 1",
                 [project_id],
                 map_highlight_run,
             )
@@ -782,14 +866,24 @@ impl AiRepository {
         let mut connection = self.database.connection()?;
         let transaction = connection.transaction()?;
         let now = Utc::now().to_rfc3339();
-        let selected_keys = {
+        let previous_candidates = {
             let mut statement = transaction.prepare(
-                "SELECT candidate_key FROM ai_highlight_candidates WHERE run_id = ?1 AND selected = 1",
+                "SELECT candidate_key, total_score, selected FROM ai_highlight_candidates WHERE run_id = ?1",
             )?;
             statement
-                .query_map([run_id], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
+                .query_map([run_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (row.get::<_, f32>(1)?, row.get::<_, bool>(2)?),
+                    ))
+                })?
+                .collect::<std::result::Result<HashMap<_, _>, _>>()?
         };
+        let excellent_score = transaction.query_row(
+            "SELECT excellent_score FROM ai_highlight_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )?;
         transaction.execute(
             "DELETE FROM ai_highlight_candidates WHERE run_id = ?1",
             [run_id],
@@ -819,7 +913,12 @@ impl AiRepository {
                     score.information_score, score.emotion_score, score.tag_relevance_score,
                     score.completeness_score, score.shareability_score, score.reason,
                     serde_json::to_string(&draft.matched_tags).map_err(|_| AiRepositoryError::Serialization("命中标签无法序列化".to_owned()))?, score.rank,
-                    selected_keys.iter().any(|key| key == &draft.candidate_key), now],
+                    match previous_candidates.get(&draft.candidate_key) {
+                        None => score.total_score >= excellent_score as f32,
+                        Some((_, true)) => true,
+                        Some((previous_score, false)) => *previous_score < excellent_score as f32
+                            && score.total_score >= excellent_score as f32,
+                    }, now],
             )?;
         }
         transaction.commit()?;
@@ -892,6 +991,118 @@ impl AiRepository {
             .collect()
     }
 
+    pub fn list_qualified_highlight_candidates(
+        &self,
+        run_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> Result<AiHighlightCandidatePage> {
+        if page_size == 0 || page_size > 100 {
+            return Err(AiRepositoryError::Integrity(
+                "候选分页大小必须在 1 到 100 之间".to_owned(),
+            ));
+        }
+        let connection = self.database.connection()?;
+        let (qualified_score, total_candidates, qualified_candidates, selected_candidates) = connection
+            .query_row(
+                r#"SELECT
+                    qualified_score,
+                    (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = ai_highlight_runs.id),
+                    (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = ai_highlight_runs.id AND total_score >= ai_highlight_runs.qualified_score),
+                    (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = ai_highlight_runs.id AND selected = 1)
+                   FROM ai_highlight_runs WHERE id = ?1"#,
+                [run_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => AiRepositoryError::NotFound("高光运行"),
+                error => AiRepositoryError::Sqlite(error),
+            })?;
+        let offset = i64::from(page)
+            .checked_mul(i64::from(page_size))
+            .ok_or_else(|| AiRepositoryError::Integrity("候选分页页码无效".to_owned()))?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, chunk_id, candidate_key, title, input_id, segment_ids_json, start_ms, end_ms, total_score, hook_score, information_score, emotion_score, tag_relevance_score, completeness_score, shareability_score, reason, matched_tags_json, rank, selected FROM ai_highlight_candidates WHERE run_id = ?1 AND total_score >= ?2 ORDER BY COALESCE(rank, 999999), total_score DESC, id LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = statement.query_map(
+            params![run_id, qualified_score, i64::from(page_size), offset],
+            map_highlight_candidate,
+        )?;
+        let items = rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(parse_highlight_candidate)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AiHighlightCandidatePage {
+            items,
+            page,
+            page_size,
+            total_candidates: u64::try_from(total_candidates)
+                .map_err(|_| AiRepositoryError::Integrity("候选总数无效".to_owned()))?,
+            qualified_candidates: u64::try_from(qualified_candidates)
+                .map_err(|_| AiRepositoryError::Integrity("合格候选数无效".to_owned()))?,
+            selected_candidates: u64::try_from(selected_candidates)
+                .map_err(|_| AiRepositoryError::Integrity("已选择候选数无效".to_owned()))?,
+        })
+    }
+
+    /// 已选择的候选需要独立分页读取，不能从当前“合格候选”页推导；否则在大结果集
+    /// 中切换选择会把不在当前页的人工选择错误清空。
+    pub fn list_selected_highlight_candidates(
+        &self,
+        run_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> Result<AiHighlightCandidatePage> {
+        if page_size == 0 || page_size > 100 {
+            return Err(AiRepositoryError::Integrity(
+                "候选分页大小必须在 1 到 100 之间".to_owned(),
+            ));
+        }
+        let connection = self.database.connection()?;
+        let (_qualified_score, total_candidates, qualified_candidates, selected_candidates) = connection
+            .query_row(
+                r#"SELECT
+                    qualified_score,
+                    (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = ai_highlight_runs.id),
+                    (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = ai_highlight_runs.id AND total_score >= ai_highlight_runs.qualified_score),
+                    (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = ai_highlight_runs.id AND selected = 1)
+                   FROM ai_highlight_runs WHERE id = ?1"#,
+                [run_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => AiRepositoryError::NotFound("高光运行"),
+                error => AiRepositoryError::Sqlite(error),
+            })?;
+        let offset = i64::from(page)
+            .checked_mul(i64::from(page_size))
+            .ok_or_else(|| AiRepositoryError::Integrity("候选分页页码无效".to_owned()))?;
+        let mut statement = connection.prepare(
+            "SELECT id, run_id, chunk_id, candidate_key, title, input_id, segment_ids_json, start_ms, end_ms, total_score, hook_score, information_score, emotion_score, tag_relevance_score, completeness_score, shareability_score, reason, matched_tags_json, rank, selected FROM ai_highlight_candidates WHERE run_id = ?1 AND selected = 1 ORDER BY COALESCE(rank, 999999), total_score DESC, id LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = statement.query_map(
+            params![run_id, i64::from(page_size), offset],
+            map_highlight_candidate,
+        )?;
+        let items = rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(parse_highlight_candidate)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AiHighlightCandidatePage {
+            items,
+            page,
+            page_size,
+            total_candidates: u64::try_from(total_candidates)
+                .map_err(|_| AiRepositoryError::Integrity("候选总数无效".to_owned()))?,
+            qualified_candidates: u64::try_from(qualified_candidates)
+                .map_err(|_| AiRepositoryError::Integrity("合格候选数无效".to_owned()))?,
+            selected_candidates: u64::try_from(selected_candidates)
+                .map_err(|_| AiRepositoryError::Integrity("已选择候选数无效".to_owned()))?,
+        })
+    }
+
     pub fn select_highlight_candidates(
         &self,
         run_id: i64,
@@ -915,6 +1126,437 @@ impl AiRepository {
         transaction.commit()?;
         drop(connection);
         self.list_highlight_candidates(run_id)
+    }
+
+    /// UI 的分页选择必须只影响一个候选，避免当前页提交覆盖其它页的选择状态。
+    pub fn set_highlight_candidate_selected(
+        &self,
+        run_id: i64,
+        candidate_id: i64,
+        selected: bool,
+    ) -> Result<AiHighlightCandidate> {
+        let changed = self.database.connection()?.execute(
+            r#"UPDATE ai_highlight_candidates
+               SET selected = ?1
+               WHERE id = ?2
+                 AND run_id = ?3
+                 AND total_score >= (SELECT qualified_score FROM ai_highlight_runs WHERE id = ?3)"#,
+            params![selected, candidate_id, run_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::InvalidState(
+                "只能选择达到本次合格阈值的高光候选".to_owned(),
+            ));
+        }
+        self.list_highlight_candidates(run_id)?
+            .into_iter()
+            .find(|candidate| candidate.id == candidate_id)
+            .ok_or(AiRepositoryError::NotFound("高光候选"))
+    }
+
+    pub fn get_or_create_clip_project(&self, run_id: i64) -> Result<AiClipProjectDetail> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT id FROM ai_clip_projects WHERE highlight_run_id = ?1",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let project_id = if let Some(id) = existing {
+            id
+        } else {
+            let (project_name, status, selected_count) = transaction.query_row(
+                r#"SELECT p.name, r.status,
+                          (SELECT COUNT(*) FROM ai_highlight_candidates WHERE run_id = r.id AND selected = 1)
+                   FROM ai_highlight_runs r JOIN ai_projects p ON p.id = r.project_id WHERE r.id = ?1"#,
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )?;
+            if !matches!(status.as_str(), "completed" | "partial") {
+                return Err(AiRepositoryError::InvalidState(
+                    "高光分析尚未完成，暂时不能创建剪辑工程".to_owned(),
+                ));
+            }
+            if selected_count == 0 {
+                return Err(AiRepositoryError::InvalidState(
+                    "请至少选择一个高光候选后再编辑视频".to_owned(),
+                ));
+            }
+            let now = Utc::now().to_rfc3339();
+            transaction.execute(
+                "INSERT INTO ai_clip_projects(highlight_run_id, name, export_status, export_progress, created_at, updated_at) VALUES(?1, ?2, 'idle', 0, ?3, ?3)",
+                params![run_id, format!("{} - 高光剪辑", project_name), now],
+            )?;
+            let id = transaction.last_insert_rowid();
+            transaction.execute(
+                r#"INSERT INTO ai_clip_segments(clip_project_id, candidate_id, input_id, position, title, source_start_ms, source_end_ms, volume_percent, effect, created_at, updated_at)
+                   SELECT ?1, c.id, c.input_id,
+                          ROW_NUMBER() OVER (ORDER BY i.position, c.start_ms, c.id) - 1,
+                          c.title, c.start_ms, c.end_ms, 100, 'none', ?2, ?2
+                   FROM ai_highlight_candidates c
+                   JOIN ai_project_inputs i ON i.id = c.input_id
+                   WHERE c.run_id = ?3 AND c.selected = 1
+                   ORDER BY i.position, c.start_ms, c.id"#,
+                params![id, now, run_id],
+            )?;
+            id
+        };
+        transaction.commit()?;
+        drop(connection);
+        self.get_clip_project(project_id)
+    }
+
+    pub fn get_clip_project(&self, clip_project_id: i64) -> Result<AiClipProjectDetail> {
+        let connection = self.database.connection()?;
+        let project = connection
+            .query_row(
+                "SELECT id, highlight_run_id, name, export_status, export_progress, output_path, last_error_code, last_error_message, output_width, output_height, version, created_at, updated_at FROM ai_clip_projects WHERE id = ?1",
+                [clip_project_id],
+                map_clip_project,
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+        let mut statement = connection.prepare(
+            "SELECT id, clip_project_id, candidate_id, input_id, position, title, source_start_ms, source_end_ms, volume_percent, effect FROM ai_clip_segments WHERE clip_project_id = ?1 ORDER BY position, id",
+        )?;
+        let segments = statement
+            .query_map([clip_project_id], map_clip_segment)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut transcripts_by_input = HashMap::new();
+        let mut transcript_statement = connection.prepare(
+            r#"SELECT ts.id, ts.artifact_id, ts.ordinal, ts.source_start_ms,
+                      ts.source_end_ms, ts.raw_text, ts.normalized_text, ts.confidence
+               FROM ai_project_inputs input
+               JOIN asr_artifacts artifact ON artifact.id = input.artifact_id
+               JOIN transcript_segments ts ON ts.artifact_id = artifact.id
+               WHERE input.id = ?1 AND artifact.status = 'published'
+               ORDER BY ts.source_start_ms, ts.ordinal, ts.id"#,
+        )?;
+        for input_id in segments
+            .iter()
+            .map(|segment| segment.input_id)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let transcripts = transcript_statement
+                .query_map([input_id], map_segment)?
+                .map(|row| row.map_err(AiRepositoryError::from).and_then(parse_segment))
+                .collect::<Result<Vec<_>>>()?;
+            transcripts_by_input.insert(input_id, transcripts);
+        }
+        let (subtitles, subtitles_complete) =
+            project_clip_subtitles(&segments, &transcripts_by_input);
+        Ok(AiClipProjectDetail {
+            project,
+            segments,
+            subtitles,
+            subtitles_complete,
+        })
+    }
+
+    pub fn update_clip_segment(
+        &self,
+        clip_project_id: i64,
+        segment_id: i64,
+        update: &AiClipSegmentUpdate,
+    ) -> Result<AiClipProjectDetail> {
+        if update.volume_percent > 200 {
+            return Err(AiRepositoryError::Integrity(
+                "片段音量必须在 0% 到 200% 之间".to_owned(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let changed = self.database.connection()?.execute(
+            "UPDATE ai_clip_segments SET volume_percent = ?1, effect = ?2, updated_at = ?3 WHERE id = ?4 AND clip_project_id = ?5",
+            params![i64::from(update.volume_percent), update.effect.as_str(), now, segment_id, clip_project_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("剪辑片段"));
+        }
+        self.database.connection()?.execute(
+            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn insert_clip_candidate(
+        &self,
+        clip_project_id: i64,
+        candidate_id: i64,
+        insert_index: u32,
+    ) -> Result<AiClipProjectDetail> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let segment_count = transaction.query_row(
+            "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
+            [clip_project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if i64::from(insert_index) > segment_count {
+            return Err(AiRepositoryError::Integrity(
+                "视频素材插入位置超出时间轴范围".to_owned(),
+            ));
+        }
+        let candidate = transaction
+            .query_row(
+                r#"SELECT c.input_id, c.title, c.start_ms, c.end_ms
+                   FROM ai_clip_projects p
+                   JOIN ai_highlight_candidates c ON c.run_id = p.highlight_run_id
+                   WHERE p.id = ?1 AND c.id = ?2 AND c.selected = 1"#,
+                params![clip_project_id, candidate_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AiRepositoryError::Integrity("只能追加当前高光运行中已进入待切片的视频".to_owned())
+            })?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM ai_clip_segments WHERE clip_project_id = ?1 AND candidate_id = ?2",
+                params![clip_project_id, candidate_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(AiRepositoryError::Integrity(
+                "该视频片段已经在时间轴中".to_owned(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            "UPDATE ai_clip_segments SET position = position + 1, updated_at = ?1 WHERE clip_project_id = ?2 AND position >= ?3",
+            params![now, clip_project_id, i64::from(insert_index)],
+        )?;
+        transaction.execute(
+            r#"INSERT INTO ai_clip_segments(
+                   clip_project_id, candidate_id, input_id, position, title,
+                   source_start_ms, source_end_ms, volume_percent, effect, created_at, updated_at
+               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'none', ?8, ?8)"#,
+            params![
+                clip_project_id,
+                candidate_id,
+                candidate.0,
+                i64::from(insert_index),
+                candidate.1,
+                candidate.2,
+                candidate.3,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn reorder_clip_segments(
+        &self,
+        clip_project_id: i64,
+        ordered_ids: &[i64],
+    ) -> Result<AiClipProjectDetail> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .prepare(
+                "SELECT id FROM ai_clip_segments WHERE clip_project_id = ?1 ORDER BY position, id",
+            )?
+            .query_map([clip_project_id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if existing.len() != ordered_ids.len()
+            || existing.iter().collect::<std::collections::HashSet<_>>()
+                != ordered_ids.iter().collect::<std::collections::HashSet<_>>()
+        {
+            return Err(AiRepositoryError::Integrity(
+                "重排必须包含工程中的全部片段且不能重复".to_owned(),
+            ));
+        }
+        for (position, id) in ordered_ids.iter().enumerate() {
+            transaction.execute(
+                "UPDATE ai_clip_segments SET position = ?1, updated_at = ?2 WHERE id = ?3 AND clip_project_id = ?4",
+                params![position as i64, Utc::now().to_rfc3339(), id, clip_project_id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn remove_clip_segment(
+        &self,
+        clip_project_id: i64,
+        segment_id: i64,
+    ) -> Result<AiClipProjectDetail> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        if transaction.execute(
+            "DELETE FROM ai_clip_segments WHERE id = ?1 AND clip_project_id = ?2",
+            params![segment_id, clip_project_id],
+        )? == 0
+        {
+            return Err(AiRepositoryError::NotFound("剪辑片段"));
+        }
+        let remaining = transaction.query_row(
+            "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
+            [clip_project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if remaining == 0 {
+            return Err(AiRepositoryError::InvalidState(
+                "剪辑工程至少需要保留一个片段".to_owned(),
+            ));
+        }
+        let rows = transaction
+            .prepare(
+                "SELECT id FROM ai_clip_segments WHERE clip_project_id = ?1 ORDER BY position, id",
+            )?
+            .query_map([clip_project_id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (position, id) in rows.iter().enumerate() {
+            transaction.execute(
+                "UPDATE ai_clip_segments SET position = ?1, updated_at = ?2 WHERE id = ?3",
+                params![position as i64, Utc::now().to_rfc3339(), id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn set_clip_export_state(
+        &self,
+        clip_project_id: i64,
+        status: AiClipExportStatus,
+        progress: u8,
+        output_path: Option<&str>,
+        error: Option<(&str, &str)>,
+    ) -> Result<AiClipProject> {
+        let (code, message) = error
+            .map(|(code, message)| (Some(code), Some(message)))
+            .unwrap_or((None, None));
+        let changed = self.database.connection()?.execute(
+            "UPDATE ai_clip_projects SET export_status = ?1, export_progress = ?2, output_path = ?3, last_error_code = ?4, last_error_message = ?5, updated_at = ?6 WHERE id = ?7",
+            params![status.as_str(), i64::from(progress), output_path, code, message, Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("剪辑工程"));
+        }
+        self.get_clip_project(clip_project_id)
+            .map(|detail| detail.project)
+    }
+
+    pub fn set_clip_output_dimensions(
+        &self,
+        clip_project_id: i64,
+        width: u32,
+        height: u32,
+    ) -> Result<AiClipProject> {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(AiRepositoryError::Integrity(
+                "剪辑输出尺寸必须是正偶数".to_owned(),
+            ));
+        }
+        let changed = self.database.connection()?.execute(
+            "UPDATE ai_clip_projects SET output_width = ?1, output_height = ?2, updated_at = ?3 WHERE id = ?4",
+            params![i64::from(width), i64::from(height), Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("剪辑工程"));
+        }
+        self.get_clip_project(clip_project_id)
+            .map(|detail| detail.project)
+    }
+
+    /// 导出子进程不会跨应用重启恢复；启动时将遗留的运行状态安全降级为可重试状态。
+    pub fn recover_interrupted_clip_exports(&self) -> Result<u64> {
+        let changed = self.database.connection()?.execute(
+            r#"UPDATE ai_clip_projects
+               SET export_status = 'cancelled', export_progress = 0, output_path = NULL,
+                   last_error_code = 'app_restarted',
+                   last_error_message = '上次视频导出因应用退出而取消，可重新导出',
+                   updated_at = ?1
+               WHERE export_status = 'exporting'"#,
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(changed as u64)
+    }
+
+    pub fn clip_export_sources(&self, clip_project_id: i64) -> Result<Vec<ClipExportSource>> {
+        let detail = self.get_clip_project(clip_project_id)?;
+        let connection = self.database.connection()?;
+        if detail.project.export_status == AiClipExportStatus::Exporting {
+            return Err(AiRepositoryError::InvalidState(
+                "剪辑工程正在导出".to_owned(),
+            ));
+        }
+        let mut statement = connection.prepare(
+            r#"SELECT s.id, s.clip_project_id, s.candidate_id, s.input_id, s.position, s.title,
+                      s.source_start_ms, s.source_end_ms, s.volume_percent, s.effect,
+                      i.source_path, i.source_fingerprint_json
+               FROM ai_clip_segments s
+               JOIN ai_project_inputs i ON i.id = s.input_id
+               WHERE s.clip_project_id = ?1 ORDER BY s.position, s.id"#,
+        )?;
+        let rows = statement.query_map([clip_project_id], |row| {
+            let segment = map_clip_segment(row)?;
+            Ok((
+                segment,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        })?;
+        let sources = rows
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(segment, source_path, fingerprint_json)| {
+                let source_fingerprint = serde_json::from_str(&fingerprint_json)
+                    .map_err(|_| AiRepositoryError::Integrity("剪辑来源指纹数据损坏".to_owned()))?;
+                let subtitles = detail
+                    .subtitles
+                    .iter()
+                    .filter(|subtitle| subtitle.clip_segment_id == segment.id)
+                    .cloned()
+                    .collect();
+                Ok(ClipExportSource {
+                    segment,
+                    source_path,
+                    source_fingerprint,
+                    subtitles,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if sources.is_empty() {
+            return Err(AiRepositoryError::InvalidState(
+                "剪辑工程至少需要一个片段才能导出".to_owned(),
+            ));
+        }
+        Ok(sources)
     }
 
     pub fn transition_project(&self, project_id: i64, next: AiProjectStatus) -> Result<()> {
@@ -1725,6 +2367,185 @@ pub(crate) fn migrate_ai_v9(connection: &mut Connection) -> crate::database::Res
     Ok(())
 }
 
+/// v12 冻结高光筛选阈值，保证历史运行的推荐和自动选择语义稳定。
+pub(crate) fn migrate_ai_v12(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 12",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    for (table, column, definition) in [
+        (
+            "llm_provider_settings",
+            "qualified_score",
+            "INTEGER NOT NULL DEFAULT 70 CHECK(qualified_score BETWEEN 0 AND 100)",
+        ),
+        (
+            "llm_provider_settings",
+            "excellent_score",
+            "INTEGER NOT NULL DEFAULT 80 CHECK(excellent_score BETWEEN 0 AND 100)",
+        ),
+        (
+            "ai_highlight_runs",
+            "qualified_score",
+            "INTEGER NOT NULL DEFAULT 70 CHECK(qualified_score BETWEEN 0 AND 100)",
+        ),
+        (
+            "ai_highlight_runs",
+            "excellent_score",
+            "INTEGER NOT NULL DEFAULT 80 CHECK(excellent_score BETWEEN 0 AND 100)",
+        ),
+    ] {
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            transaction.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS validate_llm_highlight_threshold_insert
+        BEFORE INSERT ON llm_provider_settings
+        WHEN NEW.excellent_score < NEW.qualified_score
+        BEGIN
+            SELECT RAISE(ABORT, '优秀片段阈值不能低于合格片段阈值');
+        END;
+        CREATE TRIGGER IF NOT EXISTS validate_llm_highlight_threshold_update
+        BEFORE UPDATE OF qualified_score, excellent_score ON llm_provider_settings
+        WHEN NEW.excellent_score < NEW.qualified_score
+        BEGIN
+            SELECT RAISE(ABORT, '优秀片段阈值不能低于合格片段阈值');
+        END;
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(12, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// v13 持久化本地剪辑工程和受控导出状态。来源路径不会写入工程表，导出时仅通过
+/// 已冻结的 AI 输入重新取得并校验，避免工程 JSON 成为任意文件读取入口。
+pub(crate) fn migrate_ai_v13(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 13",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_clip_projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            highlight_run_id INTEGER NOT NULL UNIQUE REFERENCES ai_highlight_runs(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            export_status TEXT NOT NULL DEFAULT 'idle' CHECK(export_status IN ('idle', 'exporting', 'completed', 'cancelled', 'failed')),
+            export_progress INTEGER NOT NULL DEFAULT 0 CHECK(export_progress BETWEEN 0 AND 100),
+            output_path TEXT,
+            last_error_code TEXT,
+            last_error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ai_clip_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clip_project_id INTEGER NOT NULL REFERENCES ai_clip_projects(id) ON DELETE CASCADE,
+            candidate_id INTEGER NOT NULL REFERENCES ai_highlight_candidates(id) ON DELETE CASCADE,
+            input_id INTEGER NOT NULL REFERENCES ai_project_inputs(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK(position >= 0),
+            title TEXT NOT NULL,
+            source_start_ms INTEGER NOT NULL CHECK(source_start_ms >= 0),
+            source_end_ms INTEGER NOT NULL CHECK(source_end_ms > source_start_ms),
+            volume_percent INTEGER NOT NULL DEFAULT 100 CHECK(volume_percent BETWEEN 0 AND 200),
+            effect TEXT NOT NULL DEFAULT 'none' CHECK(effect IN ('none', 'fade_in', 'fade_out', 'fade_in_out', 'flash', 'black')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(clip_project_id, candidate_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_clip_segments_project_position
+            ON ai_clip_segments(clip_project_id, position, id);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(13, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// v14 冻结剪辑工程的输出画幅，并为可恢复工程保存单调递增的编辑版本。
+pub(crate) fn migrate_ai_v14(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 14",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    for (column, definition) in [
+        (
+            "output_width",
+            "INTEGER CHECK(output_width IS NULL OR output_width > 0)",
+        ),
+        (
+            "output_height",
+            "INTEGER CHECK(output_height IS NULL OR output_height > 0)",
+        ),
+        ("version", "INTEGER NOT NULL DEFAULT 1 CHECK(version > 0)"),
+    ] {
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('ai_clip_projects') WHERE name = ?1",
+                [column],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            transaction.execute(
+                &format!("ALTER TABLE ai_clip_projects ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(14, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 type ProjectRow = (
     i64,
     String,
@@ -2000,6 +2821,8 @@ type HighlightRunRow = (
     String,
     Option<String>,
     String,
+    i64,
+    i64,
     bool,
     i64,
     i64,
@@ -2031,6 +2854,8 @@ fn map_highlight_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<HighlightRunRo
         row.get(15)?,
         row.get(16)?,
         row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
     ))
 }
 
@@ -2047,19 +2872,146 @@ fn parse_highlight_run(row: HighlightRunRow) -> Result<AiHighlightRun> {
             .map_err(|_| AiRepositoryError::Integrity("Skills 快照损坏".to_owned()))?,
         analysis_goal: row.7,
         analysis_fingerprint: row.8,
-        user_authorized: row.9,
-        total_segments: u64::try_from(row.10)
+        qualified_score: u8::try_from(row.9)
+            .map_err(|_| AiRepositoryError::Integrity("合格片段阈值无效".to_owned()))?,
+        excellent_score: u8::try_from(row.10)
+            .map_err(|_| AiRepositoryError::Integrity("优秀片段阈值无效".to_owned()))?,
+        user_authorized: row.11,
+        total_segments: u64::try_from(row.12)
             .map_err(|_| AiRepositoryError::Integrity("句段数无效".to_owned()))?,
-        total_chars: u64::try_from(row.11)
+        total_chars: u64::try_from(row.13)
             .map_err(|_| AiRepositoryError::Integrity("文本量无效".to_owned()))?,
-        estimated_batches: u64::try_from(row.12)
+        estimated_batches: u64::try_from(row.14)
             .map_err(|_| AiRepositoryError::Integrity("批次数无效".to_owned()))?,
-        total_tokens: u64::try_from(row.13)
+        total_tokens: u64::try_from(row.15)
             .map_err(|_| AiRepositoryError::Integrity("token 用量无效".to_owned()))?,
-        last_error_code: row.14,
-        last_error_message: row.15,
-        created_at: row.16,
-        updated_at: row.17,
+        last_error_code: row.16,
+        last_error_message: row.17,
+        created_at: row.18,
+        updated_at: row.19,
+    })
+}
+
+fn map_clip_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiClipProject> {
+    let status = row.get::<_, String>(3)?;
+    let parsed_status = AiClipExportStatus::parse(&status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "无效剪辑导出状态",
+            )),
+        )
+    })?;
+    let progress = row.get::<_, i64>(4)?;
+    let progress = u8::try_from(progress).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "无效导出进度",
+            )),
+        )
+    })?;
+    let output_width = optional_positive_u32(row, 8, "无效剪辑输出宽度")?;
+    let output_height = optional_positive_u32(row, 9, "无效剪辑输出高度")?;
+    if output_width.is_some() != output_height.is_some() {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            8,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "剪辑输出规格不完整",
+            )),
+        ));
+    }
+    let version = row.get::<_, i64>(10)?;
+    let version = u32::try_from(version)
+        .ok()
+        .filter(|version| *version > 0)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "无效剪辑工程版本",
+                )),
+            )
+        })?;
+    Ok(AiClipProject {
+        id: row.get(0)?,
+        highlight_run_id: row.get(1)?,
+        name: row.get(2)?,
+        output_width,
+        output_height,
+        version,
+        export_status: parsed_status,
+        export_progress: progress,
+        output_path: row.get(5)?,
+        last_error_code: row.get(6)?,
+        last_error_message: row.get(7)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn optional_positive_u32(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    message: &'static str,
+) -> rusqlite::Result<Option<u32>> {
+    row.get::<_, Option<i64>>(index)?.map_or(Ok(None), |value| {
+        u32::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        message,
+                    )),
+                )
+            })
+    })
+}
+
+fn map_clip_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiClipSegment> {
+    let effect = row.get::<_, String>(9)?;
+    let parsed_effect = AiClipEffect::parse(&effect).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "无效内置效果",
+            )),
+        )
+    })?;
+    let position = row.get::<_, i64>(4)?;
+    let start = row.get::<_, i64>(6)?;
+    let end = row.get::<_, i64>(7)?;
+    let volume = row.get::<_, i64>(8)?;
+    Ok(AiClipSegment {
+        id: row.get(0)?,
+        clip_project_id: row.get(1)?,
+        candidate_id: row.get(2)?,
+        input_id: row.get(3)?,
+        position: u32::try_from(position)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, position))?,
+        title: row.get(5)?,
+        source_start_ms: u64::try_from(start)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, start))?,
+        source_end_ms: u64::try_from(end)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, end))?,
+        volume_percent: u16::try_from(volume)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, volume))?,
+        effect: parsed_effect,
     })
 }
 

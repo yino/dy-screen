@@ -95,7 +95,10 @@ fn packaged_upgrade_wins_over_older_installed_resources() {
     assert!(!state.view().ready);
     assert!(state.current_root().is_none());
     assert!(state.refresh().ready);
-    assert_eq!(state.current_root().as_deref(), Some(bundled_root.as_path()));
+    assert_eq!(
+        state.current_root().as_deref(),
+        Some(bundled_root.as_path())
+    );
 }
 
 #[test]
@@ -115,7 +118,10 @@ fn resolved_resources_are_cached_and_metadata_changes_trigger_recheck() {
     let state = RuntimeResourceState::new(database, app_data, bundled_root.clone());
 
     assert!(state.refresh().ready);
-    assert_eq!(state.current_root().as_deref(), Some(bundled_root.as_path()));
+    assert_eq!(
+        state.current_root().as_deref(),
+        Some(bundled_root.as_path())
+    );
     let (cached_ffmpeg, cached_ffprobe) = state.media_tools().unwrap();
     assert_eq!(cached_ffmpeg, bundled_root.join("bin/ffmpeg"));
     assert_eq!(cached_ffprobe, bundled_root.join("bin/ffprobe"));

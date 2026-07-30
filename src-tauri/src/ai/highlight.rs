@@ -13,9 +13,7 @@ use super::{
     RankingAgentRequest,
 };
 
-const RESULT_POLICY_VERSION: &str = "top-10-resumable-batches-v3";
-const MAX_CANDIDATES_PER_CHUNK: usize = 5;
-const MAX_RANKING_CANDIDATES: usize = 60;
+const RESULT_POLICY_VERSION: &str = "all-qualified-candidates-v4";
 const MAX_CHUNK_ATTEMPTS: usize = 2;
 const MAX_CONSECUTIVE_CHUNK_FAILURES: usize = 3;
 
@@ -159,30 +157,39 @@ pub fn chunk_segments(
     chunks
 }
 
+#[derive(Clone, Copy)]
+pub struct AnalysisFingerprintConfig<'a> {
+    pub skills: &'a [HighlightSkill],
+    pub model_id: &'a str,
+    pub prompt_version: &'a str,
+    pub goal: Option<&'a str>,
+    pub qualified_score: u8,
+    pub excellent_score: u8,
+}
+
 pub fn analysis_fingerprint(
     project_id: i64,
     segments: &[AnalysisSegment],
     tags: &[String],
-    skills: &[HighlightSkill],
-    model_id: &str,
-    prompt_version: &str,
-    goal: Option<&str>,
+    config: AnalysisFingerprintConfig<'_>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(project_id.to_le_bytes());
     hasher.update(serde_json::to_vec(segments).unwrap_or_default());
     hasher.update(serde_json::to_vec(tags).unwrap_or_default());
     hasher.update(
-        skills
+        config
+            .skills
             .iter()
             .flat_map(|skill| [skill.id, skill.version])
             .collect::<Vec<_>>()
             .join("|")
             .as_bytes(),
     );
-    hasher.update(model_id.as_bytes());
-    hasher.update(prompt_version.as_bytes());
-    hasher.update(goal.unwrap_or_default().as_bytes());
+    hasher.update(config.model_id.as_bytes());
+    hasher.update(config.prompt_version.as_bytes());
+    hasher.update(config.goal.unwrap_or_default().as_bytes());
+    hasher.update([config.qualified_score, config.excellent_score]);
     hasher.update(RESULT_POLICY_VERSION.as_bytes());
     hex::encode(hasher.finalize())
 }
@@ -248,10 +255,14 @@ impl HighlightWorkflow {
             project_id,
             &segments,
             &tags,
-            &skills,
-            &settings.model_id,
-            &settings.prompt_version,
-            detail.project.analysis_goal.as_deref(),
+            AnalysisFingerprintConfig {
+                skills: &skills,
+                model_id: &settings.model_id,
+                prompt_version: &settings.prompt_version,
+                goal: detail.project.analysis_goal.as_deref(),
+                qualified_score: settings.qualified_score,
+                excellent_score: settings.excellent_score,
+            },
         );
         let run = self.repository.create_highlight_run(NewAiHighlightRun {
             project_id,
@@ -264,6 +275,8 @@ impl HighlightWorkflow {
                 .collect(),
             analysis_goal: detail.project.analysis_goal.clone(),
             analysis_fingerprint: fingerprint,
+            qualified_score: settings.qualified_score,
+            excellent_score: settings.excellent_score,
             total_segments: segments.len() as u64,
             total_chars: segments
                 .iter()
@@ -390,7 +403,6 @@ impl HighlightWorkflow {
                                 .unwrap_or(std::cmp::Ordering::Equal)
                                 .then_with(|| left.candidate_key.cmp(&right.candidate_key))
                         });
-                        valid.truncate(MAX_CANDIDATES_PER_CHUNK);
                         self.repository.complete_highlight_chunk(
                             run.id,
                             chunk_row.id,
@@ -433,6 +445,9 @@ impl HighlightWorkflow {
             .flat_map(|(chunk, drafts)| drafts.into_iter().map(move |draft| (chunk.id, draft)))
             .filter(|(_, draft)| seen_candidates.insert(draft.candidate_key.clone()))
             .collect::<Vec<_>>();
+        for (_, draft) in &mut all_drafts {
+            normalize_candidate_draft_score_scale(draft);
+        }
         if all_drafts.is_empty() {
             let status = if progress.failed_batches == progress.total_batches {
                 AiHighlightRunStatus::Failed
@@ -455,7 +470,6 @@ impl HighlightWorkflow {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.candidate_key.cmp(&right.candidate_key))
         });
-        all_drafts.truncate(MAX_RANKING_CANDIDATES);
         self.repository
             .update_highlight_run_status(run.id, AiHighlightRunStatus::Ranking, None)?;
         let ranking_drafts = all_drafts
@@ -486,11 +500,11 @@ impl HighlightWorkflow {
             Ok(ranked) => {
                 self.repository
                     .add_highlight_run_tokens(run.id, ranked.token_usage)?;
-                let scores = select_top_scores(ranked.scores, &candidate_keys);
+                let scores = normalize_scores(ranked.scores, &candidate_keys);
                 if scores.is_empty() {
                     (fallback_scores(&ranking_drafts), true)
                 } else {
-                    (scores, false)
+                    (merge_missing_scores(scores, &ranking_drafts), false)
                 }
             }
             Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
@@ -630,6 +644,59 @@ fn discovery_score(draft: &HighlightCandidateDraft) -> f32 {
         / 6.0
 }
 
+fn score_scale(values: &[f32]) -> f32 {
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return 1.0;
+    }
+    let maximum = values.iter().copied().fold(0.0_f32, f32::max);
+    if maximum <= 1.0 {
+        100.0
+    } else if maximum <= 10.0 {
+        10.0
+    } else {
+        1.0
+    }
+}
+
+fn normalize_candidate_draft_score_scale(draft: &mut HighlightCandidateDraft) {
+    let scale = score_scale(&[
+        draft.hook_score,
+        draft.information_score,
+        draft.emotion_score,
+        draft.tag_relevance_score,
+        draft.completeness_score,
+        draft.shareability_score,
+    ]);
+    draft.hook_score *= scale;
+    draft.information_score *= scale;
+    draft.emotion_score *= scale;
+    draft.tag_relevance_score *= scale;
+    draft.completeness_score *= scale;
+    draft.shareability_score *= scale;
+}
+
+fn normalize_candidate_score_scale(score: &mut HighlightCandidateScore) {
+    let scale = score_scale(&[
+        score.total_score,
+        score.hook_score,
+        score.information_score,
+        score.emotion_score,
+        score.tag_relevance_score,
+        score.completeness_score,
+        score.shareability_score,
+    ]);
+    score.total_score *= scale;
+    score.hook_score *= scale;
+    score.information_score *= scale;
+    score.emotion_score *= scale;
+    score.tag_relevance_score *= scale;
+    score.completeness_score *= scale;
+    score.shareability_score *= scale;
+}
+
 fn fallback_scores(drafts: &[HighlightCandidateDraft]) -> Vec<HighlightCandidateScore> {
     let mut drafts = drafts.to_vec();
     drafts.sort_by(|left, right| {
@@ -640,7 +707,6 @@ fn fallback_scores(drafts: &[HighlightCandidateDraft]) -> Vec<HighlightCandidate
     });
     drafts
         .into_iter()
-        .take(10)
         .enumerate()
         .map(|(index, draft)| {
             let total_score = discovery_score(&draft).clamp(0.0, 100.0);
@@ -679,13 +745,17 @@ fn llm_error_code(error: &LlmError) -> &'static str {
     }
 }
 
-fn select_top_scores(
+fn normalize_scores(
     scores: Vec<HighlightCandidateScore>,
     candidate_keys: &HashSet<String>,
 ) -> Vec<HighlightCandidateScore> {
     let mut seen_scores = HashSet::new();
     let mut scores = scores
         .into_iter()
+        .map(|mut score| {
+            normalize_candidate_score_scale(&mut score);
+            score
+        })
         .filter(|score| candidate_keys.contains(&score.candidate_key))
         .filter(|score| {
             score.rank > 0
@@ -711,7 +781,31 @@ fn select_top_scores(
             .then_with(|| left.rank.cmp(&right.rank))
             .then_with(|| left.candidate_key.cmp(&right.candidate_key))
     });
-    scores.truncate(10);
+    scores
+}
+
+/// Ranking Agent 可能因输出截断漏掉部分候选。候选仍应被持久化，缺失项用发现阶段的
+/// 分项分数补齐，同时把它们稳定地排在已统一评分的候选之后。
+fn merge_missing_scores(
+    mut scores: Vec<HighlightCandidateScore>,
+    drafts: &[HighlightCandidateDraft],
+) -> Vec<HighlightCandidateScore> {
+    let known = scores
+        .iter()
+        .map(|score| score.candidate_key.clone())
+        .collect::<HashSet<_>>();
+    let mut missing = fallback_scores(
+        &drafts
+            .iter()
+            .filter(|draft| !known.contains(&draft.candidate_key))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let rank_offset = scores.len() as u32;
+    for (index, score) in missing.iter_mut().enumerate() {
+        score.rank = rank_offset + index as u32 + 1;
+    }
+    scores.append(&mut missing);
     scores
 }
 
@@ -877,11 +971,7 @@ mod tests {
         }
     }
 
-    fn add_completed_input(
-        repository: &AiRepository,
-        project_id: i64,
-        position: i64,
-    ) -> i64 {
+    fn add_completed_input(repository: &AiRepository, project_id: i64, position: i64) -> i64 {
         let path = format!("/tmp/highlight-{position}.mp4");
         let fingerprint = SourceFingerprint {
             normalized_path: path.clone(),
@@ -991,10 +1081,14 @@ mod tests {
             1,
             &segments,
             &[],
-            &[GENERIC_HOOK],
-            "deepseek-chat",
-            "highlight-v1",
-            None,
+            AnalysisFingerprintConfig {
+                skills: &[GENERIC_HOOK],
+                model_id: "deepseek-chat",
+                prompt_version: "highlight-v1",
+                goal: None,
+                qualified_score: 70,
+                excellent_score: 80,
+            },
         );
         let mut legacy = Sha256::new();
         legacy.update(1_i64.to_le_bytes());
@@ -1024,7 +1118,7 @@ mod tests {
             rank,
             reason: "测试评分".to_owned(),
         };
-        let selected = select_top_scores(
+        let selected = normalize_scores(
             vec![
                 score("reference", 64.0, 2),
                 score("qualified", 82.0, 1),
@@ -1036,6 +1130,72 @@ mod tests {
         assert_eq!(selected[0].candidate_key, "qualified");
         assert_eq!(selected[1].candidate_key, "reference");
         assert_eq!(selected[1].total_score, 64.0);
+    }
+
+    #[test]
+    fn provider_score_scales_are_normalized_to_percentages() {
+        let candidate_keys = [
+            "fractional".to_owned(),
+            "ten-point".to_owned(),
+            "percentage".to_owned(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        let score = |candidate_key: &str, value: f32, rank: u32| HighlightCandidateScore {
+            candidate_key: candidate_key.to_owned(),
+            total_score: value,
+            hook_score: value,
+            information_score: value,
+            emotion_score: value,
+            tag_relevance_score: value,
+            completeness_score: value,
+            shareability_score: value,
+            rank,
+            reason: "测试评分".to_owned(),
+        };
+
+        let normalized = normalize_scores(
+            vec![
+                score("fractional", 0.82, 1),
+                score("ten-point", 8.2, 2),
+                score("percentage", 82.0, 3),
+            ],
+            &candidate_keys,
+        );
+
+        assert_eq!(normalized.len(), 3);
+        assert!(
+            normalized
+                .iter()
+                .all(|score| (score.total_score - 82.0).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn legacy_fractional_drafts_are_normalized_before_fallback_ranking() {
+        let mut draft = HighlightCandidateDraft {
+            candidate_key: "fractional".to_owned(),
+            title: "候选".to_owned(),
+            input_id: 1,
+            segment_ids: vec!["s1".to_owned()],
+            start_ms: 0,
+            end_ms: 15_000,
+            hook_score: 0.65,
+            information_score: 0.5,
+            emotion_score: 0.75,
+            tag_relevance_score: 0.4,
+            completeness_score: 0.85,
+            shareability_score: 0.65,
+            reason: "测试".to_owned(),
+            matched_tags: vec![],
+        };
+
+        normalize_candidate_draft_score_scale(&mut draft);
+        let fallback = fallback_scores(&[draft]);
+
+        assert_eq!(fallback.len(), 1);
+        assert!((fallback[0].total_score - 63.333_332).abs() < 0.001);
+        assert!((fallback[0].completeness_score - 85.0).abs() < 0.001);
     }
 
     #[tokio::test]
@@ -1066,11 +1226,8 @@ mod tests {
         let credentials = MemoryCredentialStore::new();
         credentials.set("test-key").unwrap();
         let provider = Arc::new(FirstChunkTimesOut::default());
-        let workflow = HighlightWorkflow::new(
-            repository.clone(),
-            provider.clone(),
-            Arc::new(credentials),
-        );
+        let workflow =
+            HighlightWorkflow::new(repository.clone(), provider.clone(), Arc::new(credentials));
 
         let run = workflow.prepare(project.id, true).unwrap();
         assert_eq!(run.estimated_batches, 2);

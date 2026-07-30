@@ -14,6 +14,14 @@ fi
 SOURCE_ARCHIVE=$1
 OUTPUT_ROOT=$2
 
+SOURCE_DIRECTORY=$(dirname "$SOURCE_ARCHIVE")
+SOURCE_NAME=$(basename "$SOURCE_ARCHIVE")
+SOURCE_ARCHIVE=$(cd "$SOURCE_DIRECTORY" && pwd)/$SOURCE_NAME
+OUTPUT_PARENT=$(dirname "$OUTPUT_ROOT")
+OUTPUT_NAME=$(basename "$OUTPUT_ROOT")
+mkdir -p "$OUTPUT_PARENT"
+OUTPUT_ROOT=$(cd "$OUTPUT_PARENT" && pwd)/$OUTPUT_NAME
+
 for tool in shasum tar make clang install_name_tool otool codesign rg; do
   command -v "$tool" >/dev/null 2>&1 || {
     printf '错误：缺少构建工具 %s。\n' "$tool" >&2
@@ -59,14 +67,15 @@ cd "$SOURCE_ROOT"
   --enable-swscale \
   --enable-network \
   --enable-securetransport \
+  --enable-zlib \
   --enable-videotoolbox \
   --enable-protocol=file,pipe,http,https,tcp,tls,crypto,httpproxy \
-  --enable-demuxer=mov,matroska,flv,hls,mpegts,mp3,wav,ogg,flac,aac \
+  --enable-demuxer=mov,matroska,flv,hls,mpegts,mp3,wav,ogg,flac,aac,concat,image2 \
   --enable-parser=aac,aac_latm,ac3,av1,flac,h264,hevc,mjpeg,mpeg4video,mpegaudio,opus,vorbis,vp8,vp9 \
-  --enable-decoder=aac,aac_fixed,alac,flac,mp3,mp3float,opus,vorbis,ac3,eac3,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,h264,hevc,av1,vp8,vp9,mpeg4,mjpeg \
+  --enable-decoder=aac,aac_fixed,alac,flac,mp3,mp3float,opus,vorbis,ac3,eac3,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,h264,hevc,av1,vp8,vp9,mpeg4,mjpeg,png \
   --enable-encoder=pcm_s16le,aac,h264_videotoolbox,mjpeg \
-  --enable-muxer=wav,segment,matroska,mov,image2 \
-  --enable-filter=aresample,aformat,anull,scale,format \
+  --enable-muxer=wav,segment,matroska,mov,mp4,image2 \
+  --enable-filter=aresample,aformat,anull,asetpts,scale,format,setpts,pad,setsar,volume,fade,concat,overlay \
   --enable-bsf=aac_adtstoasc,h264_mp4toannexb,hevc_mp4toannexb
 
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '%s' 4)
@@ -125,6 +134,7 @@ PROTOCOLS_OUTPUT=$("$BIN_ROOT/ffmpeg" -hide_banner -protocols 2>&1)
 DEMUXERS_OUTPUT=$("$BIN_ROOT/ffmpeg" -hide_banner -demuxers 2>&1)
 MUXERS_OUTPUT=$("$BIN_ROOT/ffmpeg" -hide_banner -muxers 2>&1)
 ENCODERS_OUTPUT=$("$BIN_ROOT/ffmpeg" -hide_banner -encoders 2>&1)
+DECODERS_OUTPUT=$("$BIN_ROOT/ffmpeg" -hide_banner -decoders 2>&1)
 FILTERS_OUTPUT=$("$BIN_ROOT/ffmpeg" -hide_banner -filters 2>&1)
 
 for protocol in http https tcp tls; do
@@ -133,13 +143,17 @@ for protocol in http https tcp tls; do
     exit 1
   }
 done
-for demuxer in flv hls matroska mov mpegts; do
+for demuxer in concat flv hls image2 matroska mov mpegts; do
   printf '%s\n' "$DEMUXERS_OUTPUT" | rg -q "^ D +$demuxer( |,)" || {
     printf '错误：运行时 FFmpeg 缺少 %s demuxer。\n' "$demuxer" >&2
     exit 1
   }
 done
-for muxer in segment matroska mov image2 wav; do
+printf '%s\n' "$DECODERS_OUTPUT" | rg -q '^ [VAS][A-Z.]{5} png +' || {
+  printf '%s\n' '错误：运行时 FFmpeg 缺少 png decoder。' >&2
+  exit 1
+}
+for muxer in segment matroska mov mp4 image2 wav; do
   printf '%s\n' "$MUXERS_OUTPUT" | rg -q "^  E +$muxer( |,)" || {
     printf '错误：运行时 FFmpeg 缺少 %s muxer。\n' "$muxer" >&2
     exit 1
@@ -151,10 +165,12 @@ for encoder in aac h264_videotoolbox mjpeg pcm_s16le; do
     exit 1
   }
 done
-printf '%s\n' "$FILTERS_OUTPUT" | rg -q '^ [A-Z.]+ +scale +' || {
-  printf '%s\n' '错误：运行时 FFmpeg 缺少 scale filter。' >&2
-  exit 1
-}
+for filter in aformat asetpts concat fade format overlay pad scale setsar setpts volume; do
+  printf '%s\n' "$FILTERS_OUTPUT" | rg -q "^ [A-Z.]+ +$filter +" || {
+    printf '错误：运行时 FFmpeg 缺少 %s filter。\n' "$filter" >&2
+    exit 1
+  }
+done
 
 printf '%s\n' \
   "source=ffmpeg-8.1.2.tar.xz" \
@@ -163,6 +179,7 @@ printf '%s\n' \
   'network=enabled-for-recording' \
   'recording=https-flv-hls-segment-matroska' \
   'preview=mov-aac-h264_videotoolbox-mjpeg' \
+  'clip-export=h264_videotoolbox-aac-png-concat-overlay' \
   > "$OUTPUT_ROOT/build-record.txt"
 
 printf 'macOS arm64 应用运行时 FFmpeg 已构建到：%s\n' "$OUTPUT_ROOT"

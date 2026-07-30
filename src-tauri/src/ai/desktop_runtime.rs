@@ -103,7 +103,8 @@ impl LocalAsrEnvironment {
     }
 
     fn runtime_diagnostic(&self) -> Option<AiRuntimeResourceDiagnostic> {
-        let text = std::fs::read_to_string(self.active_root().join("runtime-manifest.json")).ok()?;
+        let text =
+            std::fs::read_to_string(self.active_root().join("runtime-manifest.json")).ok()?;
         let manifest = RuntimeManifest::from_json(&text).ok()?;
         Some(AiRuntimeResourceDiagnostic {
             bundle_version: manifest.bundle_version.clone(),
@@ -237,41 +238,73 @@ fn load_asr_manifest_text(resource_root: &Path) -> Result<String, AsrError> {
         return Ok(text);
     }
     let runtime_text = std::fs::read_to_string(resource_root.join("runtime-manifest.json"))
-        .map_err(|_| AsrError::new(
+        .map_err(|_| {
+            AsrError::new(
+                AsrErrorKind::EnvironmentUnavailable,
+                "asr_manifest_missing",
+                "本地 ASR 资源清单缺失，请重新安装应用",
+                false,
+            )
+        })?;
+    let runtime = RuntimeManifest::from_json(&runtime_text).map_err(|_| {
+        AsrError::new(
             AsrErrorKind::EnvironmentUnavailable,
-            "asr_manifest_missing",
-            "本地 ASR 资源清单缺失，请重新安装应用",
+            "asr_manifest_invalid",
+            "本地运行资源清单无效，请重新安装应用",
             false,
-        ))?;
-    let runtime = RuntimeManifest::from_json(&runtime_text).map_err(|_| AsrError::new(
-        AsrErrorKind::EnvironmentUnavailable,
-        "asr_manifest_invalid",
-        "本地运行资源清单无效，请重新安装应用",
-        false,
-    ))?;
-    let platform = runtime.for_current_platform().map_err(|_| AsrError::new(
-        AsrErrorKind::UnsupportedPlatform,
-        "unsupported_asr_platform",
-        "当前系统不支持本地语音识别",
-        false,
-    ))?;
+        )
+    })?;
+    let platform = runtime.for_current_platform().map_err(|_| {
+        AsrError::new(
+            AsrErrorKind::UnsupportedPlatform,
+            "unsupported_asr_platform",
+            "当前系统不支持本地语音识别",
+            false,
+        )
+    })?;
     let component_file = |id: &str| -> Result<(&str, u64, &str), AsrError> {
         runtime
             .components
             .iter()
             .find(|component| component.id == id)
-            .and_then(|component| component.files.first().map(|file| (file.path.as_str(), file.size_bytes, file.sha256.as_str())))
-            .ok_or_else(|| AsrError::new(AsrErrorKind::EnvironmentUnavailable, "asr_manifest_invalid", "运行资源缺少 ASR 组件", false))
+            .and_then(|component| {
+                component
+                    .files
+                    .first()
+                    .map(|file| (file.path.as_str(), file.size_bytes, file.sha256.as_str()))
+            })
+            .ok_or_else(|| {
+                AsrError::new(
+                    AsrErrorKind::EnvironmentUnavailable,
+                    "asr_manifest_invalid",
+                    "运行资源缺少 ASR 组件",
+                    false,
+                )
+            })
     };
     let (model_file, model_size, model_sha) = component_file("asr.model")?;
     let (vad_model_file, vad_size, vad_sha) = component_file("asr.vad-model")?;
-    let (normalization_file, normalization_size, normalization_sha) = component_file("asr.normalization")?;
+    let (normalization_file, normalization_size, normalization_sha) =
+        component_file("asr.normalization")?;
     let (_, _, engine_version) = runtime
         .components
         .iter()
         .find(|component| component.id == "asr.whisper")
-        .map(|component| (component.id.as_str(), component.version.as_str(), component.version.as_str()))
-        .ok_or_else(|| AsrError::new(AsrErrorKind::EnvironmentUnavailable, "asr_manifest_invalid", "运行资源缺少 Whisper 组件", false))?;
+        .map(|component| {
+            (
+                component.id.as_str(),
+                component.version.as_str(),
+                component.version.as_str(),
+            )
+        })
+        .ok_or_else(|| {
+            AsrError::new(
+                AsrErrorKind::EnvironmentUnavailable,
+                "asr_manifest_invalid",
+                "运行资源缺少 Whisper 组件",
+                false,
+            )
+        })?;
     let whisper = component_file("asr.whisper")?;
     let vad_sidecar = component_file("asr.vad-sidecar")?;
     let ffmpeg = component_file("media.ffmpeg")?;
@@ -282,7 +315,11 @@ fn load_asr_manifest_text(resource_root: &Path) -> Result<String, AsrError> {
         serde_json::json!({"file": ffmpeg.0, "sizeBytes": ffmpeg.1, "sha256": ffmpeg.2}),
         serde_json::json!({"file": ffprobe.0, "sizeBytes": ffprobe.1, "sha256": ffprobe.2}),
     ];
-    for component in runtime.components.iter().filter(|component| component.id.starts_with("platform.library.")) {
+    for component in runtime
+        .components
+        .iter()
+        .filter(|component| component.id.starts_with("platform.library."))
+    {
         if let Some(file) = component.files.first() {
             integrity.push(serde_json::json!({"file": file.path, "sizeBytes": file.size_bytes, "sha256": file.sha256}));
         }
@@ -297,7 +334,14 @@ fn load_asr_manifest_text(resource_root: &Path) -> Result<String, AsrError> {
         "licenseFiles": runtime.licenses.iter().map(|license| license.path.clone()).collect::<Vec<_>>(),
         "platforms": [{"os": platform.os, "arch": platform.arch, "accelerator": if platform.os == "macos" { "metal" } else { "cpu" }, "sidecar": whisper.0, "vadSidecar": vad_sidecar.0, "ffmpeg": ffmpeg.0, "ffprobe": ffprobe.0, "libraries": runtime.components.iter().filter(|component| component.id.starts_with("platform.library.")).filter_map(|component| component.files.first().map(|file| file.path.clone())).collect::<Vec<_>>(), "minimumMemoryBytes": platform.minimum_memory_bytes, "minimumFreeDiskBytes": platform.minimum_free_disk_bytes, "maximumThreads": 4, "minimumCpuFeatures": [], "runtime": null, "runtimeFile": null, "resourceIntegrity": integrity}]
     });
-    serde_json::to_string_pretty(&legacy).map_err(|_| AsrError::new(AsrErrorKind::EnvironmentUnavailable, "asr_manifest_invalid", "无法生成兼容的 ASR 资源清单", false))
+    serde_json::to_string_pretty(&legacy).map_err(|_| {
+        AsrError::new(
+            AsrErrorKind::EnvironmentUnavailable,
+            "asr_manifest_invalid",
+            "无法生成兼容的 ASR 资源清单",
+            false,
+        )
+    })
 }
 
 #[async_trait]
@@ -473,18 +517,20 @@ impl LocalAsrRuntime {
             .environment
             .default_recognition_profile()?
             .normalization_version;
-        let scheduler = Arc::new(build_scheduler(
-            self.database.clone(),
-            self.repository.clone(),
-            resources,
-            self.temporary_root.clone(),
-            self.publisher.clone(),
-            Arc::new(ReloadableMediaInspector {
-                current: self.inspector_switch.clone(),
-            }),
-            &normalization_version,
-        )
-        .map_err(command_asr_error)?);
+        let scheduler = Arc::new(
+            build_scheduler(
+                self.database.clone(),
+                self.repository.clone(),
+                resources,
+                self.temporary_root.clone(),
+                self.publisher.clone(),
+                Arc::new(ReloadableMediaInspector {
+                    current: self.inspector_switch.clone(),
+                }),
+                &normalization_version,
+            )
+            .map_err(command_asr_error)?,
+        );
         *self.scheduler.lock().map_err(|_| {
             AiCommandError::new(
                 "asr_scheduler_unavailable",
@@ -570,10 +616,9 @@ impl LocalAsrRuntime {
             .ok()
             .and_then(|mut scheduler| scheduler.take());
         if let Some(scheduler) = scheduler {
-            self.lifecycle
-                .shutdown(&scheduler)
-                .await
-                .map_err(|error| AiCommandError::new("ai_authorization_pause_failed", error.to_string(), true))
+            self.lifecycle.shutdown(&scheduler).await.map_err(|error| {
+                AiCommandError::new("ai_authorization_pause_failed", error.to_string(), true)
+            })
         } else {
             self.recover_startup()
         }
@@ -816,9 +861,11 @@ impl SchedulerEventSink for RuntimeSchedulerEvents {
     fn publish(&self, event: SchedulerEvent) {
         let (job, stage, message) = match event {
             SchedulerEvent::Queued(job) => (job, "queued", "已加入本地语音识别队列"),
-            SchedulerEvent::WaitingForRecording(job) => {
-                (job, "waiting_for_recording", "录制优先模式：正在等待录制结束")
-            }
+            SchedulerEvent::WaitingForRecording(job) => (
+                job,
+                "waiting_for_recording",
+                "录制优先模式：正在等待录制结束",
+            ),
             SchedulerEvent::Started(job) => {
                 if self
                     .repository
@@ -958,7 +1005,12 @@ mod tests {
         let database = Database::open_in_memory().expect("打开测试数据库");
         database.migrate().expect("完成测试数据库迁移");
         let streamer = database
-            .add_streamer(&NewStreamer::room("并行测试主播", "parallel-1", "parallel-room", true))
+            .add_streamer(&NewStreamer::room(
+                "并行测试主播",
+                "parallel-1",
+                "parallel-room",
+                true,
+            ))
             .expect("创建测试主播");
         database
             .update_streamer_status(streamer.id, "live", "recording", None)

@@ -19,6 +19,16 @@ pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub const DEFAULT_MODEL_ID: &str = "deepseek-chat";
 pub const PROMPT_VERSION: &str = "highlight-v1";
 pub const MAX_AGENT_TURNS: u8 = 3;
+pub const DEFAULT_QUALIFIED_SCORE: u8 = 70;
+pub const DEFAULT_EXCELLENT_SCORE: u8 = 80;
+
+const fn default_qualified_score() -> u8 {
+    DEFAULT_QUALIFIED_SCORE
+}
+
+const fn default_excellent_score() -> u8 {
+    DEFAULT_EXCELLENT_SCORE
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +37,10 @@ pub struct LlmProviderSettings {
     pub model_id: String,
     pub timeout_ms: u64,
     pub prompt_version: String,
+    #[serde(default = "default_qualified_score")]
+    pub qualified_score: u8,
+    #[serde(default = "default_excellent_score")]
+    pub excellent_score: u8,
     pub key_configured: bool,
     pub updated_at: Option<String>,
 }
@@ -38,6 +52,8 @@ impl Default for LlmProviderSettings {
             model_id: DEFAULT_MODEL_ID.to_owned(),
             timeout_ms: 30_000,
             prompt_version: PROMPT_VERSION.to_owned(),
+            qualified_score: DEFAULT_QUALIFIED_SCORE,
+            excellent_score: DEFAULT_EXCELLENT_SCORE,
             key_configured: false,
             updated_at: None,
         }
@@ -59,6 +75,16 @@ impl LlmProviderSettings {
         if !(1_000..=120_000).contains(&self.timeout_ms) {
             return Err(LlmError::InvalidConfiguration(
                 "请求超时必须在 1 秒到 120 秒之间".to_owned(),
+            ));
+        }
+        if self.qualified_score > 100 || self.excellent_score > 100 {
+            return Err(LlmError::InvalidConfiguration(
+                "合格片段和优秀片段阈值必须在 0 到 100 之间".to_owned(),
+            ));
+        }
+        if self.excellent_score < self.qualified_score {
+            return Err(LlmError::InvalidConfiguration(
+                "优秀片段阈值不能低于合格片段阈值".to_owned(),
             ));
         }
         Ok(())
@@ -493,10 +519,19 @@ impl CancellationCheck for CancellationToken {
 }
 
 pub fn settings_from_row(
-    row: Option<(String, String, i64, String, String)>,
+    row: Option<(String, String, i64, String, i64, i64, String)>,
     key_configured: bool,
 ) -> Result<LlmProviderSettings, LlmError> {
-    let Some((provider, model_id, timeout_ms, prompt_version, updated_at)) = row else {
+    let Some((
+        provider,
+        model_id,
+        timeout_ms,
+        prompt_version,
+        qualified_score,
+        excellent_score,
+        updated_at,
+    )) = row
+    else {
         return Ok(LlmProviderSettings {
             key_configured,
             ..LlmProviderSettings::default()
@@ -508,6 +543,10 @@ pub fn settings_from_row(
         timeout_ms: u64::try_from(timeout_ms)
             .map_err(|_| LlmError::InvalidConfiguration("超时参数无效".to_owned()))?,
         prompt_version,
+        qualified_score: u8::try_from(qualified_score)
+            .map_err(|_| LlmError::InvalidConfiguration("合格片段阈值无效".to_owned()))?,
+        excellent_score: u8::try_from(excellent_score)
+            .map_err(|_| LlmError::InvalidConfiguration("优秀片段阈值无效".to_owned()))?,
         key_configured,
         updated_at: Some(updated_at),
     };

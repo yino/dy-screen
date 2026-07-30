@@ -188,7 +188,7 @@ export interface BrowserAccessState {
   updatedAt: string;
 }
 
-export type ActivationStatus = "missing" | "active" | "retrying" | "revoked" | "invalid";
+export type ActivationStatus = "missing" | "active" | "retrying" | "revoked" | "invalid" | "development_bypass";
 
 export interface ActivationState {
   configured: boolean;
@@ -404,6 +404,8 @@ export interface LlmProviderSettings {
   modelId: string;
   timeoutMs: number;
   promptVersion: string;
+  qualifiedScore: number;
+  excellentScore: number;
   keyConfigured: boolean;
   updatedAt: string | null;
 }
@@ -420,6 +422,8 @@ export interface AiHighlightRun {
   skillsSnapshot: string[];
   analysisGoal: string | null;
   analysisFingerprint: string;
+  qualifiedScore: number;
+  excellentScore: number;
   userAuthorized: boolean;
   totalSegments: number;
   totalChars: number;
@@ -462,6 +466,70 @@ export interface AiHighlightCandidate {
   matchedTags: string[];
   rank: number | null;
   selected: boolean;
+}
+
+export interface AiHighlightCandidatePage {
+  items: AiHighlightCandidate[];
+  page: number;
+  pageSize: number;
+  totalCandidates: number;
+  qualifiedCandidates: number;
+  selectedCandidates: number;
+}
+
+export type AiClipEffect = "none" | "fade_in" | "fade_out" | "fade_in_out" | "flash" | "black";
+export type AiClipExportStatus = "idle" | "exporting" | "completed" | "cancelled" | "failed";
+
+export interface AiClipProject {
+  id: number;
+  highlightRunId: number;
+  name: string;
+  outputWidth: number | null;
+  outputHeight: number | null;
+  version: number;
+  exportStatus: AiClipExportStatus;
+  exportProgress: number;
+  outputPath: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiClipSegment {
+  id: number;
+  clipProjectId: number;
+  candidateId: number;
+  inputId: number;
+  position: number;
+  title: string;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  volumePercent: number;
+  effect: AiClipEffect;
+}
+
+export interface AiClipSubtitle {
+  stableSegmentId: string;
+  clipSegmentId: number;
+  inputId: number;
+  normalizedText: string;
+  sourceStartMs: number;
+  sourceEndMs: number;
+  projectStartMs: number;
+  projectEndMs: number;
+}
+
+export interface AiClipProjectDetail {
+  project: AiClipProject;
+  segments: AiClipSegment[];
+  subtitles: AiClipSubtitle[];
+  subtitlesComplete: boolean;
+}
+
+export interface AiClipSegmentUpdate {
+  volumePercent: number;
+  effect: AiClipEffect;
 }
 
 export interface AiExportResult {
@@ -605,7 +673,18 @@ export interface ClientApi {
   getAiHighlightProgress?(runId: number): Promise<AiHighlightProgress>;
   resumeAiHighlightAnalysis?(runId: number): Promise<AiHighlightRun>;
   listAiHighlightCandidates?(runId: number): Promise<AiHighlightCandidate[]>;
+  listQualifiedAiHighlightCandidates?(runId: number, page?: number, pageSize?: number): Promise<AiHighlightCandidatePage>;
+  listSelectedAiHighlightCandidates?(runId: number, page?: number, pageSize?: number): Promise<AiHighlightCandidatePage>;
   selectAiHighlightCandidates?(runId: number, candidateIds: number[]): Promise<AiHighlightCandidate[]>;
+  setAiHighlightCandidateSelected?(runId: number, candidateId: number, selected: boolean): Promise<AiHighlightCandidate>;
+  openAiClipProject?(runId: number): Promise<AiClipProjectDetail>;
+  getAiClipProject?(clipProjectId: number): Promise<AiClipProjectDetail>;
+  updateAiClipSegment?(clipProjectId: number, segmentId: number, update: AiClipSegmentUpdate): Promise<AiClipProjectDetail>;
+  insertAiClipCandidate?(clipProjectId: number, candidateId: number, insertIndex: number): Promise<AiClipProjectDetail>;
+  reorderAiClipSegments?(clipProjectId: number, orderedIds: number[]): Promise<AiClipProjectDetail>;
+  removeAiClipSegment?(clipProjectId: number, segmentId: number): Promise<AiClipProjectDetail>;
+  startAiClipExport?(clipProjectId: number): Promise<AiClipProject>;
+  cancelAiClipExport?(clipProjectId: number): Promise<AiClipProject>;
   requestAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
   retryAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;
   requestExit(force: boolean): Promise<void>;

@@ -8,7 +8,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -125,7 +125,11 @@ pub struct TelemetryEvent {
 }
 
 impl TelemetryEvent {
-    pub fn new(event: &str, props: serde_json::Map<String, Value>, client_version: &str) -> Option<Self> {
+    pub fn new(
+        event: &str,
+        props: serde_json::Map<String, Value>,
+        client_version: &str,
+    ) -> Option<Self> {
         const EVENTS: &[&str] = &["app_open", "feature_use", "export", "ai_call", "error"];
         const PROPS: &[&str] = &[
             "feature", "action", "result", "duration", "platform", "count", "source",
@@ -347,7 +351,8 @@ impl ApiClient {
 fn client_headers(device_id: &str, activate_code: &str) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::new();
     let device_id = HeaderValue::try_from(device_id).map_err(|_| ApiError::Configuration)?;
-    let activate_code = HeaderValue::try_from(activate_code).map_err(|_| ApiError::Configuration)?;
+    let activate_code =
+        HeaderValue::try_from(activate_code).map_err(|_| ApiError::Configuration)?;
     headers.insert(HeaderName::from_static("device_id"), device_id);
     headers.insert(HeaderName::from_static("activate_code"), activate_code);
     Ok(headers)
@@ -391,15 +396,24 @@ mod tests {
 
     #[test]
     fn normalizes_base_url_without_exposing_query_data() {
-        assert_eq!(normalize_base_url(" http://localhost/api/// "), "http://localhost/api");
+        assert_eq!(
+            normalize_base_url(" http://localhost/api/// "),
+            "http://localhost/api"
+        );
         assert_eq!(normalize_base_url(""), "http://localhost/api");
     }
 
     #[test]
     fn business_messages_are_bounded_and_control_free() {
         assert_eq!(safe_business_message("  激活失败  ".to_owned()), "激活失败");
-        assert_eq!(safe_business_message("\u{0}".to_owned()), "服务端拒绝了本次请求");
-        assert_eq!(safe_business_message("x".repeat(257)), "服务端拒绝了本次请求");
+        assert_eq!(
+            safe_business_message("\u{0}".to_owned()),
+            "服务端拒绝了本次请求"
+        );
+        assert_eq!(
+            safe_business_message("x".repeat(257)),
+            "服务端拒绝了本次请求"
+        );
     }
 
     #[test]
@@ -473,8 +487,22 @@ mod tests {
             client_version: "test".to_owned(),
             platform: "mac".to_owned(),
         };
-        assert!(ApiClient::new(config("https://user:secret@example.com/api"), Arc::new(PlainJsonCodec)).is_err());
-        assert!(ApiClient::new(config("https://example.com/api?token=secret"), Arc::new(PlainJsonCodec)).is_err());
-        assert!(ApiClient::new(config("https://example.com/api"), Arc::new(PlainJsonCodec)).is_ok());
+        assert!(
+            ApiClient::new(
+                config("https://user:secret@example.com/api"),
+                Arc::new(PlainJsonCodec)
+            )
+            .is_err()
+        );
+        assert!(
+            ApiClient::new(
+                config("https://example.com/api?token=secret"),
+                Arc::new(PlainJsonCodec)
+            )
+            .is_err()
+        );
+        assert!(
+            ApiClient::new(config("https://example.com/api"), Arc::new(PlainJsonCodec)).is_ok()
+        );
     }
 }

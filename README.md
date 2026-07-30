@@ -2,7 +2,7 @@
 
 直播管家是一个基于 Tauri 2.0、React、TypeScript、Rust 和 SQLite 的本地桌面客户端，用于通过公开抖音个人主页或直播间入口同时监听多个主播，在开播后自动保存包含视频和声音的 MKV 分片，并允许用户主动把多个视频转换为带时间戳的本地语音转写。
 
-当前版本交付“可靠录制 + 用户触发的本地 ASR + 可选高光候选分析”能力。高光分析通过 Rust 中的受限 Agent 工作流调用 DeepSeek，只发送用户授权的规范化转写、时间戳、标签和分析目标；自动切片、字幕烧录和成品视频导出仍属于后续独立能力。
+当前版本交付“可靠录制 + 用户触发的本地 ASR + 高光候选分析 + 带 ASR 字幕的本地单轨剪辑导出”能力。高光分析通过 Rust 中的受限 Agent 工作流调用 DeepSeek，只发送用户授权的规范化转写、时间戳、标签和分析目标；用户显式选择高光后可编排并导出新的 MP4，字幕默认烧录到成品画面，多轨和自动切片仍属于后续独立能力。
 
 ## 已实现功能
 
@@ -41,10 +41,10 @@
 - 本地流水线使用 FFprobe、FFmpeg、Silero VAD 和 `whisper.cpp small-q5_1`，macOS arm64 使用 Metal，Windows x64 使用 CPU；
 - ASR 全局单并发，默认允许已完成视频在录制期间识别，不占用录制并发许可；设置中关闭并行后可恢复录制优先；相同源版本与识别配置可以跨项目复用稳定转写产物；
 - 项目结果提供播放器、点击句段跳转、当前句段高亮、可关闭的跟随播放、仅存在于 WebView 的临时字幕、复制及 TXT/JSON 导出；
-- AI 工作区支持标签/分析目标快照、队列中的“下一个处理”和“立即切换”，并在 ASR 完成后按用户授权运行候选发现 Agent 与评分 Agent；默认展示总分不低于 70 的前 10 个高光候选供勾选保存；
+- AI 工作区支持标签/分析目标快照、队列中的“下一个处理”和“立即切换”，并在 ASR 完成后按用户授权运行候选发现 Agent 与评分 Agent；合格/优秀阈值默认分别为 70/80，合格候选按页展示且不设数量上限，优秀候选首次分析完成时自动选中；
 - 设置页支持 DeepSeek 模型、超时和系统凭据状态；API Key 只保存到操作系统凭据库，连接诊断使用固定提示，不保存原始响应；
 - 高光分析使用版本化通用、带货、搞笑、知识和故事 Skills，未知标签只作为数据，不可改变 Agent 工具边界；
-- 第一版转写不可编辑，不生成 SRT/ASS，不修改或烧录原视频，也不提供波形、多轨、裁剪或视频渲染入口；
+- 转写和原始录像不可编辑、不生成 SRT/ASS，也不会覆盖原视频；已选择高光可进入单轨剪辑页，预览只读 ASR 字幕并导出带烧录字幕的新 MP4，但仍不提供波形、多轨、关键帧、外部素材或字幕样式编辑；
 - 主播、设置、视频、ASR 和高光结果均保存在本机；客户端只向授权运营服务上报白名单启动/功能/错误埋点，不上传媒体、ASR 文本、本地路径、Cookie 或直播页面正文。
 
 ## 录制方式
@@ -70,7 +70,7 @@ dy-screen/
 ├── ui/                          React + TypeScript + Vite 客户端界面
 │   └── src/
 │       ├── App.tsx              监控中心、视频库、设置和 AI 工作区入口
-│       ├── AiWorkspace.tsx      AI 项目、播放器与只读时间戳文本界面
+│       ├── AiWorkspace.tsx      AI 项目、高光候选、播放器与独立剪辑界面
 │       ├── api.ts               Tauri command 与浏览器演示适配
 │       └── styles.css           参考图风格和响应式主题
 ├── src-tauri/                   Tauri 2.0 桌面后端
@@ -159,9 +159,15 @@ cp .env.example .env
 make app-dev
 ```
 
+开发构建默认跳过客户端激活，正式 `tauri build` 仍强制校验。需要在本地回归完整激活流程时运行：
+
+```bash
+make app-dev DEV_REQUIRE_ACTIVATION=1
+```
+
 首次启动后：
 
-1. 在不可关闭的激活弹窗输入服务端签发的激活码；激活成功前不会启动监听或录制；
+1. 正式包首次启动时，在不可关闭的激活弹窗输入服务端签发的激活码；激活成功前不会启动监听或录制；
 2. 点击“添加主播”；
 3. 可输入便于识别的主播名称；个人主页可留空；
 4. 输入公开个人主页，例如 `https://www.douyin.com/user/...`，或直播间链接，例如 `https://live.douyin.com/452086788686`；
@@ -203,7 +209,11 @@ FFprobe → FFmpeg → Silero VAD → AsrEngine
 6. 点击句段可跳转到源视频时间；“跟随播放”只控制列表滚动，“显示字幕”只在当前 WebView 临时覆盖；
 7. 可复制单句、当前视频或整个项目，也可导出包含稳定定位信息的 TXT/JSON。
 
-ASR 完成后，打开设置页填写 DeepSeek 模型和 API Key，点击“测试连接”验证凭据；回到已完成项目，确认发送范围后点击“开始高光分析”。分析只发送规范化文本和相对时间，不发送视频、音频、本地路径、Cookie 或签名流地址。候选结果的时间和句段 ID由 Rust 本地校验，选择保存只写入 SQLite，不触发 FFmpeg。
+ASR 完成后，打开设置页填写 DeepSeek 模型和 API Key，点击“测试连接”验证凭据；回到已完成项目，确认发送范围后点击“开始高光分析”。分析只发送规范化文本和相对时间，不发送视频、音频、本地路径、Cookie 或签名流地址。候选结果的时间和句段 ID 由 Rust 本地校验，选择保存只写入 SQLite，不会自动触发 FFmpeg；用户可在“已选择”中点击“编辑视频”创建可恢复的单轨工程，再显式导出新的 MP4。
+
+剪辑字幕直接复用每个来源视频已经发布的规范化 ASR 句段，不会再次识别。句段越过片段边界时会先裁剪，再映射到当前工程时间；重排或移除片段后自动重新计算。编辑器播放器默认同步显示当前字幕，没有句段命中时不显示空背景。导出使用固定的白字、半透明黑底、安全边距和自动换行样式，将字幕直接烧录进 H.264/AAC MP4；第一版不允许编辑文本、字体、位置或样式，也不接受外部字幕文件。
+
+每个剪辑片段必须至少关联一条非空 ASR 字幕。缺少字幕时仍可预览、重排或移除片段，但界面和后端都会阻止导出，并提示先补全 ASR 或移除该片段。原始录像、ASR 产物和预览缓存始终只读，导出只生成用户指定的新 MP4。
 
 “添加本地视频”和“添加整场直播”是两个独立入口：前者用于外部文件多选；后者以录制会话为单位，一次加入该场直播的全部登记分片，不再打开文件或分片选择器。整场导入后，每个分片仍在统一输入列表中单独展示，用户可在开始分析前删除或调整顺序；重复分片会跳过，缺失、损坏、未完成、不可读取或无音轨的分片会保留为不可用项并计入反馈。
 
@@ -265,7 +275,7 @@ src-tauri/target/release/bundle/macos/直播管家.app
 
 ### Runtime Resource Pack 发行与首次启动
 
-资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证。`asr-bundle stage` 会同时生成 `runtime-manifest.json`，清单采用 v2 结构，记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。
+资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证。`asr-bundle stage` 会同时生成 `runtime-manifest.json`，清单采用 v2 结构，记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。带字幕剪辑要求 FFmpeg 同时具备 PNG 解码、`concat`/`image2` demuxer、`overlay` 等受控滤镜以及平台 H.264/AAC 编码器，`make runtime-resource-verify` 和正式发行验收会逐项检查，旧资源包不满足时必须升级后才能导出。
 
 ```bash
 # 生成并校验 macOS arm64 随包资源
@@ -278,14 +288,14 @@ make app-build-resources ASR_SOURCE=/absolute/path/to/resources
 # 生成自有 HTTPS 静态托管目录（上传前必须用正式 Ed25519 私钥签署清单）
 make runtime-resource-publish \
   ASR_STAGE=resources/asr-stage \
-  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.3/ \
+  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/ \
   RESOURCE_RELEASE_DIR=dist/runtime-resources
 ```
 
 托管目录约定为 `channel/appVersion/platform/arch/bundleVersion/`，并在同一固定地址提供 `runtime-manifest.json` 及清单声明的资源文件。服务器应支持 HTTPS、Range 和大文件缓存；应用不会上传视频、音频、转写、主播信息、Cookie 或本地数据库。用户安装后如果资源未就绪，只能在资源页查看版本/大小/组件、下载、取消、重试或重新检测，监控、录制、视频库和 AI 剪辑保持锁定。
 
 当前 macOS arm64 发行构建使用的固定资源基地址为：
-`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.3/`。
+`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/`。
 `index.json` 仅用于发布目录索引，不能直接作为下载基地址。
 
 macOS 的 ASR 专用 FFmpeg 应从锁定的官方 `ffmpeg-8.1.2.tar.xz` 构建：
@@ -296,7 +306,7 @@ make asr-ffmpeg-macos \
   FFMPEG_ASR_OUTPUT=/absolute/path/to/output
 ```
 
-脚本校验源码 SHA-256，只启用常见本地容器、音频解码和 PCM WAV，禁用网络、GPL/nonfree 与第三方编码器；输出使用 LGPL-2.1-or-later，携带完整许可证，并把 dylib 改写为包内相对路径。Homebrew 常规 FFmpeg 启用了 GPL 外部组件且依赖开发机动态库，不能直接复制进正式安装包。
+脚本校验源码 SHA-256，只启用录制、预览、封面、ASR 和剪辑导出需要的协议、容器、PNG、滤镜及系统 VideoToolbox 编码器，仍禁用 GPL/nonfree 与第三方编码器；输出使用 LGPL-2.1-or-later，携带完整许可证，并把 dylib 改写为包内相对路径。Homebrew 常规 FFmpeg 启用了 GPL 外部组件且依赖开发机动态库，不能直接复制进正式安装包。
 
 macOS Whisper sidecar 应使用静态、可移植构建：
 
@@ -791,7 +801,7 @@ make accept-real-multi \
 - 不录制弹幕、礼物动画或网页 UI；
 - 内置播放器一次只预览单个已完成分片，不提供整场分片合并、统一时间轴或无缝连播；
 - 预览仅在需要时生成可清理 MP4 缓存，不会在每次录制结束后自动转换全部录像；
-- AI 工作区第一版只生成和浏览只读时间戳文本；不支持人工编辑、SRT/ASS、说话人分离、LLM 高光评分、裁剪计划、视频拼接、字幕烧录或成品导出；
+- AI 工作区支持只读时间戳文本、DeepSeek 高光评分、合格/优秀阈值、已选择候选的单轨剪辑工程，以及带烧录 ASR 字幕的 H.264/AAC MP4 导出；仍不支持人工编辑转写、SRT/ASS、说话人分离、波形、多轨、外部素材、字幕样式编辑或对原始录像的就地修改；
 - 本地 ASR 只支持 macOS arm64 Metal 和 Windows x64 CPU；不支持 Intel Mac、Windows ARM64、Linux、CUDA/Vulkan、多模型切换、在线下载或任意模型路径；
 - small 量化模型已通过固定中文短句测试，但至少 10 场真实中文直播的商品名、金额、主播名召回率和 8 GB 双平台长时性能仍需目标设备样本验收；效果不达标时应另立用户明确授权的云端 `AsrEngine` Adapter 变更，本版不自动上传或回退；
 - 主播标签目前只作为未来切片上下文预留，不会自动生成 Prompt 或触发模型调用；

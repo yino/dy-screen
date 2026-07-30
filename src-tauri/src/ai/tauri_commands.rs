@@ -7,8 +7,9 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use super::{
-    AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
-    AiHighlightCandidate, AiHighlightProgress, AiHighlightRun, AiImportBatchView, AiProject,
+    AiClipProjectDetail, AiClipSegmentUpdate, AiCommandError, AiCommandService,
+    AiCreateProjectRequest, AiEnvironmentDiagnostic, AiHighlightCandidate,
+    AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun, AiImportBatchView, AiProject,
     AiProjectDetailView, AiProjectSummary, AiSessionImportView, AiSessionOption,
     AiTranscriptProjection, AiTrustedFileGrant, LlmProviderSettings, ProviderDiagnostic,
 };
@@ -362,6 +363,34 @@ pub(crate) fn ai_list_highlight_candidates(
 }
 
 #[tauri::command]
+pub(crate) fn ai_list_qualified_highlight_candidates(
+    run_id: i64,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiHighlightCandidatePage, AiCommandError> {
+    state.commands.list_qualified_highlight_candidates(
+        run_id,
+        page.unwrap_or(0),
+        page_size.unwrap_or(50),
+    )
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_selected_highlight_candidates(
+    run_id: i64,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiHighlightCandidatePage, AiCommandError> {
+    state.commands.list_selected_highlight_candidates(
+        run_id,
+        page.unwrap_or(0),
+        page_size.unwrap_or(50),
+    )
+}
+
+#[tauri::command]
 pub(crate) fn ai_select_highlight_candidates(
     run_id: i64,
     candidate_ids: Vec<i64>,
@@ -370,6 +399,80 @@ pub(crate) fn ai_select_highlight_candidates(
     state
         .commands
         .select_highlight_candidates(run_id, &candidate_ids)
+}
+
+#[tauri::command]
+pub(crate) fn ai_set_highlight_candidate_selected(
+    run_id: i64,
+    candidate_id: i64,
+    selected: bool,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiHighlightCandidate, AiCommandError> {
+    state
+        .commands
+        .set_highlight_candidate_selected(run_id, candidate_id, selected)
+}
+
+#[tauri::command]
+pub(crate) fn ai_open_clip_project(
+    run_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state.commands.open_clip_project(run_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_clip_project(
+    clip_project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state.commands.get_clip_project(clip_project_id)
+}
+
+#[tauri::command]
+pub(crate) fn ai_update_clip_segment(
+    clip_project_id: i64,
+    segment_id: i64,
+    update: AiClipSegmentUpdate,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state
+        .commands
+        .update_clip_segment(clip_project_id, segment_id, update)
+}
+
+#[tauri::command]
+pub(crate) fn ai_insert_clip_candidate(
+    clip_project_id: i64,
+    candidate_id: i64,
+    insert_index: u32,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state
+        .commands
+        .insert_clip_candidate(clip_project_id, candidate_id, insert_index)
+}
+
+#[tauri::command]
+pub(crate) fn ai_reorder_clip_segments(
+    clip_project_id: i64,
+    ordered_ids: Vec<i64>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state
+        .commands
+        .reorder_clip_segments(clip_project_id, &ordered_ids)
+}
+
+#[tauri::command]
+pub(crate) fn ai_remove_clip_segment(
+    clip_project_id: i64,
+    segment_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state
+        .commands
+        .remove_clip_segment(clip_project_id, segment_id)
 }
 
 async fn save_export(

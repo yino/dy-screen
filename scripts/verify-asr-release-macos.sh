@@ -4,6 +4,8 @@
 
 set -eu
 
+SCRIPT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 usage() {
   printf '%s\n' \
     '用法：verify-asr-release-macos.sh --app APP --dmg DMG --asr-cli FILE --asr-bundle FILE --video FILE --output FILE --launch-app' >&2
@@ -86,6 +88,13 @@ RESOURCE_ROOT="$APP/Contents/Resources/resources/asr"
 INFO_PLIST="$APP/Contents/Info.plist"
 require_regular_file "$RESOURCE_ROOT/manifest.json" '包内资源 manifest'
 require_regular_file "$INFO_PLIST" '应用 Info.plist'
+FFMPEG_RELATIVE=$(/usr/bin/plutil -extract platforms.0.ffmpeg raw -o - -- "$RESOURCE_ROOT/manifest.json" 2>/dev/null || true)
+if [ -z "$FFMPEG_RELATIVE" ]; then
+  printf '%s\n' '错误：包内资源 manifest 缺少 macOS FFmpeg 路径。' >&2
+  exit 2
+fi
+RESOURCE_FFMPEG="$RESOURCE_ROOT/$FFMPEG_RELATIVE"
+require_regular_file "$RESOURCE_FFMPEG" '包内 FFmpeg'
 APP_EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print:CFBundleExecutable' "$INFO_PLIST" 2>/dev/null || true)
 BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print:CFBundleIdentifier' "$INFO_PLIST" 2>/dev/null || true)
 if [ -z "$APP_EXECUTABLE" ] || [ -z "$BUNDLE_ID" ]; then
@@ -142,6 +151,7 @@ GATEKEEPER_APP=$(bool_command spctl --assess --type execute --verbose=4 "$APP")
 GATEKEEPER_DMG=$(bool_command spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG")
 DMG_VALID=$(bool_command hdiutil verify "$DMG")
 RESOURCE_BUNDLE_VALID=$(bool_command "$ASR_BUNDLE" verify --root "$RESOURCE_ROOT" --platform macos-aarch64)
+FFMPEG_CLIP_CAPABILITIES_VALID=$(bool_command "$SCRIPT_ROOT/verify-clip-ffmpeg-capabilities.sh" "$RESOURCE_FFMPEG")
 
 INSTALLED_UNDER_APPLICATIONS=false
 case "$APP" in
@@ -210,6 +220,7 @@ if [ "$APP_CODE_SIGNATURE_VALID" = true ] \
   && [ "$GATEKEEPER_DMG" = true ] \
   && [ "$DMG_VALID" = true ] \
   && [ "$RESOURCE_BUNDLE_VALID" = true ] \
+  && [ "$FFMPEG_CLIP_CAPABILITIES_VALID" = true ] \
   && [ "$INSTALLED_UNDER_APPLICATIONS" = true ] \
   && [ "$OFFLINE_OBSERVED" = true ] \
   && [ "$ASR_EXIT_CODE" -eq 0 ] \
@@ -245,6 +256,7 @@ printf '%s\n' \
   "  \"gatekeeperDmgPassed\": $GATEKEEPER_DMG," \
   "  \"dmgVerified\": $DMG_VALID," \
   "  \"resourceBundleValid\": $RESOURCE_BUNDLE_VALID," \
+  "  \"ffmpegClipCapabilitiesValid\": $FFMPEG_CLIP_CAPABILITIES_VALID," \
   "  \"installedUnderApplications\": $INSTALLED_UNDER_APPLICATIONS," \
   "  \"offlineObserved\": $OFFLINE_OBSERVED," \
   "  \"appLaunchPassed\": $APP_LAUNCH_PASSED," \

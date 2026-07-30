@@ -14,12 +14,15 @@ fn macos_ffmpeg_build_is_locked_lgpl_media_capable_and_relocatable() {
         "--disable-static",
         "--enable-network",
         "--enable-securetransport",
+        "--enable-zlib",
         "--enable-protocol=file,pipe,http,https,tcp,tls,crypto,httpproxy",
-        "--enable-demuxer=mov,matroska,flv,hls,mpegts",
-        "--enable-muxer=wav,segment,matroska,mov,image2",
+        "--enable-demuxer=mov,matroska,flv,hls,mpegts,mp3,wav,ogg,flac,aac,concat,image2",
+        "--enable-muxer=wav,segment,matroska,mov,mp4,image2",
         "--enable-encoder=pcm_s16le,aac,h264_videotoolbox,mjpeg",
-        "--enable-decoder=",
+        "--enable-decoder=aac,aac_fixed,alac,flac,mp3,mp3float,opus,vorbis,ac3,eac3,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,h264,hevc,av1,vp8,vp9,mpeg4,mjpeg,png",
+        "--enable-filter=aresample,aformat,anull,asetpts,scale,format,setpts,pad,setsar,volume,fade,concat,overlay",
         "PROTOCOLS_OUTPUT",
+        "DECODERS_OUTPUT",
         "MUXERS_OUTPUT",
         "@loader_path",
         "@executable_path/../../lib/macos-aarch64",
@@ -31,6 +34,42 @@ fn macos_ffmpeg_build_is_locked_lgpl_media_capable_and_relocatable() {
     assert!(!script.contains("--disable-network"));
     assert!(!script.contains("--enable-gpl "));
     assert!(!script.contains("--enable-nonfree "));
+}
+
+#[test]
+fn release_checks_require_clip_subtitle_ffmpeg_capabilities_on_both_platforms() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "scripts/verify-clip-ffmpeg-capabilities.sh",
+        "scripts/verify-clip-ffmpeg-capabilities.ps1",
+    ] {
+        let script = fs::read_to_string(root.join(relative)).unwrap();
+        for required in [
+            "png",
+            "concat",
+            "image2",
+            "mp4",
+            "overlay",
+            "aformat",
+            "asetpts",
+            "h264_videotoolbox",
+            "h264_mf",
+            "libx264",
+            "aac",
+        ] {
+            assert!(
+                script.contains(required),
+                "{relative} 缺少剪辑字幕能力 {required}"
+            );
+        }
+    }
+
+    let macos = fs::read_to_string(root.join("scripts/verify-asr-release-macos.sh")).unwrap();
+    let windows = fs::read_to_string(root.join("scripts/verify-asr-release-windows.ps1")).unwrap();
+    assert!(macos.contains("verify-clip-ffmpeg-capabilities.sh"));
+    assert!(macos.contains("ffmpegClipCapabilitiesValid"));
+    assert!(windows.contains("verify-clip-ffmpeg-capabilities.ps1"));
+    assert!(windows.contains("ffmpegClipCapabilitiesValid"));
 }
 
 #[test]

@@ -22,6 +22,8 @@ pub const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const TELEMETRY_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const TELEMETRY_BATCH_SIZE: usize = 20;
 const TELEMETRY_QUEUE_CAPACITY: usize = 200;
+#[cfg(debug_assertions)]
+const DEV_REQUIRE_ACTIVATION_ENV: &str = "DY_SCREEN_DEV_REQUIRE_ACTIVATION";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -50,11 +52,14 @@ pub struct ActivationService {
     device_id: Arc<String>,
     record: Arc<Mutex<Option<ClientActivationRecord>>>,
     cancellation: CancellationToken,
+    development_bypass: bool,
 }
 
 impl ActivationService {
     pub fn new(database: Database, api: ApiClient, app_data_dir: &Path) -> Result<Self, String> {
-        let record = database.client_activation().map_err(|error| error.to_string())?;
+        let record = database
+            .client_activation()
+            .map_err(|error| error.to_string())?;
         let device_id = record
             .as_ref()
             .map(|record| record.device_id.clone())
@@ -65,7 +70,26 @@ impl ActivationService {
             device_id: Arc::new(device_id),
             record: Arc::new(Mutex::new(record)),
             cancellation: CancellationToken::new(),
+            development_bypass: false,
         })
+    }
+
+    /// 开发应用默认跳过远程激活，release 构建不会进入该分支。
+    /// 设置 `DY_SCREEN_DEV_REQUIRE_ACTIVATION=1` 可在本地重新启用完整激活流程。
+    #[cfg(debug_assertions)]
+    pub fn with_development_bypass(mut self) -> Self {
+        self.development_bypass =
+            !environment_flag_enabled(std::env::var(DEV_REQUIRE_ACTIVATION_ENV).ok().as_deref());
+        self
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn with_development_bypass(self) -> Self {
+        self
+    }
+
+    pub fn is_development_bypass(&self) -> bool {
+        self.development_bypass
     }
 
     pub fn api(&self) -> &ApiClient {
@@ -73,6 +97,17 @@ impl ActivationService {
     }
 
     pub fn state(&self) -> ActivationStateView {
+        if self.development_bypass {
+            return ActivationStateView {
+                configured: true,
+                active: true,
+                status: "development_bypass".to_owned(),
+                message: Some("本地开发模式已跳过客户端激活".to_owned()),
+                device_id_hint: device_hint(&self.device_id),
+                last_heartbeat_at: None,
+                next_heartbeat_at: None,
+            };
+        }
         let record = self.record.lock().ok().and_then(|record| record.clone());
         state_from_record(record.as_ref(), &self.device_id)
     }
@@ -82,6 +117,9 @@ impl ActivationService {
     }
 
     pub async fn activate(&self, code: &str) -> Result<ActivationStateView, String> {
+        if self.development_bypass {
+            return Ok(self.state());
+        }
         let code = normalize_activation_code(code)?;
         let response = self
             .api
@@ -108,6 +146,9 @@ impl ActivationService {
     }
 
     pub async fn heartbeat_once(&self) -> HeartbeatOutcome {
+        if self.development_bypass {
+            return HeartbeatOutcome::Active;
+        }
         let Some(mut record) = self.record.lock().ok().and_then(|record| record.clone()) else {
             return HeartbeatOutcome::Missing;
         };
@@ -176,6 +217,9 @@ impl ActivationService {
     }
 
     pub fn credentials(&self) -> Option<(String, String)> {
+        if self.development_bypass {
+            return None;
+        }
         self.record.lock().ok().and_then(|record| {
             record.as_ref().and_then(|record| {
                 matches!(record.state.as_str(), "active" | "retrying")
@@ -185,6 +229,9 @@ impl ActivationService {
     }
 
     pub fn clear(&self) -> Result<ActivationStateView, String> {
+        if self.development_bypass {
+            return Ok(self.state());
+        }
         self.database
             .clear_client_activation()
             .map_err(|error| error.to_string())?;
@@ -229,6 +276,16 @@ fn stable_device_id(app_data_dir: &Path) -> String {
     }
     let digest = hex::encode(hasher.finalize());
     format!("DY-{}", &digest[..24])
+}
+
+#[cfg(debug_assertions)]
+fn environment_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn normalize_activation_code(code: &str) -> Result<String, String> {
@@ -376,6 +433,15 @@ mod tests {
     }
 
     #[test]
+    fn development_activation_override_accepts_only_explicit_truthy_values() {
+        assert!(environment_flag_enabled(Some("1")));
+        assert!(environment_flag_enabled(Some(" TRUE ")));
+        assert!(environment_flag_enabled(Some("yes")));
+        assert!(!environment_flag_enabled(Some("0")));
+        assert!(!environment_flag_enabled(None));
+    }
+
+    #[test]
     fn revoked_record_never_reports_active() {
         let record = ClientActivationRecord {
             device_id: "DY-123456789".to_owned(),
@@ -400,7 +466,8 @@ mod tests {
     #[test]
     fn telemetry_queue_can_start_without_a_current_tokio_reactor() {
         assert!(tokio::runtime::Handle::try_current().is_err());
-        let database = Database::open_in_memory().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("activation.sqlite3")).unwrap();
         database.migrate().unwrap();
         let api = ApiClient::new(
             ApiConfig {
@@ -412,8 +479,8 @@ mod tests {
             Arc::new(PlainJsonCodec),
         )
         .unwrap();
-        let service = ActivationService::new(database, api, Path::new("/tmp/dy-screen-test"))
-            .unwrap();
+        let service =
+            ActivationService::new(database, api, Path::new("/tmp/dy-screen-test")).unwrap();
 
         let queue = TelemetryQueue::spawn(service.clone());
         queue.track("app_open", Map::new());

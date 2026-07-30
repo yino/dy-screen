@@ -13,11 +13,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AiHighlightCandidate, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus,
-    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectService,
-    AiProjectStatus, AiProjectSummary, AiRepository, AiSessionOption, AiTranscriptProjection,
-    CredentialStore, HighlightWorkflow, ImportBatchResult, ImportRejection, LlmProviderSettings,
-    ProviderDiagnostic, RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
+    AiClipProjectDetail, AiClipSegmentUpdate, AiHighlightCandidate, AiHighlightCandidatePage,
+    AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
+    AiProject, AiProjectDetail, AiProjectInput, AiProjectService, AiProjectStatus,
+    AiProjectSummary, AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore,
+    HighlightWorkflow, ImportBatchResult, ImportRejection, LlmProviderSettings, ProviderDiagnostic,
+    RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +531,28 @@ impl AiCommandService {
             .map_err(repository_error)
     }
 
+    pub fn list_qualified_highlight_candidates(
+        &self,
+        run_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> Result<AiHighlightCandidatePage, AiCommandError> {
+        self.repository
+            .list_qualified_highlight_candidates(run_id, page, page_size)
+            .map_err(repository_error)
+    }
+
+    pub fn list_selected_highlight_candidates(
+        &self,
+        run_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> Result<AiHighlightCandidatePage, AiCommandError> {
+        self.repository
+            .list_selected_highlight_candidates(run_id, page, page_size)
+            .map_err(repository_error)
+    }
+
     pub fn latest_highlight_run(
         &self,
         project_id: i64,
@@ -552,6 +575,74 @@ impl AiCommandService {
     ) -> Result<Vec<AiHighlightCandidate>, AiCommandError> {
         self.repository
             .select_highlight_candidates(run_id, candidate_ids)
+            .map_err(repository_error)
+    }
+
+    pub fn set_highlight_candidate_selected(
+        &self,
+        run_id: i64,
+        candidate_id: i64,
+        selected: bool,
+    ) -> Result<AiHighlightCandidate, AiCommandError> {
+        self.repository
+            .set_highlight_candidate_selected(run_id, candidate_id, selected)
+            .map_err(repository_error)
+    }
+
+    pub fn open_clip_project(&self, run_id: i64) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .get_or_create_clip_project(run_id)
+            .map_err(repository_error)
+    }
+
+    pub fn get_clip_project(
+        &self,
+        clip_project_id: i64,
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .get_clip_project(clip_project_id)
+            .map_err(repository_error)
+    }
+
+    pub fn update_clip_segment(
+        &self,
+        clip_project_id: i64,
+        segment_id: i64,
+        update: AiClipSegmentUpdate,
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .update_clip_segment(clip_project_id, segment_id, &update)
+            .map_err(repository_error)
+    }
+
+    pub fn insert_clip_candidate(
+        &self,
+        clip_project_id: i64,
+        candidate_id: i64,
+        insert_index: u32,
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .insert_clip_candidate(clip_project_id, candidate_id, insert_index)
+            .map_err(repository_error)
+    }
+
+    pub fn reorder_clip_segments(
+        &self,
+        clip_project_id: i64,
+        ordered_ids: &[i64],
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .reorder_clip_segments(clip_project_id, ordered_ids)
+            .map_err(repository_error)
+    }
+
+    pub fn remove_clip_segment(
+        &self,
+        clip_project_id: i64,
+        segment_id: i64,
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .remove_clip_segment(clip_project_id, segment_id)
             .map_err(repository_error)
     }
 

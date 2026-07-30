@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频剪辑工作台</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            background: #12121f;
+            color: #e0e0e0;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ==================== 顶部导航 ==================== */
+        .top-bar {
+            height: 48px;
+            background: #0d0d1a;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            border-bottom: 1px solid #1e1e3a;
+            flex-shrink: 0;
+        }
+        .top-bar .logo {
+            font-size: 16px;
+            font-weight: 700;
+            color: #e94560;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .top-bar .logo svg { width: 20px; height: 20px; }
+        .top-bar .actions { display: flex; gap: 8px; }
+        .btn {
+            padding: 6px 14px; border: none; border-radius: 5px;
+            cursor: pointer; font-size: 12px; font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: linear-gradient(135deg, #e94560, #c0392b); color: #fff; }
+        .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 3px 12px rgba(233,69,96,.4); }
+        .btn-outline { background: transparent; color: #999; border: 1px solid #333; }
+        .btn-outline:hover { border-color: #e94560; color: #e94560; }
+
+        /* ==================== 主体布局 ==================== */
+        .main-content { flex: 1; display: flex; overflow: hidden; }
+
+        /* ==================== 左侧动画素材库 ==================== */
+        .sidebar-left {
+            width: 240px; background: #161628;
+            border-right: 1px solid #1e1e3a;
+            display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden;
+        }
+        .sidebar-header { padding: 14px 16px; border-bottom: 1px solid #1e1e3a; }
+        .sidebar-header h3 { font-size: 13px; color: #ccc; display: flex; align-items: center; gap: 6px; }
+        .material-tabs { display: flex; padding: 8px 12px; gap: 4px; border-bottom: 1px solid #1e1e3a; }
+        .material-tab {
+            padding: 4px 10px; border-radius: 4px; font-size: 11px;
+            cursor: pointer; color: #777; transition: all .2s;
+        }
+        .material-tab.active { background: #e94560; color: #fff; }
+        .material-tab:hover:not(.active) { background: #1e1e3a; color: #bbb; }
+
+        .material-list {
+            flex: 1; overflow-y: auto; padding: 10px;
+            display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+        }
+        .material-list::-webkit-scrollbar { width: 3px; }
+        .material-list::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+
+        .material-item {
+            aspect-ratio: 16/10; border-radius: 6px; overflow: hidden;
+            position: relative; cursor: grab; border: 2px solid transparent;
+            transition: all .2s;
+        }
+        .material-item:hover { border-color: #e94560; transform: scale(1.04); }
+        .material-item .thumb {
+            width: 100%; height: 100%;
+            display: flex; align-items: center; justify-content: center; font-size: 24px;
+        }
+        .material-item .label {
+            position: absolute; bottom: 0; left: 0; right: 0;
+            padding: 3px 5px; background: linear-gradient(transparent, rgba(0,0,0,.8));
+            font-size: 9px; color: #fff; text-align: center;
+        }
+
+        .mat-fire    { background: linear-gradient(135deg, #ff6b35, #f7c948); }
+        .mat-sparkle { background: linear-gradient(135deg, #a855f7, #ec4899); }
+        .mat-confetti{ background: linear-gradient(135deg, #10b981, #34d399); }
+        .mat-heart   { background: linear-gradient(135deg, #ef4444, #f87171); }
+        .mat-star    { background: linear-gradient(135deg, #f59e0b, #fbbf24); }
+        .mat-bolt    { background: linear-gradient(135deg, #3b82f6, #60a5fa); }
+        .mat-snow    { background: linear-gradient(135deg, #06b6d4, #67e8f9); }
+        .mat-rainbow { background: linear-gradient(135deg, #ec4899, #8b5cf6, #3b82f6); }
+        .mat-bubble  { background: linear-gradient(135deg, #6366f1, #a78bfa); }
+        .mat-flame   { background: linear-gradient(135deg, #dc2626, #f97316); }
+
+        /* ==================== 中间区域 ==================== */
+        .center-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+
+        /* ---- 播放器 ---- */
+        .player-section {
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            background: #0a0a14; position: relative; overflow: hidden;
+        }
+        .player-wrapper {
+            position: relative; width: 100%; max-width: 820px;
+            aspect-ratio: 16/9; background: #000; border-radius: 10px; overflow: hidden;
+            box-shadow: 0 0 50px rgba(0,0,0,.5), 0 0 0 1px #1e1e3a;
+        }
+        .video-placeholder {
+            width: 100%; height: 100%;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            color: #444; gap: 12px;
+        }
+        .video-placeholder .play-icon {
+            width: 60px; height: 60px; border-radius: 50%;
+            background: rgba(255,255,255,.05); border: 2px solid #2a2a3e;
+            display: flex; align-items: center; justify-content: center;
+            transition: all .3s;
+        }
+        .video-placeholder .play-icon:hover { border-color: #e94560; background: rgba(233,69,96,.1); }
+        .video-placeholder .play-icon svg { width: 24px; height: 24px; fill: #555; margin-left: 2px; }
+        .video-placeholder:hover .play-icon svg { fill: #e94560; }
+        .video-placeholder span { font-size: 13px; color: #555; }
+
+        .effect-overlay { position: absolute; top:0; left:0; right:0; bottom:0; pointer-events:none; overflow:hidden; }
+        .floating-emoji {
+            position: absolute; font-size: 28px;
+            animation: floatUp 2.5s ease-in forwards; opacity: 0;
+        }
+        @keyframes floatUp {
+            0%   { opacity:0; transform: translateY(15px) scale(.5); }
+            20%  { opacity:1; transform: translateY(0) scale(1); }
+            80%  { opacity:1; transform: translateY(-25px) scale(1); }
+            100% { opacity:0; transform: translateY(-50px) scale(.6); }
+        }
+
+        /* 播放控制条 */
+        .player-controls {
+            position: absolute; bottom: 0; left: 0; right: 0;
+            padding: 8px 14px; background: linear-gradient(transparent, rgba(0,0,0,.85));
+            display: flex; align-items: center; gap: 10px; opacity: 0; transition: opacity .3s;
+        }
+        .player-wrapper:hover .player-controls { opacity: 1; }
+        .player-controls .ctrl-btn {
+            background: none; border: none; color: #fff; cursor: pointer;
+            font-size: 16px; padding: 3px; opacity: .75; transition: opacity .2s;
+        }
+        .player-controls .ctrl-btn:hover { opacity: 1; color: #e94560; }
+        .progress-bar {
+            flex: 1; height: 3px; background: rgba(255,255,255,.15);
+            border-radius: 2px; cursor: pointer; position: relative;
+        }
+        .progress-bar .progress-fill {
+            height: 100%; width: 30%;
+            background: linear-gradient(90deg, #e94560, #ff6b6b); border-radius: 2px;
+        }
+        .progress-bar .progress-fill::after {
+            content:''; position:absolute; right:-4px; top:50%; transform:translateY(-50%);
+            width:9px; height:9px; background:#fff; border-radius:50%;
+        }
+        .time-display { font-size: 11px; color: #999; white-space: nowrap; }
+
+        /* ==================== 时间轴区域（核心改造） ==================== */
+        .timeline-section {
+            height: 280px; background: #161628;
+            border-top: 1px solid #1e1e3a;
+            display: flex; flex-direction: column; flex-shrink: 0;
+        }
+
+        .timeline-toolbar {
+            height: 36px; display: flex; align-items: center; justify-content: space-between;
+            padding: 0 14px; border-bottom: 1px solid #1e1e3a;
+        }
+        .timeline-toolbar .left-tools { display: flex; gap: 6px; }
+        .tool-btn {
+            padding: 3px 10px; border-radius: 4px; font-size: 11px;
+            background: #1a1a30; border: 1px solid #2a2a45; color: #999;
+            cursor: pointer; transition: all .2s;
+        }
+        .tool-btn:hover { border-color: #e94560; color: #e94560; }
+        .timeline-toolbar .zoom-controls { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #666; }
+        .zoom-slider { width: 90px; height: 3px; -webkit-appearance: none; background: #2a2a45; border-radius: 2px; outline: none; }
+        .zoom-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 10px; border-radius: 50%; background: #e94560; cursor: pointer; }
+
+        /* 时间轴主体 */
+        .timeline-body { flex: 1; overflow-x: auto; overflow-y: hidden; position: relative; }
+        .timeline-body::-webkit-scrollbar { height: 5px; }
+        .timeline-body::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+        .timeline-canvas {
+            min-width: 1400px; padding: 0 16px;
+            display: flex; flex-direction: column;
+        }
+
+        /* 时间刻度尺 */
+        .time-ruler {
+            height: 28px; position: relative; border-bottom: 1px solid #1e1e3a;
+            margin-bottom: 6px; flex-shrink: 0;
+        }
+        .time-ruler .tick {
+            position: absolute; bottom: 4px; font-size: 10px; color: #555;
+            transform: translateX(-50%); white-space: nowrap;
+        }
+        .time-ruler .tick::before {
+            content:''; position: absolute; bottom: 14px; left: 50%;
+            width: 1px; height: 7px; background: #333;
+        }
+        .time-ruler .tick.major { color: #888; font-weight: 600; }
+        .time-ruler .tick.major::before { height: 10px; background: #555; width: 2px; }
+
+        /* === 单一轨道 === */
+        .single-track {
+            position: relative;
+            height: 56px;
+            background: #0d0d1a;
+            border-radius: 8px;
+            border: 1px solid #1e1e3a;
+            display: flex;
+            align-items: center;
+            padding: 0;
+            overflow: hidden;
+        }
+
+        /* 轨道背景网格 */
+        .track-grid {
+            position: absolute; top:0; left:0; right:0; bottom:0;
+            display: flex; pointer-events: none;
+        }
+        .track-grid span {
+            flex: 1; border-right: 1px solid #15152a;
+        }
+
+        /* 片段通用 */
+        .clip {
+            position: relative; height: 44px; border-radius: 6px;
+            display: flex; align-items: center; padding: 0 10px;
+            font-size: 11px; color: #fff; cursor: grab; user-select: none;
+            transition: box-shadow .2s, transform .15s; overflow: hidden;
+            z-index: 2; flex-shrink: 0;
+        }
+        .clip:hover { box-shadow: 0 0 0 2px rgba(255,255,255,.15); }
+        .clip.selected { box-shadow: 0 0 0 2px #e94560; }
+        .clip.dragging { opacity: .5; }
+        .clip .clip-icon { margin-right: 5px; font-size: 13px; opacity: .85; flex-shrink: 0; }
+        .clip .clip-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+        .clip .clip-duration { font-size: 10px; opacity: .65; padding-left: 6px; flex-shrink: 0; }
+
+        /* 片段类型配色 */
+        .clip-video    { background: linear-gradient(90deg, #1a3a6c, #2563eb); }
+        .clip-animation { background: linear-gradient(90deg, #7c1d3e, #db2777); }
+        .clip-effect   { background: linear-gradient(90deg, #7c2d12, #ea580c); }
+        .clip-transition{ background: linear-gradient(90deg, #4a1d6e, #7c3aed); }
+        .clip-audio    { background: linear-gradient(90deg, #064e3b, #059669); }
+
+        /* 可插入间隙高亮 */
+        .insert-gap {
+            width: 6px; height: 44px; border-radius: 3px;
+            background: transparent; transition: all .2s; flex-shrink: 0;
+            position: relative; z-index: 1;
+        }
+        .insert-gap.active {
+            background: rgba(233,69,96,.25);
+            border: 1px dashed #e94560;
+            width: 10px;
+        }
+        .insert-gap::after {
+            content: '+'; position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%,-50%); font-size: 12px; color: #e94560;
+            opacity: 0; transition: opacity .2s;
+        }
+        .insert-gap.active::after { opacity: 1; }
+
+        /* 播放头 */
+        .playhead {
+            position: absolute; top: 0; bottom: 0; width: 2px;
+            background: #e94560; z-index: 20; pointer-events: none;
+        }
+        .playhead::before {
+            content:''; position: absolute; top: -2px; left: -5px;
+            width: 12px; height: 10px; background: #e94560;
+            clip-path: polygon(0 0, 100% 0, 50% 100%);
+        }
+
+        /* 轨道标签 */
+        .track-label-tag {
+            position: absolute; left: 6px; top: 50%; transform: translateY(-50%);
+            font-size: 10px; color: #555; z-index: 3; pointer-events: none;
+            background: #0d0d1a; padding: 2px 6px; border-radius: 3px;
+            border: 1px solid #1e1e3a;
+        }
+
+        /* 轨道上的片段容器 */
+        .track-clips {
+            position: relative; z-index: 2;
+            display: flex; align-items: center; height: 100%;
+            padding-left: 50px; padding-right: 10px;
+            width: 100%;
+        }
+
+        /* 总时长显示 */
+        .timeline-footer {
+            height: 24px; display: flex; align-items: center; justify-content: flex-end;
+            padding: 0 16px; font-size: 11px; color: #555; border-top: 1px solid #1e1e3a;
+        }
+
+        /* ==================== 右侧属性面板 ==================== */
+        .sidebar-right {
+            width: 230px; background: #161628;
+            border-left: 1px solid #1e1e3a; flex-shrink: 0;
+            overflow-y: auto; padding: 14px;
+        }
+        .sidebar-right::-webkit-scrollbar { width: 3px; }
+        .sidebar-right::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+
+        .prop-group { margin-bottom: 18px; }
+        .prop-group h4 { font-size: 11px; color: #777; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        .prop-row { display: flex; align-items: center; margin-bottom: 8px; gap: 6px; }
+        .prop-row label { font-size: 11px; color: #999; min-width: 44px; }
+        .prop-row input[type="range"] { flex: 1; height: 3px; -webkit-appearance: none; background: #2a2a45; border-radius: 2px; outline: none; }
+        .prop-row input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 10px; height: 10px; border-radius: 50%; background: #e94560; cursor: pointer; }
+        .prop-row .val { font-size: 10px; color: #e94560; min-width: 30px; text-align: right; }
+        .prop-row input[type="text"] {
+            flex: 1; background: #1a1a30; border: 1px solid #2a2a45; color: #fff;
+            padding: 3px 8px; border-radius: 4px; font-size: 11px;
+        }
+
+        /* ==================== 拖拽提示 ==================== */
+        .drag-hint {
+            position: fixed; bottom: 300px; left: 50%; transform: translateX(-50%);
+            background: rgba(233,69,96,.12); border: 1px dashed #e94560;
+            color: #e94560; padding: 6px 18px; border-radius: 6px;
+            font-size: 12px; pointer-events: none; opacity: 0; transition: opacity .3s; z-index: 100;
+        }
+        .drag-hint.show { opacity: 1; }
+
+        /* 片段类型图例 */
+        .legend { display: flex; gap: 10px; padding: 6px 14px; border-bottom: 1px solid #1e1e3a; }
+        .legend-item { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #666; }
+        .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+    </style>
+</head>
+<body>
+
+<!-- 顶部导航 -->
+<header class="top-bar">
+    <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="23 7 16 12 23 17 23 7"></polygon>
+            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+        </svg>
+        返回
+    </div>
+    <div class="actions">
+        <button class="btn btn-outline">↩ 撤销</button>
+        <button class="btn btn-outline">↻ 重做</button>
+        <button class="btn btn-outline">⤓ 导入</button>
+        <button class="btn btn-primary">▶ 导出视频</button>
+    </div>
+</header>
+
+<div class="main-content">
+
+    <!-- 左侧：动画素材库 -->
+    <aside class="sidebar-left">
+        <div class="sidebar-header">
+            <h3>🎬 动画素材库</h3>
+        </div>
+        <div class="material-tabs">
+            <div class="material-tab active">全部</div>
+            <div class="material-tab">分组1</div>
+            <div class="material-tab">分组2</div>
+            <div class="material-tab">分组3</div>
+        </div>
+        <div class="material-list" id="materialList">
+            <div class="material-item mat-fire"     draggable="true" data-emoji="🔥" data-name="火焰特效" data-type="animation">
+                <div class="thumb">🔥</div><div class="label">火焰特效</div>
+            </div>
+            <div class="material-item mat-sparkle"  draggable="true" data-emoji="✨" data-name="闪光粒子" data-type="effect">
+                <div class="thumb">✨</div><div class="label">闪光粒子</div>
+            </div>
+            <div class="material-item mat-confetti" draggable="true" data-emoji="🎉" data-name="彩纸庆祝" data-type="animation">
+                <div class="thumb">🎉</div><div class="label">彩纸庆祝</div>
+            </div>
+            <div class="material-item mat-heart"    draggable="true" data-emoji="❤️" data-name="爱心飘落" data-type="animation">
+                <div class="thumb">❤️</div><div class="label">爱心飘落</div>
+            </div>
+            <div class="material-item mat-star"     draggable="true" data-emoji="⭐" data-name="星光闪烁" data-type="effect">
+                <div class="thumb">⭐</div><div class="label">星光闪烁</div>
+            </div>
+            <div class="material-item mat-bolt"     draggable="true" data-emoji="⚡" data-name="闪电冲击" data-type="effect">
+                <div class="thumb">⚡</div><div class="label">闪电冲击</div>
+            </div>
+            <div class="material-item mat-snow"     draggable="true" data-emoji="❄️" data-name="雪花飘落" data-type="animation">
+                <div class="thumb">❄️</div><div class="label">雪花飘落</div>
+            </div>
+            <div class="material-item mat-rainbow"  draggable="true" data-emoji="🌈" data-name="彩虹光效" data-type="effect">
+                <div class="thumb">🌈</div><div class="label">彩虹光效</div>
+            </div>
+            <div class="material-item mat-bubble"   draggable="true" data-emoji="🫧" data-name="气泡上升" data-type="animation">
+                <div class="thumb">🫧</div><div class="label">气泡上升</div>
+            </div>
+            <div class="material-item mat-flame"    draggable="true" data-emoji="🕯️" data-name="烛光摇曳" data-type="effect">
+                <div class="thumb">🕯️</div><div class="label">烛光摇曳</div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- 中间主区域 -->
+    <div class="center-area">
+
+        <!-- 视频播放器 -->
+        <section class="player-section">
+            <div class="player-wrapper" id="playerWrapper">
+                <div class="video-placeholder" id="videoPlaceholder">
+                    <div class="play-icon">
+                        <svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                    </div>
+                    <span>点击此处预览视频</span>
+                </div>
+                <div class="effect-overlay" id="effectOverlay"></div>
+                <div class="player-controls">
+                    <button class="ctrl-btn" id="playPauseBtn" title="播放/暂停">⏸</button>
+                    <button class="ctrl-btn" title="上一帧">⏮</button>
+                    <button class="ctrl-btn" title="下一帧">⏭</button>
+                    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+                    <span class="time-display" id="timeDisplay">00:00 / 02:30</span>
+                    <button class="ctrl-btn" title="全屏">⛶</button>
+                    <button class="ctrl-btn" title="音量">🔊</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 时间轴（单一轨道） -->
+        <section class="timeline-section">
+            <div class="timeline-toolbar">
+                <div class="left-tools">
+                    <button class="tool-btn" id="splitBtn">✂ 分割</button>
+                    <button class="tool-btn" id="deleteBtn">🗑 删除选中</button>
+                </div>
+                <div class="zoom-controls">
+                    <span>🔍−</span>
+                    <input type="range" class="zoom-slider" id="zoomSlider" min="1" max="100" value="50">
+                    <span>🔍＋</span>
+                </div>
+            </div>
+
+            <!-- 图例 -->
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot" style="background:#2563eb"></div>视频</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#db2777"></div>动画</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#ea580c"></div>特效</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#7c3aed"></div>转场</div>
+                <div class="legend-item"><div class="legend-dot" style="background:#059669"></div>音频</div>
+                <div class="legend-item" style="margin-left:auto; color:#e94560;">💡 拖拽素材到片段之间即可插入</div>
+            </div>
+
+            <div class="timeline-body" id="timelineBody">
+                <div class="timeline-canvas" id="timelineCanvas">
+                    <!-- 时间刻度 -->
+                    <div class="time-ruler" id="timeRuler"></div>
+
+                    <!-- 单一轨道 -->
+                    <div class="single-track" id="mainTrack">
+                        <!-- 背景网格 -->
+                        <div class="track-grid" id="trackGrid"></div>
+
+                        <!-- 片段 + 可插入间隙 -->
+                        <div class="track-clips" id="trackClips"></div>
+
+                        <!-- 播放头 -->
+                        <div class="playhead" id="playhead"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="timeline-footer">
+                <span id="totalDuration">总时长: 02:30</span>
+            </div>
+        </section>
+    </div>
+
+    <!-- 右侧属性面板 -->
+    <aside class="sidebar-right">
+        <!-- 片段属性 -->
+        <div class="prop-group">
+            <h4>🎞 片段属性</h4>
+            <div class="prop-row">
+                <label>名称</label>
+                <input type="text" id="propName" value="—" readonly>
+            </div>
+            <div class="prop-row">
+                <label>类型</label>
+                <span class="val" id="propType">—</span>
+            </div>
+            <div class="prop-row">
+                <label>时长</label>
+                <span class="val" id="propDuration">—</span>
+            </div>
+            <div class="prop-row">
+                <label>起始</label>
+                <span class="val" id="propStart">—</span>
+            </div>
+        </div>
+
+        <!-- 音频音量调整 -->
+        <div class="prop-group">
+            <h4>🔊 音频音量</h4>
+            <div class="prop-row">
+                <label>音量</label>
+                <input type="range" id="audioVolume" min="0" max="200" value="80">
+                <span class="val" id="audioVolumeVal">80%</span>
+            </div>
+
+        </div>
+    </aside>
+</div>
+
+<div class="drag-hint" id="dragHint">拖拽到片段之间即可插入动画素材</div>
+
+<script>
+// ==================== 数据模型 ====================
+// 所有片段按时间顺序线性排列，不叠加
+// 每个片段: { id, type, label, icon, duration(秒), start(秒) }
+const TOTAL_TIMELINE = 150; // 总时间轴 150秒 = 2:30
+const PX_PER_SECOND = 8;    // 每秒对应的像素宽度（缩放基准）
+
+let clips = [
+    { id: 'c1', type: 'video',     label: '开场镜头.mp4',  icon: '🎥', duration: 12 },
+    { id: 'c2', type: 'transition',label: '淡入淡出',       icon: '🔀', duration: 3  },
+    { id: 'c3', type: 'video',     label: '主场景拍摄.mp4', icon: '🎥', duration: 25 },
+    { id: 'c4', type: 'effect',    label: '闪光粒子',       icon: '✨', duration: 4  },
+    { id: 'c5', type: 'video',     label: '采访片段.mp4',   icon: '🎥', duration: 18 },
+    { id: 'c6', type: 'animation', label: '彩纸庆祝',       icon: '🎉', duration: 5  },
+    { id: 'c7', type: 'video',     label: '结尾片段.mp4',   icon: '🎥', duration: 15 },
+    { id: 'c8', type: 'audio',     label: '背景音乐_BGM',   icon: '🎵', duration: 150},
+];
+
+let selectedClipId = null;
+let isPlaying = false;
+let currentTime = 0; // 当前播放时间（秒）
+let zoom = 50;
+
+// ==================== 渲染时间轴 ====================
+function recalcStartTimes() {
+    let t = 0;
+    for (const c of clips) {
+        c.start = t;
+        t += c.duration;
+    }
+}
+
+function formatTime(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+
+function getTypeClass(type) {
+    const map = { video:'clip-video', animation:'clip-animation', effect:'clip-effect', transition:'clip-transition', audio:'clip-audio' };
+    return map[type] || 'clip-video';
+}
+
+function renderTimeRuler() {
+    const ruler = document.getElementById('timeRuler');
+    ruler.innerHTML = '';
+    const totalW = TOTAL_TIMELINE * getPxPerSec();
+    ruler.style.width = totalW + 'px';
+
+    for (let s = 0; s <= TOTAL_TIMELINE; s += 5) {
+        const tick = document.createElement('span');
+        tick.className = 'tick' + (s % 15 === 0 ? ' major' : '');
+        tick.style.left = (s * getPxPerSec()) + 'px';
+        tick.textContent = formatTime(s);
+        ruler.appendChild(tick);
+    }
+}
+
+function renderTrackGrid() {
+    const grid = document.getElementById('trackGrid');
+    grid.innerHTML = '';
+    const totalW = TOTAL_TIMELINE * getPxPerSec();
+    grid.style.width = totalW + 'px';
+    const cols = TOTAL_TIMELINE / 5;
+    for (let i = 0; i < cols; i++) {
+        const span = document.createElement('span');
+        grid.appendChild(span);
+    }
+}
+
+function getPxPerSec() {
+    return 4 + (zoom / 100) * 12; // 4 ~ 16 px/sec
+}
+
+function renderClips() {
+    const container = document.getElementById('trackClips');
+    container.innerHTML = '';
+
+    recalcStartTimes();
+    const pxPerSec = getPxPerSec();
+
+    clips.forEach((clip, index) => {
+        // 片段前的插入间隙
+        const gapBefore = document.createElement('div');
+        gapBefore.className = 'insert-gap';
+        gapBefore.dataset.index = index;
+        gapBefore.title = '在此处插入素材';
+        container.appendChild(gapBefore);
+
+        // 片段元素
+        const el = document.createElement('div');
+        el.className = `clip ${getTypeClass(clip.type)}` + (selectedClipId === clip.id ? ' selected' : '');
+        el.style.width = (clip.duration * pxPerSec) + 'px';
+        el.draggable = true;
+        el.dataset.id = clip.id;
+
+        el.innerHTML = `
+            <span class="clip-icon">${clip.icon}</span>
+            <span class="clip-label">${clip.label}</span>
+            <span class="clip-duration">${formatTime(clip.duration)}</span>
+        `;
+
+        // 点击选中
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectedClipId = clip.id;
+            renderClips();
+            updatePropsPanel(clip);
+        });
+
+        // 拖拽排序
+        el.addEventListener('dragstart', (e) => {
+            e.stopPropagation();
+            el.classList.add('dragging');
+            e.dataTransfer.setData('clipId', clip.id);
+            e.dataTransfer.setData('source', 'timeline');
+        });
+        el.addEventListener('dragend', () => {
+            el.classList.remove('dragging');
+            clearGapHighlights();
+        });
+
+        container.appendChild(el);
+    });
+
+    // 最后一个间隙（末尾插入）
+    const lastGap = document.createElement('div');
+    lastGap.className = 'insert-gap';
+    lastGap.dataset.index = clips.length;
+    lastGap.title = '在末尾插入素材';
+    container.appendChild(lastGap);
+
+    // 更新总宽度
+    const totalW = TOTAL_TIMELINE * pxPerSec;
+    document.getElementById('timelineCanvas').style.minWidth = (totalW + 80) + 'px';
+    document.getElementById('mainTrack').style.width = (totalW + 60) + 'px';
+
+    // 更新总时长
+    const totalDur = clips.reduce((sum, c) => sum + c.duration, 0);
+    document.getElementById('totalDuration').textContent = '总时长: ' + formatTime(totalDur);
+    document.getElementById('timeDisplay').textContent = formatTime(currentTime) + ' / ' + formatTime(totalDur);
+}
+
+function clearGapHighlights() {
+    document.querySelectorAll('.insert-gap').forEach(g => g.classList.remove('active'));
+}
+
+// ==================== 间隙拖拽插入 ====================
+document.getElementById('trackClips').addEventListener('dragover', (e) => {
+    e.preventDefault();
+    clearGapHighlights();
+    const gaps = document.querySelectorAll('.insert-gap');
+    gaps.forEach(gap => {
+        const rect = gap.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right) {
+            gap.classList.add('active');
+        }
+    });
+});
+
+document.getElementById('trackClips').addEventListener('drop', (e) => {
+    e.preventDefault();
+    clearGapHighlights();
+
+    const activeGap = document.querySelector('.insert-gap.active');
+    if (!activeGap) return;
+    const insertIndex = parseInt(activeGap.dataset.index);
+
+    // 从素材库拖入
+    const emoji = e.dataTransfer.getData('emoji');
+    const name = e.dataTransfer.getData('materialName');
+    const matType = e.dataTransfer.getData('materialType');
+
+    if (emoji && name) {
+        const newClip = {
+            id: 'c' + Date.now(),
+            type: matType || 'animation',
+            label: name,
+            icon: emoji,
+            duration: 4
+        };
+        clips.splice(insertIndex, 0, newClip);
+        renderClips();
+        return;
+    }
+
+    // 从轨道内拖拽排序
+    const clipId = e.dataTransfer.getData('clipId');
+    const source = e.dataTransfer.getData('source');
+    if (clipId && source === 'timeline') {
+        const fromIdx = clips.findIndex(c => c.id === clipId);
+        if (fromIdx !== -1) {
+            const [moved] = clips.splice(fromIdx, 1);
+            let toIdx = insertIndex;
+            if (fromIdx < insertIndex) toIdx--; // 调整偏移
+            clips.splice(toIdx, 0, moved);
+            renderClips();
+        }
+    }
+});
+
+// ==================== 素材库拖拽 ====================
+const materialItems = document.querySelectorAll('.material-item');
+const playerWrapper = document.getElementById('playerWrapper');
+const effectOverlay = document.getElementById('effectOverlay');
+const dragHint = document.getElementById('dragHint');
+
+materialItems.forEach(item => {
+    item.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData('emoji', item.dataset.emoji);
+        e.dataTransfer.setData('materialName', item.dataset.name);
+        e.dataTransfer.setData('materialType', item.dataset.type);
+        dragHint.classList.add('show');
+    });
+    item.addEventListener('dragend', () => {
+        dragHint.classList.remove('show');
+        clearGapHighlights();
+    });
+});
+
+// 拖入播放器 → 预览动画
+playerWrapper.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    playerWrapper.style.boxShadow = '0 0 50px rgba(233,69,96,.3), 0 0 0 2px #e94560';
+});
+playerWrapper.addEventListener('dragleave', () => {
+    playerWrapper.style.boxShadow = '0 0 50px rgba(0,0,0,.5), 0 0 0 1px #1e1e3a';
+});
+playerWrapper.addEventListener('drop', (e) => {
+    e.preventDefault();
+    playerWrapper.style.boxShadow = '0 0 50px rgba(0,0,0,.5), 0 0 0 1px #1e1e3a';
+    const emoji = e.dataTransfer.getData('emoji');
+    if (!emoji) return;
+    const rect = playerWrapper.getBoundingClientRect();
+    const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    for (let i = 0; i < 5; i++) {
+        setTimeout(() => {
+            const el = document.createElement('div');
+            el.className = 'floating-emoji';
+            el.textContent = emoji;
+            el.style.left = (x - 14 + (Math.random()-.5)*60) + 'px';
+            el.style.top  = (y - 14 + (Math.random()-.5)*30) + 'px';
+            effectOverlay.appendChild(el);
+            setTimeout(() => el.remove(), 2500);
+        }, i * 200);
+    }
+});
+
+// ==================== 播放头 ====================
+function updatePlayhead() {
+    const pxPerSec = getPxPerSec();
+    const playhead = document.getElementById('playhead');
+    playhead.style.left = (50 + currentTime * pxPerSec) + 'px';
+    document.getElementById('progressFill').style.width = (currentTime / clips.reduce((s,c)=>s+c.duration,0) * 100) + '%';
+}
+
+// ==================== 播放控制 ====================
+document.getElementById('playPauseBtn').addEventListener('click', () => {
+    isPlaying = !isPlaying;
+    document.getElementById('playPauseBtn').textContent = isPlaying ? '⏸' : '▶';
+});
+
+setInterval(() => {
+    if (!isPlaying) return;
+    const totalDur = clips.reduce((s,c) => s + c.duration, 0);
+    currentTime += 0.15;
+    if (currentTime > totalDur) currentTime = 0;
+    updatePlayhead();
+    document.getElementById('timeDisplay').textContent = formatTime(currentTime) + ' / ' + formatTime(totalDur);
+}, 80);
+
+// ==================== 删除选中 ====================
+document.getElementById('deleteBtn').addEventListener('click', () => {
+    if (!selectedClipId) return;
+    // 不允许删除音频（背景音乐）
+    const clip = clips.find(c => c.id === selectedClipId);
+    if (clip && clip.type === 'audio') {
+        alert('背景音乐轨道不可删除');
+        return;
+    }
+    clips = clips.filter(c => c.id !== selectedClipId);
+    selectedClipId = null;
+    renderClips();
+    updatePlayhead();
+});
+
+// ==================== 缩放 ====================
+document.getElementById('zoomSlider').addEventListener('input', () => {
+    zoom = parseInt(document.getElementById('zoomSlider').value);
+    renderTimeRuler();
+    renderTrackGrid();
+    renderClips();
+    updatePlayhead();
+});
+
+// ==================== 属性面板 ====================
+function updatePropsPanel(clip) {
+    document.getElementById('propName').value = clip.label;
+    const typeMap = { video:'视频', animation:'动画', effect:'特效', transition:'转场', audio:'音频' };
+    document.getElementById('propType').textContent = typeMap[clip.type] || clip.type;
+    document.getElementById('propDuration').textContent = formatTime(clip.duration);
+    document.getElementById('propStart').textContent = formatTime(clip.start);
+}
+
+// 点击轨道空白取消选中
+document.getElementById('mainTrack').addEventListener('click', (e) => {
+    if (e.target === document.getElementById('mainTrack') || e.target.classList.contains('track-grid')) {
+        selectedClipId = null;
+        renderClips();
+        document.getElementById('propName').value = '—';
+        document.getElementById('propType').textContent = '—';
+        document.getElementById('propDuration').textContent = '—';
+        document.getElementById('propStart').textContent = '—';
+    }
+});
+
+// ==================== Tab 切换 ====================
+document.querySelectorAll('.material-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.material-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+    });
+});
+
+// ==================== 音频音量滑块联动 ====================
+const audioVolume = document.getElementById('audioVolume');
+const audioVolumeVal = document.getElementById('audioVolumeVal');
+audioVolume.addEventListener('input', () => {
+    audioVolumeVal.textContent = audioVolume.value + '%';
+});
+
+const audioFadeIn = document.getElementById('audioFadeIn');
+const audioFadeInVal = document.getElementById('audioFadeInVal');
+audioFadeIn.addEventListener('input', () => {
+    audioFadeInVal.textContent = audioFadeIn.value + 's';
+});
+
+const audioFadeOut = document.getElementById('audioFadeOut');
+const audioFadeOutVal = document.getElementById('audioFadeOutVal');
+audioFadeOut.addEventListener('input', () => {
+    audioFadeOutVal.textContent = audioFadeOut.value + 's';
+});
+
+// ==================== 初始化 ====================
+recalcStartTimes();
+renderTimeRuler();
+renderTrackGrid();
+renderClips();
+updatePlayhead();
+</script>
+</body>
+</html>

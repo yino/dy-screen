@@ -236,6 +236,14 @@ $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | Convert
 $platform = @($manifest.platforms | Where-Object { $_.os -eq "windows" -and $_.arch -eq "x86_64" })[0]
 $runtimeFile = Join-Path $resourceRoot ([string]$platform.runtimeFile)
 Assert-RegularFile -Path $runtimeFile -Label "已安装 VC++ x64 运行库"
+$resourceFfmpeg = Join-Path $resourceRoot ([string]$platform.ffmpeg)
+$ffmpegClipCapabilitiesValid = $true
+try {
+    & (Join-Path $PSScriptRoot "verify-clip-ffmpeg-capabilities.ps1") -Ffmpeg $resourceFfmpeg | Out-Null
+}
+catch {
+    $ffmpegClipCapabilitiesValid = $false
+}
 
 $signedFiles = [Collections.Generic.List[string]]::new()
 $signedFiles.Add($installedApp)
@@ -341,6 +349,7 @@ $allPassed = $installerSignatureValid -and
     $allInstalledBinariesSigned -and
     $runtimeSignatureValid -and
     $resourceBundleValid -and
+    $ffmpegClipCapabilitiesValid -and
     $vcRuntimeInstalled -and
     $webView2Installed -and
     $offlineObserved -and
@@ -375,6 +384,7 @@ $report = [ordered]@{
     installWallMs = $install.WallMs
     installOutputSha256 = Get-TextSha256 ($install.Stdout + $install.Stderr)
     resourceBundleValid = $resourceBundleValid
+    ffmpegClipCapabilitiesValid = $ffmpegClipCapabilitiesValid
     bundleVerifierOutputSha256 = Get-TextSha256 ($bundle.Stdout + $bundle.Stderr)
     vcRuntimeInstalled = $vcRuntimeInstalled
     webView2Installed = $webView2Installed
