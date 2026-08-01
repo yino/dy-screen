@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::DateTime;
 use dy_screen::asr::{AsrError, FrozenMediaSource, MediaInspector};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -105,6 +107,63 @@ pub struct AiSessionOption {
     pub unavailable_video_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReplayStreamerCursor {
+    pub latest_ended_at: String,
+    pub streamer_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReplaySessionCursor {
+    pub started_at: String,
+    pub session_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReplayStreamerOption {
+    pub streamer_id: i64,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub web_rid: Option<String>,
+    pub archived: bool,
+    pub monitor_enabled: bool,
+    pub live_status: String,
+    pub monitor_status: String,
+    pub replay_count: usize,
+    pub latest_ended_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReplaySessionOption {
+    pub session_id: i64,
+    pub started_at: String,
+    pub ended_at: String,
+    pub status: String,
+    pub video_count: usize,
+    pub total_duration_ms: u64,
+    pub unavailable_video_count: usize,
+    pub imported_video_count: usize,
+    pub fully_imported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReplayStreamerPage {
+    pub items: Vec<AiReplayStreamerOption>,
+    pub next_cursor: Option<AiReplayStreamerCursor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReplaySessionPage {
+    pub items: Vec<AiReplaySessionOption>,
+    pub next_cursor: Option<AiReplaySessionCursor>,
+}
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -119,6 +178,8 @@ pub enum ServiceError {
     NoValidInput,
     #[error("本地 ASR 环境未就绪：{0}")]
     Preflight(String),
+    #[error("历史直播查询参数无效：{0}")]
+    InvalidReplayQuery(String),
 }
 
 /// 用户主动操作的 AI 项目服务。构造或读取服务不会自动创建项目或运行 ASR。
@@ -180,6 +241,243 @@ impl AiProjectService {
                 })
             })
             .collect()
+    }
+
+    pub fn list_replay_streamers(
+        &self,
+        search: Option<&str>,
+        cursor: Option<&AiReplayStreamerCursor>,
+        limit: usize,
+    ) -> Result<AiReplayStreamerPage, ServiceError> {
+        let pattern = replay_search_pattern(search)?;
+        let page_size = replay_page_size(limit);
+        if let Some(cursor) = cursor {
+            validate_replay_cursor(&cursor.latest_ended_at, cursor.streamer_id)?;
+        }
+        let cursor_time = cursor.map(|value| value.latest_ended_at.as_str());
+        let cursor_id = cursor.map(|value| value.streamer_id);
+        let connection = self.database.connection()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+            WITH eligible AS (
+                SELECT rs.streamer_id,
+                       COUNT(*) AS replay_count,
+                       MAX(rs.ended_at) AS latest_ended_at
+                FROM recording_sessions rs
+                WHERE rs.ended_at IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM videos v WHERE v.session_id = rs.id)
+                GROUP BY rs.streamer_id
+            )
+            SELECT s.id, s.name, s.web_rid, s.archived, s.monitor_enabled,
+                   s.live_status, s.monitor_status, eligible.replay_count,
+                   eligible.latest_ended_at,
+                   COALESCE((
+                       SELECT GROUP_CONCAT(tag.name, char(31))
+                       FROM (
+                           SELECT name
+                           FROM streamer_tags
+                           WHERE streamer_id = s.id
+                           ORDER BY sort_order, id
+                       ) tag
+                   ), '') AS tag_names
+            FROM eligible
+            JOIN streamers s ON s.id = eligible.streamer_id
+            WHERE (
+                    ?1 IS NULL
+                    OR lower(s.name) LIKE ?1 ESCAPE '\'
+                    OR lower(COALESCE(s.web_rid, '')) LIKE ?1 ESCAPE '\'
+                    OR EXISTS (
+                        SELECT 1 FROM streamer_tags search_tag
+                        WHERE search_tag.streamer_id = s.id
+                          AND lower(search_tag.name) LIKE ?1 ESCAPE '\'
+                    )
+                  )
+              AND (
+                    ?2 IS NULL
+                    OR eligible.latest_ended_at < ?2
+                    OR (eligible.latest_ended_at = ?2 AND s.id < ?3)
+                  )
+            ORDER BY eligible.latest_ended_at DESC, s.id DESC
+            LIMIT ?4
+            "#,
+            )
+            .map_err(DatabaseError::from)?;
+        let rows = statement
+            .query_map(
+                params![
+                    pattern.as_deref(),
+                    cursor_time,
+                    cursor_id,
+                    i64::try_from(page_size + 1).unwrap_or(51),
+                ],
+                |row| {
+                    let tag_names = row.get::<_, String>(9)?;
+                    Ok(AiReplayStreamerOption {
+                        streamer_id: row.get(0)?,
+                        name: row.get(1)?,
+                        web_rid: row.get(2)?,
+                        archived: row.get::<_, i64>(3)? != 0,
+                        monitor_enabled: row.get::<_, i64>(4)? != 0,
+                        live_status: row.get(5)?,
+                        monitor_status: row.get(6)?,
+                        replay_count: row.get::<_, i64>(7)?.max(0) as usize,
+                        latest_ended_at: row.get(8)?,
+                        tags: tag_names
+                            .split('\u{1f}')
+                            .filter(|tag| !tag.is_empty())
+                            .map(str::to_owned)
+                            .collect(),
+                    })
+                },
+            )
+            .map_err(DatabaseError::from)?;
+        let mut items = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DatabaseError::from)?;
+        let has_more = items.len() > page_size;
+        items.truncate(page_size);
+        let next_cursor = has_more.then(|| {
+            let last = items.last().expect("有下一页时当前页不能是空页");
+            AiReplayStreamerCursor {
+                latest_ended_at: last.latest_ended_at.clone(),
+                streamer_id: last.streamer_id,
+            }
+        });
+        Ok(AiReplayStreamerPage { items, next_cursor })
+    }
+
+    pub fn list_replay_sessions(
+        &self,
+        streamer_id: i64,
+        project_id: i64,
+        search: Option<&str>,
+        cursor: Option<&AiReplaySessionCursor>,
+        limit: usize,
+    ) -> Result<AiReplaySessionPage, ServiceError> {
+        self.database.get_streamer(streamer_id)?;
+        self.repository.get_project(project_id)?;
+        let pattern = replay_search_pattern(search)?;
+        let page_size = replay_page_size(limit);
+        if let Some(cursor) = cursor {
+            validate_replay_cursor(&cursor.started_at, cursor.session_id)?;
+        }
+        let cursor_time = cursor.map(|value| value.started_at.as_str());
+        let cursor_id = cursor.map(|value| value.session_id);
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(
+            r#"
+            WITH page_sessions AS (
+                SELECT rs.id, rs.started_at, rs.ended_at, rs.status
+                FROM recording_sessions rs
+                WHERE rs.streamer_id = ?1
+                  AND rs.ended_at IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM videos existing WHERE existing.session_id = rs.id)
+                  AND (
+                        ?2 IS NULL
+                        OR CAST(rs.id AS TEXT) LIKE ?2 ESCAPE '\'
+                        OR strftime('%Y-%m-%d %H:%M', rs.started_at, 'localtime') LIKE ?2 ESCAPE '\'
+                        OR strftime('%Y-%m-%d %H:%M', rs.ended_at, 'localtime') LIKE ?2 ESCAPE '\'
+                        OR replace(strftime('%Y-%m-%d %H:%M', rs.started_at, 'localtime'), '-', '/') LIKE ?2 ESCAPE '\'
+                        OR replace(strftime('%Y-%m-%d %H:%M', rs.ended_at, 'localtime'), '-', '/') LIKE ?2 ESCAPE '\'
+                      )
+                  AND (
+                        ?3 IS NULL
+                        OR rs.started_at < ?3
+                        OR (rs.started_at = ?3 AND rs.id < ?4)
+                      )
+                ORDER BY rs.started_at DESC, rs.id DESC
+                LIMIT ?5
+            )
+            SELECT page.id, page.started_at, page.ended_at, page.status,
+                   video.id, video.path, video.duration_seconds,
+                   video.audio_present, video.status,
+                   EXISTS(
+                       SELECT 1 FROM ai_project_inputs input
+                       WHERE input.project_id = ?6 AND input.video_id = video.id
+                   ) AS imported
+            FROM page_sessions page
+            JOIN videos video ON video.session_id = page.id
+            ORDER BY page.started_at DESC, page.id DESC,
+                     COALESCE(video.started_at, page.started_at), video.id
+            "#,
+        )
+        .map_err(DatabaseError::from)?;
+        let rows = statement
+            .query_map(
+                params![
+                    streamer_id,
+                    pattern.as_deref(),
+                    cursor_time,
+                    cursor_id,
+                    i64::try_from(page_size + 1).unwrap_or(51),
+                    project_id,
+                ],
+                |row| {
+                    Ok(ReplayDirectoryVideoRow {
+                        session_id: row.get(0)?,
+                        started_at: row.get(1)?,
+                        ended_at: row.get(2)?,
+                        session_status: row.get(3)?,
+                        path: row.get(5)?,
+                        duration_seconds: row.get(6)?,
+                        audio_present: row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+                        video_status: row.get(8)?,
+                        imported: row.get::<_, i64>(9)? != 0,
+                    })
+                },
+            )
+            .map_err(DatabaseError::from)?;
+
+        let mut items = Vec::<AiReplaySessionOption>::new();
+        for row in rows {
+            let row = row.map_err(DatabaseError::from)?;
+            if items
+                .last()
+                .is_none_or(|item| item.session_id != row.session_id)
+            {
+                items.push(AiReplaySessionOption {
+                    session_id: row.session_id,
+                    started_at: row.started_at.clone(),
+                    ended_at: row.ended_at.clone(),
+                    status: row.session_status.clone(),
+                    video_count: 0,
+                    total_duration_ms: 0,
+                    unavailable_video_count: 0,
+                    imported_video_count: 0,
+                    fully_imported: false,
+                });
+            }
+            let item = items.last_mut().expect("视频行必须属于一个会话");
+            item.video_count += 1;
+            item.total_duration_ms = item.total_duration_ms.saturating_add(
+                row.duration_seconds
+                    .and_then(|seconds| u64::try_from(seconds).ok())
+                    .unwrap_or_default()
+                    .saturating_mul(1_000),
+            );
+            if row.video_status != "complete"
+                || row.audio_present == Some(false)
+                || !Path::new(&row.path).is_file()
+            {
+                item.unavailable_video_count += 1;
+            }
+            if row.imported {
+                item.imported_video_count += 1;
+            }
+            item.fully_imported = item.imported_video_count == item.video_count;
+        }
+
+        let has_more = items.len() > page_size;
+        items.truncate(page_size);
+        let next_cursor = has_more.then(|| {
+            let last = items.last().expect("有下一页时当前页不能是空页");
+            AiReplaySessionCursor {
+                started_at: last.started_at.clone(),
+                session_id: last.session_id,
+            }
+        });
+        Ok(AiReplaySessionPage { items, next_cursor })
     }
 
     pub fn create_draft(
@@ -429,6 +727,48 @@ impl AiProjectService {
         }
         Ok(self.repository.freeze_project(project_id)?)
     }
+}
+
+struct ReplayDirectoryVideoRow {
+    session_id: i64,
+    started_at: String,
+    ended_at: String,
+    session_status: String,
+    path: String,
+    duration_seconds: Option<i64>,
+    audio_present: Option<bool>,
+    video_status: String,
+    imported: bool,
+}
+
+fn replay_page_size(limit: usize) -> usize {
+    if limit == 0 { 20 } else { limit.min(50) }
+}
+
+fn replay_search_pattern(search: Option<&str>) -> Result<Option<String>, ServiceError> {
+    let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if search.chars().count() > 100 {
+        return Err(ServiceError::InvalidReplayQuery(
+            "搜索内容不能超过 100 个字符".to_owned(),
+        ));
+    }
+    let escaped = search
+        .to_lowercase()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Ok(Some(format!("%{escaped}%")))
+}
+
+fn validate_replay_cursor(timestamp: &str, id: i64) -> Result<(), ServiceError> {
+    if id <= 0 || DateTime::parse_from_rfc3339(timestamp).is_err() {
+        return Err(ServiceError::InvalidReplayQuery(
+            "分页游标已经失效，请重新加载第一页".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn summary_from(detail: &AiProjectDetail, environment: &PreflightReport) -> AiProjectSummary {

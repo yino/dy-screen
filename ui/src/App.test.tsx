@@ -214,6 +214,8 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     pickAiLocalVideos: vi.fn().mockResolvedValue([]),
     importAiLocalGrants: vi.fn().mockResolvedValue({ added: [], rejected: [] }),
     listAiCompletedSessions: vi.fn().mockResolvedValue([]),
+    listAiReplayStreamers: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    listAiReplaySessions: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     addAiCompletedSession: vi.fn().mockResolvedValue({
       detail: emptyAiDetail,
       addedCount: 0,
@@ -746,15 +748,32 @@ describe("App", () => {
       { grantId: "grant-a", displayName: "第一段.mp4" },
       { grantId: "grant-b", displayName: "第二段.mkv" },
     ]);
-    api.listAiCompletedSessions = vi.fn().mockResolvedValue([{
+    api.listAiReplayStreamers = vi.fn().mockResolvedValue({
+      items: [{
+        streamerId: 18,
+        name: "小鱼直播间",
+        tags: ["带货"],
+        webRid: "1800",
+        archived: false,
+        monitorEnabled: true,
+        liveStatus: "offline",
+        monitorStatus: "waiting",
+        replayCount: 1,
+        latestEndedAt: "2026-07-21T22:00:00Z",
+      }],
+      nextCursor: null,
+    });
+    api.listAiReplaySessions = vi.fn().mockResolvedValue({ items: [{
       sessionId: 88,
-      streamerName: "小鱼直播间",
       startedAt: "2026-07-21T20:00:00Z",
       endedAt: "2026-07-21T22:00:00Z",
+      status: "completed",
       videoCount: 8,
       totalDurationMs: 7_200_000,
       unavailableVideoCount: 0,
-    }]);
+      importedVideoCount: 0,
+      fullyImported: false,
+    }], nextCursor: null });
     render(<App api={api} />);
     await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
     await user.click(await screen.findByRole("button", { name: "添加本地视频" }));
@@ -762,7 +781,10 @@ describe("App", () => {
       aiProject.id,
       ["grant-a", "grant-b"],
     ));
-    await user.selectOptions(screen.getByLabelText("选择已结束直播"), "88");
+    await user.click(screen.getByRole("combobox", { name: "选择历史主播" }));
+    await user.click(await screen.findByRole("option", { name: /小鱼直播间/ }));
+    await user.click(screen.getByRole("combobox", { name: "选择历史回放" }));
+    await user.click(await screen.findByRole("option", { name: /8 个分片/ }));
     await user.click(screen.getByRole("button", { name: "添加整场直播" }));
     expect(api.addAiCompletedSession).toHaveBeenCalledWith(aiProject.id, 88);
   });

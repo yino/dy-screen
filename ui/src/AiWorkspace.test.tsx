@@ -10,6 +10,7 @@ import type {
   AiHighlightRun,
   AiProject,
   AiProjectDetail,
+  AiReplayStreamerPage,
   AiTranscriptProjection,
   AiTranscriptSegment,
   ClientApi,
@@ -215,6 +216,8 @@ function createAiApi(
     queryAiTranscript: vi.fn().mockResolvedValue(projection),
     diagnoseAiEnvironment: vi.fn().mockResolvedValue(environment),
     listAiCompletedSessions: vi.fn().mockResolvedValue([]),
+    listAiReplayStreamers: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    listAiReplaySessions: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
     subscribeAi: vi.fn().mockResolvedValue(() => undefined),
     subscribePreview: vi.fn().mockResolvedValue(() => undefined),
     requestAiInputPreview: vi.fn().mockResolvedValue(readyPreview),
@@ -328,14 +331,36 @@ describe("AiWorkspace", () => {
       inputFrozen: false,
       progressPercent: 0,
     };
+    const replayStreamer = {
+      streamerId: 73,
+      name: "正在直播主播的历史回放",
+      tags: ["带货"],
+      webRid: "7300",
+      archived: false,
+      monitorEnabled: true,
+      liveStatus: "live",
+      monitorStatus: "recording",
+      replayCount: 1,
+      latestEndedAt: "2026-07-21T22:00:00Z",
+    };
     const session = {
       sessionId: 88,
-      streamerName: "正在直播主播的历史回放",
       startedAt: "2026-07-21T20:00:00Z",
       endedAt: "2026-07-21T22:00:00Z",
+      status: "completed",
       videoCount: 3,
       totalDurationMs: 7_200_000,
       unavailableVideoCount: 1,
+      importedVideoCount: 0,
+      fullyImported: false,
+    };
+    const fullyImportedSession = {
+      ...session,
+      sessionId: 89,
+      startedAt: "2026-07-20T20:00:00Z",
+      endedAt: "2026-07-20T22:00:00Z",
+      importedVideoCount: 3,
+      fullyImported: true,
     };
     const sessionInputs: AiProjectDetail["inputs"] = [
       {
@@ -404,6 +429,8 @@ describe("AiWorkspace", () => {
       })),
       diagnoseAiEnvironment: vi.fn().mockResolvedValue(environment),
       listAiCompletedSessions: vi.fn().mockResolvedValue([session]),
+      listAiReplayStreamers: vi.fn().mockResolvedValue({ items: [replayStreamer], nextCursor: null }),
+      listAiReplaySessions: vi.fn().mockResolvedValue({ items: [session, fullyImportedSession], nextCursor: null }),
       subscribeAi: vi.fn().mockResolvedValue(() => undefined),
       subscribePreview: vi.fn().mockResolvedValue(() => undefined),
       pickAiLocalVideos,
@@ -412,10 +439,12 @@ describe("AiWorkspace", () => {
     } as unknown as ClientApi;
     render(<AiWorkspace api={api} />);
 
-    await user.selectOptions(await screen.findByLabelText("选择已结束直播"), "88");
-    expect(screen.getByRole("option", { name: /正在直播主播的历史回放/ })).toBeInTheDocument();
-    expect(screen.getByLabelText("已选历史直播详情")).toHaveTextContent("3 个分片");
-    expect(screen.getByLabelText("已选历史直播详情")).toHaveTextContent("1 个不可用");
+    await user.click(await screen.findByRole("combobox", { name: "选择历史主播" }));
+    await user.click(await screen.findByRole("option", { name: /正在直播主播的历史回放/ }));
+    await user.click(screen.getByRole("combobox", { name: "选择历史回放" }));
+    expect(await screen.findByRole("option", { name: /已全部添加/ })).toBeDisabled();
+    const replayOption = await screen.findByRole("option", { name: /会话 88.*3 个分片.*1 个不可用/ });
+    await user.click(replayOption);
 
     await user.click(screen.getByRole("button", { name: "添加整场直播" }));
 
@@ -429,6 +458,111 @@ describe("AiWorkspace", () => {
     await user.click(screen.getByRole("button", { name: "移除 直播-002.mkv" }));
     expect(removeAiInput).toHaveBeenCalledWith(draftProject.id, 402);
     await waitFor(() => expect(screen.queryByText("直播-002.mkv")).not.toBeInTheDocument());
+  });
+
+  it("AI 页面隐藏期间今天直播结束后，重新进入无需重启即可出现在回放目录", async () => {
+    const user = userEvent.setup();
+    const draftProject: AiProject = {
+      ...project,
+      id: 204,
+      name: "今日回放",
+      status: "draft",
+      inputFrozen: false,
+      progressPercent: 0,
+    };
+    const draftDetail: AiProjectDetail = { project: draftProject, inputs: [] };
+    const todayStreamer = {
+      streamerId: 91,
+      name: "今天刚结束的主播",
+      tags: ["知识"],
+      webRid: "9100",
+      archived: false,
+      monitorEnabled: true,
+      liveStatus: "offline",
+      monitorStatus: "waiting",
+      replayCount: 1,
+      latestEndedAt: "2026-08-01T12:30:00Z",
+    };
+    const todayReplay = {
+      sessionId: 991,
+      startedAt: "2026-08-01T11:30:00Z",
+      endedAt: "2026-08-01T12:30:00Z",
+      status: "completed",
+      videoCount: 4,
+      totalDurationMs: 3_600_000,
+      unavailableVideoCount: 0,
+      importedVideoCount: 0,
+      fullyImported: false,
+    };
+    let streamerItems: typeof todayStreamer[] = [];
+    let replayItems: typeof todayReplay[] = [];
+    const api = createAiApi(draftDetail, { project: draftProject, inputs: [] });
+    api.listAiReplayStreamers = vi.fn(async () => ({ items: streamerItems, nextCursor: null }));
+    api.listAiReplaySessions = vi.fn(async () => ({ items: replayItems, nextCursor: null }));
+    const { rerender } = render(
+      <AiWorkspace api={api} active={false} replayDirectoryVersion={0} />,
+    );
+    expect((await screen.findAllByText("今日回放")).length).toBeGreaterThan(0);
+    expect(api.listAiReplayStreamers).not.toHaveBeenCalled();
+
+    streamerItems = [todayStreamer];
+    replayItems = [todayReplay];
+    rerender(<AiWorkspace api={api} active={false} replayDirectoryVersion={1} />);
+    expect(api.listAiReplayStreamers).not.toHaveBeenCalled();
+    rerender(<AiWorkspace api={api} active replayDirectoryVersion={1} />);
+    await waitFor(() => expect(api.listAiReplayStreamers).toHaveBeenCalled());
+
+    await user.click(screen.getByRole("combobox", { name: "选择历史主播" }));
+    await user.click(await screen.findByRole("option", { name: /今天刚结束的主播/ }));
+    await user.click(screen.getByRole("combobox", { name: "选择历史回放" }));
+    expect(await screen.findByRole("option", { name: /会话 991/ })).toBeInTheDocument();
+  });
+
+  it("快速搜索主播时忽略较晚返回的旧查询结果", async () => {
+    const user = userEvent.setup();
+    let resolveOld: ((value: { items: Array<{
+      streamerId: number;
+      name: string;
+      tags: string[];
+      webRid: string | null;
+      archived: boolean;
+      monitorEnabled: boolean;
+      liveStatus: string;
+      monitorStatus: string;
+      replayCount: number;
+      latestEndedAt: string;
+    }>; nextCursor: null }) => void) | null = null;
+    const oldStreamer = {
+      streamerId: 31,
+      name: "旧搜索结果",
+      tags: [],
+      webRid: "31",
+      archived: false,
+      monitorEnabled: true,
+      liveStatus: "offline",
+      monitorStatus: "waiting",
+      replayCount: 1,
+      latestEndedAt: "2026-07-31T10:00:00Z",
+    };
+    const newStreamer = { ...oldStreamer, streamerId: 32, name: "新搜索结果", webRid: "32" };
+    const api = createAiApi({ ...detail, project: { ...project, status: "draft", inputFrozen: false } });
+    api.listAiReplayStreamers = vi.fn((search = "") => {
+      if (search === "旧") {
+        return new Promise<AiReplayStreamerPage>((resolve) => { resolveOld = resolve; });
+      }
+      return Promise.resolve({ items: search === "新" ? [newStreamer] : [], nextCursor: null });
+    });
+    render(<AiWorkspace api={api} />);
+    expect((await screen.findAllByText(project.name)).length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("combobox", { name: "选择历史主播" }));
+    const search = screen.getByLabelText("选择历史主播搜索");
+    await user.type(search, "旧");
+    await waitFor(() => expect(api.listAiReplayStreamers).toHaveBeenCalledWith("旧", null, 20));
+    await user.clear(search);
+    await user.type(search, "新");
+    expect(await screen.findByRole("option", { name: /新搜索结果/ })).toBeInTheDocument();
+    await act(async () => resolveOld?.({ items: [oldStreamer], nextCursor: null }));
+    expect(screen.queryByRole("option", { name: /旧搜索结果/ })).not.toBeInTheDocument();
   });
 
   it("展示播放器与只读时间戳文本，点击句段跳转并用 WebView 元素显示临时字幕", async () => {

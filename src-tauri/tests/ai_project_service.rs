@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use dy_screen::asr::{AsrError, EngineResult, FrozenMediaSource, MediaInspection, MediaInspector};
 use dy_screen_app_lib::ai::{
-    AiInputStatus, AiPreflight, AiProjectService, AiProjectStatus, PreflightReport,
-    RecognitionProfile, TrustedLocalFile,
+    AiInputStatus, AiPreflight, AiProjectService, AiProjectStatus, AiReplaySessionCursor,
+    PreflightReport, RecognitionProfile, TrustedLocalFile,
 };
 use dy_screen_app_lib::database::Database;
-use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
+use dy_screen_app_lib::domain::{NewStreamer, NewVideo, StreamerTagInput};
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
@@ -125,6 +125,22 @@ fn completed_session_list_keeps_history_while_the_streamer_is_live_again() {
         .start_session(streamer.id, directory.path().to_str().unwrap())
         .unwrap();
     database
+        .add_video(&NewVideo {
+            session_id: history.id,
+            path: directory
+                .path()
+                .join("history.mkv")
+                .to_string_lossy()
+                .into_owned(),
+            started_at: None,
+            ended_at: None,
+            duration_seconds: Some(4),
+            size_bytes: 4,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    database
         .finish_session(history.id, "completed", None)
         .unwrap();
     let active = database
@@ -137,6 +153,222 @@ fn completed_session_list_keeps_history_while_the_streamer_is_live_again() {
     assert_eq!(options[0].session_id, history.id);
     assert_eq!(options[0].streamer_name, "重复开播主播");
     assert_ne!(options[0].session_id, active.id);
+}
+
+#[test]
+fn replay_directory_searches_streamer_metadata_and_excludes_active_or_empty_sessions() {
+    let directory = tempdir().unwrap();
+    let (database, service) = service(Arc::new(MutablePreflight::new(true)));
+    let mut input = NewStreamer::room("今日带货主播", "998877", "room-998877", true);
+    input.tags = vec![StreamerTagInput {
+        name: "带货".to_owned(),
+        prompt_guidance: None,
+    }];
+    let streamer = database.add_streamer(&input).unwrap();
+    let history_path = directory.path().join("today-history.mkv");
+    write_video(&history_path, b"history");
+    let history = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database
+        .add_video(&NewVideo {
+            session_id: history.id,
+            path: history_path.to_string_lossy().into_owned(),
+            started_at: None,
+            ended_at: None,
+            duration_seconds: Some(5),
+            size_bytes: 7,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    database
+        .finish_session(history.id, "interrupted", Some("测试异常结束"))
+        .unwrap();
+    let empty = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database
+        .finish_session(empty.id, "completed", None)
+        .unwrap();
+    let active = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database
+        .add_video(&NewVideo {
+            session_id: active.id,
+            path: directory
+                .path()
+                .join("active.mkv")
+                .to_string_lossy()
+                .into_owned(),
+            started_at: None,
+            ended_at: None,
+            duration_seconds: Some(5),
+            size_bytes: 7,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    database.set_monitor_enabled(streamer.id, false).unwrap();
+    database.archive_streamer(streamer.id).unwrap();
+    let project = service.create_draft("目录查询", &profile()).unwrap();
+
+    for search in ["今日带货", "带货", "998877"] {
+        let page = service
+            .list_replay_streamers(Some(search), None, 20)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].streamer_id, streamer.id);
+        assert!(page.items[0].archived);
+        assert!(!page.items[0].monitor_enabled);
+        assert_eq!(page.items[0].tags, vec!["带货"]);
+        assert_eq!(page.items[0].replay_count, 1);
+    }
+
+    let replay_page = service
+        .list_replay_sessions(streamer.id, project.id, None, None, 20)
+        .unwrap();
+    assert_eq!(replay_page.items.len(), 1);
+    assert_eq!(replay_page.items[0].session_id, history.id);
+    assert_eq!(replay_page.items[0].status, "interrupted");
+    assert_eq!(replay_page.items[0].video_count, 1);
+    assert_eq!(replay_page.items[0].total_duration_ms, 5_000);
+    assert_eq!(replay_page.items[0].unavailable_video_count, 0);
+    assert_ne!(replay_page.items[0].session_id, active.id);
+    assert_ne!(replay_page.items[0].session_id, empty.id);
+
+    let date_search = chrono::DateTime::parse_from_rfc3339(&replay_page.items[0].started_at)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        service
+            .list_replay_sessions(streamer.id, project.id, Some(&date_search), None, 20)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(
+        service
+            .list_replay_sessions(streamer.id, project.id, Some("%_"), None, 20)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        service
+            .list_replay_sessions(
+                streamer.id,
+                project.id,
+                None,
+                Some(&AiReplaySessionCursor {
+                    started_at: "not-a-time".to_owned(),
+                    session_id: history.id,
+                }),
+                20,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("分页游标")
+    );
+    assert!(
+        service
+            .list_replay_streamers(Some(&"长".repeat(101)), None, 20)
+            .unwrap_err()
+            .to_string()
+            .contains("100")
+    );
+    assert!(
+        service
+            .list_replay_sessions(i64::MAX, project.id, None, None, 20)
+            .unwrap_err()
+            .to_string()
+            .contains("找不到记录")
+    );
+    assert!(
+        service
+            .list_replay_sessions(streamer.id, i64::MAX, None, None, 20)
+            .unwrap_err()
+            .to_string()
+            .contains("找不到记录：AI 项目")
+    );
+}
+
+#[test]
+fn replay_directory_cursor_discovers_more_than_two_hundred_sessions_without_duplicates() {
+    let directory = tempdir().unwrap();
+    let (database, service) = service(Arc::new(MutablePreflight::new(true)));
+    let streamer = database
+        .add_streamer(&NewStreamer::room(
+            "长历史主播",
+            "997700",
+            "room-997700",
+            true,
+        ))
+        .unwrap();
+    for index in 0..205 {
+        let session = database
+            .start_session(streamer.id, directory.path().to_str().unwrap())
+            .unwrap();
+        database
+            .add_video(&NewVideo {
+                session_id: session.id,
+                path: directory
+                    .path()
+                    .join(format!("history-{index:03}.mkv"))
+                    .to_string_lossy()
+                    .into_owned(),
+                started_at: None,
+                ended_at: None,
+                duration_seconds: Some(1),
+                size_bytes: 1,
+                audio_present: Some(true),
+                status: "complete".to_owned(),
+            })
+            .unwrap();
+        database
+            .finish_session(session.id, "completed", None)
+            .unwrap();
+    }
+    let project = service.create_draft("大目录", &profile()).unwrap();
+    let mut cursor = None;
+    let mut session_ids = std::collections::HashSet::new();
+    loop {
+        let page = service
+            .list_replay_sessions(streamer.id, project.id, None, cursor.as_ref(), 500)
+            .unwrap();
+        assert!(page.items.len() <= 50);
+        for item in page.items {
+            assert!(session_ids.insert(item.session_id));
+        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    assert_eq!(session_ids.len(), 205);
+
+    let oldest = *session_ids.iter().min().unwrap();
+    let mut search_cursor = None;
+    let mut found_oldest = false;
+    loop {
+        let searched = service
+            .list_replay_sessions(
+                streamer.id,
+                project.id,
+                Some(&oldest.to_string()),
+                search_cursor.as_ref(),
+                20,
+            )
+            .unwrap();
+        found_oldest |= searched.items.iter().any(|item| item.session_id == oldest);
+        let Some(next) = searched.next_cursor else {
+            break;
+        };
+        search_cursor = Some(next);
+    }
+    assert!(found_oldest);
 }
 
 #[tokio::test]
@@ -312,9 +544,20 @@ async fn whole_session_import_is_idempotent_and_keeps_unavailable_sources_untouc
         silent.last_error_code.as_deref(),
         Some("session_video_no_audio")
     );
+    let fully_imported = service
+        .list_replay_sessions(streamer.id, project.id, None, None, 20)
+        .unwrap();
+    assert_eq!(fully_imported.items[0].imported_video_count, 3);
+    assert!(fully_imported.items[0].fully_imported);
+    assert_eq!(fully_imported.items[0].unavailable_video_count, 2);
 
     service.remove_input(project.id, silent.id).unwrap();
     assert!(no_audio.is_file());
+    let partially_imported = service
+        .list_replay_sessions(streamer.id, project.id, None, None, 20)
+        .unwrap();
+    assert_eq!(partially_imported.items[0].imported_video_count, 2);
+    assert!(!partially_imported.items[0].fully_imported);
     let retry = service
         .select_completed_session(project.id, session.id, CancellationToken::new())
         .await

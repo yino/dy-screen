@@ -64,8 +64,10 @@ pub use repository::{
     AiRepository, AiRepositoryError, ClipExportSource, Result, project_clip_subtitles,
 };
 pub use service::{
-    AiPreflight, AiProjectService, AiProjectSummary, AiSessionOption, ImportBatchResult,
-    ImportRejection, PreflightReport, ServiceError, SessionImportResult, TrustedLocalFile,
+    AiPreflight, AiProjectService, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionOption,
+    AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerOption, AiReplayStreamerPage,
+    AiSessionOption, ImportBatchResult, ImportRejection, PreflightReport, ServiceError,
+    SessionImportResult, TrustedLocalFile,
 };
 
 pub(crate) use repository::{

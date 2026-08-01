@@ -16,7 +16,8 @@ use super::{
     AiClipProjectDetail, AiClipSegmentUpdate, AiHighlightCandidate, AiHighlightCandidatePage,
     AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
     AiProject, AiProjectDetail, AiProjectInput, AiProjectService, AiProjectStatus,
-    AiProjectSummary, AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore,
+    AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage, AiReplayStreamerCursor,
+    AiReplayStreamerPage, AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore,
     HighlightWorkflow, ImportBatchResult, ImportRejection, LlmProviderSettings, ProviderDiagnostic,
     RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
 };
@@ -312,6 +313,30 @@ impl AiCommandService {
     ) -> Result<Vec<AiSessionOption>, AiCommandError> {
         self.project_service
             .list_completed_sessions(limit.min(200))
+            .map_err(service_error)
+    }
+
+    pub fn list_replay_streamers(
+        &self,
+        search: Option<&str>,
+        cursor: Option<&AiReplayStreamerCursor>,
+        limit: usize,
+    ) -> Result<AiReplayStreamerPage, AiCommandError> {
+        self.project_service
+            .list_replay_streamers(search, cursor, limit)
+            .map_err(service_error)
+    }
+
+    pub fn list_replay_sessions(
+        &self,
+        streamer_id: i64,
+        project_id: i64,
+        search: Option<&str>,
+        cursor: Option<&AiReplaySessionCursor>,
+        limit: usize,
+    ) -> Result<AiReplaySessionPage, AiCommandError> {
+        self.project_service
+            .list_replay_sessions(streamer_id, project_id, search, cursor, limit)
             .map_err(service_error)
     }
 
@@ -925,6 +950,7 @@ fn service_error(error: ServiceError) -> AiCommandError {
         ServiceError::Media(_) => "media_inspection_failed",
         ServiceError::Repository(_) => "ai_repository_error",
         ServiceError::Database(_) => "ai_database_error",
+        ServiceError::InvalidReplayQuery(_) => "invalid_replay_query",
     };
     AiCommandError::new(code, error.to_string(), true)
 }

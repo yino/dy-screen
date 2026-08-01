@@ -303,6 +303,51 @@ export interface AiSessionOption {
   unavailableVideoCount: number;
 }
 
+export interface AiReplayStreamerCursor {
+  latestEndedAt: string;
+  streamerId: number;
+}
+
+export interface AiReplaySessionCursor {
+  startedAt: string;
+  sessionId: number;
+}
+
+export interface AiReplayStreamerOption {
+  streamerId: number;
+  name: string;
+  tags: string[];
+  webRid: string | null;
+  archived: boolean;
+  monitorEnabled: boolean;
+  liveStatus: string;
+  monitorStatus: string;
+  replayCount: number;
+  latestEndedAt: string;
+}
+
+export interface AiReplaySessionOption {
+  sessionId: number;
+  startedAt: string;
+  endedAt: string;
+  status: string;
+  videoCount: number;
+  totalDurationMs: number;
+  unavailableVideoCount: number;
+  importedVideoCount: number;
+  fullyImported: boolean;
+}
+
+export interface AiReplayStreamerPage {
+  items: AiReplayStreamerOption[];
+  nextCursor: AiReplayStreamerCursor | null;
+}
+
+export interface AiReplaySessionPage {
+  items: AiReplaySessionOption[];
+  nextCursor: AiReplaySessionCursor | null;
+}
+
 export interface AiSessionImportResult {
   detail: AiProjectDetail;
   addedCount: number;
@@ -648,6 +693,8 @@ export interface ClientApi {
   pickAiLocalVideos(): Promise<AiTrustedFileGrant[]>;
   importAiLocalGrants(projectId: number, grantIds: string[]): Promise<AiImportBatch>;
   listAiCompletedSessions(limit?: number): Promise<AiSessionOption[]>;
+  listAiReplayStreamers(search?: string, cursor?: AiReplayStreamerCursor | null, limit?: number): Promise<AiReplayStreamerPage>;
+  listAiReplaySessions(streamerId: number, projectId: number, search?: string, cursor?: AiReplaySessionCursor | null, limit?: number): Promise<AiReplaySessionPage>;
   addAiCompletedSession(projectId: number, sessionId: number): Promise<AiSessionImportResult>;
   reorderAiInputs(projectId: number, orderedIds: number[]): Promise<AiProjectDetail>;
   removeAiInput(projectId: number, inputId: number): Promise<AiProjectDetail>;

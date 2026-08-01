@@ -107,6 +107,34 @@ fn migration_is_idempotent_and_creates_defaults() {
     database.migrate().unwrap();
     database.migrate().unwrap();
 
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 15",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    for index in [
+        "idx_sessions_completed_directory",
+        "idx_ai_inputs_project_video",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+    drop(connection);
+
     let settings = database.get_settings().unwrap();
     assert_eq!(settings.quality, "HD1");
     assert_eq!(settings.protocol, "flv");

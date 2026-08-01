@@ -10,7 +10,8 @@ use super::{
     AiClipProjectDetail, AiClipSegmentUpdate, AiCommandError, AiCommandService,
     AiCreateProjectRequest, AiEnvironmentDiagnostic, AiHighlightCandidate,
     AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun, AiImportBatchView, AiProject,
-    AiProjectDetailView, AiProjectSummary, AiSessionImportView, AiSessionOption,
+    AiProjectDetailView, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage,
+    AiReplayStreamerCursor, AiReplayStreamerPage, AiSessionImportView, AiSessionOption,
     AiTranscriptProjection, AiTrustedFileGrant, LlmProviderSettings, ProviderDiagnostic,
 };
 
@@ -129,6 +130,36 @@ pub(crate) fn ai_list_completed_sessions(
     state: State<'_, AiDesktopState>,
 ) -> Result<Vec<AiSessionOption>, AiCommandError> {
     state.commands.list_completed_sessions(limit.unwrap_or(100))
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_replay_streamers(
+    search: Option<String>,
+    cursor: Option<AiReplayStreamerCursor>,
+    limit: Option<usize>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiReplayStreamerPage, AiCommandError> {
+    state
+        .commands
+        .list_replay_streamers(search.as_deref(), cursor.as_ref(), limit.unwrap_or(20))
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_replay_sessions(
+    streamer_id: i64,
+    project_id: i64,
+    search: Option<String>,
+    cursor: Option<AiReplaySessionCursor>,
+    limit: Option<usize>,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiReplaySessionPage, AiCommandError> {
+    state.commands.list_replay_sessions(
+        streamer_id,
+        project_id,
+        search.as_deref(),
+        cursor.as_ref(),
+        limit.unwrap_or(20),
+    )
 }
 
 #[tauri::command]

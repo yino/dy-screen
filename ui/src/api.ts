@@ -12,6 +12,8 @@ import type {
   AiProject,
   AiProjectDetail,
   AiProjectSummary,
+  AiReplaySessionPage,
+  AiReplayStreamerPage,
   AiSessionOption,
   AiSessionImportResult,
   AiTranscriptProjection,
@@ -123,6 +125,16 @@ const tauriApi: ClientApi = {
     invoke<AiImportBatch>("ai_import_local_grants", { projectId, grantIds }),
   listAiCompletedSessions: (limit = 100) =>
     invoke<AiSessionOption[]>("ai_list_completed_sessions", { limit }),
+  listAiReplayStreamers: (search = "", cursor = null, limit = 20) =>
+    invoke<AiReplayStreamerPage>("ai_list_replay_streamers", { search, cursor, limit }),
+  listAiReplaySessions: (streamerId, projectId, search = "", cursor = null, limit = 20) =>
+    invoke<AiReplaySessionPage>("ai_list_replay_sessions", {
+      streamerId,
+      projectId,
+      search,
+      cursor,
+      limit,
+    }),
   addAiCompletedSession: (projectId, sessionId) =>
     invoke<AiSessionImportResult>("ai_add_completed_session", { projectId, sessionId }),
   reorderAiInputs: (projectId, orderedIds) =>
@@ -594,6 +606,8 @@ export function createBrowserApi(): ClientApi {
     pickAiLocalVideos: async () => [],
     importAiLocalGrants: async () => ({ added: [], rejected: [] }),
     listAiCompletedSessions: async () => [],
+    listAiReplayStreamers: async () => ({ items: [], nextCursor: null }),
+    listAiReplaySessions: async () => ({ items: [], nextCursor: null }),
     addAiCompletedSession: async () => {
       throw new Error("浏览器演示模式不能读取录像会话");
     },

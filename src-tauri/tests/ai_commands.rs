@@ -236,6 +236,19 @@ async fn completed_session_command_returns_counts_and_sanitized_project_detail()
         })
         .unwrap();
 
+    let streamer_page = commands
+        .list_replay_streamers(Some("903"), None, 500)
+        .unwrap();
+    assert_eq!(streamer_page.items.len(), 1);
+    assert_eq!(streamer_page.items[0].streamer_id, streamer.id);
+    let session_page = commands
+        .list_replay_sessions(streamer.id, project.id, None, None, 500)
+        .unwrap();
+    assert_eq!(session_page.items.len(), 1);
+    assert!(!session_page.items[0].fully_imported);
+    let serialized_directory = serde_json::to_string(&session_page).unwrap();
+    assert!(!serialized_directory.contains(source.to_string_lossy().as_ref()));
+
     let imported = commands
         .add_completed_session(project.id, history.id)
         .await
@@ -255,6 +268,11 @@ async fn completed_session_command_returns_counts_and_sanitized_project_detail()
             .to_string()
             .contains(source.to_string_lossy().as_ref())
     );
+    let imported_page = commands
+        .list_replay_sessions(streamer.id, project.id, None, None, 20)
+        .unwrap();
+    assert!(imported_page.items[0].fully_imported);
+    assert_eq!(imported_page.items[0].imported_video_count, 1);
 
     let repeated = commands
         .add_completed_session(project.id, history.id)

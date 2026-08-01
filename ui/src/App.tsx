@@ -216,6 +216,7 @@ export function App({ api }: AppProps) {
   const [activation, setActivation] = useState<ActivationState | null>(null);
   const [page, setPage] = useState<Page>("monitor");
   const [aiWorkspaceMounted, setAiWorkspaceMounted] = useState(false);
+  const [replayDirectoryVersion, setReplayDirectoryVersion] = useState(0);
   const [dashboard, setDashboard] = useState<Dashboard>(emptyDashboard);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [currentVideos, setCurrentVideos] = useState<VideoItem[]>([]);
@@ -338,6 +339,9 @@ export function App({ api }: AppProps) {
         void refreshDashboard().then(() => setSelectedId(event.streamerId));
       } else {
         void refreshDashboard();
+      }
+      if (event.kind === "session_changed") {
+        setReplayDirectoryVersion((version) => version + 1);
       }
       if (selectedIdRef.current) void refreshCurrentVideos(selectedIdRef.current);
       if (pageRef.current === "library") {
@@ -801,7 +805,7 @@ export function App({ api }: AppProps) {
 
         {(page === "ai" || aiWorkspaceMounted) && (
           <div hidden={page !== "ai"}>
-            <AiWorkspace api={api} active={page === "ai"} />
+            <AiWorkspace api={api} active={page === "ai"} replayDirectoryVersion={replayDirectoryVersion} />
           </div>
         )}
 

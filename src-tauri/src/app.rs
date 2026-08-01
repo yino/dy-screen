@@ -1347,6 +1347,8 @@ pub fn run() {
             ai_pick_local_videos,
             ai_import_local_grants,
             ai_list_completed_sessions,
+            ai_list_replay_streamers,
+            ai_list_replay_sessions,
             ai_add_completed_session,
             ai_reorder_inputs,
             ai_remove_input,

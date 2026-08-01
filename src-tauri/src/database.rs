@@ -233,6 +233,7 @@ impl Database {
         crate::ai::migrate_ai_v12(&mut connection)?;
         crate::ai::migrate_ai_v13(&mut connection)?;
         crate::ai::migrate_ai_v14(&mut connection)?;
+        migrate_ai_replay_directory_v15(&mut connection)?;
 
         let applied = connection
             .query_row(
@@ -1769,6 +1770,38 @@ fn migrate_client_activation_v10(connection: &mut Connection) -> Result<()> {
     )?;
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(10, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_ai_replay_directory_v15(connection: &mut Connection) -> Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 15",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sessions_completed_directory
+            ON recording_sessions(streamer_id, ended_at DESC, started_at DESC, id DESC)
+            WHERE ended_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_ai_inputs_project_video
+            ON ai_project_inputs(project_id, video_id)
+            WHERE video_id IS NOT NULL;
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(15, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

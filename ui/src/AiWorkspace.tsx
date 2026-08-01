@@ -52,7 +52,10 @@ import type {
   AiProjectDetail,
   AiProjectInput,
   AiProjectStatus,
-  AiSessionOption,
+  AiReplaySessionCursor,
+  AiReplaySessionOption,
+  AiReplayStreamerCursor,
+  AiReplayStreamerOption,
   AiTranscriptInput,
   AiTranscriptProjection,
   AiTranscriptSegment,
@@ -60,6 +63,7 @@ import type {
   LlmProviderSettings,
   PreviewSnapshot,
 } from "./types";
+import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
 
 const segmentPageSize = 200;
 
@@ -337,13 +341,29 @@ function HighlightAudit({
   </details>;
 }
 
-export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: boolean }) {
+export function AiWorkspace({
+  api,
+  active = true,
+  replayDirectoryVersion = 0,
+}: {
+  api: ClientApi;
+  active?: boolean;
+  replayDirectoryVersion?: number;
+}) {
   const [projects, setProjects] = useState<AiProject[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
   const [detail, setDetail] = useState<AiProjectDetail | null>(null);
   const [environment, setEnvironment] = useState<AiEnvironmentDiagnostic | null>(null);
-  const [sessions, setSessions] = useState<AiSessionOption[]>([]);
-  const [selectedSessionId, setSelectedSessionId] = useState("");
+  const [replayStreamers, setReplayStreamers] = useState<AiReplayStreamerOption[]>([]);
+  const [selectedReplayStreamer, setSelectedReplayStreamer] = useState<AiReplayStreamerOption | null>(null);
+  const [replaySessions, setReplaySessions] = useState<AiReplaySessionOption[]>([]);
+  const [selectedReplaySession, setSelectedReplaySession] = useState<AiReplaySessionOption | null>(null);
+  const [replayStreamerLoading, setReplayStreamerLoading] = useState(false);
+  const [replayStreamerLoadingMore, setReplayStreamerLoadingMore] = useState(false);
+  const [replaySessionLoading, setReplaySessionLoading] = useState(false);
+  const [replaySessionLoadingMore, setReplaySessionLoadingMore] = useState(false);
+  const [replayStreamerError, setReplayStreamerError] = useState<string | null>(null);
+  const [replaySessionError, setReplaySessionError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<AiTranscriptProjection | null>(null);
   const [currentInputId, setCurrentInputId] = useState<number | null>(null);
   const [preview, setPreview] = useState<PreviewSnapshot | null>(null);
@@ -384,6 +404,14 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   const selectedProjectRef = useRef<number | null>(null);
   const currentSegmentRef = useRef<string | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
+  const replayStreamerCursorRef = useRef<AiReplayStreamerCursor | null>(null);
+  const replaySessionCursorRef = useRef<AiReplaySessionCursor | null>(null);
+  const replayStreamerSearchRef = useRef("");
+  const replaySessionSearchRef = useRef("");
+  const replayStreamerGenerationRef = useRef(0);
+  const replaySessionGenerationRef = useRef(0);
+  const replayDirectoryDirtyRef = useRef(true);
+  const observedReplayVersionRef = useRef(replayDirectoryVersion);
   selectedProjectRef.current = selectedProjectId;
   currentSegmentRef.current = currentSegmentId;
 
@@ -463,12 +491,89 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
     setEnvironment(await api.diagnoseAiEnvironment());
   }, [api]);
 
+  const loadReplayStreamers = useCallback(async (search: string, append = false) => {
+    const cursor = append ? replayStreamerCursorRef.current : null;
+    if (append && !cursor) return;
+    const generation = ++replayStreamerGenerationRef.current;
+    replayStreamerSearchRef.current = search;
+    if (append) setReplayStreamerLoadingMore(true);
+    else {
+      replayStreamerCursorRef.current = null;
+      setReplayStreamerLoading(true);
+      setReplayStreamerError(null);
+    }
+    try {
+      const page = await api.listAiReplayStreamers(search, cursor, 20);
+      if (generation !== replayStreamerGenerationRef.current) return;
+      replayStreamerCursorRef.current = page.nextCursor;
+      setReplayStreamers((current) => {
+        if (!append) return page.items;
+        const known = new Set(current.map((item) => item.streamerId));
+        return [...current, ...page.items.filter((item) => !known.has(item.streamerId))];
+      });
+      setSelectedReplayStreamer((current) => {
+        if (!current) return null;
+        return page.items.find((item) => item.streamerId === current.streamerId) ?? current;
+      });
+      replayDirectoryDirtyRef.current = false;
+    } catch (error) {
+      if (generation === replayStreamerGenerationRef.current) {
+        setReplayStreamerError(safeError(error, "无法读取主播回放目录"));
+      }
+    } finally {
+      if (generation === replayStreamerGenerationRef.current) {
+        setReplayStreamerLoading(false);
+        setReplayStreamerLoadingMore(false);
+      }
+    }
+  }, [api]);
+
+  const loadReplaySessions = useCallback(async (
+    streamerId: number,
+    projectId: number,
+    search: string,
+    append = false,
+  ) => {
+    const cursor = append ? replaySessionCursorRef.current : null;
+    if (append && !cursor) return;
+    const generation = ++replaySessionGenerationRef.current;
+    replaySessionSearchRef.current = search;
+    if (append) setReplaySessionLoadingMore(true);
+    else {
+      replaySessionCursorRef.current = null;
+      setReplaySessionLoading(true);
+      setReplaySessionError(null);
+    }
+    try {
+      const page = await api.listAiReplaySessions(streamerId, projectId, search, cursor, 20);
+      if (generation !== replaySessionGenerationRef.current) return;
+      replaySessionCursorRef.current = page.nextCursor;
+      setReplaySessions((current) => {
+        if (!append) return page.items;
+        const known = new Set(current.map((item) => item.sessionId));
+        return [...current, ...page.items.filter((item) => !known.has(item.sessionId))];
+      });
+      setSelectedReplaySession((current) => {
+        if (!current) return null;
+        return page.items.find((item) => item.sessionId === current.sessionId) ?? current;
+      });
+    } catch (error) {
+      if (generation === replaySessionGenerationRef.current) {
+        setReplaySessionError(safeError(error, "无法读取该主播的历史回放"));
+      }
+    } finally {
+      if (generation === replaySessionGenerationRef.current) {
+        setReplaySessionLoading(false);
+        setReplaySessionLoadingMore(false);
+      }
+    }
+  }, [api]);
+
   useEffect(() => {
     let disposed = false;
     void Promise.all([
       refreshProjects(),
       refreshEnvironment(),
-      api.listAiCompletedSessions().then(setSessions),
     ])
       .catch((error) => !disposed && setMessage(safeError(error, "无法打开 AI 工作区")))
       .finally(() => !disposed && setLoading(false));
@@ -476,6 +581,40 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
       disposed = true;
     };
   }, [api, refreshEnvironment, refreshProjects]);
+
+  useEffect(() => {
+    if (!active) return;
+    void loadReplayStreamers("", false);
+    const streamerId = selectedReplayStreamer?.streamerId;
+    const projectId = detail?.project.id;
+    if (streamerId && projectId) {
+      void loadReplaySessions(streamerId, projectId, "", false);
+    }
+  }, [active, loadReplaySessions, loadReplayStreamers]);
+
+  useEffect(() => {
+    const streamerId = selectedReplayStreamer?.streamerId;
+    const projectId = detail?.project.id;
+    setSelectedReplaySession(null);
+    setReplaySessions([]);
+    replaySessionCursorRef.current = null;
+    replaySessionGenerationRef.current += 1;
+    if (!streamerId || !projectId) return;
+    void loadReplaySessions(streamerId, projectId, "", false);
+  }, [detail?.project.id, loadReplaySessions, selectedReplayStreamer?.streamerId]);
+
+  useEffect(() => {
+    if (observedReplayVersionRef.current === replayDirectoryVersion) return;
+    observedReplayVersionRef.current = replayDirectoryVersion;
+    replayDirectoryDirtyRef.current = true;
+    if (!active) return;
+    void loadReplayStreamers("", false);
+    const streamerId = selectedReplayStreamer?.streamerId;
+    const projectId = detail?.project.id;
+    if (streamerId && projectId) {
+      void loadReplaySessions(streamerId, projectId, "", false);
+    }
+  }, [active, detail?.project.id, loadReplaySessions, loadReplayStreamers, replayDirectoryVersion, selectedReplayStreamer?.streamerId]);
 
   useEffect(() => {
     if (!api.getAiLlmSettings) return;
@@ -603,9 +742,38 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   }, [api]);
 
   const currentInput = detail?.inputs.find((input) => input.id === currentInputId) ?? null;
-  const selectedSession = sessions.find(
-    (session) => String(session.sessionId) === selectedSessionId,
-  ) ?? null;
+  const replayStreamerOptions = useMemo<SearchableComboboxOption[]>(() => replayStreamers.map((streamer) => ({
+    value: String(streamer.streamerId),
+    label: streamer.name,
+    description: [
+      streamer.tags.join("、"),
+      streamer.webRid ? `直播间 ${streamer.webRid}` : "未绑定直播间",
+      `${streamer.replayCount} 场回放`,
+    ].filter(Boolean).join(" · "),
+    status: streamer.liveStatus === "live" || streamer.monitorStatus === "recording"
+      ? "正在直播"
+      : streamer.archived
+        ? "已归档"
+        : !streamer.monitorEnabled
+          ? "已暂停"
+          : "可选择",
+  })), [replayStreamers]);
+  const replaySessionOptions = useMemo<SearchableComboboxOption[]>(() => replaySessions.map((session) => ({
+    value: String(session.sessionId),
+    label: `${formatSessionTime(session.startedAt)}–${formatSessionTime(session.endedAt)}`,
+    description: [
+      `会话 ${session.sessionId}`,
+      formatDuration(session.totalDurationMs),
+      `${session.videoCount} 个分片`,
+      session.unavailableVideoCount > 0 ? `${session.unavailableVideoCount} 个不可用` : "",
+    ].filter(Boolean).join(" · "),
+    status: session.fullyImported
+      ? "已全部添加"
+      : session.importedVideoCount > 0
+        ? `已添加 ${session.importedVideoCount}/${session.videoCount}`
+        : session.status === "completed" ? "已结束" : "异常结束",
+    disabled: session.fullyImported,
+  })), [replaySessions]);
   const currentTranscript = transcript?.inputs.find((input) => input.inputId === currentInputId) ?? null;
   const segments = currentTranscript?.segments ?? [];
   const currentSegment = segments.find((segment) => segment.stableSegmentId === currentSegmentId) ?? null;
@@ -807,11 +975,18 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
   });
 
   const addSession = () => run(async () => {
-    if (!detail || !selectedSessionId) return;
-    const result = await api.addAiCompletedSession(detail.project.id, Number(selectedSessionId));
+    if (!detail || !selectedReplaySession || !selectedReplayStreamer) return;
+    const result = await api.addAiCompletedSession(detail.project.id, selectedReplaySession.sessionId);
     setDetail(result.detail);
     setProjects((current) => current.map((project) =>
       project.id === result.detail.project.id ? result.detail.project : project));
+    setSelectedReplaySession(null);
+    await loadReplaySessions(
+      selectedReplayStreamer.streamerId,
+      result.detail.project.id,
+      "",
+      false,
+    );
     setMessage(
       `新增 ${result.addedCount} 个分片，跳过 ${result.duplicateCount} 个重复，${result.unavailableCount} 个不可用`,
     );
@@ -1190,8 +1365,78 @@ export function AiWorkspace({ api, active = true }: { api: ClientApi; active?: b
                   <div className="ai-project-context"><label>项目标签<input aria-label="项目标签" value={projectTags} onChange={(event) => setProjectTags(event.target.value)} onBlur={saveProjectContext} placeholder="例如：带货、搞笑、知识" /></label><label>分析目标<input aria-label="分析目标" value={analysisGoal} onChange={(event) => setAnalysisGoal(event.target.value)} onBlur={saveProjectContext} placeholder="可选：重点找出价格对比和反转" /></label></div>
                   <div className="ai-input-source-actions">
                     <button className="secondary-button" disabled={busy} onClick={addLocalVideos}><FolderPlus size={16} />添加本地视频</button>
-                    <label className="ai-session-picker"><span className="sr-only">选择已结束直播</span><select aria-label="选择已结束直播" value={selectedSessionId} onChange={(event) => setSelectedSessionId(event.target.value)}><option value="">选择已结束直播</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.streamerName} · {formatSessionTime(session.startedAt)}–{formatSessionTime(session.endedAt)} · {formatDuration(session.totalDurationMs)} · {session.videoCount} 段{session.unavailableVideoCount > 0 ? ` · ${session.unavailableVideoCount} 个不可用` : ""}</option>)}</select>{selectedSession && <small aria-label="已选历史直播详情">{formatSessionTime(selectedSession.startedAt)}–{formatSessionTime(selectedSession.endedAt)} · {selectedSession.videoCount} 个分片 · {formatDuration(selectedSession.totalDurationMs)}{selectedSession.unavailableVideoCount > 0 ? ` · ${selectedSession.unavailableVideoCount} 个不可用` : ""}</small>}</label>
-                    <button className="secondary-button" disabled={!selectedSessionId || busy} onClick={addSession}><Video size={15} />添加整场直播</button>
+                    <SearchableCombobox
+                      ariaLabel="选择历史主播"
+                      placeholder="先选择主播"
+                      searchPlaceholder="搜索名称、标签或直播间 ID"
+                      value={selectedReplayStreamer ? String(selectedReplayStreamer.streamerId) : null}
+                      selectedLabel={selectedReplayStreamer?.name}
+                      options={replayStreamerOptions}
+                      loading={replayStreamerLoading}
+                      loadingMore={replayStreamerLoadingMore}
+                      error={replayStreamerError}
+                      hasMore={replayStreamerCursorRef.current !== null}
+                      emptyMessage="没有包含历史回放的主播"
+                      onChange={(value) => {
+                        const streamer = replayStreamers.find((item) => item.streamerId === Number(value)) ?? null;
+                        setSelectedReplayStreamer(streamer);
+                        setSelectedReplaySession(null);
+                      }}
+                      onOpen={() => void loadReplayStreamers("", false)}
+                      onSearchChange={(search) => void loadReplayStreamers(search, false)}
+                      onLoadMore={() => void loadReplayStreamers(replayStreamerSearchRef.current, true)}
+                      onRetry={() => void loadReplayStreamers(replayStreamerSearchRef.current, false)}
+                    />
+                    <SearchableCombobox
+                      ariaLabel="选择历史回放"
+                      placeholder="再选择直播回放"
+                      searchPlaceholder="搜索本地日期、时间或会话 ID"
+                      value={selectedReplaySession ? String(selectedReplaySession.sessionId) : null}
+                      selectedLabel={selectedReplaySession ? replaySessionOptions.find((option) => option.value === String(selectedReplaySession.sessionId))?.label : undefined}
+                      options={replaySessionOptions}
+                      disabled={!selectedReplayStreamer || !detail}
+                      loading={replaySessionLoading}
+                      loadingMore={replaySessionLoadingMore}
+                      error={replaySessionError}
+                      hasMore={replaySessionCursorRef.current !== null}
+                      emptyMessage="该主播没有可添加的已结束回放"
+                      onChange={(value) => setSelectedReplaySession(
+                        replaySessions.find((session) => session.sessionId === Number(value)) ?? null,
+                      )}
+                      onOpen={() => {
+                        if (selectedReplayStreamer && detail) void loadReplaySessions(
+                          selectedReplayStreamer.streamerId,
+                          detail.project.id,
+                          "",
+                          false,
+                        );
+                      }}
+                      onSearchChange={(search) => {
+                        if (selectedReplayStreamer && detail) void loadReplaySessions(
+                          selectedReplayStreamer.streamerId,
+                          detail.project.id,
+                          search,
+                          false,
+                        );
+                      }}
+                      onLoadMore={() => {
+                        if (selectedReplayStreamer && detail) void loadReplaySessions(
+                          selectedReplayStreamer.streamerId,
+                          detail.project.id,
+                          replaySessionSearchRef.current,
+                          true,
+                        );
+                      }}
+                      onRetry={() => {
+                        if (selectedReplayStreamer && detail) void loadReplaySessions(
+                          selectedReplayStreamer.streamerId,
+                          detail.project.id,
+                          replaySessionSearchRef.current,
+                          false,
+                        );
+                      }}
+                    />
+                    <button className="secondary-button" disabled={!selectedReplaySession || selectedReplaySession.fullyImported || busy} onClick={addSession}><Video size={15} />添加整场直播</button>
                   </div>
                   {detail.inputs.length === 0 ? <div className="ai-input-empty">先添加一个或多个视频；“上传”仅表示本地导入，不会发生网络上传。</div> : (
                     <div className="ai-draft-inputs">
