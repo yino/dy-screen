@@ -89,6 +89,7 @@ impl WhisperCppEngine {
             &request.request_id,
             self.identity(),
             request.audio.duration_ms,
+            self.maximum_repairable_overlap_ms(),
         );
         let _ = tokio::fs::remove_file(&output_json).await;
         let mut parsed = parsed?;
@@ -167,6 +168,14 @@ impl WhisperCppEngine {
             }
         }
         command
+    }
+
+    fn maximum_repairable_overlap_ms(&self) -> u64 {
+        // Whisper VAD pads both sides of a speech window and also overlaps adjacent sample chunks.
+        self.vad
+            .speech_padding_ms
+            .saturating_mul(2)
+            .saturating_add(self.vad.samples_overlap_ms)
     }
 }
 
@@ -377,6 +386,7 @@ fn parse_whisper_json(
     request_id: &str,
     identity: AsrEngineIdentity,
     audio_duration_ms: u64,
+    maximum_repairable_overlap_ms: u64,
 ) -> EngineResult<AsrResult> {
     let output: WhisperJson = serde_json::from_slice(json).map_err(|_| {
         AsrError::new(
@@ -413,14 +423,50 @@ fn parse_whisper_json(
             confidence,
         });
     }
+    let repaired_overlap_count =
+        repair_segment_overlaps(&mut segments, maximum_repairable_overlap_ms)?;
+    let warnings = if repaired_overlap_count == 0 {
+        Vec::new()
+    } else {
+        vec![AsrWarning {
+            code: "segment_overlap_repaired".to_owned(),
+            message: format!("识别时间戳存在轻微重叠，已自动校正 {repaired_overlap_count} 处边界"),
+        }]
+    };
     Ok(AsrResult {
         request_id: request_id.to_owned(),
         identity,
         detected_language: output.result.language,
         audio_duration_ms,
         segments,
-        warnings: Vec::new(),
+        warnings,
     })
+}
+
+fn repair_segment_overlaps(
+    segments: &mut [AsrSegment],
+    maximum_repairable_overlap_ms: u64,
+) -> EngineResult<usize> {
+    let mut repaired = 0;
+    for index in 1..segments.len() {
+        let previous_end = segments[index - 1].end_ms;
+        let current = &mut segments[index];
+        if current.start_ms >= previous_end {
+            continue;
+        }
+        let overlap_ms = previous_end - current.start_ms;
+        if overlap_ms > maximum_repairable_overlap_ms || current.end_ms <= previous_end {
+            return Err(AsrError::new(
+                AsrErrorKind::MalformedOutput,
+                "overlapping_segments",
+                "识别引擎返回了无法安全校正的重叠句段",
+                true,
+            ));
+        }
+        current.start_ms = previous_end;
+        repaired += 1;
+    }
+    Ok(repaired)
 }
 
 #[cfg(test)]
@@ -455,6 +501,7 @@ mod tests {
                 model_version: "q5_1".to_owned(),
             },
             4_191,
+            1_100,
         )
         .unwrap();
         assert_eq!(result.detected_language.as_deref(), Some("zh"));
@@ -481,9 +528,64 @@ mod tests {
                 model_version: "1".to_owned(),
             },
             1_000,
+            1_100,
         )
         .unwrap();
         assert_eq!(result.segments[0].confidence, None);
+    }
+
+    #[test]
+    fn repairs_small_forward_overlap_without_dropping_text() {
+        let json = r#"
+        {"result":{"language":"zh"},"transcription":[
+          {"offsets":{"from":0,"to":2000},"text":"第一句","tokens":[]},
+          {"offsets":{"from":1900,"to":3200},"text":"第二句","tokens":[]}
+        ]}
+        "#
+        .as_bytes();
+        let result = parse_whisper_json(json, "request", identity(), 3_200, 1_100).unwrap();
+
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.segments[0].text, "第一句");
+        assert_eq!(result.segments[1].text, "第二句");
+        assert_eq!(result.segments[1].start_ms, 2_000);
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(result.warnings[0].code, "segment_overlap_repaired");
+        result.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_contained_or_large_overlaps_without_dropping_text() {
+        let contained = r#"
+        {"result":{"language":"zh"},"transcription":[
+          {"offsets":{"from":0,"to":2000},"text":"第一句","tokens":[]},
+          {"offsets":{"from":1500,"to":1800},"text":"不能静默丢弃","tokens":[]}
+        ]}
+        "#
+        .as_bytes();
+        let error = parse_whisper_json(contained, "request", identity(), 2_000, 1_100).unwrap_err();
+        assert_eq!(error.code, "overlapping_segments");
+        assert!(error.retryable);
+
+        let large = r#"
+        {"result":{"language":"zh"},"transcription":[
+          {"offsets":{"from":0,"to":3000},"text":"第一句","tokens":[]},
+          {"offsets":{"from":1000,"to":4000},"text":"严重重叠","tokens":[]}
+        ]}
+        "#
+        .as_bytes();
+        let error = parse_whisper_json(large, "request", identity(), 4_000, 1_100).unwrap_err();
+        assert_eq!(error.code, "overlapping_segments");
+        assert!(error.retryable);
+    }
+
+    fn identity() -> AsrEngineIdentity {
+        AsrEngineIdentity {
+            engine_id: "whisper.cpp".to_owned(),
+            engine_version: "v1.9.1".to_owned(),
+            model_id: "small".to_owned(),
+            model_version: "q5_1".to_owned(),
+        }
     }
 
     #[test]
