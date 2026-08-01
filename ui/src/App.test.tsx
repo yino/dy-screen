@@ -274,6 +274,7 @@ describe("App", () => {
     render(<App api={api} />);
 
     const dialog = await screen.findByRole("dialog", { name: "客户端激活" });
+    expect(dialog).toHaveTextContent("激活切片智能体");
     expect(dialog).toHaveTextContent("未激活前不会启动监听或录制任务");
     expect(screen.queryByRole("button", { name: "关闭" })).not.toBeInTheDocument();
     await user.type(screen.getByLabelText("激活码"), "TEST-CODE-1234");

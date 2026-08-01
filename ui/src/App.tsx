@@ -925,7 +925,7 @@ function Sidebar({
       <aside className={open ? "sidebar is-open" : "sidebar"}>
         <div className="brand">
           <div className="brand-mark"><Radio size={22} /></div>
-          <div><strong>LivePilot</strong><span>直播管家</span></div>
+          <div><strong>切片智能体</strong><span>直播录制与剪辑</span></div>
           <button className="icon-button sidebar-close" onClick={onClose} aria-label="关闭菜单"><X size={18} /></button>
         </div>
         <nav className="nav-list" aria-label="主导航">
@@ -951,8 +951,8 @@ function Sidebar({
           <div className="storage-line"><span>默认目录</span><b>Downloads</b></div>
         </div>
         <div className="sidebar-footer">
-          <div className="avatar">LP</div>
-          <div><strong>直播管家</strong><span>后台自动监听</span></div>
+          <div className="avatar">切</div>
+          <div><strong>切片智能体</strong><span>后台自动监听</span></div>
         </div>
       </aside>
     </>
@@ -1533,7 +1533,7 @@ function ActivationModal({ state, onActivate }: { state: ActivationState | null;
   return (
     <div className="modal-backdrop activation-backdrop" role="presentation">
       <form className="modal activation-modal" role="dialog" aria-modal="true" aria-label="客户端激活" onSubmit={submit}>
-        <div className="modal-header"><div className="modal-title-icon"><KeyRound size={21} /></div><div><h2>激活直播管家</h2><p>当前设备 {state?.deviceIdHint ?? "正在识别"}</p></div></div>
+        <div className="modal-header"><div className="modal-title-icon"><KeyRound size={21} /></div><div><h2>激活切片智能体</h2><p>当前设备 {state?.deviceIdHint ?? "正在识别"}</p></div></div>
         <div className="modal-body">
           <label htmlFor="activation-code">激活码<input id="activation-code" type="password" autoComplete="off" autoFocus value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="请输入激活码" disabled={!state || submitting} /></label>
           {(error || state?.message) && <p className="form-error" role="alert">{error || state?.message}</p>}

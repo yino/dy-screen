@@ -1,6 +1,6 @@
-# 直播管家（dy-screen）
+# 切片智能体（dy-screen）
 
-直播管家是一个基于 Tauri 2.0、React、TypeScript、Rust 和 SQLite 的本地桌面客户端，用于通过公开抖音个人主页或直播间入口同时监听多个主播，在开播后自动保存包含视频和声音的 MKV 分片，并允许用户主动把多个视频转换为带时间戳的本地语音转写。
+切片智能体是一个基于 Tauri 2.0、React、TypeScript、Rust 和 SQLite 的本地桌面客户端，用于通过公开抖音个人主页或直播间入口同时监听多个主播，在开播后自动保存包含视频和声音的 MKV 分片，并允许用户主动把多个视频转换为带时间戳的本地语音转写。
 
 当前版本交付“可靠录制 + 用户触发的本地 ASR + 高光候选分析 + 带 ASR 字幕的本地单轨剪辑导出”能力。高光分析通过 Rust 中的受限 Agent 工作流调用 DeepSeek，只发送用户授权的规范化转写、时间戳、标签和分析目标；用户显式选择高光后可编排并导出新的 MP4，字幕默认烧录到成品画面，多轨和自动切片仍属于后续独立能力。
 
@@ -264,7 +264,7 @@ make app-build
 默认产物位于：
 
 ```text
-src-tauri/target/release/bundle/macos/直播管家.app
+src-tauri/target/release/bundle/macos/切片智能体.app
 ```
 
 正式 ASR 安装包必须先准备一个符合 `resources/asr/manifest.json` 结构的可信资源目录。该目录包含公共模型、VAD、规范化字典和至少一个目标平台的 `whisper.cpp`、VAD、FFmpeg、FFprobe；Windows 还包含官方 `vc_redist.x64.exe`。构建工具不会联网，也拒绝把指向 Homebrew 或开发机路径的符号链接放进安装包。

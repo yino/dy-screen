@@ -95,7 +95,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 
 help:
 	@printf '%s\n' \
-		'直播管家：Tauri 2.0 多主播自动监听与录制客户端' \
+		'切片智能体：Tauri 2.0 多主播自动监听、录制与 AI 剪辑客户端' \
 		'' \
 		'首次使用：' \
 		'  make doctor          检查 Node、npm、Cargo、FFmpeg 和 FFprobe' \
@@ -129,7 +129,7 @@ help:
 		'  make asr-test-stages ASR_RESOURCE_ROOT=... [ASR_TEST_VIDEO=...] 顺序执行全部 ASR 阶段入口' \
 		'  make asr-transcribe ASR_RESOURCE_ROOT=... [ASR_TRANSCRIBE_VIDEO=绝对路径] 将单个视频转成带时间戳 JSON' \
 		'  make asr-test-windows-target ASR_RESOURCE_ROOT=... ASR_TARGET_EVIDENCE=... 在真实 Windows x64 执行 Unicode/取消/CPU/运行库验收' \
-		'  make asr-verify-release-macos ASR_APP=/Applications/直播管家.app ASR_DMG=... ASR_VIDEO=... ASR_RELEASE_EVIDENCE=... 验证签名、公证、离线运行' \
+		'  make asr-verify-release-macos ASR_APP=/Applications/切片智能体.app ASR_DMG=... ASR_VIDEO=... ASR_RELEASE_EVIDENCE=... 验证签名、公证、离线运行' \
 		'  make asr-verify-release-windows ASR_INSTALLER=... ASR_INSTALL_DIR=... ASR_VIDEO=... ASR_SIGNER_THUMBPRINT=... ASR_SMARTSCREEN_EVIDENCE=... ASR_RELEASE_EVIDENCE=... 验证安装发行' \
 		'  make asr-quality-collect ASR_QUALITY_DATASET=... ASR_QUALITY_RESULTS=... ASR_RESOURCE_ROOT=... 采集至少 10 个授权样本' \
 		'  make asr-quality-evaluate ASR_QUALITY_DATASET=... ASR_QUALITY_RESULTS=... ASR_QUALITY_JSON_REPORT=... ASR_QUALITY_MARKDOWN_REPORT=... 生成质量报告' \

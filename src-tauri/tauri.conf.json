@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "直播管家",
+  "productName": "切片智能体",
   "version": "0.2.0",
   "identifier": "com.yino.dyscreen",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "直播管家",
+        "title": "切片智能体",
         "width": 1280,
         "height": 800,
         "minWidth": 980,

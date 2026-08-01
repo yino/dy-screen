@@ -92,7 +92,7 @@ impl RoomResolutionPublisher for DesktopRoomResolutionPublisher {
                 .notification()
                 .builder()
                 .title("需要访问验证")
-                .body("请打开直播管家的抖音验证窗口")
+                .body("请打开切片智能体的抖音验证窗口")
                 .show();
         }
     }
@@ -1564,11 +1564,11 @@ pub fn run() {
                 .text("pause_all", "暂停全部监听")
                 .text("resume_all", "恢复全部监听")
                 .separator()
-                .text("quit", "退出直播管家")
+                .text("quit", "退出切片智能体")
                 .build()?;
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&tray_menu)
-                .tooltip("直播管家")
+                .tooltip("切片智能体")
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| handle_tray_event(app, event.id().0.as_str()));
             if let Some(icon) = app.default_window_icon() {
@@ -1594,7 +1594,7 @@ pub fn run() {
 
     let app = builder
         .build(tauri::generate_context!())
-        .expect("无法创建直播管家应用");
+        .expect("无法创建切片智能体应用");
     app.run(|app, event| match event {
         RunEvent::ExitRequested { api, .. } => {
             if let Some(state) = app.try_state::<AppState>()

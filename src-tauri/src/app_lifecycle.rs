@@ -13,9 +13,9 @@ const INSTANCE_LOCK_FILE: &str = "dy-screen.lock";
 
 #[derive(Debug, Error)]
 pub enum InstanceLockError {
-    #[error("直播管家已在运行")]
+    #[error("切片智能体已在运行")]
     AlreadyRunning,
-    #[error("无法获取直播管家实例锁")]
+    #[error("无法获取切片智能体实例锁")]
     Io(#[source] io::Error),
 }
 

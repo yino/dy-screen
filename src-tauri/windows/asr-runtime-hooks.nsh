@@ -7,7 +7,7 @@
     IntCmp $0 3010 runtime_ready runtime_failed runtime_failed
 
   runtime_failed:
-    MessageBox MB_ICONSTOP|MB_OK "Microsoft Visual C++ x64 运行库安装失败，直播管家无法启动本地语音识别。请重新运行安装程序。"
+    MessageBox MB_ICONSTOP|MB_OK "Microsoft Visual C++ x64 运行库安装失败，切片智能体无法启动本地语音识别。请重新运行安装程序。"
     Abort
 
   runtime_missing:

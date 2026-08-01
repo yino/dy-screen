@@ -80,7 +80,7 @@ cargo run --offline --bin asr-quality -- evaluate \
 ./scripts/collect-asr-performance-macos.sh \
   --video /secure/performance/long-authorized-sample.mp4 \
   --asr-binary /secure/release/dy-screen \
-  --resource-root /Applications/直播管家.app/Contents/Resources/resources/asr \
+  --resource-root /Applications/切片智能体.app/Contents/Resources/resources/asr \
   --output /secure/performance/macos-arm64-8gb.json \
   --require-8gb
 ```
@@ -117,7 +117,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File scripts/collect-asr-performance-windows.ps1 `
   -Video "C:\ASR验收\long-authorized-sample.mp4" `
   -AsrBinary "C:\ASR验收\release\dy-screen.exe" `
-  -ResourceRoot "C:\Program Files\直播管家\resources\asr" `
+  -ResourceRoot "C:\Program Files\切片智能体\resources\asr" `
   -Output "C:\ASR验收\windows-x64-8gb.json" `
   -Require8GB
 ```

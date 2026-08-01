@@ -149,8 +149,8 @@ cargo run --offline -- asr /absolute/path/to/video.mp4 --stop-after vad --json
 
 ```bash
 make asr-verify-release-macos \
-  ASR_APP='/Applications/直播管家.app' \
-  ASR_DMG='/secure/release/直播管家.dmg' \
+  ASR_APP='/Applications/切片智能体.app' \
+  ASR_DMG='/secure/release/切片智能体.dmg' \
   ASR_VIDEO='/secure/fixtures/short_zh.mp4' \
   ASR_RELEASE_EVIDENCE='/secure/evidence/macos-release.json'
 ```
@@ -174,8 +174,8 @@ Windows 依赖和资源编译脚本的静态构建边界，但没有运行生成
 
 ```powershell
 make asr-verify-release-windows `
-  ASR_INSTALLER="C:\Release\直播管家-setup.exe" `
-  ASR_INSTALL_DIR="$env:LOCALAPPDATA\直播管家" `
+  ASR_INSTALLER="C:\Release\切片智能体-setup.exe" `
+  ASR_INSTALL_DIR="$env:LOCALAPPDATA\切片智能体" `
   ASR_VIDEO="C:\ASR验收\short_zh.mp4" `
   ASR_SIGNER_THUMBPRINT="0123456789ABCDEF0123456789ABCDEF01234567" `
   ASR_SMARTSCREEN_EVIDENCE="release-ticket-2026-001" `

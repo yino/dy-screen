@@ -1094,7 +1094,7 @@ impl Supervisor {
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
                     self.publisher
-                        .notify("需要访问验证", "请在直播管家中完成抖音访问验证")
+                        .notify("需要访问验证", "请在切片智能体中完成抖音访问验证")
                         .await;
                     VERIFICATION_WAIT_INTERVAL.as_secs()
                 }
