@@ -1104,7 +1104,15 @@ function MonitorPage({
             </div>
           ) : (
             <div className="table-wrap">
-              <table>
+              <table className="streamer-table">
+                <colgroup>
+                  <col className="streamer-source-column" />
+                  <col className="streamer-live-column" />
+                  <col className="streamer-monitor-column" />
+                  <col className="streamer-check-column" />
+                  <col className="streamer-video-column" />
+                  <col className="streamer-actions-column" />
+                </colgroup>
                 <thead><tr><th>主播 / 来源</th><th>直播状态</th><th>监听状态</th><th>最近检查</th><th>视频</th><th><span className="sr-only">操作</span></th></tr></thead>
                 <tbody>
                   {streamers.map((streamer) => (
