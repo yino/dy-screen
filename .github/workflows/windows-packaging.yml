@@ -1,0 +1,59 @@
+name: Windows 发行契约
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-packaging.yml"
+      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "scripts/*.ps1"
+      - "src-tauri/**"
+      - "ui/**"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    branches: [dev]
+    paths:
+      - ".github/workflows/windows-packaging.yml"
+      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "scripts/*.ps1"
+      - "src-tauri/**"
+      - "ui/**"
+      - "package.json"
+      - "package-lock.json"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-static:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo test --test windows_packaging_contract -- --nocapture
+      - run: cargo test --test windows_powershell_scripts -- --nocapture
+      - run: cargo check --all-targets --target x86_64-pc-windows-msvc
+      - run: cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib ai::llm::windows_credential_tests::system_credentials_support_windows_read_replace_and_idempotent_clear -- --exact --nocapture
+      - run: npm run build

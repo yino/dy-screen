@@ -7,11 +7,20 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
 # 锁定 whisper.cpp v1.9.1 源码归档。脚本必须在 VS 2022 x64 Developer PowerShell 中运行。
-$ExpectedSha256 = "d8cd961352377b1cc612224016a9ebdfe0ae508dc2b2f9ef514b341d672e3fdc"
+$ExpectedSha256 = "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3"
 $ExpectedVersion = "1.9.1"
 $ExpectedCommit = "f049fff95a089aa9969deb009cdd4892b3e74916"
+
+function Assert-RegularFile {
+    param([string]$Path, [string]$Label)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "$Label 必须是普通文件，不能是目录或重解析点。"
+    }
+}
 
 foreach ($Tool in @("cmake.exe", "tar.exe", "dumpbin.exe")) {
     if (-not (Get-Command $Tool -ErrorAction SilentlyContinue)) {
@@ -19,9 +28,12 @@ foreach ($Tool in @("cmake.exe", "tar.exe", "dumpbin.exe")) {
     }
 }
 
-if (-not [Environment]::Is64BitOperatingSystem) {
+if (-not [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [Runtime.InteropServices.OSPlatform]::Windows
+) -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant() -ne "x64") {
     throw "Windows x64 ASR sidecar 只能在 64 位 Windows 构建。"
 }
+Assert-RegularFile -Path $SourceArchive -Label "whisper.cpp 源码归档"
 if (Test-Path -LiteralPath $OutputRoot) {
     throw "输出目录已经存在，请使用一个新的目录。"
 }
@@ -32,8 +44,9 @@ if ($ActualSha256 -ne $ExpectedSha256) {
 }
 
 $TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("dy-screen-whisper-" + [Guid]::NewGuid())
-$SourceRoot = Join-Path $TemporaryRoot "ggml-org-whisper.cpp-f049fff"
+$SourceRoot = Join-Path $TemporaryRoot "whisper.cpp-f049fff95a089aa9969deb009cdd4892b3e74916"
 $BuildRoot = Join-Path $TemporaryRoot "build"
+$Succeeded = $false
 
 try {
     New-Item -ItemType Directory -Path $TemporaryRoot | Out-Null
@@ -103,8 +116,8 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "无法读取 $Binary 的 PE 依赖。"
         }
-        if ($Dependencies -match "(?i)(libwhisper|libggml|libomp|vcomp)[^\r\n]*\.dll") {
-            throw "$Binary 仍依赖未随包声明的 Whisper/GGML/OpenMP DLL。"
+        if ($Dependencies -match "(?i)(libwhisper|libggml|libomp|vcomp|vcruntime|msvcp|ucrtbase)[^\r\n]*\.dll") {
+            throw "$Binary 仍依赖未随包声明的 Whisper/GGML/OpenMP/MSVC DLL。"
         }
     }
 
@@ -112,9 +125,13 @@ try {
     if ($LASTEXITCODE -ne 0 -or $VersionOutput -notmatch [Regex]::Escape($ExpectedVersion)) {
         throw "whisper-cli 版本与锁定版本不一致。"
     }
-    Set-Content -LiteralPath (Join-Path $OutputRoot "whisper-version.txt") -Value $VersionOutput -Encoding utf8NoBOM
+    [IO.File]::WriteAllText(
+        (Join-Path $OutputRoot "whisper-version.txt"),
+        $VersionOutput,
+        [Text.UTF8Encoding]::new($false)
+    )
 
-    @(
+    $BuildRecord = @(
         "source=whisper.cpp-v1.9.1.tar.gz"
         "source_sha256=$ExpectedSha256"
         "source_commit=$ExpectedCommit"
@@ -125,11 +142,20 @@ try {
         "linkage=static-whisper-ggml-msvc-runtime"
         "gpu=disabled"
         "network=disabled"
-    ) | Set-Content -LiteralPath (Join-Path $OutputRoot "build-record.txt") -Encoding utf8NoBOM
+    ) -join [Environment]::NewLine
+    [IO.File]::WriteAllText(
+        (Join-Path $OutputRoot "build-record.txt"),
+        $BuildRecord + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false)
+    )
 
     Write-Host "Windows x64 whisper.cpp sidecar 已构建到：$OutputRoot"
+    $Succeeded = $true
 }
 finally {
+    if (-not $Succeeded -and (Test-Path -LiteralPath $OutputRoot)) {
+        Remove-Item -LiteralPath $OutputRoot -Recurse -Force
+    }
     if (Test-Path -LiteralPath $TemporaryRoot) {
         Remove-Item -LiteralPath $TemporaryRoot -Recurse -Force
     }

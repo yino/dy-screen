@@ -11,6 +11,8 @@
 - [AI 高光分析与候选](AI-高光分析与候选.md)
 - [客户端生命周期与访问恢复](客户端生命周期与访问恢复.md)
 - [运行资源与视频预览](运行资源与视频预览.md)
+- [Windows x64 构建与发行](Windows-构建与发行.md)
 - [最近变更](最近变更.md)
 - [Runtime Resource Pack 发行清单](运行资源发行清单.md)
+- [Windows x64 发行清单模板](../templates/windows-release-checklist.md)
 - [AI ASR 变更验收记录](AI-ASR-验收记录.md)

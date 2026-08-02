@@ -2,9 +2,11 @@
 //!
 //! 本模块刻意不暴露 API Key，也不把 Rig 类型传播到 repository 或 Tauri DTO。
 
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use async_trait::async_trait;
 use rig_core::providers::openai;
@@ -143,9 +145,9 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
-/// 使用当前操作系统凭据工具保存 DeepSeek Key。
-/// macOS 使用 Keychain 的 `security` 命令；Windows/Linux 在没有对应安全适配器时明确禁用保存，
-/// 绝不回退到明文文件或 SQLite。
+/// 使用当前操作系统凭据库保存 DeepSeek Key。
+/// macOS 使用 Keychain，Windows 使用当前用户的 Credential Manager；Linux 在没有安全适配器时
+/// 明确禁用保存，绝不回退到明文文件或 SQLite。
 #[derive(Clone)]
 pub struct SystemCredentialStore {
     service: String,
@@ -162,7 +164,7 @@ impl Default for SystemCredentialStore {
 }
 
 impl SystemCredentialStore {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn unsupported() -> CredentialError {
         CredentialError::Unavailable("当前平台没有可用的系统凭据适配器".to_owned())
     }
@@ -173,6 +175,22 @@ impl SystemCredentialStore {
             .args(args)
             .output()
             .map_err(|_| CredentialError::Unavailable("无法访问 macOS Keychain".to_owned()))
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_target(&self) -> Vec<u16> {
+        format!("{}.{}", self.service, self.account)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_account(&self) -> Vec<u16> {
+        self.account
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
     }
 }
 
@@ -196,7 +214,55 @@ impl CredentialStore for SystemCredentialStore {
                 Ok(None)
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            use std::ptr::null_mut;
+            use std::slice;
+            use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+            use windows_sys::Win32::Security::Credentials::{
+                CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+            };
+
+            let target = self.windows_target();
+            let mut credential: *mut CREDENTIALW = null_mut();
+            // CredReadW allocates the returned credential and blob as one CredFree-owned buffer.
+            let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+            if read == 0 {
+                // GetLastError must be read immediately after the failed Win32 call.
+                return match unsafe { GetLastError() } {
+                    ERROR_NOT_FOUND => Ok(None),
+                    _ => Err(CredentialError::Operation),
+                };
+            }
+            if credential.is_null() {
+                return Err(CredentialError::Operation);
+            }
+
+            // Copy the blob while the CredReadW buffer is valid, then release it on every result.
+            let value = unsafe {
+                let credential_ref = &*credential;
+                let result = if credential_ref.CredentialBlobSize == 0
+                    || credential_ref.CredentialBlob.is_null()
+                {
+                    Err(CredentialError::Operation)
+                } else {
+                    let bytes = slice::from_raw_parts(
+                        credential_ref.CredentialBlob,
+                        credential_ref.CredentialBlobSize as usize,
+                    );
+                    String::from_utf8(bytes.to_vec())
+                        .map_err(|_| CredentialError::Operation)
+                        .and_then(|value| {
+                            validate_key(&value)?;
+                            Ok(value)
+                        })
+                };
+                CredFree(credential.cast());
+                result
+            }?;
+            Ok(Some(value))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Err(Self::unsupported())
         }
@@ -223,7 +289,36 @@ impl CredentialStore for SystemCredentialStore {
                 Err(CredentialError::Operation)
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            use std::ptr::null_mut;
+            use windows_sys::Win32::Security::Credentials::{
+                CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
+            };
+
+            let mut target = self.windows_target();
+            let mut account = self.windows_account();
+            let mut blob = value.as_bytes().to_vec();
+            let credential = CREDENTIALW {
+                Type: CRED_TYPE_GENERIC,
+                TargetName: target.as_mut_ptr(),
+                CredentialBlobSize: blob.len() as u32,
+                CredentialBlob: blob.as_mut_ptr(),
+                Persist: CRED_PERSIST_LOCAL_MACHINE,
+                UserName: account.as_mut_ptr(),
+                Comment: null_mut(),
+                TargetAlias: null_mut(),
+                Attributes: null_mut(),
+                ..CREDENTIALW::default()
+            };
+            // CredWriteW copies the credential before returning; all backing vectors stay alive here.
+            if unsafe { CredWriteW(&credential, 0) } == 0 {
+                Err(CredentialError::Operation)
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Err(Self::unsupported())
         }
@@ -245,7 +340,23 @@ impl CredentialStore for SystemCredentialStore {
                 Err(CredentialError::Operation)
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
+            use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
+
+            let target = self.windows_target();
+            // The UTF-16 target buffer remains alive for the duration of the Win32 call.
+            if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0 {
+                return Ok(());
+            }
+            // Clearing an already missing credential is intentionally idempotent.
+            match unsafe { GetLastError() } {
+                ERROR_NOT_FOUND => Ok(()),
+                _ => Err(CredentialError::Operation),
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             Err(Self::unsupported())
         }
@@ -258,6 +369,44 @@ fn validate_key(value: &str) -> Result<(), CredentialError> {
         return Err(CredentialError::Invalid);
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_credential_tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{CredentialStore, SystemCredentialStore};
+
+    struct CredentialCleanup(SystemCredentialStore);
+
+    impl Drop for CredentialCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.clear();
+        }
+    }
+
+    #[test]
+    fn system_credentials_support_windows_read_replace_and_idempotent_clear() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间必须晚于 Unix epoch")
+            .as_nanos();
+        let store = SystemCredentialStore {
+            service: format!("dy-screen.test.{}.{}", std::process::id(), unique),
+            account: "integration".to_owned(),
+        };
+        let _cleanup = CredentialCleanup(store.clone());
+
+        store.clear().unwrap();
+        assert_eq!(store.get().unwrap(), None);
+        store.set("sk-windows-test").unwrap();
+        assert_eq!(store.get().unwrap().as_deref(), Some("sk-windows-test"));
+        store.set("sk-windows-replaced").unwrap();
+        assert_eq!(store.get().unwrap().as_deref(), Some("sk-windows-replaced"));
+        store.clear().unwrap();
+        store.clear().unwrap();
+        assert_eq!(store.get().unwrap(), None);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]

@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn refuses_tampered_files_and_symlinks_during_install() {
         let source = tempdir().unwrap();
-        let mut manifest = manifest(source.path());
+        let manifest = manifest(source.path());
         fs::write(source.path().join("bin/tool"), b"tampered").unwrap();
         let target = tempdir().unwrap();
         let installer = RuntimeInstaller::new(target.path().join("resources")).unwrap();
@@ -992,6 +992,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
+            let mut manifest = manifest;
             let linked = source.path().join("bin/linked");
             symlink("tool", &linked).unwrap();
             manifest.components[0].files.push(RuntimeFile {

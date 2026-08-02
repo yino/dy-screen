@@ -77,7 +77,7 @@ fn macos_whisper_build_is_locked_static_metal_offline_and_relocatable() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = fs::read_to_string(root.join("scripts/build-asr-whisper-macos.sh")).unwrap();
     for required in [
-        "d8cd961352377b1cc612224016a9ebdfe0ae508dc2b2f9ef514b341d672e3fdc",
+        "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3",
         "f049fff95a089aa9969deb009cdd4892b3e74916",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DGGML_STATIC=ON",
@@ -98,7 +98,7 @@ fn windows_whisper_build_locks_cpu_baseline_and_static_dependencies() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = fs::read_to_string(root.join("scripts/build-asr-whisper-windows.ps1")).unwrap();
     for required in [
-        "d8cd961352377b1cc612224016a9ebdfe0ae508dc2b2f9ef514b341d672e3fdc",
+        "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3",
         "f049fff95a089aa9969deb009cdd4892b3e74916",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DGGML_STATIC=ON",
@@ -117,6 +117,8 @@ fn windows_whisper_build_locks_cpu_baseline_and_static_dependencies() {
             "Windows Whisper 构建脚本缺少 {required}"
         );
     }
+    assert!(script.contains("whisper.cpp-f049fff95a089aa9969deb009cdd4892b3e74916"));
+    assert!(!script.contains("utf8NoBOM"));
 }
 
 #[test]

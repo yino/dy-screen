@@ -367,7 +367,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiClipEffect, AiClipSegment, AiClipSubtitle, render_clip_subtitle_assets};
+    use crate::ai::{AiClipEffect, AiClipSegment};
+    #[cfg(unix)]
+    use crate::ai::{AiClipSubtitle, render_clip_subtitle_assets};
 
     fn source(effect: AiClipEffect) -> ClipExportSource {
         ClipExportSource {

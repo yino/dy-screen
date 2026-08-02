@@ -326,20 +326,30 @@ make asr-build-macos
 
 该命令默认从 `resources/asr-source/` 重新封存 `resources/asr-stage/`，再将同一份资源复制进 `.app` 的 `Contents/Resources/resources/asr/`。如需使用其他资源目录，可显式传入 `ASR_SOURCE=/absolute/path/to/asr-resources`。
 
-Windows x64（在 Windows x64 构建机运行）：
+Windows x64 必须在原生 Windows 10/11 x64 的 Visual Studio 2022 Developer PowerShell 中构建。
+先诊断工具链，再从仓库锁定源码构建 FFmpeg/Whisper、组装 Microsoft VC++ 运行库并生成开发包：
 
 ```powershell
-make asr-build-windows ASR_SOURCE=C:\absolute\path\to\asr-resources
+make windows-build-doctor
+make asr-ffmpeg-windows
+make asr-whisper-windows
+make asr-prepare-windows VC_REDIST_SOURCE=C:/inputs/vc_redist.x64.exe VC_REDIST_LICENSE=C:/inputs/Microsoft-VCRedist.txt
+make app-build-windows-dev WINDOWS_ASR_SOURCE=resources/asr-source-windows RESOURCE_CHANNEL=development WINDOWS_RESOURCE_BASE_URL=https://resources.example/development/0.2.0/windows/x86_64/2026.07.4/
 ```
 
-Apple Silicon 开发机可用 `make asr-check-windows` 对根 crate 和 Tauri crate 执行 Windows
-x64 全目标交叉编译与严格 Clippy；该检查不能替代 Windows 实机识别、签名和安装验收。
+开发 NSIS 可以无签名，但无签名资源不能发布到 `stable`。正式发行要求项目 PE/DLL 先完成
+Authenticode，再 staging 并对 Runtime manifest 进行外部 Ed25519 签名，最后签署 NSIS 并执行
+干净 Windows 设备验收。DeepSeek Key 在 Windows 上只保存到 Credential Manager，不写入 SQLite。
+完整的工具版本、签名顺序、资源发布、升级/卸载和故障排查见
+[`docs/wiki/Windows-构建与发行.md`](docs/wiki/Windows-构建与发行.md)；每次候选发行使用
+[`docs/templates/windows-release-checklist.md`](docs/templates/windows-release-checklist.md) 记录真实证据。
 
-Windows x64 构建机可在 Visual Studio 2022 Developer PowerShell 中运行
-`make asr-whisper-windows`，生成静态 CPU sidecar。脚本固定 SSE4.2 最低指令集并显式关闭
-AVX/AVX2/BMI2，避免构建机 CPU 自动优化导致安装后非法指令崩溃。
+Apple Silicon 开发机可用 `make asr-check-windows` 执行 Windows x64 条件编译与严格 Clippy；
+该检查不能替代 PowerShell AST、NSIS、签名、安装、业务运行或 SmartScreen 实机验收。
 
-两个命令先调用 Rust `asr-bundle` 工具校验并生成 `resources/asr-stage/`，再使用对应 Tauri 配置覆盖构建。macOS 默认生成可直接运行的 `.app`；在有 Finder 会话的构建机上设置 `ASR_BUNDLES=app,dmg` 可同时生成 `.dmg`。Windows 覆盖生成 NSIS 安装器并使用离线 WebView2 安装模式。正式发行仍必须在各自目标机完成签名、公证或 Authenticode、安装、卸载和离线 ASR 验收，不能用开发构建代替发行证据。
+macOS 和 Windows 构建都会先由 `asr-bundle` 生成单平台 `resources/asr-stage/`。macOS 可通过
+`ASR_BUNDLES=app,dmg` 同时生成 `.app`/`.dmg`；Windows 生成 currentUser NSIS，并携带离线
+WebView2、VC++ 运行库和完整运行资源。
 
 ## 自动监听与录制逻辑
 
@@ -580,8 +590,14 @@ make help
 | `make asr-stage-macos ASR_SOURCE=...` | 校验并准备单平台 macOS arm64 ASR 随包目录 |
 | `make asr-build-macos ASR_SOURCE=...` | 构建包含本地 ASR 资源的 macOS `.app`/`.dmg` |
 | `make asr-stage-windows ASR_SOURCE=...` | 校验并准备单平台 Windows x64 ASR 随包目录 |
-| `make asr-build-windows ASR_SOURCE=...` | 构建包含 VC++/WebView2 离线安装能力的 Windows NSIS 安装器 |
+| `make windows-build-doctor` | 在原生 Windows x64 检查 VS/SDK/Rust/Node/CMake/NSIS/MSYS2/签名工具 |
+| `make asr-ffmpeg-windows` | 从锁定 FFmpeg 8.1.2 源码构建 Windows x64 LGPL sidecar |
+| `make asr-prepare-windows ...` | 组装 FFmpeg、Whisper、模型、字典、许可证和 Microsoft VC++ 可信源目录 |
+| `make app-build-windows-dev ...` | 构建明确标记为非正式的无签名 Windows NSIS 开发包 |
+| `make app-build-windows-release ...` | 使用证书存储和 RFC 3161 时间戳构建正式 Windows NSIS |
+| `make runtime-resource-publish-windows ...` | 生成与 staging 哈希一致的 Windows HTTPS 静态资源目录 |
 | `make asr-check-windows` | 交叉检查 Windows x64 根/Tauri crate 与严格 Clippy |
+| `make asr-test-windows-scripts` | 在原生 Windows 使用 PowerShell 5.1 AST 校验全部发行脚本 |
 | `make asr-test-windows-target ...` | 在真实 Windows x64 设备执行 CPU、Unicode、运行中取消、VC++ 与真实中文 ASR 验收 |
 | `make asr-verify-release-macos ...` | 验证已安装 macOS 包的 Developer ID、公证、Gatekeeper、包内资源与离线 ASR |
 | `make asr-verify-release-windows ...` | 安装并验证 Windows 包的 Authenticode、SmartScreen 证据、运行库、中文目录、离线 ASR 与卸载 |

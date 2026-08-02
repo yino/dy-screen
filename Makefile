@@ -62,13 +62,25 @@ FFMPEG_SOURCE ?= $(if $(wildcard resources/asr-source/sources/ffmpeg-8.1.2.tar.x
 FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg
 WHISPER_SOURCE ?= $(if $(wildcard resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz),resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz,)
 WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper
+WINDOWS_FFMPEG_OUTPUT ?= resources/asr-build/ffmpeg-windows
+WINDOWS_WHISPER_OUTPUT ?= resources/asr-build/whisper-windows
+WINDOWS_RESOURCE_SOURCE ?= resources/asr-source-windows
+WINDOWS_ASR_SOURCE ?= $(if $(wildcard $(WINDOWS_RESOURCE_SOURCE)/manifest.json),$(WINDOWS_RESOURCE_SOURCE),$(ASR_SOURCE))
+VC_REDIST_SOURCE ?=
+VC_REDIST_LICENSE ?=
 POWERSHELL ?= powershell.exe
 RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/
+WINDOWS_RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/windows/x86_64/2026.07.4/
 RESOURCE_RELEASE_DIR ?= dist/runtime-resources
 RESOURCE_CHANNEL ?= stable
 RESOURCE_APP_VERSION ?= 0.2.0
 # 必须与 resources/asr-source/manifest.json 中的 bundleVersion 一致。
 RESOURCE_BUNDLE_VERSION ?= 2026.07.4
+RUNTIME_MANIFEST_KEY_ID ?= stable-2026
+RUNTIME_MANIFEST_PAYLOAD ?= dist/runtime-manifest.payload
+RUNTIME_MANIFEST_SIGNATURE ?=
+WINDOWS_CERTIFICATE_THUMBPRINT ?=
+WINDOWS_TIMESTAMP_URL ?=
 DY_SCREEN_API_BASE_URL ?= http://localhost/api/
 DEV_REQUIRE_ACTIVATION ?= 0
 
@@ -88,9 +100,9 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
 	accept-deepseek \
 	diagnose-real-room tail-access-log accept-real-room accept-real-multi \
-	asr-ffmpeg-macos asr-whisper-macos asr-whisper-windows asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows runtime-resource-verify runtime-resource-verify-windows runtime-resource-publish \
+	asr-ffmpeg-macos asr-ffmpeg-windows asr-whisper-macos asr-whisper-windows asr-prepare-windows asr-sign-windows-resources windows-build-doctor asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows app-build-windows-dev app-build-windows-release runtime-resource-verify runtime-resource-verify-windows runtime-resource-verify-windows-release runtime-resource-publish runtime-resource-publish-windows runtime-resource-publish-windows-dev runtime-manifest-payload runtime-manifest-apply-signature \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
-	asr-check-windows asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
+	asr-check-windows asr-test-windows-scripts asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
 	inspect-profile inspect-room resolve record record-multi clean
 
 help:
@@ -110,17 +122,22 @@ help:
 		'  make app-build-resources ASR_SOURCE=... 构建强制携带运行资源的发行包（缺资源直接失败）' \
 		'  make app-build-resources-windows ASR_SOURCE=... 构建 Windows x64 强制资源发行包' \
 		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL 应用运行时 FFmpeg' \
+		'  make asr-ffmpeg-windows FFMPEG_SOURCE=C:/ffmpeg-8.1.2.tar.xz 构建 Windows x64 LGPL FFmpeg' \
 		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
 		'  make asr-whisper-windows WHISPER_SOURCE=C:/whisper.cpp-v1.9.1.tar.gz 构建 SSE4.2 CPU sidecar' \
+		'  make asr-prepare-windows VC_REDIST_SOURCE=... VC_REDIST_LICENSE=... 组装 Windows 可信资源源目录' \
 		'  make asr-stage-macos ASR_SOURCE=/可信资源目录  准备 macOS ASR 随包资源' \
 		'  make asr-build-macos ASR_SOURCE=/可信资源目录  构建含本地 ASR 的 macOS .app' \
 		'  本机已准备资源时可直接运行 make asr-build-macos；默认复用 resources/asr-source/' \
 		'  make asr-build-macos ASR_BUNDLES=app,dmg  同时生成 DMG（需要可用 Finder 会话）' \
 		'  make asr-stage-windows ASR_SOURCE=/可信资源目录 准备 Windows ASR 随包资源' \
-		'  make asr-build-windows ASR_SOURCE=/可信资源目录 构建 Windows NSIS 安装包' \
+		'  make app-build-windows-dev ASR_SOURCE=/可信资源目录 构建无签名 Windows NSIS 开发包' \
+		'  make app-build-windows-release ASR_SOURCE=... WINDOWS_CERTIFICATE_THUMBPRINT=... WINDOWS_TIMESTAMP_URL=... 构建正式 Windows NSIS' \
+		'  make runtime-resource-publish-windows ASR_STAGE=... 生成已签名 Windows HTTPS 资源目录' \
 		'  make runtime-resource-verify ASR_STAGE=... 校验 Runtime Resource Pack 清单和逐文件哈希' \
 		'  make runtime-resource-publish ASR_STAGE=... RESOURCE_RELEASE_DIR=... 输出自有 HTTPS 静态托管目录' \
 		'  make asr-check-windows 交叉检查 Windows x64 根/Tauri crate 与严格 Clippy' \
+		'  make asr-test-windows-scripts 在原生 Windows 使用 PowerShell 5.1 AST 校验发行脚本' \
 		'  make asr-test-contract 只测试中立契约、资源、错误、取消和调度边界' \
 		'  make asr-test-media 只测试 FFprobe、FFmpeg、临时音频和原视频不变' \
 		'  make asr-test-vad ASR_RESOURCE_ROOT=... 使用随包 FFmpeg/VAD 运行真实人声、静音和纯音乐测试' \
@@ -243,11 +260,22 @@ app-build-resources: asr-stage-macos
 	"$(MAKE)" runtime-resource-verify ASR_STAGE="$(ASR_STAGE)"
 	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
 
-app-build-resources-windows: asr-stage-windows
-	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
-	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
-	"$(MAKE)" runtime-resource-verify-windows ASR_STAGE="$(ASR_STAGE)"
-	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
+app-build-resources-windows: app-build-windows-release
+
+app-build-windows-dev: asr-stage-windows
+	@test -n "$(WINDOWS_RESOURCE_BASE_URL)" || { printf '%s\n' '错误：必须设置 WINDOWS_RESOURCE_BASE_URL。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/build-windows-installer.ps1 \
+		-RepoRoot "$(CURDIR)" -Mode Development -ResourceBaseUrl "$(WINDOWS_RESOURCE_BASE_URL)" \
+		-Cargo "$(CARGO)" -Npm "$(NPM)"
+
+app-build-windows-release: runtime-resource-verify-windows-release
+	@test -n "$(WINDOWS_CERTIFICATE_THUMBPRINT)" || { printf '%s\n' '错误：正式 Windows 构建必须设置 WINDOWS_CERTIFICATE_THUMBPRINT。' >&2; exit 2; }
+	@test -n "$(WINDOWS_TIMESTAMP_URL)" || { printf '%s\n' '错误：正式 Windows 构建必须设置 WINDOWS_TIMESTAMP_URL。' >&2; exit 2; }
+	@test -n "$(WINDOWS_RESOURCE_BASE_URL)" || { printf '%s\n' '错误：必须设置 WINDOWS_RESOURCE_BASE_URL。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/build-windows-installer.ps1 \
+		-RepoRoot "$(CURDIR)" -Mode Release -ResourceBaseUrl "$(WINDOWS_RESOURCE_BASE_URL)" \
+		-CertificateThumbprint "$(WINDOWS_CERTIFICATE_THUMBPRINT)" -TimestampUrl "$(WINDOWS_TIMESTAMP_URL)" \
+		-Cargo "$(CARGO)" -Npm "$(NPM)"
 
 runtime-resource-verify:
 	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }
@@ -259,6 +287,14 @@ runtime-resource-verify-windows:
 	"$(CARGO)" run --offline --bin asr-bundle -- verify --root "$(ASR_STAGE)" --platform windows-x86-64
 	"$(POWERSHELL)" -NoProfile -File scripts/verify-clip-ffmpeg-capabilities.ps1 -Ffmpeg "$(ASR_STAGE)/bin/windows-x86_64/ffmpeg.exe"
 
+runtime-resource-verify-windows-release: runtime-resource-verify-windows
+	"$(CARGO)" run --offline --bin asr-bundle -- verify-signature --root "$(ASR_STAGE)"
+	@test -n "$(WINDOWS_CERTIFICATE_THUMBPRINT)" || { printf '%s\n' '错误：必须设置 WINDOWS_CERTIFICATE_THUMBPRINT。' >&2; exit 2; }
+	@test -n "$(WINDOWS_TIMESTAMP_URL)" || { printf '%s\n' '错误：必须设置 WINDOWS_TIMESTAMP_URL。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/sign-windows-resource-binaries.ps1 \
+		-ResourceRoot "$(ASR_STAGE)" -CertificateThumbprint "$(WINDOWS_CERTIFICATE_THUMBPRINT)" \
+		-TimestampUrl "$(WINDOWS_TIMESTAMP_URL)" -VerifyOnly
+
 runtime-resource-publish: runtime-resource-verify
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：必须设置 RESOURCE_BASE_URL（仅用于发布说明，应用地址由构建期注入）。' >&2; exit 2; }
 	@mkdir -p "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/aarch64/$(RESOURCE_BUNDLE_VERSION)"
@@ -266,9 +302,37 @@ runtime-resource-publish: runtime-resource-verify
 	@printf '{"channel":"%s","appVersion":"%s","platform":"macos","arch":"aarch64","bundleVersion":"%s","manifest":"runtime-manifest.json"}\n' "$(RESOURCE_CHANNEL)" "$(RESOURCE_APP_VERSION)" "$(RESOURCE_BUNDLE_VERSION)" > "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/index.json"
 	@printf '%s\n' '资源发布目录已生成。请在上传前使用正式 Ed25519 私钥签署 runtime-manifest.json，并将 RESOURCE_BASE_URL 配置到构建环境。'
 
+runtime-manifest-payload:
+	"$(CARGO)" run --offline --bin asr-bundle -- manifest-payload --root "$(ASR_STAGE)" \
+		--output "$(RUNTIME_MANIFEST_PAYLOAD)" --key-id "$(RUNTIME_MANIFEST_KEY_ID)"
+
+runtime-manifest-apply-signature:
+	@test -n "$(RUNTIME_MANIFEST_SIGNATURE)" || { printf '%s\n' '错误：必须设置 RUNTIME_MANIFEST_SIGNATURE。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- apply-signature --root "$(ASR_STAGE)" \
+		--signature-file "$(RUNTIME_MANIFEST_SIGNATURE)" --key-id "$(RUNTIME_MANIFEST_KEY_ID)"
+
+runtime-resource-publish-windows: runtime-resource-verify-windows-release
+	"$(CARGO)" run --offline --bin asr-bundle -- publish --root "$(ASR_STAGE)" \
+		--target "$(RESOURCE_RELEASE_DIR)" --platform windows-x86-64 --channel "$(RESOURCE_CHANNEL)" \
+		--app-version "$(RESOURCE_APP_VERSION)" --resource-base-url "$(WINDOWS_RESOURCE_BASE_URL)"
+
+runtime-resource-publish-windows-dev: runtime-resource-verify-windows
+	"$(CARGO)" run --offline --bin asr-bundle -- publish --root "$(ASR_STAGE)" \
+		--target "$(RESOURCE_RELEASE_DIR)" --platform windows-x86-64 --channel "$(RESOURCE_CHANNEL)" \
+		--app-version "$(RESOURCE_APP_VERSION)" --resource-base-url "$(WINDOWS_RESOURCE_BASE_URL)" \
+		--allow-unsigned-development
+
 asr-ffmpeg-macos:
 	@test -n "$(FFMPEG_SOURCE)" || { printf '%s\n' '错误：必须通过 FFMPEG_SOURCE 指定 ffmpeg-8.1.2.tar.xz。' >&2; exit 2; }
 	./scripts/build-asr-ffmpeg-macos.sh "$(FFMPEG_SOURCE)" "$(FFMPEG_ASR_OUTPUT)"
+
+windows-build-doctor:
+	"$(POWERSHELL)" -NoProfile -File scripts/windows-build-doctor.ps1
+
+asr-ffmpeg-windows: windows-build-doctor
+	@test -n "$(FFMPEG_SOURCE)" || { printf '%s\n' '错误：必须通过 FFMPEG_SOURCE 指定 ffmpeg-8.1.2.tar.xz。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/build-asr-ffmpeg-windows.ps1 \
+		-SourceArchive "$(FFMPEG_SOURCE)" -OutputRoot "$(WINDOWS_FFMPEG_OUTPUT)"
 
 asr-whisper-macos:
 	@test -n "$(WHISPER_SOURCE)" || { printf '%s\n' '错误：必须通过 WHISPER_SOURCE 指定 whisper.cpp-v1.9.1.tar.gz。' >&2; exit 2; }
@@ -276,27 +340,47 @@ asr-whisper-macos:
 
 asr-whisper-windows:
 	@test -n "$(WHISPER_SOURCE)" || { printf '%s\n' '错误：必须通过 WHISPER_SOURCE 指定 whisper.cpp-v1.9.1.tar.gz。' >&2; exit 2; }
-	"$(POWERSHELL)" -NoProfile -File scripts/build-asr-whisper-windows.ps1 -SourceArchive "$(WHISPER_SOURCE)" -OutputRoot "$(WHISPER_ASR_OUTPUT)"
+	"$(POWERSHELL)" -NoProfile -File scripts/build-asr-whisper-windows.ps1 -SourceArchive "$(WHISPER_SOURCE)" -OutputRoot "$(WINDOWS_WHISPER_OUTPUT)"
+
+asr-prepare-windows:
+	@test -n "$(VC_REDIST_SOURCE)" || { printf '%s\n' '错误：必须设置 VC_REDIST_SOURCE。' >&2; exit 2; }
+	@test -n "$(VC_REDIST_LICENSE)" || { printf '%s\n' '错误：必须设置 VC_REDIST_LICENSE。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/prepare-asr-resources-windows.ps1 \
+		-CommonSource "resources/asr-source" -FfmpegRoot "$(WINDOWS_FFMPEG_OUTPUT)" \
+		-WhisperRoot "$(WINDOWS_WHISPER_OUTPUT)" -VcRedist "$(VC_REDIST_SOURCE)" \
+		-VcLicense "$(VC_REDIST_LICENSE)" -OutputRoot "$(WINDOWS_RESOURCE_SOURCE)" \
+		-BundleVersion "$(RESOURCE_BUNDLE_VERSION)"
+
+asr-sign-windows-resources:
+	@test -n "$(WINDOWS_CERTIFICATE_THUMBPRINT)" || { printf '%s\n' '错误：必须设置 WINDOWS_CERTIFICATE_THUMBPRINT。' >&2; exit 2; }
+	@test -n "$(WINDOWS_TIMESTAMP_URL)" || { printf '%s\n' '错误：必须设置 WINDOWS_TIMESTAMP_URL。' >&2; exit 2; }
+	"$(POWERSHELL)" -NoProfile -File scripts/sign-windows-resource-binaries.ps1 \
+		-ResourceRoot "$(WINDOWS_RESOURCE_SOURCE)" -CertificateThumbprint "$(WINDOWS_CERTIFICATE_THUMBPRINT)" \
+		-TimestampUrl "$(WINDOWS_TIMESTAMP_URL)"
 
 asr-stage-macos:
 	@test -n "$(ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 ASR_SOURCE 指定已经准备好的可信资源目录。' >&2; exit 2; }
 	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(ASR_SOURCE)" --target "$(ASR_STAGE)" --platform macos-aarch64
 
 asr-stage-windows:
-	@test -n "$(ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 ASR_SOURCE 指定已经准备好的可信资源目录。' >&2; exit 2; }
-	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(ASR_SOURCE)" --target "$(ASR_STAGE)" --platform windows-x86-64
+	@test -n "$(WINDOWS_ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 WINDOWS_ASR_SOURCE 或 ASR_SOURCE 指定 Windows 可信资源目录。' >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(WINDOWS_ASR_SOURCE)" --target "$(ASR_STAGE)" --platform windows-x86-64 --channel "$(RESOURCE_CHANNEL)"
 
 asr-build-macos: asr-stage-macos
 	"$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
 
-asr-build-windows: asr-stage-windows
-	"$(NPM)" run tauri:build -- --config src-tauri/tauri.windows.conf.json
+asr-build-windows: app-build-windows-dev
+
+asr-test-windows-scripts:
+	"$(CARGO)" test --offline --test windows_powershell_scripts -- --nocapture
 
 asr-check-windows:
 	"$(CARGO)" xwin check --all-targets --target x86_64-pc-windows-msvc
 	"$(CARGO)" xwin clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 	"$(CARGO)" xwin check --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc
 	"$(CARGO)" xwin clippy --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+	"$(CARGO)" test --offline --test windows_packaging_contract -- --nocapture
+	"$(MAKE)" asr-test-windows-scripts
 
 asr-test-contract:
 	"$(CARGO)" test --offline --test asr_contract --test asr_resources --test asr_whisper_adapter --test asr_scheduler --test asr_spec_traceability -- --nocapture
