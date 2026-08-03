@@ -1159,8 +1159,9 @@ describe("AiWorkspace", () => {
     expect(pause).toHaveBeenCalledTimes(1);
   });
 
-  it("用左右方向键按三十帧逐帧并跨越片段边界", async () => {
+  it("用左右方向键按三十帧逐帧、保持播放状态并跨越片段边界", async () => {
     const { api, clip } = createKeyboardClipFixture();
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
     const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
     const { video } = await openKeyboardClipEditor(api);
 
@@ -1168,8 +1169,10 @@ describe("AiWorkspace", () => {
     expect(video.currentTime).toBeCloseTo(clip.segments[0].sourceStartMs / 1_000 + 1 / 30, 4);
     fireEvent.keyDown(document.body, { key: "ArrowRight", repeat: true });
     expect(video.currentTime).toBeCloseTo(clip.segments[0].sourceStartMs / 1_000 + 2 / 30, 4);
-    expect(pause).toHaveBeenCalledTimes(2);
+    expect(play).not.toHaveBeenCalled();
+    expect(pause).not.toHaveBeenCalled();
 
+    fireEvent.play(video);
     video.currentTime = clip.segments[0].sourceEndMs / 1_000 - 0.06;
     fireEvent.timeUpdate(video);
     fireEvent.keyDown(document.body, { key: "ArrowRight" });
@@ -1179,9 +1182,12 @@ describe("AiWorkspace", () => {
     const secondVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
     expect(secondVideo).toBe(video);
     await waitFor(() => expect(secondVideo.currentTime).toBeCloseTo(clip.segments[1].sourceStartMs / 1_000 + 0.007, 2));
+    await waitFor(() => expect(play).toHaveBeenCalled());
+    expect(pause).not.toHaveBeenCalled();
     fireEvent.keyDown(document.body, { key: "ArrowLeft" });
     await waitFor(() => expect(screen.getByRole("button", { name: `片段 1：${clip.segments[0].title}` })).toHaveClass("active"));
     await waitFor(() => expect(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.currentTime).toBeCloseTo(2.973, 2));
+    expect(pause).not.toHaveBeenCalled();
   });
 
   it("用组合方向键和首尾键跳转并保持播放状态", async () => {
@@ -1559,7 +1565,9 @@ describe("AiWorkspace", () => {
     await user.click(screen.getByRole("button", { name: "静音" }));
     await waitFor(() => expect(clipPreviewVideo.muted).toBe(true));
     await user.click(screen.getByRole("button", { name: "下一帧" }));
-    expect(pause).toHaveBeenCalled();
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(pause).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "暂停视频" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("时间轴缩放"), { target: { value: "80" } });
     expect(screen.getByLabelText("时间轴缩放")).toHaveValue("80");
 

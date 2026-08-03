@@ -1990,8 +1990,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
 
   const stepFrame = (direction: -1 | 1) => {
     const frameMs = 1_000 / 30;
-    videoRef.current?.pause();
-    seekProjectTime(timelinePositionMs + direction * frameMs);
+    seekProjectTime(timelinePositionMs + direction * frameMs, isPlaying);
   };
 
   const toggleMuted = () => setIsMuted((current) => !current);

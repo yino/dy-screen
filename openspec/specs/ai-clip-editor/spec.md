@@ -148,7 +148,7 @@ TBD - created by archiving change add-ai-clip-editor-and-thresholds. Update Purp
 
 #### Scenario: 使用方向键逐帧检查画面
 - **WHEN** 用户按下不带 `Shift` 的 `ArrowLeft` 或 `ArrowRight`
-- **THEN** 系统暂停播放器，并按固定 30 FPS 将工程播放头后退或前进一帧；持续按住方向键时允许连续逐帧
+- **THEN** 系统按固定 30 FPS 将工程播放头后退或前进一帧，并保持操作前的播放或暂停状态；持续按住方向键时允许连续逐帧
 
 #### Scenario: 逐帧跨越片段边界
 - **WHEN** 上一帧或下一帧落入相邻工程片段
