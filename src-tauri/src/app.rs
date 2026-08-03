@@ -1124,15 +1124,12 @@ async fn ai_start_clip_export(
         }
         tasks.insert(clip_project_id, token.clone());
     }
-    repository
-        .set_clip_export_state(
-            clip_project_id,
-            AiClipExportStatus::Exporting,
-            0,
-            None,
-            None,
-        )
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = repository.begin_clip_export(clip_project_id, project.version) {
+        if let Ok(mut tasks) = state.clip_export_tasks.lock() {
+            tasks.remove(&clip_project_id);
+        }
+        return Err(error.to_string());
+    }
     let temporary = destination.with_file_name(format!(
         ".{}.part.mp4",
         destination
@@ -1381,6 +1378,8 @@ pub fn run() {
             ai_open_clip_project,
             ai_get_clip_project,
             ai_update_clip_segment,
+            ai_update_clip_subtitle,
+            ai_reset_clip_subtitle,
             ai_insert_clip_candidate,
             ai_reorder_clip_segments,
             ai_remove_clip_segment,

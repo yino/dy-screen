@@ -1101,23 +1101,56 @@ describe("AiWorkspace", () => {
         effect: "none" as const,
       })),
       subtitles: [{
+        id: 731,
+        clipProjectId: 701,
         stableSegmentId: "clip-subtitle-first",
         clipSegmentId: 711,
         inputId: selectedCandidates[0].inputId,
-        normalizedText: "第一段 ASR 字幕。",
+        originalText: "第一段 ASR 字幕。",
+        text: "第一段 ASR 字幕。",
+        hidden: false,
         sourceStartMs: 1_000,
         sourceEndMs: 2_000,
         projectStartMs: 0,
         projectEndMs: 1_000,
       }, {
+        id: 732,
+        clipProjectId: 701,
         stableSegmentId: "clip-subtitle-second",
         clipSegmentId: 712,
         inputId: selectedCandidates[1].inputId,
-        normalizedText: "第二段 ASR 字幕。",
+        originalText: "第二段 ASR 字幕。",
+        text: "第二段 ASR 字幕。",
+        hidden: false,
         sourceStartMs: 500,
         sourceEndMs: 1_500,
         projectStartMs: 17_000,
         projectEndMs: 18_000,
+      }],
+      subtitleFrames: [{
+        subtitleId: 731,
+        clipSegmentId: 711,
+        projectStartMs: 0,
+        projectEndMs: 400,
+        pageText: "第一段 ASR 字幕。",
+        visibleText: "第一段",
+        hiddenText: " ASR 字幕。",
+      }, {
+        subtitleId: 731,
+        clipSegmentId: 711,
+        projectStartMs: 400,
+        projectEndMs: 1_000,
+        pageText: "第一段 ASR 字幕。",
+        visibleText: "第一段 ASR 字幕。",
+        hiddenText: "",
+      }, {
+        subtitleId: 732,
+        clipSegmentId: 712,
+        projectStartMs: 17_000,
+        projectEndMs: 18_000,
+        pageText: "第二段 ASR 字幕。",
+        visibleText: "第二段 ASR 字幕。",
+        hiddenText: "",
       }],
       subtitlesComplete: true,
     };
@@ -1127,6 +1160,8 @@ describe("AiWorkspace", () => {
     api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(selectedCandidatePage);
     api.openAiClipProject = vi.fn().mockResolvedValue(clip);
     let clipState = clip;
+    let rejectNextSubtitleSave = false;
+    api.getAiClipProject = vi.fn().mockImplementation(async () => clipState);
     api.updateAiClipSegment = vi.fn().mockImplementation(async (_projectId, segmentId, update) => {
       clipState = { ...clipState, segments: clipState.segments.map((segment) => segment.id === segmentId ? { ...segment, ...update } : segment) };
       return clipState;
@@ -1150,14 +1185,27 @@ describe("AiWorkspace", () => {
         ...clipState,
         segments: segments.map((segment, index) => ({ ...segment, position: index })),
         subtitles: [...clipState.subtitles, {
+          id: 733,
+          clipProjectId: 701,
           stableSegmentId: "clip-subtitle-appended",
           clipSegmentId: 713,
           inputId: candidate.inputId,
-          normalizedText: "追加片段 ASR 字幕。",
+          originalText: "追加片段 ASR 字幕。",
+          text: "追加片段 ASR 字幕。",
+          hidden: false,
           sourceStartMs: candidate.startMs,
           sourceEndMs: candidate.endMs,
           projectStartMs: 34_000,
           projectEndMs: 35_500,
+        }],
+        subtitleFrames: [...clipState.subtitleFrames, {
+          subtitleId: 733,
+          clipSegmentId: 713,
+          projectStartMs: 34_000,
+          projectEndMs: 35_500,
+          pageText: "追加片段 ASR 字幕。",
+          visibleText: "追加片段 ASR 字幕。",
+          hiddenText: "",
         }],
         subtitlesComplete: true,
       };
@@ -1165,6 +1213,45 @@ describe("AiWorkspace", () => {
     });
     api.reorderAiClipSegments = vi.fn().mockImplementation(async (_projectId: number, orderedIds: number[]) => {
       clipState = { ...clipState, segments: orderedIds.map((id, index) => ({ ...clipState.segments.find((segment) => segment.id === id)!, position: index })) };
+      return clipState;
+    });
+    api.updateAiClipSubtitle = vi.fn().mockImplementation(async (_projectId, subtitleId, update) => {
+      if (rejectNextSubtitleSave) {
+        rejectNextSubtitleSave = false;
+        throw { code: "clip_version_conflict", message: "剪辑工程版本已更新，请重新加载后再编辑字幕" };
+      }
+      const text = update.text.trim();
+      clipState = {
+        ...clipState,
+        project: {
+          ...clipState.project,
+          version: clipState.project.version + 1,
+          exportStatus: "idle",
+          outputPath: null,
+        },
+        subtitles: clipState.subtitles.map((subtitle) => subtitle.id === subtitleId
+          ? { ...subtitle, text, hidden: update.hidden }
+          : subtitle),
+        subtitleFrames: update.hidden
+          ? clipState.subtitleFrames.filter((frame) => frame.subtitleId !== subtitleId)
+          : clipState.subtitleFrames.map((frame) => frame.subtitleId === subtitleId
+            ? { ...frame, pageText: text, visibleText: text, hiddenText: "" }
+            : frame),
+      };
+      return clipState;
+    });
+    api.resetAiClipSubtitle = vi.fn().mockImplementation(async (_projectId, subtitleId) => {
+      const subtitle = clipState.subtitles.find((item) => item.id === subtitleId)!;
+      clipState = {
+        ...clipState,
+        project: { ...clipState.project, version: clipState.project.version + 1 },
+        subtitles: clipState.subtitles.map((item) => item.id === subtitleId
+          ? { ...item, text: item.originalText, hidden: false }
+          : item),
+        subtitleFrames: clipState.subtitleFrames.map((frame) => frame.subtitleId === subtitleId
+          ? { ...frame, pageText: subtitle.originalText, visibleText: subtitle.originalText, hiddenText: "" }
+          : frame),
+      };
       return clipState;
     });
     api.startAiClipExport = vi.fn().mockResolvedValue({ ...clip.project, exportStatus: "exporting", exportProgress: 0 });
@@ -1178,20 +1265,21 @@ describe("AiWorkspace", () => {
     expect(await screen.findByRole("button", { name: "追加视频 1" })).toBeEnabled();
     expect(screen.getByLabelText("时间轴缩放")).toHaveValue("50");
     expect(screen.getByRole("button", { name: "播放视频" })).toBeInTheDocument();
-    expect(screen.getByText("第一段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).toBeInTheDocument();
-    expect(screen.getByText("已关联 2 条只读字幕，导出时自动烧录")).toBeInTheDocument();
+    expect(screen.getByLabelText("播放器字幕")).toHaveTextContent("第一段 ASR 字幕。");
+    expect(screen.getByText("已关联 2 条工程字幕，可在字幕面板校对")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "字幕：第一段 ASR 字幕。" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` }));
-    expect(screen.getByText("第二段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).toBeInTheDocument();
+    expect(screen.getByLabelText("播放器字幕")).toHaveTextContent("第二段 ASR 字幕。");
     await user.click(screen.getByRole("button", { name: `片段 1：${clip.segments[0].title}` }));
     expect(screen.getByText("输出规格 1920 × 1080 · 工程版本 1")).toBeInTheDocument();
     await waitFor(() => expect(document.querySelector(".clip-preview-frame video")).not.toBeNull());
     const clipPreviewVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
     clipPreviewVideo.currentTime = 3;
     fireEvent.timeUpdate(clipPreviewVideo);
-    expect(screen.queryByText("第一段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).not.toBeInTheDocument();
-    clipPreviewVideo.currentTime = 1;
+    expect(screen.queryByLabelText("播放器字幕")).not.toBeInTheDocument();
+    clipPreviewVideo.currentTime = 1.5;
     fireEvent.timeUpdate(clipPreviewVideo);
-    expect(screen.getByText("第一段 ASR 字幕。", { selector: ".clip-subtitle-overlay" })).toBeInTheDocument();
+    expect(screen.getByLabelText("播放器字幕")).toHaveTextContent("第一段 ASR 字幕。");
     Object.defineProperties(clipPreviewVideo, {
       videoWidth: { configurable: true, value: 1080 },
       videoHeight: { configurable: true, value: 1920 },
@@ -1209,6 +1297,62 @@ describe("AiWorkspace", () => {
     expect(pause).toHaveBeenCalled();
     fireEvent.change(screen.getByLabelText("时间轴缩放"), { target: { value: "80" } });
     expect(screen.getByLabelText("时间轴缩放")).toHaveValue("80");
+
+    await user.click(screen.getByRole("button", { name: "字幕：第一段 ASR 字幕。" }));
+    expect(screen.getByRole("button", { name: "字幕属性" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("1 / 1 条字幕")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "全部字幕" }));
+    await user.type(screen.getByLabelText("搜索工程字幕"), "第二段");
+    expect(screen.getByText("1 / 2 条字幕")).toBeInTheDocument();
+    await user.clear(screen.getByLabelText("搜索工程字幕"));
+    await user.click(screen.getByRole("button", { name: "字幕列表：第二段 ASR 字幕。" }));
+    expect(screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` })).toHaveClass("active");
+    await user.click(screen.getByRole("button", { name: "字幕列表：第一段 ASR 字幕。" }));
+
+    const subtitleEditor = screen.getByLabelText("字幕文本");
+    await user.clear(subtitleEditor);
+    await user.type(subtitleEditor, "不会保存的草稿");
+    expect(screen.getByText("未保存")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(subtitleEditor).toHaveValue("第一段 ASR 字幕。");
+    expect(api.updateAiClipSubtitle).not.toHaveBeenCalled();
+
+    await user.clear(subtitleEditor);
+    await user.type(subtitleEditor, "第一段修正字幕。");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    await waitFor(() => expect(api.updateAiClipSubtitle).toHaveBeenCalledWith(701, 731, {
+      text: "第一段修正字幕。",
+      hidden: false,
+      expectedProjectVersion: 1,
+    }));
+    expect(await screen.findByText("已保存")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "隐藏字幕" }));
+    await waitFor(() => expect(api.updateAiClipSubtitle).toHaveBeenLastCalledWith(701, 731, {
+      text: "第一段修正字幕。",
+      hidden: true,
+      expectedProjectVersion: 2,
+    }));
+    expect(screen.getByRole("button", { name: "恢复显示" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "恢复显示" }));
+    await waitFor(() => expect(api.updateAiClipSubtitle).toHaveBeenLastCalledWith(701, 731, {
+      text: "第一段修正字幕。",
+      hidden: false,
+      expectedProjectVersion: 3,
+    }));
+    await user.click(screen.getByRole("button", { name: "恢复 ASR 原文" }));
+    await waitFor(() => expect(api.resetAiClipSubtitle).toHaveBeenCalledWith(701, 731, 4));
+    expect(screen.getByLabelText("字幕文本")).toHaveValue("第一段 ASR 字幕。");
+
+    rejectNextSubtitleSave = true;
+    await user.clear(screen.getByLabelText("字幕文本"));
+    await user.type(screen.getByLabelText("字幕文本"), "冲突草稿");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    expect(await screen.findByText("版本冲突")).toBeInTheDocument();
+    expect(screen.getByLabelText("字幕文本")).toHaveValue("冲突草稿");
+    await user.click(screen.getByRole("button", { name: "重新加载最新工程" }));
+    expect(screen.getByLabelText("字幕文本")).toHaveValue("第一段 ASR 字幕。");
+    await user.click(screen.getByRole("button", { name: "片段属性" }));
 
     fireEvent.change(screen.getByLabelText("片段音量"), { target: { value: "135" } });
     await waitFor(() => expect(api.updateAiClipSegment).toHaveBeenCalledWith(701, 711, {
@@ -1262,6 +1406,10 @@ describe("AiWorkspace", () => {
 
     await user.click(screen.getByRole("button", { name: "导出 MP4" }));
     expect(api.startAiClipExport).toHaveBeenCalledWith(701);
+    expect(screen.getByRole("button", { name: "删除选中" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "片段属性" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "字幕属性" }));
+    expect(screen.getByLabelText("字幕文本")).toBeDisabled();
     await user.click(await screen.findByRole("button", { name: "取消导出 0%" }));
     expect(api.cancelAiClipExport).toHaveBeenCalledWith(701);
     await user.click(screen.getByRole("button", { name: "返回 AI 剪辑" }));
@@ -1308,6 +1456,7 @@ describe("AiWorkspace", () => {
         effect: "none",
       }],
       subtitles: [],
+      subtitleFrames: [],
       subtitlesComplete: false,
     };
     const api = createAiApi();

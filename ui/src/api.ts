@@ -188,6 +188,10 @@ const tauriApi: ClientApi = {
   getAiClipProject: (clipProjectId) => invoke("ai_get_clip_project", { clipProjectId }),
   updateAiClipSegment: (clipProjectId, segmentId, update) =>
     invoke("ai_update_clip_segment", { clipProjectId, segmentId, update }),
+  updateAiClipSubtitle: (clipProjectId, subtitleId, update) =>
+    invoke("ai_update_clip_subtitle", { clipProjectId, subtitleId, update }),
+  resetAiClipSubtitle: (clipProjectId, subtitleId, expectedProjectVersion) =>
+    invoke("ai_reset_clip_subtitle", { clipProjectId, subtitleId, expectedProjectVersion }),
   insertAiClipCandidate: (clipProjectId, candidateId, insertIndex) =>
     invoke("ai_insert_clip_candidate", { clipProjectId, candidateId, insertIndex }),
   reorderAiClipSegments: (clipProjectId, orderedIds) =>
@@ -696,6 +700,8 @@ export function createBrowserApi(): ClientApi {
     openAiClipProject: async () => { throw new Error("浏览器演示模式不能创建本地剪辑工程"); },
     getAiClipProject: async () => { throw new Error("浏览器演示模式不能读取本地剪辑工程"); },
     updateAiClipSegment: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },
+    updateAiClipSubtitle: async () => { throw new Error("浏览器演示模式不能校对本地剪辑字幕"); },
+    resetAiClipSubtitle: async () => { throw new Error("浏览器演示模式不能恢复本地剪辑字幕"); },
     insertAiClipCandidate: async () => { throw new Error("浏览器演示模式不能向本地剪辑工程追加视频"); },
     reorderAiClipSegments: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },
     removeAiClipSegment: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },

@@ -131,6 +131,14 @@ function safeError(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function safeErrorCode(error: unknown): string | null {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : null;
+  }
+  return null;
+}
+
 function highlightRunIsActive(run: AiHighlightRun | null): boolean {
   return run !== null && ["pending", "running", "candidates", "ranking"].includes(run.status);
 }
@@ -1546,6 +1554,17 @@ const clipEffects: Array<{
 ];
 
 type ClipMaterialFilter = "all" | "video" | "animation" | "transition";
+type ClipPropertyMode = "segment" | "subtitle";
+type ClipSubtitleScope = "current" | "all";
+type ClipSubtitleSaveState = "saved" | "unsaved" | "saving" | "failed" | "conflict";
+
+const clipSubtitleSaveLabels: Record<ClipSubtitleSaveState, string> = {
+  saved: "已保存",
+  unsaved: "未保存",
+  saving: "保存中",
+  failed: "保存失败",
+  conflict: "版本冲突",
+};
 
 function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initial: AiClipProjectDetail; projectId: number; onBack: () => void }) {
   const [detail, setDetail] = useState(initial);
@@ -1566,6 +1585,15 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const [draggedEffect, setDraggedEffect] = useState<AiClipEffect | null>(null);
   const [draggedCandidateId, setDraggedCandidateId] = useState<number | null>(null);
   const [activeDropIndex, setActiveDropIndex] = useState<number | null>(null);
+  const [propertyMode, setPropertyMode] = useState<ClipPropertyMode>("segment");
+  const [subtitleScope, setSubtitleScope] = useState<ClipSubtitleScope>("current");
+  const [subtitleSearch, setSubtitleSearch] = useState("");
+  const [selectedSubtitleId, setSelectedSubtitleId] = useState<number | null>(null);
+  const [subtitleDrafts, setSubtitleDrafts] = useState<Record<number, string>>({});
+  const [subtitleSaveStates, setSubtitleSaveStates] = useState<Record<number, ClipSubtitleSaveState>>({});
+  const [subtitleSaveErrors, setSubtitleSaveErrors] = useState<Record<number, string>>({});
+  const [subtitleMutationPending, setSubtitleMutationPending] = useState(false);
+  const [isSubtitleComposing, setIsSubtitleComposing] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineBodyRef = useRef<HTMLDivElement>(null);
   const materialsRef = useRef<HTMLElement>(null);
@@ -1576,10 +1604,12 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const selected = detail.segments.find((segment) => segment.id === selectedId) ?? detail.segments[0] ?? null;
   const selectedIndex = selected ? detail.segments.findIndex((segment) => segment.id === selected.id) : -1;
   const totalDuration = detail.segments.reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
-  const currentSubtitle = detail.subtitles
-    .filter((subtitle) => subtitle.projectStartMs <= timelinePositionMs && subtitle.projectEndMs > timelinePositionMs)
-    .sort((left, right) => left.projectStartMs - right.projectStartMs || left.stableSegmentId.localeCompare(right.stableSegmentId))
-    .at(-1) ?? null;
+  const currentSubtitleFrame = detail.subtitleFrames.find(
+    (frame) => frame.projectStartMs <= timelinePositionMs && frame.projectEndMs > timelinePositionMs,
+  ) ?? null;
+  const currentSubtitle = currentSubtitleFrame
+    ? detail.subtitles.find((subtitle) => subtitle.id === currentSubtitleFrame.subtitleId) ?? null
+    : null;
   const timelineStartMs = detail.segments
     .slice(0, Math.max(selectedIndex, 0))
     .reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
@@ -1595,6 +1625,29 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     (_, index) => Math.min(totalDuration, index * tickIntervalSeconds * 1_000),
   );
   if (timelineTicks[timelineTicks.length - 1] !== totalDuration) timelineTicks.push(totalDuration);
+  const activeSubtitle = selectedSubtitleId === null
+    ? null
+    : detail.subtitles.find((subtitle) => subtitle.id === selectedSubtitleId) ?? null;
+  const subtitleQuery = subtitleSearch.trim().toLocaleLowerCase();
+  const scopedSubtitles = detail.subtitles.filter(
+    (subtitle) => subtitleScope === "all" || subtitle.clipSegmentId === selected?.id,
+  );
+  const filteredSubtitles = scopedSubtitles.filter((subtitle) => {
+    if (!subtitleQuery) return true;
+    return subtitle.text.toLocaleLowerCase().includes(subtitleQuery)
+      || subtitle.originalText.toLocaleLowerCase().includes(subtitleQuery);
+  });
+  const activeSubtitleDraft = activeSubtitle
+    ? subtitleDrafts[activeSubtitle.id] ?? activeSubtitle.text
+    : "";
+  const activeSubtitleSaveState = activeSubtitle
+    ? subtitleSaveStates[activeSubtitle.id] ?? "saved"
+    : "saved";
+  const hasUnsavedSubtitles = Object.values(subtitleSaveStates).some(
+    (state) => state !== "saved",
+  );
+  const editorLocked = detail.project.exportStatus === "exporting";
+  const versionMutationLocked = editorLocked || subtitleMutationPending || hasUnsavedSubtitles;
 
   const applyPreviewVolume = useCallback((video: HTMLVideoElement, volumePercent: number) => {
     const normalized = Math.min(200, Math.max(0, volumePercent));
@@ -1730,7 +1783,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   }, [api, detail.project.exportStatus, detail.project.id]);
 
   const saveSegment = async (segment: AiClipSegment, update: Partial<Pick<AiClipSegment, "volumePercent" | "effect">>) => {
-    if (!api.updateAiClipSegment) return;
+    if (!api.updateAiClipSegment || versionMutationLocked) return;
     try {
       setMessage(null);
       setDetail(await api.updateAiClipSegment(segment.clipProjectId, segment.id, {
@@ -1772,6 +1825,127 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     if (resume) void video.play().catch(() => setIsPlaying(false));
   };
 
+  const selectSubtitle = (subtitleId: number) => {
+    const subtitle = detail.subtitles.find((item) => item.id === subtitleId);
+    if (!subtitle) return;
+    setPropertyMode("subtitle");
+    setSelectedSubtitleId(subtitle.id);
+    setSelectedId(subtitle.clipSegmentId);
+    seekProjectTime(subtitle.projectStartMs);
+  };
+
+  const discardSubtitleDraft = (subtitleId: number) => {
+    const subtitle = detail.subtitles.find((item) => item.id === subtitleId);
+    if (!subtitle) return;
+    setSubtitleDrafts((current) => ({ ...current, [subtitleId]: subtitle.text }));
+    setSubtitleSaveStates((current) => ({ ...current, [subtitleId]: "saved" }));
+    setSubtitleSaveErrors((current) => {
+      const next = { ...current };
+      delete next[subtitleId];
+      return next;
+    });
+  };
+
+  const saveSubtitle = async (subtitleId: number, hidden?: boolean) => {
+    const subtitle = detail.subtitles.find((item) => item.id === subtitleId);
+    if (!subtitle || !api.updateAiClipSubtitle || editorLocked || subtitleMutationPending) return;
+    const text = subtitleDrafts[subtitle.id] ?? subtitle.text;
+    const nextHidden = hidden ?? subtitle.hidden;
+    if (text === subtitle.text && nextHidden === subtitle.hidden) {
+      discardSubtitleDraft(subtitle.id);
+      return;
+    }
+    const wasCompleted = detail.project.exportStatus === "completed";
+    setSubtitleMutationPending(true);
+    setSubtitleSaveStates((current) => ({ ...current, [subtitle.id]: "saving" }));
+    setSubtitleSaveErrors((current) => {
+      const next = { ...current };
+      delete next[subtitle.id];
+      return next;
+    });
+    try {
+      const next = await api.updateAiClipSubtitle(detail.project.id, subtitle.id, {
+        text,
+        hidden: nextHidden,
+        expectedProjectVersion: detail.project.version,
+      });
+      setDetail(next);
+      const saved = next.subtitles.find((item) => item.id === subtitle.id);
+      setSubtitleDrafts((current) => ({ ...current, [subtitle.id]: saved?.text ?? text }));
+      setSubtitleSaveStates((current) => ({ ...current, [subtitle.id]: "saved" }));
+      if (wasCompleted) setMessage("字幕已更新，旧成品仍保留；请重新导出包含最新字幕的 MP4");
+    } catch (error) {
+      const conflict = safeErrorCode(error) === "clip_version_conflict";
+      setSubtitleSaveStates((current) => ({
+        ...current,
+        [subtitle.id]: conflict ? "conflict" : "failed",
+      }));
+      setSubtitleSaveErrors((current) => ({
+        ...current,
+        [subtitle.id]: safeError(error, conflict ? "工程已更新，请重新加载后再编辑" : "保存字幕失败"),
+      }));
+    } finally {
+      setSubtitleMutationPending(false);
+    }
+  };
+
+  const resetSubtitle = async (subtitleId: number) => {
+    const subtitle = detail.subtitles.find((item) => item.id === subtitleId);
+    if (!subtitle || !api.resetAiClipSubtitle || editorLocked || subtitleMutationPending) return;
+    const wasCompleted = detail.project.exportStatus === "completed";
+    setSubtitleMutationPending(true);
+    setSubtitleSaveStates((current) => ({ ...current, [subtitle.id]: "saving" }));
+    try {
+      const next = await api.resetAiClipSubtitle(
+        detail.project.id,
+        subtitle.id,
+        detail.project.version,
+      );
+      setDetail(next);
+      const saved = next.subtitles.find((item) => item.id === subtitle.id);
+      setSubtitleDrafts((current) => ({
+        ...current,
+        [subtitle.id]: saved?.text ?? subtitle.originalText,
+      }));
+      setSubtitleSaveStates((current) => ({ ...current, [subtitle.id]: "saved" }));
+      setSubtitleSaveErrors((current) => {
+        const values = { ...current };
+        delete values[subtitle.id];
+        return values;
+      });
+      if (wasCompleted) setMessage("字幕已恢复为 ASR 原文，旧成品仍保留；请重新导出 MP4");
+    } catch (error) {
+      const conflict = safeErrorCode(error) === "clip_version_conflict";
+      setSubtitleSaveStates((current) => ({
+        ...current,
+        [subtitle.id]: conflict ? "conflict" : "failed",
+      }));
+      setSubtitleSaveErrors((current) => ({
+        ...current,
+        [subtitle.id]: safeError(error, conflict ? "工程已更新，请重新加载后再编辑" : "恢复 ASR 原文失败"),
+      }));
+    } finally {
+      setSubtitleMutationPending(false);
+    }
+  };
+
+  const reloadClipProject = async () => {
+    if (!api.getAiClipProject) return;
+    try {
+      const next = await api.getAiClipProject(detail.project.id);
+      setDetail(next);
+      setSubtitleDrafts({});
+      setSubtitleSaveStates({});
+      setSubtitleSaveErrors({});
+      if (selectedSubtitleId !== null && !next.subtitles.some((item) => item.id === selectedSubtitleId)) {
+        setSelectedSubtitleId(null);
+      }
+      setMessage("已重新加载最新剪辑工程");
+    } catch (error) {
+      setMessage(safeError(error, "重新加载剪辑工程失败"));
+    }
+  };
+
   const togglePlayback = () => {
     const video = videoRef.current;
     if (!video) return;
@@ -1796,7 +1970,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const applyDraggedEffect = (event: DragEvent<HTMLElement>, segment: AiClipSegment) => {
-    if (!draggedEffect) return;
+    if (!draggedEffect || versionMutationLocked) return;
     event.preventDefault();
     event.stopPropagation();
     void saveSegment(segment, { effect: draggedEffect });
@@ -1804,7 +1978,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const insertCandidate = async (candidateId: number, insertIndex: number) => {
-    if (!api.insertAiClipCandidate) return;
+    if (!api.insertAiClipCandidate || versionMutationLocked) return;
     try {
       setMessage(null);
       const next = await api.insertAiClipCandidate(detail.project.id, candidateId, insertIndex);
@@ -1847,7 +2021,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     event.preventDefault();
     event.stopPropagation();
     setActiveDropIndex(null);
-    if (draggedSegmentId === null || !api.reorderAiClipSegments) return;
+    if (draggedSegmentId === null || !api.reorderAiClipSegments || versionMutationLocked) return;
     const ids = detail.segments.map((segment) => segment.id);
     const fromIndex = ids.indexOf(draggedSegmentId);
     if (fromIndex < 0) return;
@@ -1865,7 +2039,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const reorder = async (from: number, direction: -1 | 1) => {
-    if (!api.reorderAiClipSegments) return;
+    if (!api.reorderAiClipSegments || versionMutationLocked) return;
     const next = from + direction;
     if (next < 0 || next >= detail.segments.length) return;
     const ids = detail.segments.map((segment) => segment.id);
@@ -1875,7 +2049,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const remove = async () => {
-    if (!selected || !api.removeAiClipSegment) return;
+    if (!selected || !api.removeAiClipSegment || versionMutationLocked) return;
     try {
       const next = await api.removeAiClipSegment(detail.project.id, selected.id);
       setDetail(next);
@@ -1884,7 +2058,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const exportVideo = async () => {
-    if (!api.startAiClipExport) return;
+    if (!api.startAiClipExport || hasUnsavedSubtitles || subtitleMutationPending) return;
     try {
       const project = await api.startAiClipExport(detail.project.id);
       setDetail((current) => ({ ...current, project }));
@@ -1970,7 +2144,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
       <div className="clip-export-actions">
         <button
           className="secondary-button"
-          disabled={loadingVideoMaterials || availableVideoMaterials.length === 0}
+          disabled={versionMutationLocked || loadingVideoMaterials || availableVideoMaterials.length === 0}
           onClick={() => {
             setMaterialFilter("video");
             materialsRef.current?.focus();
@@ -1978,7 +2152,16 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
         ><Plus size={15} />追加视频{availableVideoMaterials.length > 0 ? ` ${availableVideoMaterials.length}` : ""}</button>
         {detail.project.exportStatus === "exporting"
           ? <button className="secondary-button" onClick={() => void cancelExport()}>取消导出 {detail.project.exportProgress}%</button>
-          : <button className="primary-button" disabled={!detail.subtitlesComplete} title={detail.subtitlesComplete ? "导出带烧录字幕的 MP4" : "存在缺少 ASR 字幕的片段"} onClick={() => void exportVideo()}><Download size={16} />{detail.project.exportStatus === "failed" ? "重试导出" : "导出 MP4"}</button>}
+          : <button
+            className="primary-button"
+            disabled={!detail.subtitlesComplete || hasUnsavedSubtitles || subtitleMutationPending}
+            title={!detail.subtitlesComplete
+              ? "存在缺少 ASR 字幕的片段"
+              : hasUnsavedSubtitles || subtitleMutationPending
+                ? "请先保存或放弃所有字幕草稿"
+                : "导出带烧录字幕的 MP4"}
+            onClick={() => void exportVideo()}
+          ><Download size={16} />{detail.project.exportStatus === "failed" ? "重试导出" : "导出 MP4"}</button>}
       </div>
     </header>
 
@@ -1994,7 +2177,8 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
             className="clip-video-material"
             aria-label={`追加视频：${candidate.title}`}
             title="点击追加到末尾，或拖到时间轴间隙"
-            draggable
+            draggable={!versionMutationLocked}
+            disabled={versionMutationLocked}
             onClick={() => void insertCandidate(candidate.id, detail.segments.length)}
             onDragStart={(event) => { event.dataTransfer.effectAllowed = "copy"; setDraggedCandidateId(candidate.id); }}
             onDragEnd={() => { setDraggedCandidateId(null); setActiveDropIndex(null); }}
@@ -2006,8 +2190,8 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               className={`${selected?.effect === effect.value ? "active" : ""} ${effect.category}`}
               aria-label={`${effect.label}内置效果`}
               title={`${effect.label}：${effect.description}`}
-              draggable={Boolean(selected)}
-              disabled={!selected}
+              draggable={Boolean(selected) && !versionMutationLocked}
+              disabled={!selected || versionMutationLocked}
               onClick={() => selected && void saveSegment(selected, { effect: effect.value })}
               onDragStart={(event) => { event.dataTransfer.effectAllowed = "copy"; setDraggedEffect(effect.value); }}
               onDragEnd={() => setDraggedEffect(null)}
@@ -2034,7 +2218,11 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                 onTimeUpdate={(event) => updateTimelinePosition(event.currentTarget)}
               />
               {previewOverlay && <i className={`clip-preview-effect ${previewOverlay.color}`} style={{ opacity: previewOverlay.opacity }} aria-hidden="true" />}
-              {currentSubtitle && <div className="clip-subtitle-overlay" aria-live="polite">{currentSubtitle.normalizedText}</div>}
+              {currentSubtitle && currentSubtitleFrame && <div
+                className="clip-subtitle-overlay"
+                aria-label="播放器字幕"
+                aria-live="polite"
+              ><span>{currentSubtitleFrame.visibleText}</span><span className="clip-subtitle-hidden-layout" aria-hidden="true">{currentSubtitleFrame.hiddenText}</span></div>}
               <div className="clip-player-controls">
                 <button className="icon-button" aria-label={isPlaying ? "暂停视频" : "播放视频"} title={isPlaying ? "暂停" : "播放"} onClick={togglePlayback}>{isPlaying ? <Pause size={17} /> : <Play size={17} />}</button>
                 <button className="icon-button" aria-label="上一帧" title="上一帧" onClick={() => stepFrame(-1)}><SkipBack size={16} /></button>
@@ -2052,13 +2240,13 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
           <header className="clip-timeline-toolbar">
             <div className="clip-timeline-actions">
               <strong>时间轨道</strong>
-              <button className="clip-tool-button danger" disabled={!selected} onClick={() => void remove()}><Trash2 size={13} />删除选中</button>
-              <button className="clip-tool-button" aria-label="片段左移" disabled={!selected || selected.position === 0} onClick={() => selected && void reorder(selected.position, -1)}><ArrowUp size={13} />左移</button>
-              <button className="clip-tool-button" aria-label="片段右移" disabled={!selected || selected.position === detail.segments.length - 1} onClick={() => selected && void reorder(selected.position, 1)}><ArrowDown size={13} />右移</button>
+              <button className="clip-tool-button danger" disabled={!selected || versionMutationLocked} onClick={() => void remove()}><Trash2 size={13} />删除选中</button>
+              <button className="clip-tool-button" aria-label="片段左移" disabled={!selected || selected.position === 0 || versionMutationLocked} onClick={() => selected && void reorder(selected.position, -1)}><ArrowUp size={13} />左移</button>
+              <button className="clip-tool-button" aria-label="片段右移" disabled={!selected || selected.position === detail.segments.length - 1 || versionMutationLocked} onClick={() => selected && void reorder(selected.position, 1)}><ArrowDown size={13} />右移</button>
             </div>
             <label className="clip-zoom-control"><ZoomOut size={13} /><input aria-label="时间轴缩放" type="range" min="1" max="100" value={timelineZoom} onChange={(event) => setTimelineZoom(Number(event.target.value))} /><ZoomIn size={13} /><b>{timelineZoom}%</b></label>
           </header>
-          <div className="clip-timeline-legend"><span><i className="video" />视频片段</span><span><i className="effect" />已应用效果</span><span><i className="selected" />当前片段</span><small>拖动片段到间隙可调整顺序</small></div>
+          <div className="clip-timeline-legend"><span><i className="video" />视频片段</span><span><i className="subtitle" />工程字幕</span><span><i className="effect" />已应用效果</span><span><i className="selected" />当前片段</span><small>字幕轨只用于定位，不能拖动调时</small></div>
           <div className="clip-timeline-body" ref={timelineBodyRef}>
             <div className="clip-timeline-canvas" style={{ width: timelineWidth }}>
               <div className="clip-ruler" onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); seekProjectTime(((event.clientX - rect.left) / rect.width) * totalDuration); }}>
@@ -2075,12 +2263,13 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                       <button
                         className={`clip-insert-gap ${activeDropIndex === index ? "active" : ""}`}
                         aria-label={`拖放到位置 ${index + 1}`}
+                        disabled={versionMutationLocked}
                         onDragOver={(event) => { if (draggedSegmentId !== null || draggedCandidateId !== null || draggedEffect !== null) { event.preventDefault(); setActiveDropIndex(index); } }}
                         onDragLeave={() => setActiveDropIndex((current) => current === index ? null : current)}
                         onDrop={(event) => void dropMaterialOrSegmentAt(event, index)}
                       />
                       <button
-                        draggable
+                        draggable={!versionMutationLocked}
                         aria-label={`片段 ${index + 1}：${segment.title}`}
                         className={`${segment.id === selected?.id ? "active" : ""} ${draggedEffect ? "effect-target" : ""}`}
                         style={{ width: `${Math.max(3, duration / Math.max(totalDuration, 1) * 100)}%` }}
@@ -2095,49 +2284,149 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                   <button
                     className={`clip-insert-gap ${activeDropIndex === detail.segments.length ? "active" : ""}`}
                     aria-label={`拖放到位置 ${detail.segments.length + 1}`}
+                    disabled={versionMutationLocked}
                     onDragOver={(event) => { if (draggedSegmentId !== null || draggedCandidateId !== null || draggedEffect !== null) { event.preventDefault(); setActiveDropIndex(detail.segments.length); } }}
                     onDragLeave={() => setActiveDropIndex((current) => current === detail.segments.length ? null : current)}
                     onDrop={(event) => void dropMaterialOrSegmentAt(event, detail.segments.length)}
                   />
                 </div>
               </div>
+              <div className="clip-subtitle-track" aria-label="字幕轨" onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); seekProjectTime(((event.clientX - rect.left) / rect.width) * totalDuration); }}>
+                <i className="clip-playhead" style={{ left: `${playheadPercent}%` }} aria-hidden="true" />
+                <div className="clip-track-grid" aria-hidden="true">{timelineTicks.slice(1).map((tick) => <i key={tick} style={{ left: `${totalDuration > 0 ? tick / totalDuration * 100 : 0}%` }} />)}</div>
+                {detail.subtitles.map((subtitle) => <button
+                  key={subtitle.id}
+                  type="button"
+                  aria-label={`字幕：${subtitle.text}`}
+                  aria-current={currentSubtitle?.id === subtitle.id ? "true" : undefined}
+                  className={`${subtitle.hidden ? "hidden" : ""} ${selectedSubtitleId === subtitle.id ? "active" : ""} ${currentSubtitle?.id === subtitle.id ? "playing" : ""}`}
+                  style={{
+                    left: `${totalDuration > 0 ? subtitle.projectStartMs / totalDuration * 100 : 0}%`,
+                    width: `${totalDuration > 0 ? Math.max(0.8, (subtitle.projectEndMs - subtitle.projectStartMs) / totalDuration * 100) : 0}%`,
+                  }}
+                  title={subtitle.hidden ? `已隐藏：${subtitle.text}` : subtitle.text}
+                  onClick={(event) => { event.stopPropagation(); selectSubtitle(subtitle.id); }}
+                >{subtitle.hidden && <CircleOff size={10} />}<span>{subtitle.text}</span></button>)}
+              </div>
             </div>
           </div>
-          <footer><span>总时长 {formatDuration(totalDuration)}</span><span>{detail.segments.length} 个视频片段</span><span>{Math.round(pixelsPerSecond)} px/s</span></footer>
+          <footer><span>总时长 {formatDuration(totalDuration)}</span><span>{detail.segments.length} 个视频片段</span><span>{detail.subtitles.length} 条字幕</span><span>{Math.round(pixelsPerSecond)} px/s</span></footer>
         </section>
       </section>
 
-      <aside className="clip-properties" aria-label="片段属性">
-        <header><p className="section-kicker">PROPERTIES</p><h3>片段属性</h3></header>
-        {selected ? <>
-          <section className="clip-property-group">
-            <h4>基本信息</h4>
-            <label>名称<input type="text" readOnly value={selected.title} /></label>
-            <dl><div><dt>类型</dt><dd>视频片段</dd></div><div><dt>工程起始</dt><dd>{formatDuration(timelineStartMs)}</dd></div><div><dt>片段时长</dt><dd>{formatDuration(selectedDuration)}</dd></div><div><dt>源时间</dt><dd>{formatTimestamp(selected.sourceStartMs)} – {formatTimestamp(selected.sourceEndMs)}</dd></div></dl>
-          </section>
-          <section className="clip-property-group">
-            <h4>音频音量</h4>
-            <label>音量 <b>{selected.volumePercent}%</b><input aria-label="片段音量" type="range" min="0" max="200" value={selected.volumePercent} onChange={(event) => void saveSegment(selected, { volumePercent: Number(event.target.value) })} /></label>
-          </section>
-          <section className="clip-property-group">
-            <h4>画面效果</h4>
-            <label>内置效果<select value={selected.effect} onChange={(event) => void saveSegment(selected, { effect: event.target.value as AiClipEffect })}>{clipEffects.map((effect) => <option key={effect.value} value={effect.value}>{effect.label}</option>)}</select></label>
-            <p><CurrentEffectIcon size={14} />{currentEffect.description}</p>
-          </section>
-          <section className="clip-property-group">
-            <h4>ASR 字幕</h4>
-            <p className={detail.subtitlesComplete ? "clip-subtitle-ready" : "clip-subtitle-missing"}><Captions size={14} />{detail.subtitlesComplete ? `已关联 ${detail.subtitles.length} 条只读字幕，导出时自动烧录` : "部分片段没有 ASR 字幕，请补全识别或移除后再导出"}</p>
-          </section>
-          <div className="clip-segment-actions">
-            <button className="icon-button" aria-label="片段上移" title="向前移动" disabled={selected.position === 0} onClick={() => void reorder(selected.position, -1)}><ArrowUp size={15} /></button>
-            <button className="icon-button" aria-label="片段下移" title="向后移动" disabled={selected.position === detail.segments.length - 1} onClick={() => void reorder(selected.position, 1)}><ArrowDown size={15} /></button>
-            <button className="icon-button danger" aria-label="移除片段" title="移除片段" onClick={() => void remove()}><Trash2 size={15} /></button>
+      <aside className="clip-properties" aria-label="剪辑属性">
+        <header><p className="section-kicker">PROPERTIES</p><h3>属性</h3></header>
+        <nav className="clip-property-tabs" aria-label="属性类型">
+          <button aria-label="片段属性" aria-pressed={propertyMode === "segment"} className={propertyMode === "segment" ? "active" : ""} onClick={() => setPropertyMode("segment")}>片段</button>
+          <button
+            aria-label="字幕属性"
+            aria-pressed={propertyMode === "subtitle"}
+            className={propertyMode === "subtitle" ? "active" : ""}
+            onClick={() => {
+              setPropertyMode("subtitle");
+              if (selectedSubtitleId === null) {
+                setSelectedSubtitleId(currentSubtitle?.id ?? scopedSubtitles[0]?.id ?? detail.subtitles[0]?.id ?? null);
+              }
+            }}
+          >字幕</button>
+        </nav>
+
+        {propertyMode === "segment" ? <div className="clip-property-panel">
+          {selected ? <>
+            <section className="clip-property-group">
+              <h4>基本信息</h4>
+              <label>名称<input type="text" readOnly value={selected.title} /></label>
+              <dl><div><dt>类型</dt><dd>视频片段</dd></div><div><dt>工程起始</dt><dd>{formatDuration(timelineStartMs)}</dd></div><div><dt>片段时长</dt><dd>{formatDuration(selectedDuration)}</dd></div><div><dt>源时间</dt><dd>{formatTimestamp(selected.sourceStartMs)} – {formatTimestamp(selected.sourceEndMs)}</dd></div></dl>
+            </section>
+            <section className="clip-property-group">
+              <h4>音频音量</h4>
+              <label>音量 <b>{selected.volumePercent}%</b><input aria-label="片段音量" disabled={versionMutationLocked} type="range" min="0" max="200" value={selected.volumePercent} onChange={(event) => void saveSegment(selected, { volumePercent: Number(event.target.value) })} /></label>
+            </section>
+            <section className="clip-property-group">
+              <h4>画面效果</h4>
+              <label>内置效果<select disabled={versionMutationLocked} value={selected.effect} onChange={(event) => void saveSegment(selected, { effect: event.target.value as AiClipEffect })}>{clipEffects.map((effect) => <option key={effect.value} value={effect.value}>{effect.label}</option>)}</select></label>
+              <p><CurrentEffectIcon size={14} />{currentEffect.description}</p>
+            </section>
+            <section className="clip-property-group">
+              <h4>工程字幕</h4>
+              <p className={detail.subtitlesComplete ? "clip-subtitle-ready" : "clip-subtitle-missing"}><Captions size={14} />{detail.subtitlesComplete ? `已关联 ${detail.subtitles.length} 条工程字幕，可在字幕面板校对` : "部分片段没有 ASR 字幕，请补全识别或移除后再导出"}</p>
+            </section>
+            <div className="clip-segment-actions">
+              <button className="icon-button" aria-label="片段上移" title="向前移动" disabled={selected.position === 0 || versionMutationLocked} onClick={() => void reorder(selected.position, -1)}><ArrowUp size={15} /></button>
+              <button className="icon-button" aria-label="片段下移" title="向后移动" disabled={selected.position === detail.segments.length - 1 || versionMutationLocked} onClick={() => void reorder(selected.position, 1)}><ArrowDown size={15} /></button>
+              <button className="icon-button danger" aria-label="移除片段" title="移除片段" disabled={versionMutationLocked} onClick={() => void remove()}><Trash2 size={15} /></button>
+            </div>
+          </> : <p className="clip-property-empty">没有可编辑片段</p>}
+        </div> : <div className="clip-subtitle-panel">
+          <div className="clip-subtitle-tools">
+            <div className="clip-subtitle-scope" role="group" aria-label="字幕列表范围">
+              <button aria-label="当前片段字幕" aria-pressed={subtitleScope === "current"} className={subtitleScope === "current" ? "active" : ""} onClick={() => setSubtitleScope("current")}>当前片段</button>
+              <button aria-label="全部字幕" aria-pressed={subtitleScope === "all"} className={subtitleScope === "all" ? "active" : ""} onClick={() => setSubtitleScope("all")}>全部</button>
+            </div>
+            <label>搜索字幕<input aria-label="搜索工程字幕" type="search" value={subtitleSearch} onChange={(event) => setSubtitleSearch(event.target.value)} placeholder="原文或修正文案" /></label>
+            <small>{filteredSubtitles.length} / {scopedSubtitles.length} 条字幕</small>
           </div>
-        </> : <p className="clip-property-empty">没有可编辑片段</p>}
-        {detail.project.outputWidth && detail.project.outputHeight && <small className="clip-output-dimensions">输出规格 {detail.project.outputWidth} × {detail.project.outputHeight} · 工程版本 {detail.project.version}</small>}
-        {detail.project.exportStatus === "completed" && detail.project.outputPath && <p className="clip-export-success"><CheckCircle2 size={14} />已导出：{detail.project.outputPath}</p>}
-        {detail.project.lastErrorMessage && <p className="form-error">{detail.project.lastErrorMessage}</p>}
-        {message && <p className="form-error">{message}</p>}
+          <div className="clip-subtitle-list" aria-label="工程字幕列表">
+            {filteredSubtitles.map((subtitle) => <button
+              key={subtitle.id}
+              type="button"
+              aria-label={`字幕列表：${subtitle.text}`}
+              className={`${selectedSubtitleId === subtitle.id ? "active" : ""} ${currentSubtitle?.id === subtitle.id ? "playing" : ""} ${subtitle.hidden ? "hidden" : ""}`}
+              onClick={() => selectSubtitle(subtitle.id)}
+            ><span><time>{formatTimestamp(subtitle.projectStartMs)}</time>{subtitle.hidden && <b>已隐藏</b>}</span><strong>{subtitle.text}</strong></button>)}
+            {filteredSubtitles.length === 0 && <p className="clip-property-empty">没有匹配的字幕</p>}
+          </div>
+          {activeSubtitle && <section className="clip-subtitle-editor-card">
+            <header><div><strong>字幕校对</strong><small>{formatTimestamp(activeSubtitle.projectStartMs)} – {formatTimestamp(activeSubtitle.projectEndMs)}</small></div><span className={`clip-subtitle-save-state ${activeSubtitleSaveState}`} role="status">{clipSubtitleSaveLabels[activeSubtitleSaveState]}</span></header>
+            <textarea
+              aria-label="字幕文本"
+              disabled={editorLocked || subtitleMutationPending}
+              maxLength={500}
+              value={activeSubtitleDraft}
+              onChange={(event) => {
+                const value = event.target.value;
+                setSubtitleDrafts((current) => ({ ...current, [activeSubtitle.id]: value }));
+                setSubtitleSaveStates((current) => ({
+                  ...current,
+                  [activeSubtitle.id]: value === activeSubtitle.text ? "saved" : "unsaved",
+                }));
+              }}
+              onCompositionStart={() => setIsSubtitleComposing(true)}
+              onCompositionEnd={() => setIsSubtitleComposing(false)}
+              onBlur={(event) => {
+                const card = event.currentTarget.closest(".clip-subtitle-editor-card");
+                const focusRemainsInside = event.relatedTarget instanceof Node && card?.contains(event.relatedTarget);
+                if (!focusRemainsInside && activeSubtitleSaveState === "unsaved") void saveSubtitle(activeSubtitle.id);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  discardSubtitleDraft(activeSubtitle.id);
+                  return;
+                }
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !isSubtitleComposing && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void saveSubtitle(activeSubtitle.id);
+                }
+              }}
+            />
+            <small className="clip-subtitle-source">ASR 原文：{activeSubtitle.originalText}</small>
+            <div className="clip-subtitle-actions">
+              <button className="secondary-button" disabled={editorLocked || subtitleMutationPending} aria-label={activeSubtitle.hidden ? "恢复显示" : "隐藏字幕"} onClick={() => void saveSubtitle(activeSubtitle.id, !activeSubtitle.hidden)}>{activeSubtitle.hidden ? <Captions size={14} /> : <CircleOff size={14} />}{activeSubtitle.hidden ? "恢复显示" : "隐藏"}</button>
+              <button className="secondary-button" disabled={editorLocked || subtitleMutationPending || (activeSubtitle.text === activeSubtitle.originalText && !activeSubtitle.hidden)} aria-label="恢复 ASR 原文" onClick={() => void resetSubtitle(activeSubtitle.id)}><RotateCcw size={14} />恢复原文</button>
+            </div>
+            {subtitleSaveErrors[activeSubtitle.id] && <p className="form-error">{subtitleSaveErrors[activeSubtitle.id]}</p>}
+            {activeSubtitleSaveState === "conflict" && <button className="secondary-button clip-reload-project" aria-label="重新加载最新工程" onClick={() => void reloadClipProject()}><RefreshCw size={14} />重新加载最新工程</button>}
+            {editorLocked && <p className="clip-editor-lock-note">导出期间字幕和片段结构已锁定</p>}
+          </section>}
+        </div>}
+
+        <div className="clip-property-footer">
+          {detail.project.outputWidth && detail.project.outputHeight && <small className="clip-output-dimensions">输出规格 {detail.project.outputWidth} × {detail.project.outputHeight} · 工程版本 {detail.project.version}</small>}
+          {detail.project.exportStatus === "completed" && detail.project.outputPath && <p className="clip-export-success"><CheckCircle2 size={14} />已导出：{detail.project.outputPath}</p>}
+          {detail.project.lastErrorMessage && <p className="form-error">{detail.project.lastErrorMessage}</p>}
+          {message && <p className="form-error">{message}</p>}
+        </div>
       </aside>
     </div>
   </main>;

@@ -7,8 +7,8 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use super::{
-    AiClipProjectDetail, AiClipSegmentUpdate, AiCommandError, AiCommandService,
-    AiCreateProjectRequest, AiEnvironmentDiagnostic, AiHighlightCandidate,
+    AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate, AiCommandError,
+    AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic, AiHighlightCandidate,
     AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun, AiImportBatchView, AiProject,
     AiProjectDetailView, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage,
     AiReplayStreamerCursor, AiReplayStreamerPage, AiSessionImportView, AiSessionOption,
@@ -470,6 +470,30 @@ pub(crate) fn ai_update_clip_segment(
     state
         .commands
         .update_clip_segment(clip_project_id, segment_id, update)
+}
+
+#[tauri::command]
+pub(crate) fn ai_update_clip_subtitle(
+    clip_project_id: i64,
+    subtitle_id: i64,
+    update: AiClipSubtitleUpdate,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state
+        .commands
+        .update_clip_subtitle(clip_project_id, subtitle_id, update)
+}
+
+#[tauri::command]
+pub(crate) fn ai_reset_clip_subtitle(
+    clip_project_id: i64,
+    subtitle_id: i64,
+    expected_project_version: u32,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiClipProjectDetail, AiCommandError> {
+    state
+        .commands
+        .reset_clip_subtitle(clip_project_id, subtitle_id, expected_project_version)
 }
 
 #[tauri::command]

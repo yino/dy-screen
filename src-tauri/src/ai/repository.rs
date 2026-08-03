@@ -8,12 +8,13 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::database::{Database, DatabaseError};
 
 use super::domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
-    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiHighlightCandidate,
+    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate, AiHighlightCandidate,
     AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
     AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail,
     AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun,
@@ -43,6 +44,12 @@ pub enum AiRepositoryError {
     Integrity(String),
     #[error("序列化错误：{0}")]
     Serialization(String),
+    #[error("剪辑工程版本已更新，请重新加载后再编辑字幕")]
+    ClipVersionConflict,
+    #[error("剪辑工程正在导出，暂时不能修改字幕")]
+    ClipExportInProgress,
+    #[error("字幕内容无效：{0}")]
+    InvalidClipSubtitle(String),
 }
 
 pub type Result<T> = std::result::Result<T, AiRepositoryError>;
@@ -89,10 +96,14 @@ pub fn project_clip_subtitles(
                 continue;
             }
             subtitles.push(AiClipSubtitle {
+                id: 0,
+                clip_project_id: clip.clip_project_id,
                 stable_segment_id: transcript.id.clone(),
                 clip_segment_id: clip.id,
                 input_id: clip.input_id,
-                normalized_text: transcript.normalized_text.trim().to_owned(),
+                original_text: transcript.normalized_text.trim().to_owned(),
+                text: transcript.normalized_text.trim().to_owned(),
+                hidden: false,
                 source_start_ms,
                 source_end_ms,
                 project_start_ms: project_cursor_ms
@@ -109,6 +120,98 @@ pub fn project_clip_subtitles(
             .saturating_add(clip.source_end_ms.saturating_sub(clip.source_start_ms));
     }
     (subtitles, complete)
+}
+
+fn seed_clip_subtitle_snapshots(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_project_id: i64,
+    clip_segment_id: Option<i64>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        r#"INSERT OR IGNORE INTO ai_clip_subtitles(
+               clip_project_id, clip_segment_id, input_id, stable_segment_id,
+               source_start_ms, source_end_ms, original_text, text, hidden,
+               created_at, updated_at
+           )
+           SELECT s.clip_project_id, s.id, s.input_id, ts.id,
+                  MAX(ts.source_start_ms, s.source_start_ms),
+                  MIN(ts.source_end_ms, s.source_end_ms),
+                  trim(ts.normalized_text), trim(ts.normalized_text), 0, ?3, ?3
+           FROM ai_clip_segments s
+           JOIN ai_project_inputs input ON input.id = s.input_id
+           JOIN asr_artifacts artifact ON artifact.id = input.artifact_id
+           JOIN transcript_segments ts ON ts.artifact_id = artifact.id
+           WHERE s.clip_project_id = ?1
+             AND (?2 IS NULL OR s.id = ?2)
+             AND artifact.status = 'published'
+             AND length(trim(ts.normalized_text)) > 0
+             AND ts.source_start_ms < s.source_end_ms
+             AND ts.source_end_ms > s.source_start_ms
+             AND NOT EXISTS (
+                 SELECT 1 FROM ai_clip_subtitles existing
+                 WHERE existing.clip_segment_id = s.id
+             )"#,
+        params![clip_project_id, clip_segment_id, now],
+    )?;
+    Ok(())
+}
+
+fn normalize_clip_subtitle_text(value: &str) -> Result<String> {
+    if value
+        .chars()
+        .any(|character| character.is_control() && !character.is_whitespace())
+    {
+        return Err(AiRepositoryError::InvalidClipSubtitle(
+            "不能包含控制字符".to_owned(),
+        ));
+    }
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Err(AiRepositoryError::InvalidClipSubtitle(
+            "文本不能为空；不需要显示时请使用隐藏字幕".to_owned(),
+        ));
+    }
+    if normalized.graphemes(true).count() > 500 {
+        return Err(AiRepositoryError::InvalidClipSubtitle(
+            "文本不能超过 500 个字符".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn ensure_clip_project_editable(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_project_id: i64,
+) -> Result<u32> {
+    let (status, version) = transaction
+        .query_row(
+            "SELECT export_status, version FROM ai_clip_projects WHERE id = ?1",
+            [clip_project_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+    if status == AiClipExportStatus::Exporting.as_str() {
+        return Err(AiRepositoryError::ClipExportInProgress);
+    }
+    u32::try_from(version).map_err(|_| AiRepositoryError::Integrity("剪辑工程版本无效".to_owned()))
+}
+
+fn mark_clip_project_edited(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_project_id: i64,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        r#"UPDATE ai_clip_projects
+           SET version = version + 1,
+               export_status = 'idle', export_progress = 0, output_path = NULL,
+               last_error_code = NULL, last_error_message = NULL, updated_at = ?1
+           WHERE id = ?2"#,
+        params![now, clip_project_id],
+    )?;
+    Ok(())
 }
 
 /// AI repository 在一个 SQLite 事务边界内维护项目、输入和识别产物。
@@ -1209,13 +1312,19 @@ impl AiRepository {
             )?;
             id
         };
+        seed_clip_subtitle_snapshots(&transaction, project_id, None)?;
         transaction.commit()?;
         drop(connection);
         self.get_clip_project(project_id)
     }
 
     pub fn get_clip_project(&self, clip_project_id: i64) -> Result<AiClipProjectDetail> {
-        let connection = self.database.connection()?;
+        let mut connection = self.database.connection()?;
+        {
+            let transaction = connection.transaction()?;
+            seed_clip_subtitle_snapshots(&transaction, clip_project_id, None)?;
+            transaction.commit()?;
+        }
         let project = connection
             .query_row(
                 "SELECT id, highlight_run_id, name, export_status, export_progress, output_path, last_error_code, last_error_message, output_width, output_height, version, created_at, updated_at FROM ai_clip_projects WHERE id = ?1",
@@ -1230,33 +1339,58 @@ impl AiRepository {
         let segments = statement
             .query_map([clip_project_id], map_clip_segment)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut transcripts_by_input = HashMap::new();
-        let mut transcript_statement = connection.prepare(
-            r#"SELECT ts.id, ts.artifact_id, ts.ordinal, ts.source_start_ms,
-                      ts.source_end_ms, ts.raw_text, ts.normalized_text, ts.confidence
-               FROM ai_project_inputs input
-               JOIN asr_artifacts artifact ON artifact.id = input.artifact_id
-               JOIN transcript_segments ts ON ts.artifact_id = artifact.id
-               WHERE input.id = ?1 AND artifact.status = 'published'
-               ORDER BY ts.source_start_ms, ts.ordinal, ts.id"#,
+        let mut subtitle_statement = connection.prepare(
+            r#"SELECT subtitle.id, subtitle.clip_project_id, subtitle.stable_segment_id,
+                      subtitle.clip_segment_id, subtitle.input_id, subtitle.original_text,
+                      subtitle.text, subtitle.hidden, subtitle.source_start_ms,
+                      subtitle.source_end_ms
+               FROM ai_clip_subtitles subtitle
+               JOIN ai_clip_segments segment ON segment.id = subtitle.clip_segment_id
+               WHERE subtitle.clip_project_id = ?1
+               ORDER BY segment.position, subtitle.source_start_ms, subtitle.id"#,
         )?;
-        for input_id in segments
-            .iter()
-            .map(|segment| segment.input_id)
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            let transcripts = transcript_statement
-                .query_map([input_id], map_segment)?
-                .map(|row| row.map_err(AiRepositoryError::from).and_then(parse_segment))
-                .collect::<Result<Vec<_>>>()?;
-            transcripts_by_input.insert(input_id, transcripts);
+        let mut subtitles = subtitle_statement
+            .query_map([clip_project_id], map_clip_subtitle)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut project_cursor_ms = 0_u64;
+        let mut segment_offsets = HashMap::new();
+        for segment in &segments {
+            segment_offsets.insert(segment.id, (project_cursor_ms, segment.source_start_ms));
+            project_cursor_ms = project_cursor_ms.saturating_add(
+                segment
+                    .source_end_ms
+                    .saturating_sub(segment.source_start_ms),
+            );
         }
-        let (subtitles, subtitles_complete) =
-            project_clip_subtitles(&segments, &transcripts_by_input);
+        for subtitle in &mut subtitles {
+            let Some((cursor, segment_start_ms)) = segment_offsets.get(&subtitle.clip_segment_id)
+            else {
+                return Err(AiRepositoryError::Integrity(
+                    "工程字幕引用的片段不存在".to_owned(),
+                ));
+            };
+            subtitle.project_start_ms =
+                cursor.saturating_add(subtitle.source_start_ms.saturating_sub(*segment_start_ms));
+            subtitle.project_end_ms =
+                cursor.saturating_add(subtitle.source_end_ms.saturating_sub(*segment_start_ms));
+        }
+        let subtitles_complete = !segments.is_empty()
+            && segments.iter().all(|segment| {
+                subtitles
+                    .iter()
+                    .any(|subtitle| subtitle.clip_segment_id == segment.id)
+            });
+        let dimensions = super::ClipOutputDimensions {
+            width: project.output_width.unwrap_or(1_920),
+            height: project.output_height.unwrap_or(1_080),
+        };
+        let subtitle_frames =
+            super::build_clip_subtitle_frames(&subtitles, dimensions, project_cursor_ms);
         Ok(AiClipProjectDetail {
             project,
             segments,
             subtitles,
+            subtitle_frames,
             subtitles_complete,
         })
     }
@@ -1272,18 +1406,92 @@ impl AiRepository {
                 "片段音量必须在 0% 到 200% 之间".to_owned(),
             ));
         }
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        ensure_clip_project_editable(&transaction, clip_project_id)?;
         let now = Utc::now().to_rfc3339();
-        let changed = self.database.connection()?.execute(
+        let changed = transaction.execute(
             "UPDATE ai_clip_segments SET volume_percent = ?1, effect = ?2, updated_at = ?3 WHERE id = ?4 AND clip_project_id = ?5",
             params![i64::from(update.volume_percent), update.effect.as_str(), now, segment_id, clip_project_id],
         )?;
         if changed == 0 {
             return Err(AiRepositoryError::NotFound("剪辑片段"));
         }
-        self.database.connection()?.execute(
-            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), clip_project_id],
-        )?;
+        mark_clip_project_edited(&transaction, clip_project_id, &now)?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn update_clip_subtitle(
+        &self,
+        clip_project_id: i64,
+        subtitle_id: i64,
+        update: &AiClipSubtitleUpdate,
+    ) -> Result<AiClipProjectDetail> {
+        let text = normalize_clip_subtitle_text(&update.text)?;
+        self.mutate_clip_subtitle(
+            clip_project_id,
+            subtitle_id,
+            update.expected_project_version,
+            Some((&text, update.hidden)),
+        )
+    }
+
+    pub fn reset_clip_subtitle(
+        &self,
+        clip_project_id: i64,
+        subtitle_id: i64,
+        expected_project_version: u32,
+    ) -> Result<AiClipProjectDetail> {
+        self.mutate_clip_subtitle(clip_project_id, subtitle_id, expected_project_version, None)
+    }
+
+    fn mutate_clip_subtitle(
+        &self,
+        clip_project_id: i64,
+        subtitle_id: i64,
+        expected_project_version: u32,
+        update: Option<(&str, bool)>,
+    ) -> Result<AiClipProjectDetail> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let (status, version) = transaction
+            .query_row(
+                "SELECT export_status, version FROM ai_clip_projects WHERE id = ?1",
+                [clip_project_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+        if status == AiClipExportStatus::Exporting.as_str() {
+            return Err(AiRepositoryError::ClipExportInProgress);
+        }
+        if version != i64::from(expected_project_version) {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        let now = Utc::now().to_rfc3339();
+        let changed = if let Some((text, hidden)) = update {
+            transaction.execute(
+                r#"UPDATE ai_clip_subtitles
+                   SET text = ?1, hidden = ?2, updated_at = ?3
+                   WHERE id = ?4 AND clip_project_id = ?5"#,
+                params![text, hidden, now, subtitle_id, clip_project_id],
+            )?
+        } else {
+            transaction.execute(
+                r#"UPDATE ai_clip_subtitles
+                   SET text = original_text, hidden = 0, updated_at = ?1
+                   WHERE id = ?2 AND clip_project_id = ?3"#,
+                params![now, subtitle_id, clip_project_id],
+            )?
+        };
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("工程字幕"));
+        }
+        mark_clip_project_edited(&transaction, clip_project_id, &now)?;
+        transaction.commit()?;
+        drop(connection);
         self.get_clip_project(clip_project_id)
     }
 
@@ -1295,6 +1503,7 @@ impl AiRepository {
     ) -> Result<AiClipProjectDetail> {
         let mut connection = self.database.connection()?;
         let transaction = connection.transaction()?;
+        ensure_clip_project_editable(&transaction, clip_project_id)?;
         let segment_count = transaction.query_row(
             "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
             [clip_project_id],
@@ -1359,10 +1568,9 @@ impl AiRepository {
                 now,
             ],
         )?;
-        transaction.execute(
-            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), clip_project_id],
-        )?;
+        let clip_segment_id = transaction.last_insert_rowid();
+        seed_clip_subtitle_snapshots(&transaction, clip_project_id, Some(clip_segment_id))?;
+        mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
         self.get_clip_project(clip_project_id)
@@ -1375,6 +1583,7 @@ impl AiRepository {
     ) -> Result<AiClipProjectDetail> {
         let mut connection = self.database.connection()?;
         let transaction = connection.transaction()?;
+        ensure_clip_project_editable(&transaction, clip_project_id)?;
         let existing = transaction
             .prepare(
                 "SELECT id FROM ai_clip_segments WHERE clip_project_id = ?1 ORDER BY position, id",
@@ -1395,10 +1604,8 @@ impl AiRepository {
                 params![position as i64, Utc::now().to_rfc3339(), id, clip_project_id],
             )?;
         }
-        transaction.execute(
-            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), clip_project_id],
-        )?;
+        let now = Utc::now().to_rfc3339();
+        mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
         self.get_clip_project(clip_project_id)
@@ -1411,6 +1618,7 @@ impl AiRepository {
     ) -> Result<AiClipProjectDetail> {
         let mut connection = self.database.connection()?;
         let transaction = connection.transaction()?;
+        ensure_clip_project_editable(&transaction, clip_project_id)?;
         if transaction.execute(
             "DELETE FROM ai_clip_segments WHERE id = ?1 AND clip_project_id = ?2",
             params![segment_id, clip_project_id],
@@ -1440,10 +1648,8 @@ impl AiRepository {
                 params![position as i64, Utc::now().to_rfc3339(), id],
             )?;
         }
-        transaction.execute(
-            "UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), clip_project_id],
-        )?;
+        let now = Utc::now().to_rfc3339();
+        mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
         self.get_clip_project(clip_project_id)
@@ -1471,6 +1677,30 @@ impl AiRepository {
             .map(|detail| detail.project)
     }
 
+    pub fn begin_clip_export(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+    ) -> Result<AiClipProject> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let version = ensure_clip_project_editable(&transaction, clip_project_id)?;
+        if version != expected_project_version {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        transaction.execute(
+            r#"UPDATE ai_clip_projects
+               SET export_status = 'exporting', export_progress = 0, output_path = NULL,
+                   last_error_code = NULL, last_error_message = NULL, updated_at = ?1
+               WHERE id = ?2"#,
+            params![Utc::now().to_rfc3339(), clip_project_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.get_clip_project(clip_project_id)
+            .map(|detail| detail.project)
+    }
+
     pub fn set_clip_output_dimensions(
         &self,
         clip_project_id: i64,
@@ -1482,13 +1712,31 @@ impl AiRepository {
                 "剪辑输出尺寸必须是正偶数".to_owned(),
             ));
         }
-        let changed = self.database.connection()?.execute(
-            "UPDATE ai_clip_projects SET output_width = ?1, output_height = ?2, updated_at = ?3 WHERE id = ?4",
-            params![i64::from(width), i64::from(height), Utc::now().to_rfc3339(), clip_project_id],
-        )?;
-        if changed == 0 {
-            return Err(AiRepositoryError::NotFound("剪辑工程"));
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        ensure_clip_project_editable(&transaction, clip_project_id)?;
+        let current = transaction
+            .query_row(
+                "SELECT output_width, output_height FROM ai_clip_projects WHERE id = ?1",
+                [clip_project_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+        if let (Some(current_width), Some(current_height)) = current {
+            if current_width != i64::from(width) || current_height != i64::from(height) {
+                return Err(AiRepositoryError::InvalidState(
+                    "剪辑工程的输出画幅已经冻结".to_owned(),
+                ));
+            }
+        } else {
+            transaction.execute(
+                "UPDATE ai_clip_projects SET output_width = ?1, output_height = ?2, updated_at = ?3 WHERE id = ?4",
+                params![i64::from(width), i64::from(height), Utc::now().to_rfc3339(), clip_project_id],
+            )?;
         }
+        transaction.commit()?;
+        drop(connection);
         self.get_clip_project(clip_project_id)
             .map(|detail| detail.project)
     }
@@ -2546,6 +2794,50 @@ pub(crate) fn migrate_ai_v14(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v16 为剪辑工程保存独立字幕副本。迁移只新增表，不回写或删除既有 ASR、
+/// 剪辑工程和成品路径；旧工程在首次打开时由 repository 幂等回填。
+pub(crate) fn migrate_ai_v16(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 16",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_clip_subtitles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clip_project_id INTEGER NOT NULL REFERENCES ai_clip_projects(id) ON DELETE CASCADE,
+            clip_segment_id INTEGER NOT NULL REFERENCES ai_clip_segments(id) ON DELETE CASCADE,
+            input_id INTEGER NOT NULL REFERENCES ai_project_inputs(id) ON DELETE CASCADE,
+            stable_segment_id TEXT NOT NULL,
+            source_start_ms INTEGER NOT NULL CHECK(source_start_ms >= 0),
+            source_end_ms INTEGER NOT NULL CHECK(source_end_ms > source_start_ms),
+            original_text TEXT NOT NULL CHECK(length(trim(original_text)) > 0),
+            text TEXT NOT NULL CHECK(length(trim(text)) > 0),
+            hidden INTEGER NOT NULL DEFAULT 0 CHECK(hidden IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(clip_segment_id, stable_segment_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_clip_subtitles_project_segment_time
+            ON ai_clip_subtitles(clip_project_id, clip_segment_id, source_start_ms, id);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 type ProjectRow = (
     i64,
     String,
@@ -3012,6 +3304,27 @@ fn map_clip_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiClipSegment> 
         volume_percent: u16::try_from(volume)
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, volume))?,
         effect: parsed_effect,
+    })
+}
+
+fn map_clip_subtitle(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiClipSubtitle> {
+    let source_start_ms = row.get::<_, i64>(8)?;
+    let source_end_ms = row.get::<_, i64>(9)?;
+    Ok(AiClipSubtitle {
+        id: row.get(0)?,
+        clip_project_id: row.get(1)?,
+        stable_segment_id: row.get(2)?,
+        clip_segment_id: row.get(3)?,
+        input_id: row.get(4)?,
+        original_text: row.get(5)?,
+        text: row.get(6)?,
+        hidden: row.get(7)?,
+        source_start_ms: u64::try_from(source_start_ms)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, source_start_ms))?,
+        source_end_ms: u64::try_from(source_end_ms)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, source_end_ms))?,
+        project_start_ms: 0,
+        project_end_ms: 0,
     })
 }
 

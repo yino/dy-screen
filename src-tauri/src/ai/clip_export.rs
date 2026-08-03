@@ -369,7 +369,7 @@ mod tests {
     use super::*;
     use crate::ai::{AiClipEffect, AiClipSegment};
     #[cfg(unix)]
-    use crate::ai::{AiClipSubtitle, render_clip_subtitle_assets};
+    use crate::ai::{AiClipSubtitle, build_clip_subtitle_frames, render_clip_subtitle_assets};
 
     fn source(effect: AiClipEffect) -> ClipExportSource {
         ClipExportSource {
@@ -556,16 +556,36 @@ mod tests {
         first.source_path = horizontal.to_string_lossy().into_owned();
         first.segment.source_start_ms = 100;
         first.segment.source_end_ms = 900;
-        first.subtitles = vec![AiClipSubtitle {
-            stable_segment_id: "seg-first".to_owned(),
-            clip_segment_id: first.segment.id,
-            input_id: first.segment.input_id,
-            normalized_text: "第一段中文字幕。".to_owned(),
-            source_start_ms: 100,
-            source_end_ms: 900,
-            project_start_ms: 0,
-            project_end_ms: 800,
-        }];
+        first.subtitles = vec![
+            AiClipSubtitle {
+                id: 1,
+                clip_project_id: 1,
+                stable_segment_id: "seg-first".to_owned(),
+                clip_segment_id: first.segment.id,
+                input_id: first.segment.input_id,
+                original_text: "第一段中文字幕。".to_owned(),
+                text: "第一段中文字幕。".to_owned(),
+                hidden: false,
+                source_start_ms: 100,
+                source_end_ms: 900,
+                project_start_ms: 0,
+                project_end_ms: 800,
+            },
+            AiClipSubtitle {
+                id: 3,
+                clip_project_id: 1,
+                stable_segment_id: "seg-overlap".to_owned(),
+                clip_segment_id: first.segment.id,
+                input_id: first.segment.input_id,
+                original_text: "后开始的重叠字幕。".to_owned(),
+                text: "后开始的重叠字幕。".to_owned(),
+                hidden: false,
+                source_start_ms: 300,
+                source_end_ms: 700,
+                project_start_ms: 200,
+                project_end_ms: 600,
+            },
+        ];
         let mut second = source(AiClipEffect::FadeInOut);
         second.segment.id = 2;
         second.segment.position = 1;
@@ -573,10 +593,14 @@ mod tests {
         second.segment.source_start_ms = 100;
         second.segment.source_end_ms = 900;
         second.subtitles = vec![AiClipSubtitle {
+            id: 2,
+            clip_project_id: 1,
             stable_segment_id: "seg-second".to_owned(),
             clip_segment_id: second.segment.id,
             input_id: second.segment.input_id,
-            normalized_text: "第二段中文字幕。".to_owned(),
+            original_text: "第二段中文字幕。".to_owned(),
+            text: "第二段中文字幕。".to_owned(),
+            hidden: true,
             source_start_ms: 100,
             source_end_ms: 900,
             project_start_ms: 800,
@@ -591,6 +615,20 @@ mod tests {
             .iter()
             .flat_map(|source| source.subtitles.iter().cloned())
             .collect::<Vec<_>>();
+        validate_export_subtitles(&sources).unwrap();
+        let display_frames = build_clip_subtitle_frames(&subtitles, output_dimensions, 1_600);
+        assert!(display_frames.iter().any(|frame| {
+            frame.project_start_ms <= 300 && frame.project_end_ms > 300 && frame.subtitle_id == 3
+        }));
+        assert!(!display_frames.iter().any(|frame| frame.subtitle_id == 2));
+        let mut missing_subtitles = sources.clone();
+        missing_subtitles[1].subtitles.clear();
+        assert_eq!(
+            validate_export_subtitles(&missing_subtitles)
+                .unwrap_err()
+                .code,
+            "subtitles_incomplete"
+        );
         let subtitle_assets =
             render_clip_subtitle_assets(&subtitles, output_dimensions, 1_600).unwrap();
         let available_encoders = ProcessCommand::new(&runtime_ffmpeg)
@@ -687,13 +725,75 @@ mod tests {
                 }
             }
         }
-        assert!(
-            dark_subtitle_pixels > 100,
-            "字幕区域没有检测到半透明黑色背景"
-        );
+        assert!(dark_subtitle_pixels > 100, "字幕区域没有检测到黑色文字描边");
         assert!(
             bright_subtitle_pixels > 20,
             "字幕区域没有检测到白色文字像素"
         );
+
+        let mut all_hidden_sources = sources.to_vec();
+        for source in &mut all_hidden_sources {
+            for subtitle in &mut source.subtitles {
+                subtitle.hidden = true;
+            }
+        }
+        validate_export_subtitles(&all_hidden_sources).unwrap();
+        let all_hidden_subtitles = all_hidden_sources
+            .iter()
+            .flat_map(|source| source.subtitles.iter().cloned())
+            .collect::<Vec<_>>();
+        let hidden_assets =
+            render_clip_subtitle_assets(&all_hidden_subtitles, output_dimensions, 1_600).unwrap();
+        let hidden_output = directory.path().join("all-hidden.part.mp4");
+        let hidden_plan = build_export_plan(
+            &all_hidden_sources,
+            hidden_output.clone(),
+            output_dimensions,
+            hidden_assets.manifest_path(),
+            video_encoder,
+        )
+        .unwrap();
+        execute_export(
+            &runtime_ffmpeg,
+            hidden_plan,
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let hidden_frame = directory.path().join("all-hidden-frame.png");
+        let status = ProcessCommand::new(&fixture_ffmpeg)
+            .args(["-y", "-v", "error", "-ss", "0.4", "-i"])
+            .arg(&hidden_output)
+            .args(["-frames:v", "1"])
+            .arg(&hidden_frame)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let decoder = png::Decoder::new(StdBufReader::new(File::open(hidden_frame).unwrap()));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        let channels = match info.color_type {
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            color_type => panic!("隐藏字幕帧颜色类型不受支持：{color_type:?}"),
+        };
+        let mut hidden_dark_pixels = 0;
+        let mut hidden_bright_pixels = 0;
+        for y in 160..info.height as usize {
+            for x in 0..info.width as usize {
+                let offset = (y * info.width as usize + x) * channels;
+                let (red, green, blue) = (pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+                if red < 180 && green < 90 && blue < 90 {
+                    hidden_dark_pixels += 1;
+                }
+                if red > 180 && green > 180 && blue > 180 {
+                    hidden_bright_pixels += 1;
+                }
+            }
+        }
+        assert!(hidden_dark_pixels < 20, "全部隐藏后仍检测到黑色字幕描边");
+        assert!(hidden_bright_pixels < 20, "全部隐藏后仍检测到白色字幕字形");
     }
 }

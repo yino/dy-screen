@@ -127,3 +127,18 @@ describe("浏览器演示公开页访问会话 API", () => {
     await expect(api.clearDouyinSession(true)).rejects.toThrow("真实访问验证仅桌面端可用");
   });
 });
+
+describe("浏览器演示剪辑字幕 API", () => {
+  it("明确拒绝伪造本地字幕保存和恢复", async () => {
+    const api = createBrowserApi();
+
+    await expect(api.updateAiClipSubtitle?.(1, 2, {
+      text: "修正文案",
+      hidden: false,
+      expectedProjectVersion: 3,
+    })).rejects.toThrow("浏览器演示模式不能校对本地剪辑字幕");
+    await expect(api.resetAiClipSubtitle?.(1, 2, 3)).rejects.toThrow(
+      "浏览器演示模式不能恢复本地剪辑字幕",
+    );
+  });
+});

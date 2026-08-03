@@ -7,6 +7,10 @@ if [ "$#" -ne 1 ]; then
 fi
 
 FFMPEG=$1
+case "$FFMPEG" in
+  */*) ;;
+  *) FFMPEG=$(command -v "$FFMPEG" 2>/dev/null || true) ;;
+esac
 if [ ! -x "$FFMPEG" ]; then
   printf '%s\n' '错误：剪辑能力审计找不到可执行的 FFmpeg。' >&2
   exit 1

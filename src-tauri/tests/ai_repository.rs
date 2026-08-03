@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use dy_screen_app_lib::ai::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipSegment, AiClipSegmentUpdate,
-    AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus, AiRepository,
-    HighlightCandidateDraft, HighlightCandidateScore, NewAiHighlightChunk, NewAiHighlightRun,
-    NewAiProjectInput, NewAsrArtifact, RecognitionProfile, SourceFingerprint, TranscriptSegment,
-    TranscriptSegmentDraft, project_clip_subtitles,
+    AiClipSubtitleUpdate, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus,
+    AiRepository, HighlightCandidateDraft, HighlightCandidateScore, NewAiHighlightChunk,
+    NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile, SourceFingerprint,
+    TranscriptSegment, TranscriptSegmentDraft, project_clip_subtitles,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
@@ -184,6 +184,7 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         "ai_highlight_candidates",
         "ai_clip_projects",
         "ai_clip_segments",
+        "ai_clip_subtitles",
         "client_activation",
     ] {
         assert_eq!(
@@ -220,6 +221,16 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 4",
                 [],
                 |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 16",
+                [],
+                |row| row.get::<_, i64>(0),
             )
             .unwrap(),
         1
@@ -293,6 +304,88 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
                 .is_some(),
             "missing clip project column {column}"
         );
+    }
+    for column in [
+        "clip_project_id",
+        "clip_segment_id",
+        "input_id",
+        "stable_segment_id",
+        "source_start_ms",
+        "source_end_ms",
+        "original_text",
+        "text",
+        "hidden",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('ai_clip_subtitles') WHERE name = ?1",
+                    [column],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some(),
+            "missing clip subtitle column {column}"
+        );
+    }
+    let subtitle_foreign_keys = connection
+        .prepare("SELECT \"table\", \"from\", on_delete FROM pragma_foreign_key_list('ai_clip_subtitles')")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        subtitle_foreign_keys
+            .iter()
+            .any(|(table, column, on_delete)| {
+                table == "ai_clip_segments" && column == "clip_segment_id" && on_delete == "CASCADE"
+            })
+    );
+    assert!(
+        subtitle_foreign_keys
+            .iter()
+            .any(|(table, column, on_delete)| {
+                table == "ai_clip_projects" && column == "clip_project_id" && on_delete == "CASCADE"
+            })
+    );
+}
+
+#[test]
+fn clip_subtitle_update_contract_rejects_rendering_and_timing_fields() {
+    let valid = serde_json::from_value::<AiClipSubtitleUpdate>(serde_json::json!({
+        "text": "修正字幕。",
+        "hidden": false,
+        "expectedProjectVersion": 2
+    }))
+    .unwrap();
+    assert_eq!(valid.text, "修正字幕。");
+
+    for injected in [
+        serde_json::json!({"sourceStartMs": 0}),
+        serde_json::json!({"originalText": "伪造原文"}),
+        serde_json::json!({"fontPath": "/tmp/font.ttf"}),
+        serde_json::json!({"filter": "movie=unsafe"}),
+    ] {
+        let mut request = serde_json::json!({
+            "text": "修正字幕。",
+            "hidden": false,
+            "expectedProjectVersion": 2
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(injected.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<AiClipSubtitleUpdate>(request).is_err());
     }
 }
 
@@ -669,12 +762,41 @@ fn video_deletion_invalidates_then_cleans_artifacts_without_deleting_media_or_mo
 
 #[test]
 fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
-    let database = Database::open_in_memory().unwrap();
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("clip-subtitle-backfill.sqlite3");
+    let database = Database::open(&database_path).unwrap();
     database.migrate().unwrap();
     let repository = AiRepository::new(database);
     let project = repository.create_project("高光候选", &profile()).unwrap();
     let project_input = repository
         .add_input(project.id, input("/tmp/highlight.mp4", 0))
+        .unwrap();
+    let artifact = repository
+        .create_artifact(NewAsrArtifact {
+            source_fingerprint: project_input.source_fingerprint.clone(),
+            recognition_profile_hash: profile().fingerprint().unwrap(),
+            engine_id: "whisper.cpp".to_owned(),
+            engine_version: "v1.9.1".to_owned(),
+            model_id: "whisper-small-multilingual-q5_1".to_owned(),
+            model_version: "small-q5_1@5359861".to_owned(),
+        })
+        .unwrap();
+    repository
+        .publish_artifact(
+            artifact.id,
+            4_000,
+            Some("zh"),
+            &[TranscriptSegmentDraft {
+                source_start_ms: 100,
+                source_end_ms: 3_900,
+                raw_text: "原始字幕".to_owned(),
+                normalized_text: "原始字幕。".to_owned(),
+                confidence: Some(0.9),
+            }],
+        )
+        .unwrap();
+    repository
+        .attach_artifact(project_input.id, artifact.id)
         .unwrap();
     repository
         .set_project_context(
@@ -1014,10 +1136,143 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
     assert_eq!(clip.segments.len(), 2);
     assert_eq!(clip.segments[0].position, 0);
     assert_eq!(clip.segments[1].position, 1);
-    let reopened = repository.get_or_create_clip_project(newer.id).unwrap();
+    Connection::open(&database_path)
+        .unwrap()
+        .execute(
+            "DELETE FROM ai_clip_subtitles WHERE clip_project_id = ?1",
+            [clip.project.id],
+        )
+        .unwrap();
+    let reopened = repository.get_clip_project(clip.project.id).unwrap();
     assert_eq!(reopened.project.id, clip.project.id);
     assert_eq!(reopened.segments.len(), 2);
     assert_eq!(reopened.project.version, 1);
+    assert_eq!(reopened.subtitles.len(), 2);
+    assert!(reopened.subtitles_complete);
+    assert!(reopened.subtitles.iter().all(|subtitle| {
+        subtitle.original_text == "原始字幕。" && subtitle.text == "原始字幕。" && !subtitle.hidden
+    }));
+    let reopened_again = repository.get_clip_project(clip.project.id).unwrap();
+    assert_eq!(reopened_again.subtitles, reopened.subtitles);
+    let original_subtitle = reopened.subtitles[0].clone();
+    let edited = repository
+        .update_clip_subtitle(
+            clip.project.id,
+            original_subtitle.id,
+            &AiClipSubtitleUpdate {
+                text: "修正后的字幕。".to_owned(),
+                hidden: false,
+                expected_project_version: reopened.project.version,
+            },
+        )
+        .unwrap();
+    let edited_subtitle = edited
+        .subtitles
+        .iter()
+        .find(|subtitle| subtitle.id == original_subtitle.id)
+        .unwrap();
+    assert_eq!(edited_subtitle.original_text, "原始字幕。");
+    assert_eq!(edited_subtitle.text, "修正后的字幕。");
+    assert_eq!(edited.project.version, reopened.project.version + 1);
+    assert!(
+        repository
+            .update_clip_subtitle(
+                clip.project.id,
+                original_subtitle.id,
+                &AiClipSubtitleUpdate {
+                    text: "迟到请求".to_owned(),
+                    hidden: false,
+                    expected_project_version: reopened.project.version,
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        repository
+            .update_clip_subtitle(
+                clip.project.id,
+                original_subtitle.id,
+                &AiClipSubtitleUpdate {
+                    text: " ".to_owned(),
+                    hidden: false,
+                    expected_project_version: edited.project.version,
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        repository
+            .update_clip_subtitle(
+                clip.project.id,
+                original_subtitle.id,
+                &AiClipSubtitleUpdate {
+                    text: "字".repeat(501),
+                    hidden: false,
+                    expected_project_version: edited.project.version,
+                },
+            )
+            .is_err()
+    );
+    let restored_subtitle = repository
+        .reset_clip_subtitle(
+            clip.project.id,
+            original_subtitle.id,
+            edited.project.version,
+        )
+        .unwrap();
+    let restored_row = restored_subtitle
+        .subtitles
+        .iter()
+        .find(|subtitle| subtitle.id == original_subtitle.id)
+        .unwrap();
+    assert_eq!(restored_row.text, restored_row.original_text);
+    assert!(!restored_row.hidden);
+    let mut hidden_detail = restored_subtitle;
+    for subtitle in hidden_detail.subtitles.clone() {
+        hidden_detail = repository
+            .update_clip_subtitle(
+                clip.project.id,
+                subtitle.id,
+                &AiClipSubtitleUpdate {
+                    text: subtitle.text,
+                    hidden: true,
+                    expected_project_version: hidden_detail.project.version,
+                },
+            )
+            .unwrap();
+    }
+    assert!(hidden_detail.subtitles_complete);
+    assert!(
+        hidden_detail
+            .subtitles
+            .iter()
+            .all(|subtitle| subtitle.hidden)
+    );
+    repository
+        .set_clip_export_state(
+            clip.project.id,
+            AiClipExportStatus::Completed,
+            100,
+            Some("/tmp/old-export.mp4"),
+            None,
+        )
+        .unwrap();
+    let invalidated_export = repository
+        .update_clip_subtitle(
+            clip.project.id,
+            hidden_detail.subtitles[0].id,
+            &AiClipSubtitleUpdate {
+                text: hidden_detail.subtitles[0].text.clone(),
+                hidden: false,
+                expected_project_version: hidden_detail.project.version,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        invalidated_export.project.export_status,
+        AiClipExportStatus::Idle
+    );
+    assert!(invalidated_export.project.output_path.is_none());
     assert!(
         repository
             .insert_clip_candidate(
@@ -1054,7 +1309,10 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
         .unwrap();
     assert_eq!(updated.segments[0].volume_percent, 135);
     assert_eq!(updated.segments[0].effect, AiClipEffect::FadeInOut);
-    assert_eq!(updated.project.version, 2);
+    assert_eq!(
+        updated.project.version,
+        invalidated_export.project.version + 1
+    );
     assert!(
         repository
             .update_clip_segment(
@@ -1119,15 +1377,44 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
             .len(),
         1
     );
+    let before_export = repository.get_clip_project(clip.project.id).unwrap();
+    assert!(
+        repository
+            .begin_clip_export(
+                clip.project.id,
+                before_export.project.version.saturating_sub(1),
+            )
+            .is_err()
+    );
     repository
-        .set_clip_export_state(
-            clip.project.id,
-            AiClipExportStatus::Exporting,
-            42,
-            None,
-            None,
-        )
+        .begin_clip_export(clip.project.id, before_export.project.version)
         .unwrap();
+    let exporting_detail = repository.get_clip_project(clip.project.id).unwrap();
+    assert!(
+        repository
+            .update_clip_subtitle(
+                clip.project.id,
+                exporting_detail.subtitles[0].id,
+                &AiClipSubtitleUpdate {
+                    text: "导出期间不能保存".to_owned(),
+                    hidden: false,
+                    expected_project_version: exporting_detail.project.version,
+                },
+            )
+            .is_err()
+    );
+    assert!(
+        repository
+            .update_clip_segment(
+                clip.project.id,
+                exporting_detail.segments[0].id,
+                &AiClipSegmentUpdate {
+                    volume_percent: 80,
+                    effect: AiClipEffect::None,
+                },
+            )
+            .is_err()
+    );
     assert_eq!(repository.recover_interrupted_clip_exports().unwrap(), 1);
     let restored_export = repository
         .get_clip_project(clip.project.id)

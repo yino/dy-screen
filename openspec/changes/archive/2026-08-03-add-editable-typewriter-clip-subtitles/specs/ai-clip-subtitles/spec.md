@@ -1,8 +1,5 @@
-# ai-clip-subtitles Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change add-asr-subtitles-to-clip-editor. Update Purpose after archive.
-## Requirements
 ### Requirement: 从稳定 ASR 句段投影剪辑字幕
 系统 SHALL 只使用剪辑片段所属输入已经发布的 ASR 稳定句段建立工程级字幕副本，并 SHALL 保存原始规范化文本、当前工程文本、隐藏状态和裁剪后的源视频内毫秒时间。系统 MUST 将相交句段裁剪到片段源范围，在首次创建工程、追加片段或旧工程首次打开时以事务幂等建立副本；后续 MUST 按当前片段顺序把副本映射为工程时间，MUST NOT 重新识别、修改 ASR 产物或用新的 ASR 发布覆盖既有副本。
 
@@ -102,6 +99,8 @@ TBD - created by archiving change add-asr-subtitles-to-clip-editor. Update Purpo
 #### Scenario: 用户隐藏已有字幕
 - **WHEN** 用户主动隐藏某个片段的部分或全部工程字幕副本
 - **THEN** 系统不显示或烧录这些字幕，但继续把该片段视为已经完成字幕来源检查
+
+## ADDED Requirements
 
 ### Requirement: 安全编辑工程字幕副本
 系统 SHALL 允许用户修改当前剪辑工程字幕的文本和隐藏状态、恢复单条字幕的 ASR 原文，并 SHALL 在同一 SQLite 事务内校验字幕归属、工程版本和导出状态后持久化修改。系统 MUST 保持原始文本不可变，MUST NOT 修改原始 ASR、其他工程、候选或视频；文本 MUST 去除控制字符、合并空白、限制为 500 个 Unicode 字素簇且不能为空，空白字幕 MUST 通过隐藏操作表达。

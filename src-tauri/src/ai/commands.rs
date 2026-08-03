@@ -13,13 +13,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AiClipProjectDetail, AiClipSegmentUpdate, AiHighlightCandidate, AiHighlightCandidatePage,
-    AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
-    AiProject, AiProjectDetail, AiProjectInput, AiProjectService, AiProjectStatus,
-    AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage, AiReplayStreamerCursor,
-    AiReplayStreamerPage, AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore,
-    HighlightWorkflow, ImportBatchResult, ImportRejection, LlmProviderSettings, ProviderDiagnostic,
-    RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
+    AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate, AiHighlightCandidate,
+    AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus,
+    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectService,
+    AiProjectStatus, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage,
+    AiReplayStreamerCursor, AiReplayStreamerPage, AiRepository, AiSessionOption,
+    AiTranscriptProjection, CredentialStore, HighlightWorkflow, ImportBatchResult, ImportRejection,
+    LlmProviderSettings, ProviderDiagnostic, RecognitionProfile, ServiceError, SessionImportResult,
+    TrustedLocalFile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -640,6 +641,28 @@ impl AiCommandService {
             .map_err(repository_error)
     }
 
+    pub fn update_clip_subtitle(
+        &self,
+        clip_project_id: i64,
+        subtitle_id: i64,
+        update: AiClipSubtitleUpdate,
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .update_clip_subtitle(clip_project_id, subtitle_id, &update)
+            .map_err(repository_error)
+    }
+
+    pub fn reset_clip_subtitle(
+        &self,
+        clip_project_id: i64,
+        subtitle_id: i64,
+        expected_project_version: u32,
+    ) -> Result<AiClipProjectDetail, AiCommandError> {
+        self.repository
+            .reset_clip_subtitle(clip_project_id, subtitle_id, expected_project_version)
+            .map_err(repository_error)
+    }
+
     pub fn insert_clip_candidate(
         &self,
         clip_project_id: i64,
@@ -956,7 +979,13 @@ fn service_error(error: ServiceError) -> AiCommandError {
 }
 
 fn repository_error(error: super::AiRepositoryError) -> AiCommandError {
-    AiCommandError::new("ai_repository_error", error.to_string(), true)
+    let code = match error {
+        super::AiRepositoryError::ClipVersionConflict => "clip_version_conflict",
+        super::AiRepositoryError::ClipExportInProgress => "clip_export_in_progress",
+        super::AiRepositoryError::InvalidClipSubtitle(_) => "invalid_clip_subtitle",
+        _ => "ai_repository_error",
+    };
+    AiCommandError::new(code, error.to_string(), true)
 }
 
 fn grant_store_error() -> AiCommandError {

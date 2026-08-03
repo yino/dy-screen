@@ -605,10 +605,14 @@ pub struct AiClipSegment {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AiClipSubtitle {
+    pub id: i64,
+    pub clip_project_id: i64,
     pub stable_segment_id: String,
     pub clip_segment_id: i64,
     pub input_id: i64,
-    pub normalized_text: String,
+    pub original_text: String,
+    pub text: String,
+    pub hidden: bool,
     pub source_start_ms: u64,
     pub source_end_ms: u64,
     pub project_start_ms: u64,
@@ -617,10 +621,23 @@ pub struct AiClipSubtitle {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AiClipSubtitleFrame {
+    pub subtitle_id: i64,
+    pub clip_segment_id: i64,
+    pub project_start_ms: u64,
+    pub project_end_ms: u64,
+    pub page_text: String,
+    pub visible_text: String,
+    pub hidden_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AiClipProjectDetail {
     pub project: AiClipProject,
     pub segments: Vec<AiClipSegment>,
     pub subtitles: Vec<AiClipSubtitle>,
+    pub subtitle_frames: Vec<AiClipSubtitleFrame>,
     pub subtitles_complete: bool,
 }
 
@@ -629,6 +646,14 @@ pub struct AiClipProjectDetail {
 pub struct AiClipSegmentUpdate {
     pub volume_percent: u16,
     pub effect: AiClipEffect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiClipSubtitleUpdate {
+    pub text: String,
+    pub hidden: bool,
+    pub expected_project_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

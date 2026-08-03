@@ -555,26 +555,47 @@ export interface AiClipSegment {
 }
 
 export interface AiClipSubtitle {
+  id: number;
+  clipProjectId: number;
   stableSegmentId: string;
   clipSegmentId: number;
   inputId: number;
-  normalizedText: string;
+  originalText: string;
+  text: string;
+  hidden: boolean;
   sourceStartMs: number;
   sourceEndMs: number;
   projectStartMs: number;
   projectEndMs: number;
 }
 
+export interface AiClipSubtitleFrame {
+  subtitleId: number;
+  clipSegmentId: number;
+  projectStartMs: number;
+  projectEndMs: number;
+  pageText: string;
+  visibleText: string;
+  hiddenText: string;
+}
+
 export interface AiClipProjectDetail {
   project: AiClipProject;
   segments: AiClipSegment[];
   subtitles: AiClipSubtitle[];
+  subtitleFrames: AiClipSubtitleFrame[];
   subtitlesComplete: boolean;
 }
 
 export interface AiClipSegmentUpdate {
   volumePercent: number;
   effect: AiClipEffect;
+}
+
+export interface AiClipSubtitleUpdate {
+  text: string;
+  hidden: boolean;
+  expectedProjectVersion: number;
 }
 
 export interface AiExportResult {
@@ -727,6 +748,8 @@ export interface ClientApi {
   openAiClipProject?(runId: number): Promise<AiClipProjectDetail>;
   getAiClipProject?(clipProjectId: number): Promise<AiClipProjectDetail>;
   updateAiClipSegment?(clipProjectId: number, segmentId: number, update: AiClipSegmentUpdate): Promise<AiClipProjectDetail>;
+  updateAiClipSubtitle?(clipProjectId: number, subtitleId: number, update: AiClipSubtitleUpdate): Promise<AiClipProjectDetail>;
+  resetAiClipSubtitle?(clipProjectId: number, subtitleId: number, expectedProjectVersion: number): Promise<AiClipProjectDetail>;
   insertAiClipCandidate?(clipProjectId: number, candidateId: number, insertIndex: number): Promise<AiClipProjectDetail>;
   reorderAiClipSegments?(clipProjectId: number, orderedIds: number[]): Promise<AiClipProjectDetail>;
   removeAiClipSegment?(clipProjectId: number, segmentId: number): Promise<AiClipProjectDetail>;

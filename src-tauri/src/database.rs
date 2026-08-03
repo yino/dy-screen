@@ -234,6 +234,7 @@ impl Database {
         crate::ai::migrate_ai_v13(&mut connection)?;
         crate::ai::migrate_ai_v14(&mut connection)?;
         migrate_ai_replay_directory_v15(&mut connection)?;
+        crate::ai::migrate_ai_v16(&mut connection)?;
 
         let applied = connection
             .query_row(

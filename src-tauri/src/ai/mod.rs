@@ -22,7 +22,9 @@ pub use clip_export::{
     probe_output_dimensions, select_clip_video_encoder, validate_export_sources,
     validate_export_subtitles,
 };
-pub use clip_subtitle::{ClipSubtitleAssets, render_clip_subtitle_assets};
+pub use clip_subtitle::{
+    ClipSubtitleAssets, build_clip_subtitle_frames, render_clip_subtitle_assets,
+};
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiProjectDetailView,
@@ -32,12 +34,12 @@ pub use commands::{
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
-    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiHighlightCandidate,
-    AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
-    AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail,
-    AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun,
-    NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint,
-    TranscriptSegment, TranscriptSegmentDraft,
+    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleFrame, AiClipSubtitleUpdate,
+    AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress,
+    AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject,
+    AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk,
+    NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary,
+    SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
@@ -72,4 +74,5 @@ pub use service::{
 
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
+    migrate_ai_v16,
 };
