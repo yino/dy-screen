@@ -235,6 +235,107 @@ function createAiApi(
   } as unknown as ClientApi;
 }
 
+function createKeyboardClipFixture() {
+  const selectedCandidates: AiHighlightCandidate[] = [{
+    ...highlightCandidates[0],
+    id: 941,
+    candidateKey: "keyboard-first",
+    title: "快捷键第一段",
+    startMs: 1_000,
+    endMs: 3_000,
+    selected: true,
+  }, {
+    ...highlightCandidates[1],
+    id: 942,
+    candidateKey: "keyboard-second",
+    title: "快捷键第二段",
+    startMs: 5_000,
+    endMs: 9_000,
+    selected: true,
+  }];
+  const candidatePage: AiHighlightCandidatePage = {
+    items: selectedCandidates,
+    page: 0,
+    pageSize: 50,
+    totalCandidates: 2,
+    qualifiedCandidates: 2,
+    selectedCandidates: 2,
+  };
+  const clip: AiClipProjectDetail = {
+    project: {
+      id: 741,
+      highlightRunId: completedHighlightRun.id,
+      name: "快捷键测试工程",
+      outputWidth: 1920,
+      outputHeight: 1080,
+      version: 1,
+      exportStatus: "idle",
+      exportProgress: 0,
+      outputPath: null,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      createdAt: "2026-08-03T00:00:00Z",
+      updatedAt: "2026-08-03T00:00:00Z",
+    },
+    segments: selectedCandidates.map((candidate, index) => ({
+      id: 751 + index,
+      clipProjectId: 741,
+      candidateId: candidate.id,
+      inputId: candidate.inputId,
+      position: index,
+      title: candidate.title,
+      sourceStartMs: candidate.startMs,
+      sourceEndMs: candidate.endMs,
+      volumePercent: 100,
+      effect: "none" as const,
+    })),
+    subtitles: [{
+      id: 761,
+      clipProjectId: 741,
+      stableSegmentId: "keyboard-subtitle",
+      clipSegmentId: 751,
+      inputId: selectedCandidates[0].inputId,
+      originalText: "快捷键输入保护。",
+      text: "快捷键输入保护。",
+      hidden: false,
+      sourceStartMs: 1_000,
+      sourceEndMs: 2_000,
+      projectStartMs: 0,
+      projectEndMs: 1_000,
+    }],
+    subtitleFrames: [{
+      subtitleId: 761,
+      clipSegmentId: 751,
+      projectStartMs: 0,
+      projectEndMs: 1_000,
+      pageText: "快捷键输入保护。",
+      visibleText: "快捷键输入保护。",
+      hiddenText: "",
+    }],
+    subtitlesComplete: false,
+  };
+  const api = createAiApi();
+  api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
+  api.listQualifiedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
+  api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
+  api.openAiClipProject = vi.fn().mockResolvedValue(clip);
+  api.getAiClipProject = vi.fn().mockResolvedValue(clip);
+  return { api, clip };
+}
+
+async function openKeyboardClipEditor(api: ClientApi) {
+  const user = userEvent.setup();
+  vi.spyOn(HTMLMediaElement.prototype, "readyState", "get")
+    .mockReturnValue(HTMLMediaElement.HAVE_METADATA);
+  const view = render(<AiWorkspace api={api} />);
+  await user.click(await screen.findByRole("button", { name: "编辑视频" }));
+  const editor = await screen.findByRole("main", { name: "视频剪辑页面" });
+  await waitFor(() => expect(editor.querySelector("video")).not.toBeNull());
+  const video = editor.querySelector<HTMLVideoElement>("video")!;
+  fireEvent.loadedMetadata(video);
+  return { ...view, user, editor, video };
+}
+
 beforeEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -1024,6 +1125,170 @@ describe("AiWorkspace", () => {
     render(<AiWorkspace api={api} />);
 
     expect(await screen.findByText("本次已生成 8 个候选，但没有候选达到 50 分的合格阈值。")).toBeInTheDocument();
+  });
+
+  it("在剪辑页用空格切换播放并忽略自动重复", async () => {
+    const { api } = createKeyboardClipFixture();
+    const { video } = await openKeyboardClipEditor(api);
+    let paused = true;
+    Object.defineProperty(video, "paused", { configurable: true, get: () => paused });
+    const play = vi.spyOn(video, "play").mockImplementation(async () => {
+      paused = false;
+      fireEvent.play(video);
+    });
+    const pause = vi.spyOn(video, "pause").mockImplementation(() => {
+      paused = true;
+      fireEvent.pause(video);
+    });
+
+    const playEvent = new KeyboardEvent("keydown", {
+      key: " ",
+      code: "Space",
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(document.body, playEvent);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(playEvent.defaultPrevented).toBe(true);
+
+    fireEvent.keyDown(document.body, { key: " ", code: "Space", repeat: true });
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(pause).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(document.body, { key: " ", code: "Space" });
+    expect(pause).toHaveBeenCalledTimes(1);
+  });
+
+  it("用左右方向键按三十帧逐帧并跨越片段边界", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const { video } = await openKeyboardClipEditor(api);
+
+    fireEvent.keyDown(document.body, { key: "ArrowRight" });
+    expect(video.currentTime).toBeCloseTo(clip.segments[0].sourceStartMs / 1_000 + 1 / 30, 4);
+    fireEvent.keyDown(document.body, { key: "ArrowRight", repeat: true });
+    expect(video.currentTime).toBeCloseTo(clip.segments[0].sourceStartMs / 1_000 + 2 / 30, 4);
+    expect(pause).toHaveBeenCalledTimes(2);
+
+    video.currentTime = clip.segments[0].sourceEndMs / 1_000 - 0.06;
+    fireEvent.timeUpdate(video);
+    fireEvent.keyDown(document.body, { key: "ArrowRight" });
+    fireEvent.keyDown(document.body, { key: "ArrowRight", repeat: true });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` })).toHaveClass("active"));
+    const secondVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
+    expect(secondVideo).toBe(video);
+    await waitFor(() => expect(secondVideo.currentTime).toBeCloseTo(clip.segments[1].sourceStartMs / 1_000 + 0.007, 2));
+    fireEvent.keyDown(document.body, { key: "ArrowLeft" });
+    await waitFor(() => expect(screen.getByRole("button", { name: `片段 1：${clip.segments[0].title}` })).toHaveClass("active"));
+    await waitFor(() => expect(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.currentTime).toBeCloseTo(2.973, 2));
+  });
+
+  it("用组合方向键和首尾键跳转并保持播放状态", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    const { video } = await openKeyboardClipEditor(api);
+    fireEvent.play(video);
+
+    fireEvent.keyDown(document.body, { key: "ArrowRight", shiftKey: true });
+    await waitFor(() => expect(screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` })).toHaveClass("active"));
+    await waitFor(() => expect(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.currentTime).toBe(8));
+    let currentVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
+    await waitFor(() => expect(play).toHaveBeenCalled());
+
+    fireEvent.keyDown(document.body, { key: "ArrowLeft", shiftKey: true });
+    await waitFor(() => expect(screen.getByRole("button", { name: `片段 1：${clip.segments[0].title}` })).toHaveClass("active"));
+    await waitFor(() => expect(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.currentTime).toBe(1));
+    currentVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
+
+    fireEvent.keyDown(document.body, { key: "End" });
+    await waitFor(() => expect(screen.getByRole("button", { name: `片段 2：${clip.segments[1].title}` })).toHaveClass("active"));
+    await waitFor(() => expect(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.currentTime).toBe(9));
+    currentVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
+    fireEvent.keyDown(document.body, { key: "Home" });
+    await waitFor(() => expect(screen.getByRole("button", { name: `片段 1：${clip.segments[0].title}` })).toHaveClass("active"));
+    await waitFor(() => expect(document.querySelector<HTMLVideoElement>(".clip-preview-frame video")?.currentTime).toBe(1));
+    currentVideo = document.querySelector<HTMLVideoElement>(".clip-preview-frame video")!;
+    fireEvent.keyDown(document.body, { key: "ArrowLeft", shiftKey: true });
+    expect(currentVideo.currentTime).toBe(1);
+  });
+
+  it("用 M 切换静音并用加减键限制时间轴缩放", async () => {
+    const { api } = createKeyboardClipFixture();
+    const { video } = await openKeyboardClipEditor(api);
+    const zoom = screen.getByLabelText("时间轴缩放");
+
+    fireEvent.keyDown(document.body, { key: "m" });
+    await waitFor(() => expect(video.muted).toBe(true));
+    fireEvent.keyDown(document.body, { key: "m", repeat: true });
+    expect(video.muted).toBe(true);
+    fireEvent.keyDown(document.body, { key: "M" });
+    await waitFor(() => expect(video.muted).toBe(false));
+
+    fireEvent.keyDown(document.body, { key: "+" });
+    expect(zoom).toHaveValue("55");
+    fireEvent.keyDown(document.body, { key: "=" });
+    expect(zoom).toHaveValue("60");
+    fireEvent.keyDown(document.body, { key: "-" });
+    expect(zoom).toHaveValue("55");
+    for (let index = 0; index < 20; index += 1) fireEvent.keyDown(document.body, { key: "+" });
+    expect(zoom).toHaveValue("100");
+    fireEvent.keyDown(document.body, { key: "+" });
+    expect(zoom).toHaveValue("100");
+    for (let index = 0; index < 25; index += 1) fireEvent.keyDown(document.body, { key: "-" });
+    expect(zoom).toHaveValue("1");
+
+    expect(screen.getByRole("button", { name: "播放视频" })).toHaveAttribute("title", "播放（Space）");
+    expect(screen.getByRole("button", { name: "上一帧" })).toHaveAttribute("title", "上一帧（←）");
+    expect(screen.getByRole("button", { name: "下一帧" })).toHaveAttribute("title", "下一帧（→）");
+    expect(screen.getByRole("button", { name: "静音" })).toHaveAttribute("title", "静音（M）");
+    expect(zoom.closest("label")).toHaveAttribute("title", "时间轴缩放（+ / -）");
+  });
+
+  it("在输入控件、组合输入和系统修饰键期间不触发快捷键", async () => {
+    const { api } = createKeyboardClipFixture();
+    const { editor, user, video } = await openKeyboardClipEditor(api);
+    const play = vi.spyOn(video, "play").mockResolvedValue(undefined);
+    const pause = vi.spyOn(video, "pause").mockImplementation(() => undefined);
+    const zoom = screen.getByLabelText("时间轴缩放");
+
+    await user.click(screen.getByRole("button", { name: "字幕属性" }));
+    await user.click(screen.getByRole("button", { name: "字幕列表：快捷键输入保护。" }));
+    const textarea = screen.getByLabelText("字幕文本");
+    const search = screen.getByLabelText("搜索工程字幕");
+    const playButton = screen.getByRole("button", { name: "播放视频" });
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    editor.append(editable);
+
+    fireEvent.keyDown(textarea, { key: " ", code: "Space" });
+    fireEvent.keyDown(search, { key: "m" });
+    fireEvent.keyDown(zoom, { key: "ArrowRight" });
+    fireEvent.keyDown(playButton, { key: "ArrowRight" });
+    fireEvent.keyDown(editable, { key: "m" });
+    const composingEvent = new KeyboardEvent("keydown", { key: "m", bubbles: true, cancelable: true });
+    Object.defineProperty(composingEvent, "isComposing", { configurable: true, value: true });
+    fireEvent(document.body, composingEvent);
+    fireEvent.keyDown(document.body, { key: "m", ctrlKey: true });
+    fireEvent.keyDown(document.body, { key: "m", metaKey: true });
+    fireEvent.keyDown(document.body, { key: "ArrowRight", altKey: true });
+
+    expect(play).not.toHaveBeenCalled();
+    expect(pause).not.toHaveBeenCalled();
+    expect(video.muted).toBe(false);
+    expect(zoom).toHaveValue("50");
+    editable.remove();
+  });
+
+  it("离开剪辑页后清理快捷键监听", async () => {
+    const { api } = createKeyboardClipFixture();
+    const { unmount, video } = await openKeyboardClipEditor(api);
+    const play = vi.spyOn(video, "play").mockResolvedValue(undefined);
+
+    unmount();
+    fireEvent.keyDown(document.body, { key: " ", code: "Space" });
+    expect(play).not.toHaveBeenCalled();
   });
 
   it("从已选择候选进入独立剪辑页并保存片段、导出和返回", async () => {

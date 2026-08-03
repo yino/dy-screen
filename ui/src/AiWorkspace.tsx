@@ -66,6 +66,22 @@ import type {
 import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
 
 const segmentPageSize = 200;
+const clipShortcutInteractiveSelector = [
+  "a[href]",
+  "button",
+  "input",
+  "select",
+  "summary",
+  "textarea",
+  "[contenteditable]:not([contenteditable='false'])",
+  "[role='button']",
+  "[role='combobox']",
+  "[role='menuitem']",
+  "[role='option']",
+  "[role='slider']",
+  "[role='spinbutton']",
+  "[role='textbox']",
+].join(",");
 
 type HighlightView = "transcript" | "candidates" | "selected";
 type HighlightSort = "score" | "time";
@@ -137,6 +153,10 @@ function safeErrorCode(error: unknown): string | null {
     return typeof code === "string" ? code : null;
   }
   return null;
+}
+
+function clipShortcutTargetIsInteractive(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(clipShortcutInteractiveSelector) !== null;
 }
 
 function highlightRunIsActive(run: AiHighlightRun | null): boolean {
@@ -1595,6 +1615,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const [subtitleMutationPending, setSubtitleMutationPending] = useState(false);
   const [isSubtitleComposing, setIsSubtitleComposing] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const editorRef = useRef<HTMLElement>(null);
   const timelineBodyRef = useRef<HTMLDivElement>(null);
   const materialsRef = useRef<HTMLElement>(null);
   const pendingSeekSourceMsRef = useRef<number | null>(null);
@@ -1714,7 +1735,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     const nextStart = detail.segments
       .slice(0, nextIndex)
       .reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
-    pendingSeekSourceMsRef.current = null;
+    pendingSeekSourceMsRef.current = detail.segments[nextIndex].sourceStartMs;
     setSelectedId(segmentId);
     setTimelinePositionMs(nextStart);
     setResumeAfterSegment(resume);
@@ -1735,13 +1756,24 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
       })
       .catch((error) => { if (!disposed) setMessage(safeError(error, "无法准备剪辑预览")); });
     return () => { disposed = true; };
-  }, [api, projectId, selected?.id, selected?.inputId]);
+  }, [api, projectId, selected?.inputId]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !selected || previewInputId !== selected.inputId || preview?.state !== "ready" || !preview.media) return;
     const seekAndResume = () => {
       const requestedSourceMs = pendingSeekSourceMsRef.current;
+      const currentSourceMs = video.currentTime * 1_000;
+      const currentTimeIsInSegment = currentSourceMs >= selected.sourceStartMs
+        && currentSourceMs <= selected.sourceEndMs;
+      if (requestedSourceMs === null && currentTimeIsInSegment) {
+        applyPreviewVolume(video, selected.volumePercent);
+        if (resumeAfterSegment) {
+          setResumeAfterSegment(false);
+          void video.play().catch(() => setIsPlaying(false));
+        }
+        return;
+      }
       const sourceMs = requestedSourceMs === null
         ? selected.sourceStartMs
         : Math.min(selected.sourceEndMs, Math.max(selected.sourceStartMs, requestedSourceMs));
@@ -1964,6 +1996,55 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
 
   const toggleMuted = () => setIsMuted((current) => !current);
 
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      const editor = editorRef.current;
+      const target = event.target;
+      const targetIsPageRoot = target === document.body || target === document.documentElement;
+      if (
+        !editor
+        || event.defaultPrevented
+        || event.isComposing
+        || event.ctrlKey
+        || event.metaKey
+        || event.altKey
+        || clipShortcutTargetIsInteractive(target)
+        || (target instanceof Node && !targetIsPageRoot && !editor.contains(target))
+      ) return;
+
+      const key = event.key.toLocaleLowerCase();
+      let handled = true;
+      if ((event.code === "Space" || event.key === " " || event.key === "Spacebar") && !event.shiftKey) {
+        if (event.repeat) return;
+        togglePlayback();
+      } else if (event.key === "ArrowLeft") {
+        if (event.shiftKey) seekProjectTime(timelinePositionMs - 5_000, isPlaying);
+        else stepFrame(-1);
+      } else if (event.key === "ArrowRight") {
+        if (event.shiftKey) seekProjectTime(timelinePositionMs + 5_000, isPlaying);
+        else stepFrame(1);
+      } else if (event.key === "Home" && !event.shiftKey) {
+        seekProjectTime(0, isPlaying);
+      } else if (event.key === "End" && !event.shiftKey) {
+        seekProjectTime(totalDuration, isPlaying);
+      } else if (key === "m" && !event.shiftKey) {
+        if (event.repeat) return;
+        toggleMuted();
+      } else if (event.key === "+" || (event.key === "=" && !event.shiftKey)) {
+        setTimelineZoom((current) => Math.min(100, current + 5));
+      } else if (event.key === "-" && !event.shiftKey) {
+        setTimelineZoom((current) => Math.max(1, current - 5));
+      } else {
+        handled = false;
+      }
+
+      if (handled) event.preventDefault();
+    };
+
+    document.addEventListener("keydown", handleShortcut);
+    return () => document.removeEventListener("keydown", handleShortcut);
+  }, [detail.segments, isPlaying, selected?.id, timelinePositionMs, totalDuration]);
+
   const openFullscreen = () => {
     const frame = videoRef.current?.closest<HTMLElement>(".clip-preview-frame");
     if (frame?.requestFullscreen) void frame.requestFullscreen();
@@ -2134,7 +2215,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     }
   }, [isPlaying, playheadPercent]);
 
-  return <main className="clip-editor" aria-label="视频剪辑页面">
+  return <main ref={editorRef} className="clip-editor" aria-label="视频剪辑页面">
     <header className="clip-editor-header">
       <div className="clip-editor-identity">
         <button className="icon-button" aria-label="返回 AI 剪辑" title="返回 AI 剪辑" onClick={onBack}><ChevronLeft size={19} /></button>
@@ -2224,12 +2305,12 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                 aria-live="polite"
               ><span>{currentSubtitleFrame.visibleText}</span><span className="clip-subtitle-hidden-layout" aria-hidden="true">{currentSubtitleFrame.hiddenText}</span></div>}
               <div className="clip-player-controls">
-                <button className="icon-button" aria-label={isPlaying ? "暂停视频" : "播放视频"} title={isPlaying ? "暂停" : "播放"} onClick={togglePlayback}>{isPlaying ? <Pause size={17} /> : <Play size={17} />}</button>
-                <button className="icon-button" aria-label="上一帧" title="上一帧" onClick={() => stepFrame(-1)}><SkipBack size={16} /></button>
-                <button className="icon-button" aria-label="下一帧" title="下一帧" onClick={() => stepFrame(1)}><SkipForward size={16} /></button>
+                <button className="icon-button" aria-label={isPlaying ? "暂停视频" : "播放视频"} title={`${isPlaying ? "暂停" : "播放"}（Space）`} onClick={togglePlayback}>{isPlaying ? <Pause size={17} /> : <Play size={17} />}</button>
+                <button className="icon-button" aria-label="上一帧" title="上一帧（←）" onClick={() => stepFrame(-1)}><SkipBack size={16} /></button>
+                <button className="icon-button" aria-label="下一帧" title="下一帧（→）" onClick={() => stepFrame(1)}><SkipForward size={16} /></button>
                 <input aria-label="片段播放进度" type="range" min="0" max="100" step="0.1" value={playerProgressPercent} onChange={(event) => seekProjectTime(timelineStartMs + selectedDuration * Number(event.target.value) / 100)} />
                 <time>{formatDuration(timelinePositionMs)} / {formatDuration(totalDuration)}</time>
-                <button className="icon-button" aria-label={isMuted ? "取消静音" : "静音"} title={isMuted ? "取消静音" : "静音"} onClick={toggleMuted}>{isMuted ? <VolumeX size={17} /> : <Volume2 size={17} />}</button>
+                <button className="icon-button" aria-label={isMuted ? "取消静音" : "静音"} title={`${isMuted ? "取消静音" : "静音"}（M）`} onClick={toggleMuted}>{isMuted ? <VolumeX size={17} /> : <Volume2 size={17} />}</button>
                 <button className="icon-button" aria-label="全屏预览" title="全屏预览" onClick={openFullscreen}><Maximize2 size={17} /></button>
               </div>
             </div>
@@ -2244,7 +2325,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               <button className="clip-tool-button" aria-label="片段左移" disabled={!selected || selected.position === 0 || versionMutationLocked} onClick={() => selected && void reorder(selected.position, -1)}><ArrowUp size={13} />左移</button>
               <button className="clip-tool-button" aria-label="片段右移" disabled={!selected || selected.position === detail.segments.length - 1 || versionMutationLocked} onClick={() => selected && void reorder(selected.position, 1)}><ArrowDown size={13} />右移</button>
             </div>
-            <label className="clip-zoom-control"><ZoomOut size={13} /><input aria-label="时间轴缩放" type="range" min="1" max="100" value={timelineZoom} onChange={(event) => setTimelineZoom(Number(event.target.value))} /><ZoomIn size={13} /><b>{timelineZoom}%</b></label>
+            <label className="clip-zoom-control" title="时间轴缩放（+ / -）"><ZoomOut size={13} /><input aria-label="时间轴缩放" type="range" min="1" max="100" value={timelineZoom} onChange={(event) => setTimelineZoom(Number(event.target.value))} /><ZoomIn size={13} /><b>{timelineZoom}%</b></label>
           </header>
           <div className="clip-timeline-legend"><span><i className="video" />视频片段</span><span><i className="subtitle" />工程字幕</span><span><i className="effect" />已应用效果</span><span><i className="selected" />当前片段</span><small>字幕轨只用于定位，不能拖动调时</small></div>
           <div className="clip-timeline-body" ref={timelineBodyRef}>
