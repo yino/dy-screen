@@ -162,6 +162,7 @@ fn 无标签请求和上下文始终输出空数组() {
         room_id: Some("456".to_owned()),
         monitor_enabled: true,
         archived: false,
+        recording_priority: 1,
         live_status: "offline".to_owned(),
         monitor_status: "waiting".to_owned(),
         last_checked_at: None,

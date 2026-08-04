@@ -174,6 +174,8 @@ pub struct HeartbeatResponse {
     pub enc_key: Option<String>,
     #[serde(default)]
     pub allow_custom_api_key: Option<i64>,
+    #[serde(rename = "max_screen_limit", default)]
+    pub max_screen_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,6 +188,8 @@ pub struct AppStartResponse {
     pub signature: Option<String>,
     pub min_client_version: String,
     pub force: bool,
+    #[serde(rename = "max_screen_limit", default)]
+    pub max_screen_limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

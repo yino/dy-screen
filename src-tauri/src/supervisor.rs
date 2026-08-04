@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +22,6 @@ use dy_screen::recorder::{FfmpegConfig, FfmpegRecorder, RecordingConfig};
 use dy_screen::resolver::RoomInspection;
 use fs2::available_space;
 use tokio::sync::{Notify, broadcast, mpsc};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
@@ -304,7 +304,38 @@ enum ResolveAttempt {
 enum SessionEnd {
     Completed,
     Cancelled,
+    Deferred,
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileTrigger {
+    CandidateChanged,
+    PriorityChanged,
+    ServerLimitReduced,
+    ServerLimitIncreased,
+}
+
+#[derive(Default)]
+struct RecordingTargetState {
+    candidates: HashMap<i64, u64>,
+    selected: HashSet<i64>,
+    limit: usize,
+}
+
+pub fn recording_target_ids(
+    prioritized_streamers: &[Streamer],
+    live_candidates: &HashSet<i64>,
+    limit: usize,
+) -> Vec<i64> {
+    prioritized_streamers
+        .iter()
+        .filter(|streamer| {
+            !streamer.archived && streamer.monitor_enabled && live_candidates.contains(&streamer.id)
+        })
+        .take(limit.max(1))
+        .map(|streamer| streamer.id)
+        .collect()
 }
 
 pub struct RecordingLimiter {
@@ -432,8 +463,32 @@ impl DelayStrategy for TokioDelay {
 struct Worker {
     generation: u64,
     cancellation: CancellationToken,
-    task: JoinHandle<()>,
+    task: tauri::async_runtime::JoinHandle<()>,
     wake: mpsc::UnboundedSender<()>,
+}
+
+#[derive(Clone)]
+struct ActiveRecording {
+    generation: u64,
+    token: CancellationToken,
+}
+
+pub trait WorkerRuntime: Send + Sync {
+    fn spawn(
+        &self,
+        task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<tauri::async_runtime::JoinHandle<()>, String>;
+}
+
+struct TauriWorkerRuntime;
+
+impl WorkerRuntime for TauriWorkerRuntime {
+    fn spawn(
+        &self,
+        task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
+        Ok(tauri::async_runtime::spawn(task))
+    }
 }
 
 #[derive(Clone)]
@@ -446,13 +501,18 @@ pub struct Supervisor {
     delay: Arc<dyn DelayStrategy>,
     workers: Arc<Mutex<HashMap<i64, Worker>>>,
     worker_generation: Arc<AtomicU64>,
-    recording_tokens: Arc<Mutex<HashMap<i64, CancellationToken>>>,
+    recording_tokens: Arc<Mutex<HashMap<i64, ActiveRecording>>>,
+    recording_cancel_reasons: Arc<Mutex<HashMap<(i64, u64), String>>>,
+    recording_targets: Arc<Mutex<RecordingTargetState>>,
+    recording_reconcile: Arc<Mutex<()>>,
+    recording_target_notify: Arc<Notify>,
     recording_limiter: Arc<RecordingLimiter>,
     public_request_gate: Arc<PublicPageRequestGate>,
     monitor_logger: MonitorLogger,
     shutdown: CancellationToken,
     changes: broadcast::Sender<MonitorEvent>,
     runtime_resources: Arc<Mutex<Option<RuntimeResourceState>>>,
+    worker_runtime: Arc<dyn WorkerRuntime>,
 }
 
 impl Supervisor {
@@ -523,6 +583,29 @@ impl Supervisor {
         jitter: Arc<dyn JitterSource>,
         delay: Arc<dyn DelayStrategy>,
     ) -> Self {
+        Self::with_dependencies_and_runtime(
+            database,
+            publisher,
+            max_concurrent,
+            profile_discovery,
+            room_discovery,
+            jitter,
+            delay,
+            Arc::new(TauriWorkerRuntime),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_dependencies_and_runtime(
+        database: Database,
+        publisher: Arc<dyn MonitorPublisher>,
+        max_concurrent: usize,
+        profile_discovery: Arc<dyn ProfileDiscovery>,
+        room_discovery: Arc<dyn RoomDiscovery>,
+        jitter: Arc<dyn JitterSource>,
+        delay: Arc<dyn DelayStrategy>,
+        worker_runtime: Arc<dyn WorkerRuntime>,
+    ) -> Self {
         let (changes, _) = broadcast::channel(128);
         Self {
             database,
@@ -534,12 +617,20 @@ impl Supervisor {
             workers: Arc::new(Mutex::new(HashMap::new())),
             worker_generation: Arc::new(AtomicU64::new(0)),
             recording_tokens: Arc::new(Mutex::new(HashMap::new())),
+            recording_cancel_reasons: Arc::new(Mutex::new(HashMap::new())),
+            recording_targets: Arc::new(Mutex::new(RecordingTargetState {
+                limit: max_concurrent.max(1),
+                ..RecordingTargetState::default()
+            })),
+            recording_reconcile: Arc::new(Mutex::new(())),
+            recording_target_notify: Arc::new(Notify::new()),
             recording_limiter: Arc::new(RecordingLimiter::new(max_concurrent)),
             public_request_gate: Arc::new(PublicPageRequestGate::new(Duration::ZERO)),
             monitor_logger: MonitorLogger::default(),
             shutdown: CancellationToken::new(),
             changes,
             runtime_resources: Arc::new(Mutex::new(None)),
+            worker_runtime,
         }
     }
 
@@ -547,6 +638,11 @@ impl Supervisor {
         if let Ok(mut current) = self.runtime_resources.lock() {
             *current = Some(resources);
         }
+    }
+
+    pub fn with_worker_runtime(mut self, runtime: Arc<dyn WorkerRuntime>) -> Self {
+        self.worker_runtime = runtime;
+        self
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<MonitorEvent> {
@@ -577,19 +673,22 @@ impl Supervisor {
         let (wake, wake_receiver) = mpsc::unbounded_channel();
         let generation = self.worker_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let supervisor = self.clone();
-        let task = tokio::spawn(async move {
-            supervisor
-                .worker_loop(streamer_id, task_cancellation, wake_receiver)
-                .await;
-            if let Ok(mut workers) = supervisor.workers.lock() {
-                let is_current = workers
-                    .get(&streamer_id)
-                    .is_some_and(|worker| worker.generation == generation);
-                if is_current {
-                    workers.remove(&streamer_id);
+        let task = self
+            .worker_runtime
+            .spawn(Box::pin(async move {
+                supervisor
+                    .worker_loop(streamer_id, generation, task_cancellation, wake_receiver)
+                    .await;
+                if let Ok(mut workers) = supervisor.workers.lock() {
+                    let is_current = workers
+                        .get(&streamer_id)
+                        .is_some_and(|worker| worker.generation == generation);
+                    if is_current {
+                        workers.remove(&streamer_id);
+                    }
                 }
-            }
-        });
+            }))
+            .map_err(|_| "监听任务调度失败，请重试".to_owned())?;
         workers.insert(
             streamer_id,
             Worker {
@@ -626,19 +725,186 @@ impl Supervisor {
             .unwrap_or_default()
     }
 
-    pub fn set_max_concurrent(&self, limit: usize) {
-        self.recording_limiter.set_limit(limit);
+    pub fn set_server_recording_limit(&self, limit: usize) {
+        let limit = limit.max(1);
+        let previous = self.max_screen_limit();
+        if previous == limit {
+            return;
+        }
+        let trigger = if limit < previous {
+            ReconcileTrigger::ServerLimitReduced
+        } else {
+            ReconcileTrigger::ServerLimitIncreased
+        };
+        if let Ok(_reconcile) = self.recording_reconcile.lock() {
+            self.recording_limiter.set_limit(limit);
+            if let Ok(mut state) = self.recording_targets.lock() {
+                state.limit = limit;
+            }
+            let _ = self.reconcile_recording_targets_locked(trigger);
+        }
+        let _ = self.check_all_now();
+        let event = MonitorEvent {
+            kind: "server_recording_limit_changed".to_owned(),
+            streamer_id: None,
+        };
+        let _ = self.changes.send(event.clone());
+        let publisher = self.publisher.clone();
+        tauri::async_runtime::spawn(async move {
+            publisher.publish(event).await;
+        });
+    }
+
+    pub fn max_screen_limit(&self) -> usize {
+        self.recording_limiter.limit.load(Ordering::Acquire)
+    }
+
+    pub async fn recording_priority_changed(&self, streamer_id: i64) -> Result<(), String> {
+        self.reconcile_recording_targets(ReconcileTrigger::PriorityChanged)?;
+        self.check_all_now()?;
+        self.emit("recording_priority_changed", Some(streamer_id))
+            .await;
+        Ok(())
+    }
+
+    fn register_live_candidate(&self, streamer_id: i64, generation: u64) {
+        if let Ok(_reconcile) = self.recording_reconcile.lock() {
+            if let Ok(mut state) = self.recording_targets.lock() {
+                state.candidates.insert(streamer_id, generation);
+            }
+            let _ = self.reconcile_recording_targets_locked(ReconcileTrigger::CandidateChanged);
+        }
+    }
+
+    fn unregister_live_candidate(&self, streamer_id: i64, generation: u64) {
+        let removed = if let Ok(_reconcile) = self.recording_reconcile.lock() {
+            let removed = self
+                .recording_targets
+                .lock()
+                .map(|mut state| {
+                    if state.candidates.get(&streamer_id) == Some(&generation) {
+                        state.candidates.remove(&streamer_id);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if removed {
+                let _ = self.reconcile_recording_targets_locked(ReconcileTrigger::CandidateChanged);
+            }
+            removed
+        } else {
+            false
+        };
+        if removed {
+            self.wake_recording_targets();
+        }
+    }
+
+    fn is_recording_target(&self, streamer_id: i64, generation: u64) -> bool {
+        self.recording_targets.lock().is_ok_and(|state| {
+            state.selected.contains(&streamer_id)
+                && state.candidates.get(&streamer_id) == Some(&generation)
+        })
+    }
+
+    fn reconcile_recording_targets(&self, trigger: ReconcileTrigger) -> Result<(), String> {
+        let _reconcile = self
+            .recording_reconcile
+            .lock()
+            .map_err(|_| "录制调度锁已损坏".to_owned())?;
+        self.reconcile_recording_targets_locked(trigger)
+    }
+
+    fn reconcile_recording_targets_locked(&self, trigger: ReconcileTrigger) -> Result<(), String> {
+        let prioritized = self
+            .database
+            .list_streamers_by_recording_priority()
+            .map_err(|error| error.to_string())?;
+        let (candidates, limit) = self
+            .recording_targets
+            .lock()
+            .map(|state| {
+                (
+                    state.candidates.keys().copied().collect::<HashSet<_>>(),
+                    state.limit,
+                )
+            })
+            .map_err(|_| "录制调度锁已损坏".to_owned())?;
+        let selected = recording_target_ids(&prioritized, &candidates, limit)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        self.recording_targets
+            .lock()
+            .map(|mut state| state.selected = selected.clone())
+            .map_err(|_| "录制调度锁已损坏".to_owned())?;
+        self.recording_target_notify.notify_waiters();
+
+        let active = self
+            .recording_tokens
+            .lock()
+            .map(|tokens| tokens.keys().copied().collect::<Vec<_>>())
+            .map_err(|_| "录制锁已损坏".to_owned())?;
+        let reason = match trigger {
+            ReconcileTrigger::ServerLimitReduced => "server_limit_reduced",
+            ReconcileTrigger::CandidateChanged
+            | ReconcileTrigger::PriorityChanged
+            | ReconcileTrigger::ServerLimitIncreased => "priority_changed",
+        };
+        for streamer_id in active {
+            if !selected.contains(&streamer_id) {
+                self.cancel_recording(streamer_id, reason);
+            }
+        }
+        Ok(())
+    }
+
+    fn wake_recording_targets(&self) {
+        let selected = self
+            .recording_targets
+            .lock()
+            .map(|state| state.selected.clone())
+            .unwrap_or_default();
+        if let Ok(workers) = self.workers.lock() {
+            for streamer_id in selected {
+                if let Some(worker) = workers.get(&streamer_id) {
+                    let _ = worker.wake.send(());
+                }
+            }
+        }
+    }
+
+    fn set_cancel_reason(&self, streamer_id: i64, reason: &str) {
+        let generation = self.recording_tokens.lock().ok().and_then(|tokens| {
+            tokens
+                .get(&streamer_id)
+                .map(|recording| recording.generation)
+        });
+        if let Some(generation) = generation
+            && let Ok(mut reasons) = self.recording_cancel_reasons.lock()
+        {
+            reasons.insert((streamer_id, generation), reason.to_owned());
+        }
+    }
+
+    fn cancel_recording(&self, streamer_id: i64, reason: &str) {
+        let token = self.recording_tokens.lock().ok().and_then(|tokens| {
+            tokens
+                .get(&streamer_id)
+                .map(|recording| recording.token.clone())
+        });
+        if let Some(token) = token {
+            self.set_cancel_reason(streamer_id, reason);
+            token.cancel();
+        }
     }
 
     pub async fn stop(&self, streamer_id: i64) -> Result<(), String> {
         self.database
             .set_monitor_enabled(streamer_id, false)
             .map_err(|error| error.to_string())?;
-        if let Ok(mut recording_tokens) = self.recording_tokens.lock()
-            && let Some(token) = recording_tokens.remove(&streamer_id)
-        {
-            token.cancel();
-        }
+        self.cancel_recording(streamer_id, "user_stopped");
         let worker = self
             .workers
             .lock()
@@ -666,11 +932,7 @@ impl Supervisor {
     }
 
     pub async fn stop_recording(&self, streamer_id: i64) {
-        if let Ok(mut tokens) = self.recording_tokens.lock()
-            && let Some(token) = tokens.remove(&streamer_id)
-        {
-            token.cancel();
-        }
+        self.cancel_recording(streamer_id, "user_stopped");
     }
 
     pub async fn pause_all(&self) -> Result<(), String> {
@@ -694,9 +956,15 @@ impl Supervisor {
         let recording_tokens = self
             .recording_tokens
             .lock()
-            .map(|mut tokens| tokens.drain().map(|(_, token)| token).collect::<Vec<_>>())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|(id, recording)| (*id, recording.token.clone()))
+                    .collect::<Vec<_>>()
+            })
             .map_err(|_| "录制锁已损坏".to_owned())?;
-        for token in recording_tokens {
+        for (streamer_id, token) in recording_tokens {
+            self.set_cancel_reason(streamer_id, "authorization_revoked");
             token.cancel();
         }
         let workers = self
@@ -734,9 +1002,15 @@ impl Supervisor {
         let tokens = self
             .recording_tokens
             .lock()
-            .map(|mut tokens| tokens.drain().map(|(_, token)| token).collect::<Vec<_>>())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|(id, recording)| (*id, recording.token.clone()))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
-        for token in tokens {
+        for (streamer_id, token) in tokens {
+            self.set_cancel_reason(streamer_id, "app_shutdown");
             token.cancel();
         }
         let workers = self
@@ -759,6 +1033,7 @@ impl Supervisor {
     async fn worker_loop(
         &self,
         streamer_id: i64,
+        generation: u64,
         cancellation: CancellationToken,
         mut wake_receiver: mpsc::UnboundedReceiver<()>,
     ) {
@@ -977,8 +1252,13 @@ impl Supervisor {
                         0,
                         None,
                     );
-                    match self.record_live(streamer, cancellation.clone()).await {
+                    self.register_live_candidate(streamer_id, generation);
+                    match self
+                        .record_live(streamer, generation, cancellation.clone())
+                        .await
+                    {
                         Ok(SessionEnd::Completed) => {
+                            self.unregister_live_candidate(streamer_id, generation);
                             let _ = self.database.update_streamer_status(
                                 streamer_id,
                                 "offline",
@@ -986,8 +1266,29 @@ impl Supervisor {
                                 None,
                             );
                         }
-                        Ok(SessionEnd::Cancelled) => {}
+                        Ok(SessionEnd::Cancelled) => {
+                            if cancellation.is_cancelled() {
+                                self.unregister_live_candidate(streamer_id, generation);
+                            } else {
+                                let _ = self.database.update_streamer_status(
+                                    streamer_id,
+                                    "live",
+                                    "waiting_resource",
+                                    None,
+                                );
+                                self.emit("streamer_changed", Some(streamer_id)).await;
+                            }
+                        }
+                        Ok(SessionEnd::Deferred) => {
+                            let _ = self.database.update_streamer_status(
+                                streamer_id,
+                                "live",
+                                "waiting_resource",
+                                None,
+                            );
+                        }
                         Ok(SessionEnd::Error(error)) | Err(error) => {
+                            self.unregister_live_candidate(streamer_id, generation);
                             let _ = self.database.update_streamer_status(
                                 streamer_id,
                                 "live",
@@ -1000,6 +1301,7 @@ impl Supervisor {
                     60 + self.jitter.room_seconds().min(15)
                 }
                 ResolveAttempt::Offline { room_id } => {
+                    self.unregister_live_candidate(streamer_id, generation);
                     room_failures = 0;
                     entry_invalid_count = 0;
                     if let (Some(web_rid), Some(room_id)) =
@@ -1030,6 +1332,7 @@ impl Supervisor {
                     60 + self.jitter.room_seconds().min(15)
                 }
                 ResolveAttempt::Retryable(safe_error, http_status) => {
+                    self.unregister_live_candidate(streamer_id, generation);
                     entry_invalid_count = 0;
                     room_failures += 1;
                     let wait = backoff_seconds(room_failures.saturating_sub(1));
@@ -1054,6 +1357,7 @@ impl Supervisor {
                     wait
                 }
                 ResolveAttempt::AccessRestricted(safe_error, http_status) => {
+                    self.unregister_live_candidate(streamer_id, generation);
                     entry_invalid_count = 0;
                     room_failures += 1;
                     let wait = backoff_seconds(room_failures.saturating_sub(1));
@@ -1078,6 +1382,7 @@ impl Supervisor {
                     wait
                 }
                 ResolveAttempt::VerificationRequired(safe_error) => {
+                    self.unregister_live_candidate(streamer_id, generation);
                     entry_invalid_count = 0;
                     let _ = self.database.update_streamer_verification_required(
                         streamer_id,
@@ -1099,6 +1404,7 @@ impl Supervisor {
                     VERIFICATION_WAIT_INTERVAL.as_secs()
                 }
                 ResolveAttempt::LayoutChanged(safe_error, http_status) => {
+                    self.unregister_live_candidate(streamer_id, generation);
                     entry_invalid_count = 0;
                     room_failures += 1;
                     let wait = backoff_seconds(room_failures.saturating_sub(1));
@@ -1123,6 +1429,7 @@ impl Supervisor {
                     wait
                 }
                 ResolveAttempt::EntryInvalid(safe_error, http_status) => {
+                    self.unregister_live_candidate(streamer_id, generation);
                     room_failures = 0;
                     entry_invalid_count = entry_invalid_count.saturating_add(1);
                     if streamer.source_kind == StreamerSourceKind::Profile
@@ -1176,6 +1483,7 @@ impl Supervisor {
                 break;
             }
         }
+        self.unregister_live_candidate(streamer_id, generation);
     }
 
     async fn wait_for_next(
@@ -1248,16 +1556,35 @@ impl Supervisor {
     async fn record_live(
         &self,
         streamer: Streamer,
+        generation: u64,
         worker_cancellation: CancellationToken,
     ) -> Result<SessionEnd, String> {
         let room_url = streamer
             .room_url
             .clone()
             .ok_or_else(|| "尚未发现稳定直播入口".to_owned())?;
-        let permit = tokio::select! {
-            permit = self.recording_limiter.acquire() => permit,
-            _ = worker_cancellation.cancelled() => return Ok(SessionEnd::Cancelled),
+        if !self.is_recording_target(streamer.id, generation) {
+            return Ok(SessionEnd::Deferred);
+        }
+        let permit = loop {
+            let target_changed = self.recording_target_notify.notified();
+            if !self.is_recording_target(streamer.id, generation) {
+                return Ok(SessionEnd::Deferred);
+            }
+            tokio::select! {
+                permit = self.recording_limiter.acquire() => break permit,
+                _ = worker_cancellation.cancelled() => return Ok(SessionEnd::Cancelled),
+                _ = target_changed => {
+                    if !self.is_recording_target(streamer.id, generation) {
+                        return Ok(SessionEnd::Deferred);
+                    }
+                }
+            }
         };
+        if !self.is_recording_target(streamer.id, generation) {
+            drop(permit);
+            return Ok(SessionEnd::Deferred);
+        }
         let room = match self
             .resolve_room(
                 streamer.id,
@@ -1280,6 +1607,10 @@ impl Supervisor {
             ResolveAttempt::Cancelled => return Ok(SessionEnd::Cancelled),
         };
         let room_id = room.room_id.clone();
+        if !self.is_recording_target(streamer.id, generation) {
+            drop(permit);
+            return Ok(SessionEnd::Deferred);
+        }
         self.database
             .update_current_room_id(streamer.id, &room_id)
             .map_err(|error| error.to_string())?;
@@ -1335,13 +1666,34 @@ impl Supervisor {
             .map_err(|error| error.to_string())?;
         let token = worker_cancellation.child_token();
         if let Ok(mut recording_tokens) = self.recording_tokens.lock() {
-            recording_tokens.insert(streamer.id, token.clone());
+            recording_tokens.insert(
+                streamer.id,
+                ActiveRecording {
+                    generation,
+                    token: token.clone(),
+                },
+            );
         } else {
             let error = "录制锁已损坏".to_owned();
             let _ = self
                 .database
                 .finish_session(session.id, "error", Some(&error));
             return Err(error);
+        }
+        if !self.is_recording_target(streamer.id, generation) {
+            if let Ok(mut recording_tokens) = self.recording_tokens.lock() {
+                let is_current = recording_tokens
+                    .get(&streamer.id)
+                    .is_some_and(|recording| recording.generation == generation);
+                if is_current {
+                    recording_tokens.remove(&streamer.id);
+                }
+            }
+            let _ = self
+                .database
+                .finish_session(session.id, "cancelled", Some("priority_changed"));
+            drop(permit);
+            return Ok(SessionEnd::Deferred);
         }
         let disk_monitor_cancellation = CancellationToken::new();
         let disk_monitor = tokio::spawn(monitor_active_disk(
@@ -1527,16 +1879,45 @@ impl Supervisor {
         disk_monitor_cancellation.cancel();
         let _ = disk_monitor.await;
         if let Ok(mut recording_tokens) = self.recording_tokens.lock() {
-            recording_tokens.remove(&streamer.id);
+            let is_current = recording_tokens
+                .get(&streamer.id)
+                .is_some_and(|recording| recording.generation == generation);
+            if is_current {
+                recording_tokens.remove(&streamer.id);
+            }
+        }
+        if !matches!(&final_end, SessionEnd::Cancelled)
+            && let Ok(mut reasons) = self.recording_cancel_reasons.lock()
+        {
+            reasons.remove(&(streamer.id, generation));
         }
         let (session_status, final_error) = match &final_end {
             SessionEnd::Completed => ("completed", None),
-            SessionEnd::Cancelled => ("cancelled", Some("录制已取消")),
-            SessionEnd::Error(error) => ("error", Some(error.as_str())),
+            SessionEnd::Cancelled => {
+                let reason = self
+                    .recording_cancel_reasons
+                    .lock()
+                    .ok()
+                    .and_then(|mut reasons| reasons.remove(&(streamer.id, generation)))
+                    .unwrap_or_else(|| "recording_cancelled".to_owned());
+                ("cancelled", Some(reason))
+            }
+            SessionEnd::Error(error) => ("error", Some(error.clone())),
+            SessionEnd::Deferred => ("cancelled", Some("recording_deferred".to_owned())),
         };
+        if session_status == "cancelled" {
+            self.monitor_logger.log_room_check(
+                streamer.id,
+                streamer.web_rid.as_deref(),
+                final_error.as_deref().unwrap_or("recording_cancelled"),
+                None,
+                0,
+                None,
+            );
+        }
         let finish_result = self
             .database
-            .finish_session(session.id, session_status, final_error)
+            .finish_session(session.id, session_status, final_error.as_deref())
             .map_err(|error| error.to_string());
         drop(permit);
         self.publisher
@@ -1817,7 +2198,9 @@ mod tests {
                 Worker {
                     generation: 0,
                     cancellation: CancellationToken::new(),
-                    task: tokio::spawn(std::future::pending()),
+                    task: tauri::async_runtime::JoinHandle::Tokio(tokio::spawn(
+                        std::future::pending(),
+                    )),
                     wake,
                 }
             })

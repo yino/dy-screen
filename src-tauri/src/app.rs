@@ -13,6 +13,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -33,8 +34,8 @@ use crate::app_support::{delete_recording_session, delete_recording_video, valid
 use crate::database::Database;
 use crate::domain::{
     AppSettings, BrowserAccessState, BrowserAccessStatus, CommandError, CreateStreamerRequest,
-    Dashboard, EnvironmentStatus, MonitorEvent, Streamer, StreamerPromptContext, VideoFilter,
-    VideoPage,
+    Dashboard, EnvironmentStatus, MonitorEvent, RecordingPriorityDirection, Streamer,
+    StreamerPromptContext, VideoFilter, VideoPage,
 };
 use crate::preview::{
     PreviewCache, PreviewFailure, PreviewPublisher, PreviewRequest, PreviewService, PreviewSnapshot,
@@ -75,25 +76,47 @@ struct DesktopRoomResolutionPublisher {
     app: AppHandle,
     database: Database,
     logger: MonitorLogger,
-    verification_notified: Arc<AtomicBool>,
+    verification_prompt: VerificationPromptCoordinator,
+}
+
+#[derive(Clone, Default)]
+struct VerificationPromptCoordinator {
+    active_cycle: Arc<AtomicBool>,
+}
+
+impl VerificationPromptCoordinator {
+    fn transition(&self, status: BrowserAccessStatus) -> bool {
+        if status == BrowserAccessStatus::VerificationRequired {
+            !self.active_cycle.swap(true, Ordering::SeqCst)
+        } else {
+            self.active_cycle.store(false, Ordering::SeqCst);
+            false
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_cycle.load(Ordering::SeqCst)
+    }
 }
 
 impl RoomResolutionPublisher for DesktopRoomResolutionPublisher {
     fn publish_access_state(&self, state: &BrowserAccessState) {
         let _ = self.app.emit("browser-access-event", state);
-        if should_notify_verification(&self.verification_notified, state.status)
-            && self
+        if self.verification_prompt.transition(state.status) {
+            self.show_verification_prompt();
+            if self
                 .database
                 .get_settings()
                 .is_ok_and(|settings| settings.notifications_enabled)
-        {
-            let _ = self
-                .app
-                .notification()
-                .builder()
-                .title("需要访问验证")
-                .body("请打开切片智能体的抖音验证窗口")
-                .show();
+            {
+                let _ = self
+                    .app
+                    .notification()
+                    .builder()
+                    .title("需要访问验证")
+                    .body("请打开切片智能体的抖音验证窗口")
+                    .show();
+            }
         }
     }
 
@@ -102,12 +125,99 @@ impl RoomResolutionPublisher for DesktopRoomResolutionPublisher {
     }
 }
 
-fn should_notify_verification(notified: &AtomicBool, status: BrowserAccessStatus) -> bool {
-    if status == BrowserAccessStatus::VerificationRequired {
-        !notified.swap(true, Ordering::SeqCst)
-    } else {
-        notified.store(false, Ordering::SeqCst);
-        false
+impl DesktopRoomResolutionPublisher {
+    fn show_verification_prompt(&self) {
+        let app = self.app.clone();
+        let coordinator = self.verification_prompt.clone();
+        self.app
+            .dialog()
+            .message("抖音公开页需要完成访问验证后才能继续监听")
+            .title("需要访问验证")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "立即验证".to_owned(),
+                "稍后处理".to_owned(),
+            ))
+            .show(move |verify_now| {
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                if !should_start_verification(
+                    verify_now,
+                    coordinator.is_active(),
+                    state.shutdown_gate.is_started(),
+                    state.room_resolution.access_state().status,
+                ) {
+                    return;
+                }
+                let room_resolution = state.room_resolution.clone();
+                tauri::async_runtime::spawn(async move {
+                    if room_resolution.shutdown_token().is_cancelled()
+                        || room_resolution.access_state().status
+                            != BrowserAccessStatus::VerificationRequired
+                    {
+                        return;
+                    }
+                    let _ = room_resolution.show_verification().await;
+                });
+            });
+    }
+}
+
+fn should_start_verification(
+    verify_now: bool,
+    active_cycle: bool,
+    shutting_down: bool,
+    status: BrowserAccessStatus,
+) -> bool {
+    verify_now
+        && active_cycle
+        && !shutting_down
+        && status == BrowserAccessStatus::VerificationRequired
+}
+
+#[cfg(test)]
+mod verification_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn verification_prompt_is_deduplicated_until_access_recovers() {
+        let coordinator = VerificationPromptCoordinator::default();
+        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
+        assert!(!coordinator.transition(BrowserAccessStatus::VerificationRequired));
+        assert!(coordinator.is_active());
+
+        assert!(!coordinator.transition(BrowserAccessStatus::SessionReady));
+        assert!(!coordinator.is_active());
+        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
+    }
+
+    #[test]
+    fn verification_action_honors_later_stale_state_and_shutdown() {
+        assert!(should_start_verification(
+            true,
+            true,
+            false,
+            BrowserAccessStatus::VerificationRequired,
+        ));
+        assert!(!should_start_verification(
+            false,
+            true,
+            false,
+            BrowserAccessStatus::VerificationRequired,
+        ));
+        assert!(!should_start_verification(
+            true,
+            true,
+            true,
+            BrowserAccessStatus::VerificationRequired,
+        ));
+        assert!(!should_start_verification(
+            true,
+            false,
+            false,
+            BrowserAccessStatus::Native,
+        ));
     }
 }
 
@@ -163,15 +273,20 @@ fn spawn_activation_lifecycle(
         // AppStart 是免鉴权、best-effort 请求。只记录安全的版本决策摘要，
         // 不输出下载 URL、签名或原始响应正文。
         match api.app_start().await {
-            Ok(Some(result)) => eprintln!(
-                "{}",
-                serde_json::json!({
-                    "component": "client_api",
-                    "event": "app_start",
-                    "version": result.version,
-                    "force": result.force,
-                })
-            ),
+            Ok(Some(result)) => {
+                if let Some(limit) = activation.apply_app_start_limit(result.max_screen_limit) {
+                    supervisor.set_server_recording_limit(limit);
+                }
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "component": "client_api",
+                        "event": "app_start",
+                        "version": result.version,
+                        "force": result.force,
+                    })
+                );
+            }
             Ok(None) => eprintln!(
                 "{}",
                 serde_json::json!({
@@ -206,6 +321,7 @@ fn spawn_activation_lifecycle(
                 continue;
             }
             let outcome = activation.heartbeat_once().await;
+            supervisor.set_server_recording_limit(activation.max_screen_limit());
             let view = activation.state();
             let _ = app.emit("activation-event", &view);
             wait = match outcome {
@@ -382,10 +498,12 @@ impl ThumbnailPublisher for DesktopThumbnailPublisher {
 
 #[tauri::command]
 fn get_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
-    state
+    let mut dashboard = state
         .database
         .dashboard()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    dashboard.max_screen_limit = state.supervisor.max_screen_limit();
+    Ok(dashboard)
 }
 
 fn require_runtime_ready(state: &AppState) -> Result<(), String> {
@@ -622,6 +740,31 @@ fn check_streamer_now(id: i64, state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
+async fn move_streamer_recording_priority(
+    id: i64,
+    direction: RecordingPriorityDirection,
+    state: State<'_, AppState>,
+) -> Result<Vec<Streamer>, CommandError> {
+    require_runtime_ready(state.inner())
+        .map_err(|message| CommandError::new("resource_not_ready", message))?;
+    let streamers = state
+        .database
+        .move_recording_priority(id, direction)
+        .map_err(|_| {
+            CommandError::new(
+                "recording_priority_update_failed",
+                "录制优先级保存失败，请重试",
+            )
+        })?;
+    state
+        .supervisor
+        .recording_priority_changed(id)
+        .await
+        .map_err(|message| CommandError::new("recording_priority_refresh_failed", message))?;
+    Ok(streamers)
+}
+
+#[tauri::command]
 fn get_browser_access_state(state: State<'_, AppState>) -> BrowserAccessState {
     state.room_resolution.access_state()
 }
@@ -759,9 +902,6 @@ fn save_settings(
         .database
         .save_settings(&normalized)
         .map_err(|error| error.to_string())?;
-    state
-        .supervisor
-        .set_max_concurrent(normalized.max_concurrent_recordings);
     Ok(())
 }
 
@@ -1308,6 +1448,7 @@ pub fn run() {
             update_streamer,
             set_monitor_enabled,
             check_streamer_now,
+            move_streamer_recording_priority,
             get_browser_access_state,
             show_douyin_verification,
             recheck_douyin_access,
@@ -1467,7 +1608,6 @@ pub fn run() {
                 database: database.clone(),
                 tray_status: tray_status.clone(),
             });
-            let max_concurrent = database.get_settings()?.max_concurrent_recordings;
             let monitor_logger = MonitorLogger::file(log_dir.clone());
             let browser_driver = Arc::new(
                 TauriBrowserPageDriver::new(
@@ -1480,7 +1620,7 @@ pub fn run() {
                 app: app.handle().clone(),
                 database: database.clone(),
                 logger: monitor_logger.clone(),
-                verification_notified: Arc::new(AtomicBool::new(false)),
+                verification_prompt: VerificationPromptCoordinator::default(),
             });
             let native_room_resolver = Arc::new(
                 StreamResolver::new()
@@ -1494,7 +1634,7 @@ pub fn run() {
             let mut supervisor = Supervisor::new_with_room_discovery(
                 database.clone(),
                 publisher,
-                max_concurrent,
+                crate::domain::DEFAULT_MAX_SCREEN_LIMIT,
                 room_resolution.clone(),
                 room_resolution.public_request_gate(),
                 monitor_logger,
@@ -1977,24 +2117,12 @@ mod tests {
 
     #[test]
     fn access_verification_notification_is_deduplicated_until_session_recovers() {
-        let notified = AtomicBool::new(false);
+        let coordinator = VerificationPromptCoordinator::default();
 
-        assert!(should_notify_verification(
-            &notified,
-            BrowserAccessStatus::VerificationRequired
-        ));
-        assert!(!should_notify_verification(
-            &notified,
-            BrowserAccessStatus::VerificationRequired
-        ));
-        assert!(!should_notify_verification(
-            &notified,
-            BrowserAccessStatus::SessionReady
-        ));
-        assert!(should_notify_verification(
-            &notified,
-            BrowserAccessStatus::VerificationRequired
-        ));
+        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
+        assert!(!coordinator.transition(BrowserAccessStatus::VerificationRequired));
+        assert!(!coordinator.transition(BrowserAccessStatus::SessionReady));
+        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
     }
 
     #[test]

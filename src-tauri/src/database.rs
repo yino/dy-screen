@@ -33,6 +33,8 @@ pub enum DatabaseError {
     Poisoned,
     #[error("数据库迁移完整性检查失败：{0}")]
     MigrationIntegrity(String),
+    #[error("录制优先级调整方向无效")]
+    InvalidPriorityDirection,
     #[error("{0}")]
     TagValidation(#[from] StreamerTagValidationError),
 }
@@ -235,6 +237,7 @@ impl Database {
         crate::ai::migrate_ai_v14(&mut connection)?;
         migrate_ai_replay_directory_v15(&mut connection)?;
         crate::ai::migrate_ai_v16(&mut connection)?;
+        migrate_recording_priority_v17(&mut connection)?;
 
         let applied = connection
             .query_row(
@@ -494,8 +497,12 @@ impl Database {
             INSERT INTO streamers(
                 name, source_kind, source_url, profile_sec_uid, web_rid,
                 room_url, room_id, monitor_enabled, archived,
-                live_status, monitor_status, created_at, updated_at
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?11)
+                live_status, monitor_status, recording_priority, created_at, updated_at
+            ) VALUES(
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10,
+                (SELECT COALESCE(MAX(recording_priority), 0) + 1 FROM streamers),
+                ?11, ?11
+            )
             "#,
             params![
                 input.name.trim(),
@@ -598,6 +605,70 @@ impl Database {
         drop(statement);
         attach_tags_to_streamers(&connection, &mut streamers)?;
         Ok(streamers)
+    }
+
+    pub fn list_streamers_by_recording_priority(&self) -> Result<Vec<Streamer>> {
+        let connection = self.connection()?;
+        let sql =
+            streamer_select("WHERE s.archived = 0 ORDER BY s.recording_priority ASC, s.id ASC");
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map([], map_streamer)?;
+        let mut streamers = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        attach_tags_to_streamers(&connection, &mut streamers)?;
+        Ok(streamers)
+    }
+
+    pub fn move_recording_priority(
+        &self,
+        id: i64,
+        direction: crate::domain::RecordingPriorityDirection,
+    ) -> Result<Vec<Streamer>> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        normalize_recording_priorities(&transaction)?;
+        let current = transaction
+            .query_row(
+                "SELECT recording_priority FROM streamers WHERE id = ?1 AND archived = 0",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NotFound("主播"))?;
+        let neighbor = match direction {
+            crate::domain::RecordingPriorityDirection::Up => transaction
+                .query_row(
+                    r#"SELECT id, recording_priority FROM streamers
+                       WHERE archived = 0 AND recording_priority < ?1
+                       ORDER BY recording_priority DESC, id DESC LIMIT 1"#,
+                    [current],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?,
+            crate::domain::RecordingPriorityDirection::Down => transaction
+                .query_row(
+                    r#"SELECT id, recording_priority FROM streamers
+                       WHERE archived = 0 AND recording_priority > ?1
+                       ORDER BY recording_priority ASC, id ASC LIMIT 1"#,
+                    [current],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?,
+        };
+        if let Some((neighbor_id, neighbor_priority)) = neighbor {
+            let now = Utc::now().to_rfc3339();
+            transaction.execute(
+                "UPDATE streamers SET recording_priority = ?1, updated_at = ?2 WHERE id = ?3",
+                params![neighbor_priority, now, id],
+            )?;
+            transaction.execute(
+                "UPDATE streamers SET recording_priority = ?1, updated_at = ?2 WHERE id = ?3",
+                params![current, now, neighbor_id],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        self.list_streamers_by_recording_priority()
     }
 
     pub fn replace_streamer_tags(
@@ -778,8 +849,8 @@ impl Database {
                 room_id = ?7, monitor_enabled = ?8, archived = ?9,
                 live_status = ?10, monitor_status = ?11,
                 last_checked_at = ?12, last_error = ?13, failure_count = ?14,
-                next_retry_at = ?15, updated_at = ?16
-            WHERE id = ?17
+                next_retry_at = ?15, recording_priority = ?16, updated_at = ?17
+            WHERE id = ?18
             "#,
             params![
                 snapshot.name,
@@ -797,6 +868,7 @@ impl Database {
                 snapshot.last_error,
                 snapshot.failure_count,
                 snapshot.next_retry_at,
+                snapshot.recording_priority,
                 Utc::now().to_rfc3339(),
                 snapshot.id,
             ],
@@ -885,13 +957,14 @@ impl Database {
         let transaction = connection.transaction()?;
         let source = transaction
             .query_row(
-                "SELECT source_url, profile_sec_uid, monitor_enabled FROM streamers WHERE id = ?1",
+                "SELECT source_url, profile_sec_uid, monitor_enabled, recording_priority FROM streamers WHERE id = ?1",
                 [streamer_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, bool>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
@@ -899,19 +972,22 @@ impl Database {
             .ok_or(DatabaseError::NotFound("主播"))?;
         let target = transaction
             .query_row(
-                "SELECT id, profile_sec_uid, monitor_enabled FROM streamers WHERE web_rid = ?1 AND id <> ?2",
+                "SELECT id, profile_sec_uid, monitor_enabled, recording_priority FROM streamers WHERE web_rid = ?1 AND id <> ?2",
                 params![web_rid, streamer_id],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, bool>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()?;
 
-        let Some((target_id, target_profile_sec_uid, target_monitor_enabled)) = target else {
+        let Some((target_id, target_profile_sec_uid, target_monitor_enabled, target_priority)) =
+            target
+        else {
             transaction.execute(
                 r#"
                 UPDATE streamers
@@ -952,6 +1028,7 @@ impl Database {
             replace_streamer_tags_in_transaction(&transaction, target_id, &merged_tags)?;
             transaction.execute("DELETE FROM streamers WHERE id = ?1", [streamer_id])?;
             let monitor_enabled = source.2 || target_monitor_enabled;
+            let retained_priority = source.3.min(target_priority);
             transaction.execute(
                 r#"
                 UPDATE streamers
@@ -961,8 +1038,9 @@ impl Database {
                     web_rid = ?3, room_url = ?4, room_id = ?5,
                     monitor_enabled = ?6, archived = 0, live_status = 'checking',
                     monitor_status = CASE WHEN ?6 = 1 THEN 'waiting' ELSE 'paused' END,
-                    last_checked_at = NULL, last_error = NULL, updated_at = ?7
-                WHERE id = ?8
+                    last_checked_at = NULL, last_error = NULL,
+                    recording_priority = ?7, updated_at = ?8
+                WHERE id = ?9
                 "#,
                 params![
                     source.1,
@@ -971,10 +1049,12 @@ impl Database {
                     room_url,
                     room_id,
                     monitor_enabled,
+                    retained_priority,
                     Utc::now().to_rfc3339(),
                     target_id
                 ],
             )?;
+            normalize_recording_priorities(&transaction)?;
             transaction.commit()?;
             if tags_truncated {
                 eprintln!("主播标签合并超过 10 个，已按目标优先规则截断");
@@ -1631,6 +1711,7 @@ impl Database {
             streamers,
             active_recordings,
             current_video_count,
+            max_screen_limit: crate::domain::DEFAULT_MAX_SCREEN_LIMIT,
         })
     }
 }
@@ -1665,6 +1746,58 @@ fn migrate_streamer_tags_v3(connection: &mut Connection) -> Result<()> {
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_recording_priority_v17(connection: &mut Connection) -> Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 17",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let column_exists = connection.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('streamers') WHERE name = 'recording_priority'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? == 1;
+    if applied && column_exists {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    if !column_exists {
+        transaction.execute_batch(
+            "ALTER TABLE streamers ADD COLUMN recording_priority INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    normalize_recording_priorities(&transaction)?;
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_streamers_recording_priority ON streamers(recording_priority, id);",
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(17, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn normalize_recording_priorities(transaction: &Transaction<'_>) -> Result<()> {
+    let mut statement =
+        transaction.prepare("SELECT id FROM streamers ORDER BY recording_priority ASC, id ASC")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (index, id) in ids.into_iter().enumerate() {
+        transaction.execute(
+            "UPDATE streamers SET recording_priority = ?1 WHERE id = ?2",
+            params![index as i64 + 1, id],
+        )?;
+    }
     Ok(())
 }
 
@@ -2132,7 +2265,7 @@ fn streamer_select(suffix: &str) -> String {
         SELECT s.id, s.name, s.source_kind, s.source_url, s.profile_sec_uid,
                s.web_rid, s.room_url, s.room_id, s.monitor_enabled, s.archived,
                s.live_status, s.monitor_status, s.last_checked_at, s.last_error,
-               s.failure_count, s.next_retry_at,
+               s.failure_count, s.next_retry_at, s.recording_priority,
                (
                    SELECT COUNT(*) FROM videos v
                    JOIN recording_sessions rs ON rs.id = v.session_id
@@ -2171,8 +2304,9 @@ fn map_streamer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Streamer> {
         last_error: row.get(13)?,
         failure_count: row.get(14)?,
         next_retry_at: row.get(15)?,
-        current_video_count: row.get(16)?,
-        history_video_count: row.get(17)?,
+        recording_priority: row.get(16)?,
+        current_video_count: row.get(17)?,
+        history_video_count: row.get(18)?,
         tags: Vec::new(),
     })
 }

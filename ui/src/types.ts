@@ -54,6 +54,7 @@ export interface Streamer {
   lastError: string | null;
   failureCount: number;
   nextRetryAt: string | null;
+  recordingPriority: number;
   currentVideoCount: number;
   historyVideoCount: number;
   tags: StreamerTag[];
@@ -63,6 +64,7 @@ export interface Dashboard {
   streamers: Streamer[];
   activeRecordings: number;
   currentVideoCount: number;
+  maxScreenLimit: number;
 }
 
 export interface CreateStreamerInput {
@@ -673,6 +675,7 @@ export interface ClientApi {
   getStreamerPromptContext(id: number): Promise<StreamerPromptContext>;
   setMonitorEnabled(id: number, enabled: boolean): Promise<void>;
   checkStreamerNow(id: number): Promise<void>;
+  moveStreamerRecordingPriority(id: number, direction: "up" | "down"): Promise<Streamer[]>;
   archiveStreamer(id: number): Promise<void>;
   stopRecording(id: number): Promise<void>;
   listVideos(streamerId?: number, page?: number, pageSize?: number, filters?: VideoFilters): Promise<VideoPage>;

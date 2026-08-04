@@ -249,6 +249,8 @@ pub struct Streamer {
     pub failure_count: i64,
     #[serde(default)]
     pub next_retry_at: Option<String>,
+    #[serde(default)]
+    pub recording_priority: i64,
     pub current_video_count: i64,
     pub history_video_count: i64,
     #[serde(default)]
@@ -293,6 +295,7 @@ pub struct AppSettings {
     pub quality: String,
     pub protocol: String,
     pub segment_seconds: u64,
+    #[serde(default = "default_max_screen_limit")]
     pub max_concurrent_recordings: usize,
     pub asr_during_recording: bool,
     /// 旧版本数据库字段，仅供迁移和 Debug 测试；不序列化到生产前端。
@@ -400,6 +403,21 @@ pub struct Dashboard {
     pub streamers: Vec<Streamer>,
     pub active_recordings: i64,
     pub current_video_count: i64,
+    #[serde(default = "default_max_screen_limit")]
+    pub max_screen_limit: usize,
+}
+
+pub const DEFAULT_MAX_SCREEN_LIMIT: usize = 4;
+
+const fn default_max_screen_limit() -> usize {
+    DEFAULT_MAX_SCREEN_LIMIT
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingPriorityDirection {
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

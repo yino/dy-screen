@@ -1,6 +1,7 @@
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{
-    DiscoveryBinding, NewStreamer, NewVideo, StreamerSourceKind, VideoFilter,
+    DiscoveryBinding, NewStreamer, NewVideo, RecordingPriorityDirection, StreamerSourceKind,
+    VideoFilter,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use tempfile::tempdir;
@@ -188,6 +189,137 @@ fn diagnostic_migration_preserves_existing_streamers_and_adds_safe_defaults() {
     let streamer = database.get_streamer(11).unwrap();
     assert_eq!(streamer.failure_count, 0);
     assert_eq!(streamer.next_retry_at, None);
+}
+
+#[test]
+fn recording_priority_migration_is_idempotent_and_preserves_history_and_foreign_keys() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("recording-priority-v17.sqlite3");
+    create_legacy_database(&path);
+
+    let database = Database::open(&path).unwrap();
+    database.migrate().unwrap();
+    database.migrate().unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 17",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    let priorities = connection
+        .prepare("SELECT recording_priority FROM streamers ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(priorities, vec![1, 2]);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM recording_sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM videos", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn recording_priority_appends_moves_restores_and_survives_identity_merge() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let first_input = NewStreamer::room("a", "101", "room-101", true);
+    let first = database.add_streamer(&first_input).unwrap();
+    let second = database
+        .add_streamer(&NewStreamer::room("b", "102", "room-102", true))
+        .unwrap();
+    let third = database
+        .add_streamer(&NewStreamer::room("c", "103", "room-103", true))
+        .unwrap();
+    assert_eq!(
+        (
+            first.recording_priority,
+            second.recording_priority,
+            third.recording_priority
+        ),
+        (1, 2, 3)
+    );
+
+    let order = database
+        .move_recording_priority(third.id, RecordingPriorityDirection::Up)
+        .unwrap();
+    assert_eq!(
+        order
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c", "b"]
+    );
+    let order = database
+        .move_recording_priority(third.id, RecordingPriorityDirection::Up)
+        .unwrap();
+    assert_eq!(
+        order
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c", "a", "b"]
+    );
+
+    database.archive_streamer(first.id).unwrap();
+    let archived_priority = database.get_streamer(first.id).unwrap().recording_priority;
+    let restored = database.restore_streamer(first.id, &first_input).unwrap();
+    assert_eq!(restored.recording_priority, archived_priority);
+
+    let profile = database
+        .add_streamer(&NewStreamer {
+            name: "主页".to_owned(),
+            source_kind: StreamerSourceKind::Profile,
+            source_url: "https://www.douyin.com/user/profile-priority".to_owned(),
+            profile_sec_uid: Some("profile-priority".to_owned()),
+            web_rid: None,
+            room_url: None,
+            room_id: None,
+            monitor_enabled: true,
+            tags: Vec::new(),
+        })
+        .unwrap();
+    let room = database
+        .add_streamer(&NewStreamer::room("重复直播间", "999", "room-999", true))
+        .unwrap();
+    let profile_priority = profile.recording_priority;
+    assert!(matches!(
+        database
+            .bind_discovered_room(
+                profile.id,
+                "999",
+                "https://live.douyin.com/999",
+                Some("room-999")
+            )
+            .unwrap(),
+        DiscoveryBinding::Merged { target_streamer_id, .. } if target_streamer_id == room.id
+    ));
+    assert!(database.get_streamer(room.id).unwrap().recording_priority <= profile_priority);
 }
 
 #[test]

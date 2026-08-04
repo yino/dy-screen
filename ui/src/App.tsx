@@ -69,7 +69,27 @@ const emptyDashboard: Dashboard = {
   streamers: [],
   activeRecordings: 0,
   currentVideoCount: 0,
+  maxScreenLimit: 4,
 };
+
+function movePriorityOptimistically(
+  streamers: Streamer[],
+  id: number,
+  direction: "up" | "down",
+): Streamer[] {
+  const ordered = [...streamers].sort((left, right) =>
+    left.recordingPriority - right.recordingPriority || left.id - right.id);
+  const index = ordered.findIndex((item) => item.id === id);
+  const neighborIndex = direction === "up" ? index - 1 : index + 1;
+  if (index < 0 || neighborIndex < 0 || neighborIndex >= ordered.length) return streamers;
+  const current = ordered[index];
+  const neighbor = ordered[neighborIndex];
+  return streamers.map((item) => {
+    if (item.id === current.id) return { ...item, recordingPriority: neighbor.recordingPriority };
+    if (item.id === neighbor.id) return { ...item, recordingPriority: current.recordingPriority };
+    return item;
+  });
+}
 
 const monitorPriority: Record<MonitorStatus, number> = {
   recording: 0,
@@ -238,6 +258,7 @@ export function App({ api }: AppProps) {
   const [thumbnailBatch, setThumbnailBatch] = useState<ThumbnailBatch | null>(null);
   const [browserAccess, setBrowserAccess] = useState<BrowserAccessState | null>(null);
   const [accessBusy, setAccessBusy] = useState<"verify" | "check" | "clear" | null>(null);
+  const [priorityBusyId, setPriorityBusyId] = useState<number | null>(null);
   const browserAccessRef = useRef<BrowserAccessState | null>(null);
   const selectedIdRef = useRef(selectedId);
   const pageRef = useRef(page);
@@ -593,6 +614,25 @@ export function App({ api }: AppProps) {
     }
   };
 
+  const moveRecordingPriority = async (id: number, direction: "up" | "down") => {
+    if (priorityBusyId !== null) return;
+    const snapshot = dashboard;
+    setPriorityBusyId(id);
+    setDashboard((current) => ({
+      ...current,
+      streamers: movePriorityOptimistically(current.streamers, id, direction),
+    }));
+    try {
+      await api.moveStreamerRecordingPriority(id, direction);
+      await refreshDashboard();
+    } catch (error) {
+      setDashboard(snapshot);
+      setNotice(errorMessage(error, "录制优先级保存失败，请重试"));
+    } finally {
+      setPriorityBusyId(null);
+    }
+  };
+
   const openPreview = (video: VideoItem) => {
     setPreview({ video, snapshot: pendingPreview(video.id) });
     void api.requestVideoPreview(video.id)
@@ -734,6 +774,7 @@ export function App({ api }: AppProps) {
             videos={currentVideos}
             browserAccess={browserAccess}
             accessBusy={accessBusy}
+            priorityBusyId={priorityBusyId}
             onAdd={() => { setEditingStreamer(null); setAddOpen(true); }}
             onSelect={setSelectedId}
             onRefresh={() => void refreshDashboard()}
@@ -742,6 +783,7 @@ export function App({ api }: AppProps) {
               streamer.monitorEnabled ? "已暂停监听" : "已恢复监听",
             )}
             onCheck={(id) => void action(() => api.checkStreamerNow(id), "已安排立即检查")}
+            onMovePriority={(id, direction) => void moveRecordingPriority(id, direction)}
             onEdit={(streamer) => { setEditingStreamer(streamer); setAddOpen(true); }}
             onStop={(id) => void action(() => api.stopRecording(id), "已请求停止录制")}
             onArchive={(id) => {
@@ -813,6 +855,7 @@ export function App({ api }: AppProps) {
           <SettingsPage
             api={api}
             settings={settings}
+            maxScreenLimit={dashboard.maxScreenLimit}
             environment={environment}
             browserAccess={browserAccess}
             accessBusy={accessBusy}
@@ -1033,11 +1076,13 @@ function MonitorPage({
   videos,
   browserAccess,
   accessBusy,
+  priorityBusyId,
   onAdd,
   onSelect,
   onRefresh,
   onToggle,
   onCheck,
+  onMovePriority,
   onEdit,
   onStop,
   onArchive,
@@ -1055,11 +1100,13 @@ function MonitorPage({
   videos: VideoItem[];
   browserAccess: BrowserAccessState | null;
   accessBusy: "verify" | "check" | "clear" | null;
+  priorityBusyId: number | null;
   onAdd: () => void;
   onSelect: (id: number) => void;
   onRefresh: () => void;
   onToggle: (streamer: Streamer) => void;
   onCheck: (id: number) => void;
+  onMovePriority: (id: number, direction: "up" | "down") => void;
   onEdit: (streamer: Streamer) => void;
   onStop: (id: number) => void;
   onArchive: (id: number) => void;
@@ -1074,6 +1121,10 @@ function MonitorPage({
   const waitingCount = dashboard.streamers.filter((item) =>
     item.monitorStatus === "waiting" || item.monitorStatus === "waiting_first_live"
   ).length;
+  const priorityOrder = [...dashboard.streamers].sort((left, right) =>
+    left.recordingPriority - right.recordingPriority || left.id - right.id);
+  const firstPriorityId = priorityOrder[0]?.id;
+  const lastPriorityId = priorityOrder.at(-1)?.id;
   return (
     <div className="page-content">
       {browserAccess && browserAccess.status !== "native" && (
@@ -1087,7 +1138,7 @@ function MonitorPage({
       <section className="summary-grid">
         <SummaryCard icon={Radio} label="监控主播" value={dashboard.streamers.length} hint="已配置的活动主播" tone="green" />
         <SummaryCard icon={Wifi} label="正在直播" value={liveCount} hint="离线约 60 秒刷新" tone="orange" />
-        <SummaryCard icon={Video} label="活动录制" value={dashboard.activeRecordings} hint="默认最多同时 4 路" tone="blue" />
+        <SummaryCard icon={Video} label="活动录制" value={dashboard.activeRecordings} hint={`服务端额度 ${dashboard.maxScreenLimit} 路`} tone="blue" />
         <SummaryCard icon={Clock3} label="等待开播" value={waitingCount} hint="应用关闭窗口后继续" tone="purple" />
       </section>
 
@@ -1113,11 +1164,12 @@ function MonitorPage({
                   <col className="streamer-source-column" />
                   <col className="streamer-live-column" />
                   <col className="streamer-monitor-column" />
+                  <col className="streamer-priority-column" />
                   <col className="streamer-check-column" />
                   <col className="streamer-video-column" />
                   <col className="streamer-actions-column" />
                 </colgroup>
-                <thead><tr><th>主播 / 来源</th><th>直播状态</th><th>监听状态</th><th>最近检查</th><th>视频</th><th><span className="sr-only">操作</span></th></tr></thead>
+                <thead><tr><th>主播 / 来源</th><th>直播状态</th><th>监听状态</th><th>录制优先级</th><th>最近检查</th><th>视频</th><th><span className="sr-only">操作</span></th></tr></thead>
                 <tbody>
                   {streamers.map((streamer) => (
                     <StreamerRow
@@ -1128,6 +1180,10 @@ function MonitorPage({
                       onSelect={() => onSelect(streamer.id)}
                       onToggle={() => onToggle(streamer)}
                       onCheck={() => onCheck(streamer.id)}
+                      onMovePriority={(direction) => onMovePriority(streamer.id, direction)}
+                      priorityBusy={priorityBusyId === streamer.id}
+                      canMoveUp={streamer.id !== firstPriorityId}
+                      canMoveDown={streamer.id !== lastPriorityId}
                       onEdit={() => onEdit(streamer)}
                       onStop={() => onStop(streamer.id)}
                       onArchive={() => onArchive(streamer.id)}
@@ -1210,13 +1266,17 @@ function SummaryCard({ icon: Icon, label, value, hint, tone }: { icon: typeof Ra
   );
 }
 
-function StreamerRow({ streamer, browserAccess, selected, onSelect, onToggle, onCheck, onEdit, onStop, onArchive, onOpenLogs, onVerify }: {
+function StreamerRow({ streamer, browserAccess, selected, priorityBusy, canMoveUp, canMoveDown, onSelect, onToggle, onCheck, onMovePriority, onEdit, onStop, onArchive, onOpenLogs, onVerify }: {
   streamer: Streamer;
   browserAccess: BrowserAccessState | null;
   selected: boolean;
+  priorityBusy: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
   onSelect: () => void;
   onToggle: () => void;
   onCheck: () => void;
+  onMovePriority: (direction: "up" | "down") => void;
   onEdit: () => void;
   onStop: () => void;
   onArchive: () => void;
@@ -1243,6 +1303,31 @@ function StreamerRow({ streamer, browserAccess, selected, onSelect, onToggle, on
       <td><div className="streamer-cell"><div className="streamer-avatar">{streamer.name.slice(0, 1)}</div><div className="streamer-primary"><strong>{streamer.name}</strong><span>{sourceLabel} · {identityLabel}</span>{streamer.tags.length > 0 && <div className="streamer-tag-badges" aria-label={`${streamer.name}标签`}>{streamer.tags.slice(0, 2).map((tag) => <span key={tag.id}>{tag.name}</span>)}{streamer.tags.length > 2 && <b title={`另有 ${streamer.tags.length - 2} 个标签`}>+{streamer.tags.length - 2}</b>}</div>}</div></div></td>
       <td><StatusBadge kind={streamer.liveStatus === "live" ? "live" : streamer.liveStatus === "error" ? "error" : "neutral"}>{liveLabels[streamer.liveStatus]}</StatusBadge></td>
       <td><StatusBadge kind={monitorKind}>{monitorLabel}</StatusBadge></td>
+      <td onClick={(event) => event.stopPropagation()}>
+        <div className="recording-priority-control">
+          <strong>#{streamer.recordingPriority}</strong>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={`提高${streamer.name}录制优先级`}
+            title="提高录制优先级"
+            disabled={!canMoveUp || priorityBusy}
+            onClick={() => onMovePriority("up")}
+          >
+            {priorityBusy ? <LoaderCircle className="spin" size={14} /> : <ArrowUp size={14} />}
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={`降低${streamer.name}录制优先级`}
+            title="降低录制优先级"
+            disabled={!canMoveDown || priorityBusy}
+            onClick={() => onMovePriority("down")}
+          >
+            <ArrowDown size={14} />
+          </button>
+        </div>
+      </td>
       <td>
         <div className="muted-cell diagnostic-cell">
           <span>{formatDate(streamer.lastCheckedAt)}</span>
@@ -1545,9 +1630,10 @@ function ActivationModal({ state, onActivate }: { state: ActivationState | null;
   );
 }
 
-function SettingsPage({ api, settings, environment, browserAccess, accessBusy, activation, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onClearActivation, onSave }: {
+function SettingsPage({ api, settings, maxScreenLimit, environment, browserAccess, accessBusy, activation, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onClearActivation, onSave }: {
   api: ClientApi;
   settings: AppSettings;
+  maxScreenLimit: number;
   environment: EnvironmentStatus | null;
   browserAccess: BrowserAccessState | null;
   accessBusy: "verify" | "check" | "clear" | null;
@@ -1591,7 +1677,7 @@ function SettingsPage({ api, settings, environment, browserAccess, accessBusy, a
   return (
     <form className="page-content settings-page" onSubmit={submit}>
       <div className="settings-layout">
-        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div><HardDrive size={22} /></div><label>录像保存目录<input value={form.outputRoot} onChange={(event) => setForm({ ...form, outputRoot: event.target.value })} /><small>默认位于下载目录，修改后只影响新录制。</small></label><div className="form-grid"><label>清晰度<select value={form.quality} onChange={(event) => setForm({ ...form, quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label><label>分片时长（秒）<input type="number" min="60" value={form.segmentSeconds} onChange={(event) => setForm({ ...form, segmentSeconds: Number(event.target.value) })} /></label><label>最大并发录制<input type="number" min="1" max="16" value={form.maxConcurrentRecordings} onChange={(event) => setForm({ ...form, maxConcurrentRecordings: Number(event.target.value) })} /></label></div></section>
+        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div><HardDrive size={22} /></div><label>录像保存目录<input value={form.outputRoot} onChange={(event) => setForm({ ...form, outputRoot: event.target.value })} /><small>默认位于下载目录，修改后只影响新录制。</small></label><div className="form-grid"><label>清晰度<select value={form.quality} onChange={(event) => setForm({ ...form, quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label><label>分片时长（秒）<input type="number" min="60" value={form.segmentSeconds} onChange={(event) => setForm({ ...form, segmentSeconds: Number(event.target.value) })} /></label><div className="server-limit-field" aria-label={`服务端录制额度 ${maxScreenLimit} 路`}><span>服务端录制额度</span><strong>{maxScreenLimit} 路</strong></div></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div><button type="button" className="secondary-button" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button></div><p className="muted-copy">FFmpeg 和 FFprobe 由已校验的运行资源包管理，不能从设置中替换为任意程序。</p><div className="diagnostic-list"><div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未就绪"}</b></div><div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未就绪"}</b></div></div></section>
         <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DESKTOP</p><h2>桌面行为</h2></div><Settings size={22} /></div><label className="switch-row"><div><strong>录制时并行处理 ASR</strong><small>已完成且文件稳定的视频可在直播录制期间进行识别。关闭后恢复录制优先。</small></div><input type="checkbox" checked={form.asrDuringRecording} onChange={(event) => setForm({ ...form, asrDuringRecording: event.target.checked })} /></label><label className="switch-row"><div><strong>系统通知</strong><small>开播、录制结束、失败和磁盘不足时提醒。</small></div><input type="checkbox" checked={form.notificationsEnabled} onChange={(event) => setForm({ ...form, notificationsEnabled: event.target.checked })} /></label><label className="switch-row"><div><strong>开机自动启动</strong><small>登录系统后恢复已启用的监听任务。</small></div><input type="checkbox" checked={form.autostartEnabled} onChange={(event) => setForm({ ...form, autostartEnabled: event.target.checked })} /></label><button type="button" className="secondary-button full" onClick={onOpenLogs}><FolderOpen size={16} />打开日志目录</button><p className="tray-note">关闭主窗口后应用会驻留系统托盘；请通过托盘菜单显式退出。</p></section>
         <section className="panel settings-card activation-settings-card"><div className="panel-header"><div><p className="section-kicker">LICENSE</p><h2>客户端授权</h2></div><KeyRound size={22} /></div><div className="access-session-summary"><StatusBadge kind={activation?.active ? "live" : "error"}>{activationStatusLabel(activation)}</StatusBadge>{activation?.message && <p>{activation.message}</p>}<small>设备 {activation?.deviceIdHint ?? "正在识别"} · 最近心跳 {formatDate(activation?.lastHeartbeatAt ?? null)}</small></div><div className="access-settings-actions"><button type="button" className="danger-button" onClick={onClearActivation}>重新激活</button></div></section>

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use dy_screen_app_lib::activation::{ActivationService, HeartbeatOutcome};
+use dy_screen_app_lib::activation::{ActivationService, HeartbeatOutcome, ServerRecordingLimit};
 use dy_screen_app_lib::api::{ApiClient, ApiConfig, PlainJsonCodec, TelemetryEvent};
 use dy_screen_app_lib::database::Database;
 use serde_json::{Value, json};
@@ -91,12 +91,12 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
         }),
         json!({
             "code": 201,
-            "data": {"revoked": true, "state": "DISABLED", "reason": "disabled", "serverTime": 43},
+            "data": {"revoked": true, "state": "DISABLED", "reason": "disabled", "serverTime": 43, "max_screen_limit": 6},
             "msg": "强制下线"
         }),
         json!({
             "code": 200,
-            "data": {"modelId": "model-a", "modelAsr": "asr-a", "version": "1.0.0", "url": "https://cdn.example/app", "signature": null, "minClientVersion": "0.2.0", "force": false},
+            "data": {"modelId": "model-a", "modelAsr": "asr-a", "version": "1.0.0", "url": "https://cdn.example/app", "signature": null, "minClientVersion": "0.2.0", "force": false, "max_screen_limit": 8},
             "msg": "success"
         }),
         json!({"code": 200, "data": {"accepted": 1, "rejected": 0}, "msg": "已上报"}),
@@ -111,8 +111,10 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
         .await
         .unwrap();
     assert!(heartbeat.revoked);
+    assert_eq!(heartbeat.max_screen_limit, Some(6));
     let app_start = client.app_start().await.unwrap().unwrap();
     assert_eq!(app_start.model_id, "model-a");
+    assert_eq!(app_start.max_screen_limit, Some(8));
     let event = TelemetryEvent::new(
         "feature_use",
         json!({"feature": "monitor", "localPath": "/private/video.mkv"})
@@ -174,6 +176,54 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
     assert_eq!(events[0]["event"], "feature_use");
     assert_eq!(events[0]["props"], json!({"feature": "monitor"}));
     assert!(events[0]["props"].get("localPath").is_none());
+}
+
+#[test]
+fn server_recording_limit_uses_latest_valid_positive_value_and_preserves_it_otherwise() {
+    let limit = ServerRecordingLimit::default();
+    assert_eq!(limit.current(), 4);
+
+    assert_eq!(limit.apply(Some(6), "app_start"), Some(6));
+    assert_eq!(limit.current(), 6);
+    assert_eq!(limit.apply(None, "heartbeat"), None);
+    assert_eq!(limit.current(), 6);
+    assert_eq!(limit.apply(Some(0), "heartbeat"), None);
+    assert_eq!(limit.apply(Some(-1), "app_start"), None);
+    assert_eq!(limit.current(), 6);
+    assert_eq!(limit.apply(Some(3), "heartbeat"), Some(3));
+    assert_eq!(limit.current(), 3);
+}
+
+#[tokio::test]
+async fn app_start_and_heartbeat_parse_the_optional_limit_independently() {
+    let responses = vec![
+        json!({
+            "code": 200,
+            "data": {"modelId": "model-a", "modelAsr": "asr-a", "version": "1.0.0", "url": "https://cdn.example/app", "signature": null, "minClientVersion": "0.2.0", "force": false},
+            "msg": "success"
+        }),
+        json!({
+            "code": 200,
+            "data": {"revoked": false, "state": "ACTIVE", "reason": "", "serverTime": 43, "max_screen_limit": 5},
+            "msg": "success"
+        }),
+    ];
+    let (base_url, server) = spawn_server(responses);
+    let client = api_client(base_url);
+
+    assert_eq!(
+        client.app_start().await.unwrap().unwrap().max_screen_limit,
+        None
+    );
+    assert_eq!(
+        client
+            .heartbeat("DY-DEVICE", "ACTIVATE-CODE")
+            .await
+            .unwrap()
+            .max_screen_limit,
+        Some(5)
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
 }
 
 #[tokio::test]

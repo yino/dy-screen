@@ -217,9 +217,6 @@ pub fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if settings.segment_seconds < 60 {
         return Err("分片时长不能少于 60 秒".to_owned());
     }
-    if !(1..=16).contains(&settings.max_concurrent_recordings) {
-        return Err("最大并发录制数必须在 1 到 16 之间".to_owned());
-    }
     if !matches!(settings.protocol.as_str(), "flv" | "hls") {
         return Err("录制协议只支持 flv 或 hls".to_owned());
     }

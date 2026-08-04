@@ -38,6 +38,7 @@ describe("浏览器演示标签 API", () => {
       lastError: null,
       failureCount: 0,
       nextRetryAt: null,
+      recordingPriority: 1,
       currentVideoCount: 0,
       historyVideoCount: 0,
     }]));

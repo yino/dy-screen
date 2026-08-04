@@ -71,6 +71,8 @@ const tauriApi: ClientApi = {
   setMonitorEnabled: (id, enabled) =>
     invoke<void>("set_monitor_enabled", { id, enabled }),
   checkStreamerNow: (id) => invoke<void>("check_streamer_now", { id }),
+  moveStreamerRecordingPriority: (id, direction) =>
+    invoke<Streamer[]>("move_streamer_recording_priority", { id, direction }),
   archiveStreamer: (id) => invoke<void>("archive_streamer", { id }),
   stopRecording: (id) => invoke<void>("stop_recording", { id }),
   listVideos: (streamerId, page = 1, pageSize = 50, filters = {}) =>
@@ -78,7 +80,10 @@ const tauriApi: ClientApi = {
   listCurrentVideos: (streamerId) =>
     invoke<VideoPage>("list_current_videos", { streamerId }),
   getSettings: () => invoke<AppSettings>("get_settings"),
-  saveSettings: (settings) => invoke<void>("save_settings", { settings }),
+  saveSettings: (settings) => {
+    const { maxConcurrentRecordings: _legacyLocalLimit, ...editableSettings } = settings;
+    return invoke<void>("save_settings", { settings: editableSettings });
+  },
   requestVideoPreview: (id) => invoke<PreviewSnapshot>("request_video_preview", { id }),
   retryVideoPreview: (id) => invoke<PreviewSnapshot>("retry_video_preview", { id }),
   getVideoPreview: (requestId) => invoke<PreviewSnapshot>("get_video_preview", { requestId }),
@@ -272,7 +277,7 @@ export function createBrowserApi(): ClientApi {
   });
   try {
     streamers = (JSON.parse(window.localStorage.getItem("dy-screen-streamers") || "[]") as Streamer[])
-      .map((item) => ({
+      .map((item, index) => ({
         ...item,
         sourceKind: item.sourceKind ?? "room",
         sourceUrl: item.sourceUrl ?? item.roomUrl ?? "",
@@ -282,6 +287,9 @@ export function createBrowserApi(): ClientApi {
         roomId: item.roomId ?? null,
         failureCount: Number.isFinite(item.failureCount) ? Math.max(0, item.failureCount) : 0,
         nextRetryAt: item.nextRetryAt ?? null,
+        recordingPriority: Number.isFinite(item.recordingPriority)
+          ? Math.max(1, item.recordingPriority)
+          : index + 1,
         tags: Array.isArray(item.tags)
           ? item.tags.map((tag, index) => ({
               id: Number.isFinite(tag.id) ? tag.id : -(index + 1),
@@ -309,6 +317,7 @@ export function createBrowserApi(): ClientApi {
     streamers: [...streamers],
     activeRecordings: streamers.filter((item) => item.monitorStatus === "recording").length,
     currentVideoCount: streamers.reduce((total, item) => total + item.currentVideoCount, 0),
+    maxScreenLimit: 4,
   });
 
   const normalizeTags = (tags: StreamerTagInput[]): StreamerTag[] => {
@@ -378,6 +387,10 @@ export function createBrowserApi(): ClientApi {
         lastError: null,
         failureCount: 0,
         nextRetryAt: null,
+        recordingPriority: streamers.reduce(
+          (maximum, item) => Math.max(maximum, item.recordingPriority),
+          0,
+        ) + 1,
         currentVideoCount: 0,
         historyVideoCount: 0,
         tags: normalizeTags(input.tags),
@@ -478,6 +491,26 @@ export function createBrowserApi(): ClientApi {
           : item,
       );
       saveStreamers();
+    },
+    moveStreamerRecordingPriority: async (id, direction) => {
+      const ordered = [...streamers].sort((left, right) =>
+        left.recordingPriority - right.recordingPriority || left.id - right.id);
+      const index = ordered.findIndex((item) => item.id === id);
+      if (index < 0) throw new Error("找不到主播");
+      const neighborIndex = direction === "up" ? index - 1 : index + 1;
+      const neighbor = ordered[neighborIndex];
+      if (!neighbor) return ordered;
+      const current = ordered[index];
+      const currentPriority = current.recordingPriority;
+      current.recordingPriority = neighbor.recordingPriority;
+      neighbor.recordingPriority = currentPriority;
+      streamers = streamers.map((item) =>
+        item.id === current.id ? { ...current }
+          : item.id === neighbor.id ? { ...neighbor }
+            : item);
+      saveStreamers();
+      return [...streamers].sort((left, right) =>
+        left.recordingPriority - right.recordingPriority || left.id - right.id);
     },
     archiveStreamer: async (id) => {
       streamers = streamers.filter((item) => item.id !== id);

@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -6,11 +9,22 @@ use dy_screen::access::{
     AccessStage,
 };
 use dy_screen_app_lib::database::Database;
-use dy_screen_app_lib::domain::NewStreamer;
+use dy_screen_app_lib::domain::{NewStreamer, RecordingPriorityDirection};
 use dy_screen_app_lib::supervisor::{
     DiskDecision, MonitorLogger, MonitorState, NoopPublisher, RecordingLimiter, Supervisor,
-    backoff_seconds, decide_disk, recording_session_status,
+    WorkerRuntime, backoff_seconds, decide_disk, recording_session_status, recording_target_ids,
 };
+
+struct RejectingWorkerRuntime;
+
+impl WorkerRuntime for RejectingWorkerRuntime {
+    fn spawn(
+        &self,
+        _task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<tauri::async_runtime::JoinHandle<()>, String> {
+        Err("internal runtime detail".to_owned())
+    }
+}
 
 #[test]
 fn error_backoff_caps_at_five_minutes() {
@@ -158,6 +172,46 @@ async fn one_streamer_only_has_one_worker_and_can_be_woken_immediately() {
     supervisor.shutdown().await;
 }
 
+#[test]
+fn synchronous_start_entrypoints_work_without_a_current_tokio_reactor() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let first = database
+        .add_streamer(&NewStreamer::room("主播一", "11", "room-11", true))
+        .unwrap();
+    database
+        .add_streamer(&NewStreamer::room("主播二", "12", "room-12", true))
+        .unwrap();
+    let supervisor = Supervisor::new(database, Arc::new(NoopPublisher), 4).unwrap();
+
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        supervisor.check_now(first.id).unwrap();
+        supervisor.check_all_now().unwrap();
+        assert_eq!(supervisor.worker_count(), 2);
+        tauri::async_runtime::block_on(supervisor.shutdown());
+    })
+    .join()
+    .expect("普通系统线程启动监听不应 panic");
+}
+
+#[test]
+fn rejected_worker_spawn_leaves_no_worker_and_preserves_monitor_selection() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room("主播", "13", "room-13", true))
+        .unwrap();
+    let supervisor = Supervisor::new(database.clone(), Arc::new(NoopPublisher), 4)
+        .unwrap()
+        .with_worker_runtime(Arc::new(RejectingWorkerRuntime));
+
+    let error = supervisor.start(streamer.id).unwrap_err();
+    assert_eq!(error, "监听任务调度失败，请重试");
+    assert_eq!(supervisor.worker_count(), 0);
+    assert!(database.get_streamer(streamer.id).unwrap().monitor_enabled);
+}
+
 #[tokio::test]
 async fn recording_limit_can_be_changed_without_restarting_supervisor() {
     let limiter = Arc::new(RecordingLimiter::new(1));
@@ -177,4 +231,65 @@ async fn recording_limit_can_be_changed_without_restarting_supervisor() {
     drop(first);
     drop(second);
     assert_eq!(limiter.active(), 0);
+}
+
+#[test]
+fn priority_targets_are_deterministic_and_offline_streamers_do_not_consume_slots() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let mut ids = Vec::new();
+    for (index, name) in ["a", "b", "c", "d", "e", "f"].into_iter().enumerate() {
+        ids.push(
+            database
+                .add_streamer(&NewStreamer::room(
+                    name,
+                    (100 + index).to_string(),
+                    format!("room-{index}"),
+                    true,
+                ))
+                .unwrap()
+                .id,
+        );
+    }
+    let all_live = ids.iter().copied().collect::<HashSet<_>>();
+    let prioritized = database.list_streamers_by_recording_priority().unwrap();
+    assert_eq!(recording_target_ids(&prioritized, &all_live, 4), ids[..4]);
+
+    database
+        .move_recording_priority(ids[4], RecordingPriorityDirection::Up)
+        .unwrap();
+    let prioritized = database.list_streamers_by_recording_priority().unwrap();
+    assert_eq!(
+        recording_target_ids(&prioritized, &all_live, 4),
+        vec![ids[0], ids[1], ids[2], ids[4]]
+    );
+
+    let without_b = all_live
+        .iter()
+        .copied()
+        .filter(|id| *id != ids[1])
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        recording_target_ids(&prioritized, &without_b, 4),
+        vec![ids[0], ids[2], ids[4], ids[3]]
+    );
+    assert_eq!(recording_target_ids(&prioritized, &all_live, 6).len(), 6);
+    assert_eq!(
+        recording_target_ids(&prioritized, &all_live, 3),
+        vec![ids[0], ids[1], ids[2]]
+    );
+}
+
+#[test]
+fn legacy_local_concurrency_setting_cannot_change_supervisor_limit() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let mut settings = database.get_settings().unwrap();
+    settings.max_concurrent_recordings = 1;
+    database.save_settings(&settings).unwrap();
+
+    let supervisor = Supervisor::new(database, Arc::new(NoopPublisher), 4).unwrap();
+    assert_eq!(supervisor.max_screen_limit(), 4);
+    supervisor.set_server_recording_limit(6);
+    assert_eq!(supervisor.max_screen_limit(), 6);
 }

@@ -32,6 +32,7 @@ const streamer: Streamer = {
   lastError: null,
   failureCount: 0,
   nextRetryAt: null,
+  recordingPriority: 1,
   currentVideoCount: 0,
   historyVideoCount: 3,
   tags: [],
@@ -141,6 +142,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       streamers,
       activeRecordings: 0,
       currentVideoCount: 0,
+      maxScreenLimit: 4,
     }),
     createStreamer: vi.fn().mockResolvedValue(streamer),
     updateStreamer: vi.fn().mockResolvedValue(streamer),
@@ -152,6 +154,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     }),
     setMonitorEnabled: vi.fn().mockResolvedValue(undefined),
     checkStreamerNow: vi.fn().mockResolvedValue(undefined),
+    moveStreamerRecordingPriority: vi.fn().mockResolvedValue(streamers),
     archiveStreamer: vi.fn().mockResolvedValue(undefined),
     stopRecording: vi.fn().mockResolvedValue(undefined),
     listVideos: vi.fn().mockImplementation(async (_streamerId, page = 1, pageSize = 50, filters = {}) => {
@@ -422,6 +425,50 @@ describe("App", () => {
     expect(verificationRow).toHaveTextContent("需要访问验证");
   });
 
+  it("显示独立录制优先级并可提高主播顺序", async () => {
+    const user = userEvent.setup();
+    const first = { ...streamer, id: 51, name: "a主播", recordingPriority: 1 };
+    const second = { ...streamer, id: 52, name: "b主播", recordingPriority: 2 };
+    const updated = [
+      { ...first, recordingPriority: 2 },
+      { ...second, recordingPriority: 1 },
+    ];
+    const api = createApi([first, second]);
+    api.getDashboard = vi.fn()
+      .mockResolvedValueOnce({ streamers: [first, second], activeRecordings: 0, currentVideoCount: 0, maxScreenLimit: 4 })
+      .mockResolvedValue({ streamers: updated, activeRecordings: 0, currentVideoCount: 0, maxScreenLimit: 4 });
+    api.moveStreamerRecordingPriority = vi.fn().mockResolvedValue(updated);
+
+    render(<App api={api} />);
+    const rows = await screen.findAllByTestId("streamer-row");
+    expect(rows.find((row) => row.textContent?.includes("a主播"))).toHaveTextContent("#1");
+    expect(rows.find((row) => row.textContent?.includes("b主播"))).toHaveTextContent("#2");
+
+    await user.click(screen.getByRole("button", { name: "提高b主播录制优先级" }));
+    expect(api.moveStreamerRecordingPriority).toHaveBeenCalledWith(52, "up");
+    await waitFor(() => {
+      const latestRows = screen.getAllByTestId("streamer-row");
+      expect(latestRows.find((row) => row.textContent?.includes("b主播"))).toHaveTextContent("#1");
+    });
+  });
+
+  it("优先级保存失败时回滚界面顺序", async () => {
+    const user = userEvent.setup();
+    const first = { ...streamer, id: 61, name: "a主播", recordingPriority: 1 };
+    const second = { ...streamer, id: 62, name: "b主播", recordingPriority: 2 };
+    const api = createApi([first, second]);
+    api.moveStreamerRecordingPriority = vi.fn().mockRejectedValue(new Error("数据库暂时不可写"));
+
+    render(<App api={api} />);
+    await screen.findAllByTestId("streamer-row");
+    await user.click(screen.getByRole("button", { name: "提高b主播录制优先级" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("数据库暂时不可写");
+    const rows = screen.getAllByTestId("streamer-row");
+    expect(rows.find((row) => row.textContent?.includes("a主播"))).toHaveTextContent("#1");
+    expect(rows.find((row) => row.textContent?.includes("b主播"))).toHaveTextContent("#2");
+  });
+
   it("浏览器解析状态展示排队数量和当前主播且会话恢复后刷新", async () => {
     let accessListener: ((state: BrowserAccessState) => void) | undefined;
     const api = createApi([streamer]);
@@ -516,6 +563,24 @@ describe("App", () => {
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("不会删除主播、录像或设置"));
     expect(api.clearDouyinSession).toHaveBeenCalledWith(true);
     confirm.mockRestore();
+  });
+
+  it("设置页只读展示服务端录制额度且不再渲染本地并发输入", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.getDashboard = vi.fn().mockResolvedValue({
+      streamers: [],
+      activeRecordings: 0,
+      currentVideoCount: 0,
+      maxScreenLimit: 7,
+    });
+
+    render(<App api={api} />);
+    await user.click(screen.getByRole("button", { name: "设置" }));
+
+    expect(await screen.findByLabelText("服务端录制额度 7 路")).toHaveTextContent("7 路");
+    expect(screen.queryByLabelText("最大并发录制")).not.toBeInTheDocument();
+    expect(screen.queryByText("最大并发录制")).not.toBeInTheDocument();
   });
 
   it("首次启动时显示添加主播空状态", async () => {
@@ -1093,8 +1158,8 @@ describe("App", () => {
     const api = createApi([temporary, target]);
     api.getDashboard = vi
       .fn()
-      .mockResolvedValueOnce({ streamers: [temporary, target], activeRecordings: 0, currentVideoCount: 0 })
-      .mockResolvedValue({ streamers: [target], activeRecordings: 0, currentVideoCount: 0 });
+      .mockResolvedValueOnce({ streamers: [temporary, target], activeRecordings: 0, currentVideoCount: 0, maxScreenLimit: 4 })
+      .mockResolvedValue({ streamers: [target], activeRecordings: 0, currentVideoCount: 0, maxScreenLimit: 4 });
     api.subscribe = vi.fn().mockImplementation(async (callback) => {
       listener = callback;
       return () => undefined;
@@ -1129,8 +1194,8 @@ describe("App", () => {
     const api = createApi([previous]);
     api.getDashboard = vi
       .fn()
-      .mockResolvedValueOnce({ streamers: [previous], activeRecordings: 0, currentVideoCount: 0 })
-      .mockResolvedValue({ streamers: [latest], activeRecordings: 0, currentVideoCount: 0 });
+      .mockResolvedValueOnce({ streamers: [previous], activeRecordings: 0, currentVideoCount: 0, maxScreenLimit: 4 })
+      .mockResolvedValue({ streamers: [latest], activeRecordings: 0, currentVideoCount: 0, maxScreenLimit: 4 });
     api.subscribe = vi.fn().mockImplementation(async (callback) => {
       listener = callback;
       return () => undefined;

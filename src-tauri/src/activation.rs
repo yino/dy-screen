@@ -4,6 +4,7 @@
 //! `ActivationStateView` 摘要。网络调用全部委托给 `api.rs`。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{ApiClient, ApiError, TelemetryEvent};
 use crate::database::{ClientActivationRecord, Database};
+use crate::domain::DEFAULT_MAX_SCREEN_LIMIT;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(90);
 pub const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -46,6 +48,50 @@ pub enum HeartbeatOutcome {
 }
 
 #[derive(Clone)]
+pub struct ServerRecordingLimit {
+    current: Arc<AtomicUsize>,
+}
+
+impl Default for ServerRecordingLimit {
+    fn default() -> Self {
+        Self {
+            current: Arc::new(AtomicUsize::new(DEFAULT_MAX_SCREEN_LIMIT)),
+        }
+    }
+}
+
+impl ServerRecordingLimit {
+    pub fn current(&self) -> usize {
+        self.current.load(Ordering::Acquire)
+    }
+
+    pub fn apply(&self, value: Option<i64>, source: &'static str) -> Option<usize> {
+        let value = value?;
+        let Ok(value) = usize::try_from(value) else {
+            log_invalid_server_limit(source);
+            return None;
+        };
+        if value == 0 {
+            log_invalid_server_limit(source);
+            return None;
+        }
+        self.current.store(value, Ordering::Release);
+        Some(value)
+    }
+}
+
+fn log_invalid_server_limit(source: &str) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "component": "client_api",
+            "event": "invalid_max_screen_limit",
+            "source": source,
+        })
+    );
+}
+
+#[derive(Clone)]
 pub struct ActivationService {
     database: Database,
     api: ApiClient,
@@ -53,6 +99,7 @@ pub struct ActivationService {
     record: Arc<Mutex<Option<ClientActivationRecord>>>,
     cancellation: CancellationToken,
     development_bypass: bool,
+    recording_limit: ServerRecordingLimit,
 }
 
 impl ActivationService {
@@ -71,6 +118,7 @@ impl ActivationService {
             record: Arc::new(Mutex::new(record)),
             cancellation: CancellationToken::new(),
             development_bypass: false,
+            recording_limit: ServerRecordingLimit::default(),
         })
     }
 
@@ -94,6 +142,14 @@ impl ActivationService {
 
     pub fn api(&self) -> &ApiClient {
         &self.api
+    }
+
+    pub fn max_screen_limit(&self) -> usize {
+        self.recording_limit.current()
+    }
+
+    pub fn apply_app_start_limit(&self, value: Option<i64>) -> Option<usize> {
+        self.recording_limit.apply(value, "app_start")
     }
 
     pub fn state(&self) -> ActivationStateView {
@@ -172,6 +228,8 @@ impl ActivationService {
             }
             Ok(response) => {
                 let now = Utc::now();
+                self.recording_limit
+                    .apply(response.max_screen_limit, "heartbeat");
                 if let Some(token) = response.token {
                     record.token = Some(token);
                 }
