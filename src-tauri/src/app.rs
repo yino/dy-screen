@@ -21,9 +21,9 @@ use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome
 use crate::ai::tauri_commands::*;
 use crate::ai::{
     AiClipExportStatus, AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService,
-    AiRepository, ClipExportFailure, ClipOutputDimensions, HighlightWorkflow, LocalAsrRuntime,
-    RigDeepSeekProvider, SourceFingerprint, SystemCredentialStore, build_export_plan,
-    execute_export, probe_output_dimensions, render_clip_subtitle_assets,
+    AiRepository, ClipExportBridge, ClipExportFailure, ClipOutputDimensions, HighlightWorkflow,
+    LocalAsrRuntime, RigDeepSeekProvider, SourceFingerprint, SystemCredentialStore,
+    build_export_plan, execute_export, probe_output_dimensions, render_clip_subtitle_assets,
     select_clip_video_encoder, validate_export_sources, validate_export_subtitles,
 };
 use crate::api::ApiClient;
@@ -52,6 +52,16 @@ use crate::thumbnail::{
     ThumbnailPublisher, ThumbnailRequest, ThumbnailService, ThumbnailSnapshot,
     trusted_thumbnail_request,
 };
+use crate::transition_assets::{
+    MaterialAssetRegistry, MaterialAssetSnapshot, TransitionMaterialAssetService,
+    TransitionMaterialCache, serve_material_asset,
+};
+use crate::transition_matching::{TransitionMatchSummary, TransitionMatchingWorkflow};
+use crate::transition_materials::{
+    BoundarySelectionInput, BoundarySelectionSource, ClipTransitionBoundary,
+    TransitionCatalogCoordinator, TransitionCatalogPublisher, TransitionCatalogState,
+    TransitionMaterialRepository, TransitionMaterialView,
+};
 
 type TrayStatus = Arc<Mutex<Option<MenuItem<tauri::Wry>>>>;
 
@@ -67,6 +77,9 @@ struct AppState {
     log_dir: PathBuf,
     shutdown_gate: ShutdownGate,
     activation: ActivationService,
+    transition_catalog: TransitionCatalogCoordinator,
+    transition_assets: TransitionMaterialAssetService,
+    transition_matching: TransitionMatchingWorkflow,
     clip_export_tasks: Arc<Mutex<HashMap<i64, tokio_util::sync::CancellationToken>>>,
     _telemetry: TelemetryQueue,
 }
@@ -489,6 +502,17 @@ struct DesktopThumbnailPublisher {
     cache: ThumbnailCache,
 }
 
+#[derive(Clone)]
+struct DesktopTransitionCatalogPublisher {
+    app: AppHandle,
+}
+
+impl TransitionCatalogPublisher for DesktopTransitionCatalogPublisher {
+    fn publish(&self, state: &TransitionCatalogState) {
+        let _ = self.app.emit("transition-material-event", state);
+    }
+}
+
 impl ThumbnailPublisher for DesktopThumbnailPublisher {
     fn publish(&self, event: &ThumbnailEvent) {
         authorize_thumbnail_item_with_cache(&self.app, &self.cache, &event.item);
@@ -520,6 +544,145 @@ fn should_run_background_tasks(activation_active: bool, runtime_ready: bool) -> 
 #[tauri::command]
 fn get_activation_state(state: State<'_, AppState>) -> ActivationStateView {
     state.activation.state()
+}
+
+#[tauri::command]
+fn get_transition_catalog_state(
+    state: State<'_, AppState>,
+) -> Result<TransitionCatalogState, String> {
+    state
+        .transition_catalog
+        .state()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn retry_transition_catalog_sync(
+    state: State<'_, AppState>,
+) -> Result<TransitionCatalogState, String> {
+    state
+        .transition_catalog
+        .retry()
+        .map_err(|error| error.to_string())?;
+    state
+        .transition_catalog
+        .state()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_transition_materials(
+    state: State<'_, AppState>,
+) -> Result<Vec<TransitionMaterialView>, String> {
+    TransitionMaterialRepository::new(state.database.clone())
+        .list_current_views()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn request_transition_material_preview(
+    asset_key: String,
+    asset_version: i64,
+    state: State<'_, AppState>,
+) -> Result<MaterialAssetSnapshot, String> {
+    let (ffmpeg, ffprobe) = state
+        .runtime_resources
+        .media_tools()
+        .map_err(|_| "受控媒体资源尚未准备完成".to_owned())?;
+    state
+        .transition_assets
+        .prepare_preview(&asset_key, asset_version, &ffmpeg, &ffprobe)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn request_transition_material_thumbnail(
+    asset_key: String,
+    asset_version: i64,
+    state: State<'_, AppState>,
+) -> Result<MaterialAssetSnapshot, String> {
+    state
+        .transition_assets
+        .prepare_thumbnail(&asset_key, asset_version)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn ai_match_clip_transitions(
+    clip_project_id: i64,
+    boundary_id: Option<i64>,
+    state: State<'_, AppState>,
+) -> Result<TransitionMatchSummary, String> {
+    state
+        .transition_matching
+        .match_boundaries(
+            clip_project_id,
+            boundary_id,
+            state.activation.cancellation().child_token(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn ai_apply_clip_transition(
+    boundary_id: i64,
+    asset_key: Option<String>,
+    asset_version: Option<i64>,
+    lock_empty: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<ClipTransitionBoundary, String> {
+    let asset = match (asset_key.as_deref(), asset_version) {
+        (Some(key), Some(version)) => Some((key, version)),
+        (None, None) => None,
+        _ => return Err("转场素材键和版本必须同时提供".to_owned()),
+    };
+    let repository = TransitionMaterialRepository::new(state.database.clone());
+    let boundary = repository
+        .boundary(boundary_id)
+        .map_err(|error| error.to_string())?;
+    let result = repository
+        .save_boundary_selection(BoundarySelectionInput {
+            clip_project_id: boundary.clip_project_id,
+            left_clip_segment_id: boundary
+                .left_clip_segment_id
+                .ok_or_else(|| "剪辑工程边界已经失效".to_owned())?,
+            right_clip_segment_id: boundary
+                .right_clip_segment_id
+                .ok_or_else(|| "剪辑工程边界已经失效".to_owned())?,
+            asset,
+            selection_source: BoundarySelectionSource::Manual,
+            confidence: None,
+            reason: Some(if asset.is_some() {
+                "用户手动选择"
+            } else {
+                "用户保留无转场"
+            }),
+            manually_locked: asset.is_some() || lock_empty.unwrap_or(true),
+        })
+        .map_err(|error| error.to_string())?;
+    if let Some((key, version)) = asset {
+        state
+            .transition_assets
+            .download_source(key, version)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    repository
+        .boundary(result.id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn ai_unlock_clip_transition(
+    boundary_id: i64,
+    state: State<'_, AppState>,
+) -> Result<ClipTransitionBoundary, String> {
+    TransitionMaterialRepository::new(state.database.clone())
+        .set_boundary_lock(boundary_id, false)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -1201,9 +1364,41 @@ async fn ai_start_clip_export(
     if !detail.subtitles_complete {
         return Err("剪辑片段缺少 ASR 字幕，请先完成识别或移除该片段".to_owned());
     }
-    let sources = repository
+    let mut sources = repository
         .clip_export_sources(clip_project_id)
         .map_err(|error| error.to_string())?;
+    for index in 0..sources.len().saturating_sub(1) {
+        let left_id = sources[index].segment.id;
+        let right_id = sources[index + 1].segment.id;
+        let boundary = detail.boundaries.iter().find(|item| {
+            item.active
+                && !item.stale
+                && item.left_stable_id == left_id
+                && item.right_stable_id == right_id
+                && item.asset_key.is_some()
+        });
+        let Some(boundary) = boundary else { continue };
+        let asset_key = boundary
+            .asset_key
+            .as_deref()
+            .ok_or_else(|| "转场边界素材无效".to_owned())?;
+        let asset_version = boundary
+            .asset_version
+            .ok_or_else(|| "转场边界素材版本无效".to_owned())?;
+        let verified = state
+            .transition_assets
+            .source_for_export(asset_key, asset_version)
+            .await
+            .map_err(|error| error.message)?;
+        sources[index].bridge_after = Some(ClipExportBridge {
+            boundary_id: boundary.id,
+            asset_key: asset_key.to_owned(),
+            asset_version,
+            source_path: verified.source_path.to_string_lossy().into_owned(),
+            duration_ms: verified.material.duration_ms,
+            has_audio: verified.material.has_audio,
+        });
+    }
     validate_export_subtitles(&sources).map_err(|error| error.message)?;
     validate_export_sources(&sources).map_err(|error| error.message)?;
     let (ffmpeg_path, ffprobe_path) = state
@@ -1282,12 +1477,19 @@ async fn ai_start_clip_export(
     tauri::async_runtime::spawn(async move {
         let repository = AiRepository::new(database);
         let total_duration_ms = sources.iter().fold(0_u64, |total, source| {
-            total.saturating_add(
-                source
-                    .segment
-                    .source_end_ms
-                    .saturating_sub(source.segment.source_start_ms),
-            )
+            total
+                .saturating_add(
+                    source
+                        .segment
+                        .source_end_ms
+                        .saturating_sub(source.segment.source_start_ms),
+                )
+                .saturating_add(
+                    source
+                        .bridge_after
+                        .as_ref()
+                        .map_or(0, |bridge| bridge.duration_ms),
+                )
         });
         let subtitles = sources
             .iter()
@@ -1423,7 +1625,12 @@ fn request_exit(force: bool, app: AppHandle, state: State<'_, AppState>) -> Resu
 }
 
 pub fn run() {
+    let material_asset_registry = MaterialAssetRegistry::default();
+    let protocol_registry = material_asset_registry.clone();
     let builder = tauri::Builder::default()
+        .register_uri_scheme_protocol("transition-material", move |_context, request| {
+            serve_material_asset(&protocol_registry, &request)
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1433,6 +1640,14 @@ pub fn run() {
         ))
         .invoke_handler(tauri::generate_handler![
             get_activation_state,
+            get_transition_catalog_state,
+            retry_transition_catalog_sync,
+            list_transition_materials,
+            request_transition_material_preview,
+            request_transition_material_thumbnail,
+            ai_match_clip_transitions,
+            ai_apply_clip_transition,
+            ai_unlock_clip_transition,
             activate_client,
             clear_activation,
             runtime_resource_status,
@@ -1528,7 +1743,7 @@ pub fn run() {
             ai_cancel_clip_export,
             request_exit
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
             let app_cache_dir = app.path().app_cache_dir()?;
             let log_dir = app.path().app_log_dir()?;
@@ -1559,6 +1774,25 @@ pub fn run() {
             let activation = ActivationService::new(database.clone(), api_client, &app_data_dir)
                 .map_err(std::io::Error::other)?
                 .with_development_bypass();
+            let transition_catalog = TransitionCatalogCoordinator::spawn(
+                TransitionMaterialRepository::new(database.clone()),
+                activation.api().clone(),
+                activation.cancellation(),
+                Arc::new(DesktopTransitionCatalogPublisher {
+                    app: app.handle().clone(),
+                }),
+            );
+            activation
+                .set_transition_catalog_coordinator(transition_catalog.clone())
+                .map_err(std::io::Error::other)?;
+            let transition_assets = TransitionMaterialAssetService::new(
+                TransitionMaterialRepository::new(database.clone()),
+                TransitionMaterialCache::new(app_data_dir.join("transition-materials"))
+                    .map_err(std::io::Error::other)?,
+                activation.cancellation(),
+                material_asset_registry.clone(),
+            )
+            .map_err(std::io::Error::other)?;
             let telemetry = TelemetryQueue::spawn(activation.clone());
             let runtime_resource_state = RuntimeResourceState::new(
                 database.clone(),
@@ -1596,8 +1830,15 @@ pub fn run() {
                 ai_components.runtime.clone(),
             )
             .with_highlight_workflow(highlight_workflow)
-            .with_credential_store(credential_store);
+            .with_credential_store(credential_store.clone());
             app.manage(AiDesktopState::new(ai_commands));
+            let transition_matching = TransitionMatchingWorkflow::new(
+                TransitionMaterialRepository::new(database.clone()),
+                AiRepository::new(database.clone()),
+                Arc::new(RigDeepSeekProvider),
+                credential_store,
+                transition_assets.clone(),
+            );
 
             let tray_status_item = MenuItemBuilder::with_id("recording_status", "正在录制：0 路")
                 .enabled(false)
@@ -1691,6 +1932,9 @@ pub fn run() {
                 log_dir,
                 shutdown_gate,
                 activation: activation.clone(),
+                transition_catalog,
+                transition_assets,
+                transition_matching,
                 clip_export_tasks: Arc::new(Mutex::new(HashMap::new())),
                 _telemetry: telemetry,
             });

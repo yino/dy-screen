@@ -15,6 +15,7 @@ import type {
   AiTranscriptSegment,
   ClientApi,
   PreviewSnapshot,
+  TransitionMaterial,
 } from "./types";
 
 const project: AiProject = {
@@ -1285,6 +1286,103 @@ describe("AiWorkspace", () => {
     expect(video.muted).toBe(false);
     expect(zoom).toHaveValue("50");
     editable.remove();
+  });
+
+  it("本地搜索转场素材并对明确边界执行人工应用和智能匹配", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const boundary = {
+      id: 771,
+      clipProjectId: clip.project.id,
+      leftClipSegmentId: clip.segments[0].id,
+      rightClipSegmentId: clip.segments[1].id,
+      leftStableId: clip.segments[0].id,
+      rightStableId: clip.segments[1].id,
+      assetKey: null,
+      assetVersion: null,
+      selectionSource: "none" as const,
+      confidence: null,
+      reason: null,
+      suggestedAssetKey: null,
+      suggestedAssetVersion: null,
+      suggestionConfidence: null,
+      suggestionReason: null,
+      suggestionNone: false,
+      manuallyLocked: false,
+      stale: false,
+      active: true,
+      updatedAt: "2026-08-03T00:00:00Z",
+    };
+    clip.boundaries = [boundary];
+    clip.projectDurationMs = 6_000;
+    clip.timelineUnits = [{
+      key: `segment:${clip.segments[0].id}`, kind: "segment", projectStartMs: 0,
+      projectEndMs: 2_000, clipSegmentId: clip.segments[0].id, boundaryId: null,
+      title: clip.segments[0].title, assetKey: null, assetVersion: null,
+      sourceStatus: null, previewStatus: null,
+    }, {
+      key: `segment:${clip.segments[1].id}`, kind: "segment", projectStartMs: 2_000,
+      projectEndMs: 6_000, clipSegmentId: clip.segments[1].id, boundaryId: null,
+      title: clip.segments[1].title, assetKey: null, assetVersion: null,
+      sourceStatus: null, previewStatus: null,
+    }];
+    const material: TransitionMaterial = {
+      assetKey: "reaction_laugh", assetVersion: 2, title: "爆笑反应",
+      description: "适合搞笑包袱后的桥接", tags: ["搞笑", "反应"], category: "reaction",
+      renderMode: "bridge", durationMs: 1_500, width: 1920, height: 1080, fps: 30,
+      videoCodec: "h264", hasAudio: true, sortOrder: 1, thumbnailAvailable: false,
+      download: { assetKey: "reaction_laugh", assetVersion: 2, sourceStatus: "missing",
+        sourceRelativePath: null, previewStatus: "missing", previewRelativePath: null,
+        validatedSizeBytes: null, lastErrorCode: null, lastErrorMessage: null,
+        updatedAt: "2026-08-03T00:00:00Z" },
+    };
+    api.listTransitionMaterials = vi.fn().mockResolvedValue([material]);
+    api.applyAiClipTransition = vi.fn().mockResolvedValue({ ...boundary, assetKey: material.assetKey, assetVersion: material.assetVersion, selectionSource: "manual", manuallyLocked: true });
+    api.matchAiClipTransitions = vi.fn().mockResolvedValue({ matched: 1, autoApplied: 0, suggestions: 1, noneSuggestions: 0, boundaries: [boundary] });
+    api.unlockAiClipTransition = vi.fn().mockResolvedValue(boundary);
+
+    const { user } = await openKeyboardClipEditor(api);
+    expect(await screen.findByText("爆笑反应")).toBeInTheDocument();
+    const search = screen.getByLabelText("搜索转场素材");
+    await user.type(search, "不存在");
+    expect(screen.queryByText("爆笑反应")).not.toBeInTheDocument();
+    await user.clear(search);
+    await user.click(screen.getByRole("button", { name: /选择 快捷键第一段 与 快捷键第二段 之间的转场/ }));
+    await user.click(screen.getByRole("button", { name: "应用" }));
+    await waitFor(() => expect(api.applyAiClipTransition).toHaveBeenCalledWith(771, "reaction_laugh", 2, true));
+    await user.click(screen.getByRole("button", { name: "智能匹配全部转场" }));
+    await waitFor(() => expect(api.matchAiClipTransitions).toHaveBeenCalledWith(clip.project.id, null));
+  });
+
+  it("展示素材目录同步失败原因并允许手动重试", async () => {
+    const { api } = createKeyboardClipFixture();
+    api.listTransitionMaterials = vi.fn().mockResolvedValue([]);
+    api.getTransitionCatalogState = vi.fn().mockResolvedValue({
+      localCatalogVersion: 1,
+      remoteCatalogVersion: 2,
+      minimumAppVersion: "0.3.0",
+      status: "failed",
+      lastCheckedAt: "2026-08-05T00:00:00Z",
+      lastSuccessAt: "2026-08-04T00:00:00Z",
+      lastErrorCode: "catalog_sync_failed",
+      lastErrorMessage: "素材目录请求超时，请检查网络后重试",
+    });
+    api.retryTransitionCatalogSync = vi.fn().mockResolvedValue({
+      localCatalogVersion: 1,
+      remoteCatalogVersion: 2,
+      minimumAppVersion: "0.3.0",
+      status: "checking",
+      lastCheckedAt: "2026-08-05T00:00:01Z",
+      lastSuccessAt: "2026-08-04T00:00:00Z",
+      lastErrorCode: null,
+      lastErrorMessage: null,
+    });
+    api.subscribeTransitionCatalog = vi.fn().mockResolvedValue(() => undefined);
+
+    const { user } = await openKeyboardClipEditor(api);
+    expect(await screen.findByText("素材目录请求超时，请检查网络后重试")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试素材目录同步" }));
+    await waitFor(() => expect(api.retryTransitionCatalogSync).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("正在检查转场素材目录")).toBeInTheDocument();
   });
 
   it("离开剪辑页后清理快捷键监听", async () => {

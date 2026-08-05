@@ -9,6 +9,7 @@ NODE ?= node
 NPM ?= npm
 FFMPEG ?= ffmpeg
 FFPROBE ?= ffprobe
+FFMPEG_FIXTURE_GENERATOR ?= ffmpeg
 
 CARGO_BIN_DIR := $(patsubst %/,%,$(dir $(CARGO)))
 ifneq ($(CARGO_BIN_DIR),.)
@@ -69,11 +70,11 @@ WINDOWS_ASR_SOURCE ?= $(if $(wildcard $(WINDOWS_RESOURCE_SOURCE)/manifest.json),
 VC_REDIST_SOURCE ?=
 VC_REDIST_LICENSE ?=
 POWERSHELL ?= powershell.exe
-RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/
-WINDOWS_RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/windows/x86_64/2026.07.4/
+RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/aarch64/2026.07.4/
+WINDOWS_RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/windows/x86_64/2026.07.4/
 RESOURCE_RELEASE_DIR ?= dist/runtime-resources
 RESOURCE_CHANNEL ?= stable
-RESOURCE_APP_VERSION ?= 0.2.0
+RESOURCE_APP_VERSION ?= 0.3.0
 # 必须与 resources/asr-source/manifest.json 中的 bundleVersion 一致。
 RESOURCE_BUNDLE_VERSION ?= 2026.07.4
 RUNTIME_MANIFEST_KEY_ID ?= stable-2026
@@ -83,6 +84,7 @@ WINDOWS_CERTIFICATE_THUMBPRINT ?=
 WINDOWS_TIMESTAMP_URL ?=
 DY_SCREEN_API_BASE_URL ?= http://localhost/api/
 DEV_REQUIRE_ACTIVATION ?= 0
+TRANSITION_CATALOG_FIXTURE ?=
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
 
@@ -94,7 +96,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 
 .PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
-	preview-doctor clip-subtitle-doctor test-clip-subtitle test-clip-subtitle-integration test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
+	preview-doctor clip-subtitle-doctor test-clip-subtitle test-clip-subtitle-integration test-clip-transition-integration test-transition-catalog-fixture test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
 	test-ai-scheduler test-ai-repository test-ai-credentials test-ai-workflow test-ai \
 	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
@@ -155,6 +157,8 @@ help:
 		'  make asr-evidence-audit ASR_COMPLETION_*=... ASR_QUALITY_*=... 汇总六个门禁并输出 readyToComplete' \
 		'  make preview-doctor  检查视频预览所需 FFmpeg 编码能力' \
 		'  make clip-subtitle-doctor 检查带 ASR 字幕剪辑导出所需 FFmpeg 能力' \
+		'  make test-clip-transition-integration 使用 H.264/HEVC 带声小样验证转场预览与导出' \
+		'  make test-transition-catalog-fixture TRANSITION_CATALOG_FIXTURE=... 验证服务端 33 条素材目录' \
 		'  make test-clip-subtitle 执行字幕映射、渲染、导出门禁和编辑器测试' \
 		'  make test-clip-subtitle-integration 使用指定 FFmpeg 验证字幕实际烧录像素' \
 		'  make test-preview    执行预览服务和播放器组件测试' \
@@ -233,7 +237,18 @@ test-clip-subtitle:
 	"$(NPM)" test -- --run ui/src/AiWorkspace.test.tsx
 
 test-clip-subtitle-integration: clip-subtitle-doctor
-	DY_SCREEN_CLIP_FFMPEG="$(FFMPEG)" DY_SCREEN_CLIP_FFPROBE="$(FFPROBE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export::tests::exports_mixed_source_dimensions_to_a_playable_mp4 -- --exact --nocapture
+	DY_SCREEN_FIXTURE_FFMPEG="$(FFMPEG_FIXTURE_GENERATOR)" DY_SCREEN_CLIP_FFMPEG="$(FFMPEG)" DY_SCREEN_CLIP_FFPROBE="$(FFPROBE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export::tests::exports_mixed_source_dimensions_to_a_playable_mp4 -- --exact --nocapture
+
+test-clip-transition-integration: clip-subtitle-doctor
+	@"$(FFMPEG_FIXTURE_GENERATOR)" -hide_banner -encoders 2>/dev/null | grep -q ' libx264 ' || { printf '%s\n' '错误：受控样本生成器缺少 libx264。' >&2; exit 1; }
+	@"$(FFMPEG_FIXTURE_GENERATOR)" -hide_banner -encoders 2>/dev/null | grep -q ' libx265 ' || { printf '%s\n' '错误：受控样本生成器缺少 libx265。' >&2; exit 1; }
+	DY_SCREEN_FIXTURE_FFMPEG="$(FFMPEG_FIXTURE_GENERATOR)" DY_SCREEN_CLIP_FFMPEG="$(FFMPEG)" DY_SCREEN_CLIP_FFPROBE="$(FFPROBE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib transition_assets::tests::real_h264_and_hevc_samples_keep_audio_and_generate_compatible_preview -- --exact --nocapture
+	DY_SCREEN_FIXTURE_FFMPEG="$(FFMPEG_FIXTURE_GENERATOR)" DY_SCREEN_CLIP_FFMPEG="$(FFMPEG)" DY_SCREEN_CLIP_FFPROBE="$(FFPROBE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export::tests::exports_mixed_source_dimensions_to_a_playable_mp4 -- --exact --nocapture
+
+test-transition-catalog-fixture:
+	@test -n "$(TRANSITION_CATALOG_FIXTURE)" || { printf '%s\n' '错误：必须通过 TRANSITION_CATALOG_FIXTURE 指定服务端素材目录 JSON。' >&2; exit 2; }
+	@test -f "$(TRANSITION_CATALOG_FIXTURE)" || { printf '%s\n' '错误：服务端素材目录 JSON 不存在。' >&2; exit 2; }
+	DY_SCREEN_TRANSITION_CATALOG_FIXTURE="$(TRANSITION_CATALOG_FIXTURE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib transition_materials::tests::service_catalog_fixture_publishes_all_33_materials_without_exposing_urls -- --ignored --exact --nocapture
 
 install:
 	"$(NPM)" install

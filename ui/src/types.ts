@@ -526,6 +526,107 @@ export interface AiHighlightCandidatePage {
 
 export type AiClipEffect = "none" | "fade_in" | "fade_out" | "fade_in_out" | "flash" | "black";
 export type AiClipExportStatus = "idle" | "exporting" | "completed" | "cancelled" | "failed";
+export type MaterialDownloadStatus = "missing" | "downloading" | "transcoding" | "ready" | "failed";
+export type TransitionCatalogSyncStatus = "idle" | "checking" | "syncing" | "ready" | "upgrade_required" | "failed";
+export type BoundarySelectionSource = "none" | "agent" | "manual";
+
+export interface TransitionCatalogState {
+  localCatalogVersion: number;
+  remoteCatalogVersion: number | null;
+  minimumAppVersion: string | null;
+  status: TransitionCatalogSyncStatus;
+  lastCheckedAt: string | null;
+  lastSuccessAt: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+}
+
+export interface TransitionMaterialDownload {
+  assetKey: string;
+  assetVersion: number;
+  sourceStatus: MaterialDownloadStatus;
+  sourceRelativePath: string | null;
+  previewStatus: MaterialDownloadStatus;
+  previewRelativePath: string | null;
+  validatedSizeBytes: number | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  updatedAt: string;
+}
+
+export interface TransitionMaterial {
+  assetKey: string;
+  assetVersion: number;
+  title: string;
+  description: string;
+  tags: string[];
+  category: string;
+  renderMode: "bridge";
+  durationMs: number;
+  width: number;
+  height: number;
+  fps: number;
+  videoCodec: string;
+  hasAudio: boolean;
+  sortOrder: number;
+  thumbnailAvailable: boolean;
+  download: TransitionMaterialDownload;
+}
+
+export interface MaterialAssetSnapshot {
+  assetKey: string;
+  assetVersion: number;
+  state: MaterialDownloadStatus;
+  mediaUrl: string | null;
+  generated: boolean;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export interface ClipTransitionBoundary {
+  id: number;
+  clipProjectId: number;
+  leftClipSegmentId: number | null;
+  rightClipSegmentId: number | null;
+  leftStableId: number;
+  rightStableId: number;
+  assetKey: string | null;
+  assetVersion: number | null;
+  selectionSource: BoundarySelectionSource;
+  confidence: number | null;
+  reason: string | null;
+  suggestedAssetKey: string | null;
+  suggestedAssetVersion: number | null;
+  suggestionConfidence: number | null;
+  suggestionReason: string | null;
+  suggestionNone: boolean;
+  manuallyLocked: boolean;
+  stale: boolean;
+  active: boolean;
+  updatedAt: string;
+}
+
+export interface AiClipTimelineUnit {
+  key: string;
+  kind: "segment" | "bridge";
+  projectStartMs: number;
+  projectEndMs: number;
+  clipSegmentId: number | null;
+  boundaryId: number | null;
+  title: string;
+  assetKey: string | null;
+  assetVersion: number | null;
+  sourceStatus: MaterialDownloadStatus | null;
+  previewStatus: MaterialDownloadStatus | null;
+}
+
+export interface TransitionMatchSummary {
+  matched: number;
+  autoApplied: number;
+  suggestions: number;
+  noneSuggestions: number;
+  boundaries: ClipTransitionBoundary[];
+}
 
 export interface AiClipProject {
   id: number;
@@ -587,6 +688,9 @@ export interface AiClipProjectDetail {
   subtitles: AiClipSubtitle[];
   subtitleFrames: AiClipSubtitleFrame[];
   subtitlesComplete: boolean;
+  boundaries?: ClipTransitionBoundary[];
+  projectDurationMs?: number;
+  timelineUnits?: AiClipTimelineUnit[];
 }
 
 export interface AiClipSegmentUpdate {
@@ -756,6 +860,15 @@ export interface ClientApi {
   insertAiClipCandidate?(clipProjectId: number, candidateId: number, insertIndex: number): Promise<AiClipProjectDetail>;
   reorderAiClipSegments?(clipProjectId: number, orderedIds: number[]): Promise<AiClipProjectDetail>;
   removeAiClipSegment?(clipProjectId: number, segmentId: number): Promise<AiClipProjectDetail>;
+  getTransitionCatalogState?(): Promise<TransitionCatalogState>;
+  retryTransitionCatalogSync?(): Promise<TransitionCatalogState>;
+  subscribeTransitionCatalog?(listener: (state: TransitionCatalogState) => void): Promise<() => void>;
+  listTransitionMaterials?(): Promise<TransitionMaterial[]>;
+  requestTransitionMaterialPreview?(assetKey: string, assetVersion: number): Promise<MaterialAssetSnapshot>;
+  requestTransitionMaterialThumbnail?(assetKey: string, assetVersion: number): Promise<MaterialAssetSnapshot>;
+  matchAiClipTransitions?(clipProjectId: number, boundaryId?: number | null): Promise<TransitionMatchSummary>;
+  applyAiClipTransition?(boundaryId: number, assetKey: string | null, assetVersion: number | null, lockEmpty?: boolean): Promise<ClipTransitionBoundary>;
+  unlockAiClipTransition?(boundaryId: number): Promise<ClipTransitionBoundary>;
   startAiClipExport?(clipProjectId: number): Promise<AiClipProject>;
   cancelAiClipExport?(clipProjectId: number): Promise<AiClipProject>;
   requestAiInputPreview(projectId: number, inputId: number): Promise<PreviewSnapshot>;

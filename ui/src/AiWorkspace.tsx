@@ -22,6 +22,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Search,
   RotateCcw,
   Scissors,
   SkipBack,
@@ -62,6 +63,10 @@ import type {
   ClientApi,
   LlmProviderSettings,
   PreviewSnapshot,
+  TransitionMaterial,
+  TransitionCatalogState,
+  MaterialAssetSnapshot,
+  ClipTransitionBoundary,
 } from "./types";
 import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
 
@@ -1574,7 +1579,7 @@ const clipEffects: Array<{
 ];
 
 type ClipMaterialFilter = "all" | "video" | "animation" | "transition";
-type ClipPropertyMode = "segment" | "subtitle";
+type ClipPropertyMode = "segment" | "transition" | "subtitle";
 type ClipSubtitleScope = "current" | "all";
 type ClipSubtitleSaveState = "saved" | "unsaved" | "saving" | "failed" | "conflict";
 
@@ -1598,6 +1603,16 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const [message, setMessage] = useState<string | null>(null);
   const [previewDimensions, setPreviewDimensions] = useState<{ aspectRatio: number; portrait: boolean } | null>(null);
   const [materialFilter, setMaterialFilter] = useState<ClipMaterialFilter>("all");
+  const [transitionMaterials, setTransitionMaterials] = useState<TransitionMaterial[]>([]);
+  const [transitionCatalog, setTransitionCatalog] = useState<TransitionCatalogState | null>(null);
+  const [transitionCatalogRetrying, setTransitionCatalogRetrying] = useState(false);
+  const [transitionSearch, setTransitionSearch] = useState("");
+  const [transitionCategory, setTransitionCategory] = useState("all");
+  const [transitionThumbnails, setTransitionThumbnails] = useState<Record<string, MaterialAssetSnapshot>>({});
+  const [transitionPreview, setTransitionPreview] = useState<MaterialAssetSnapshot | null>(null);
+  const [previewingTransition, setPreviewingTransition] = useState<TransitionMaterial | null>(null);
+  const [selectedBoundaryId, setSelectedBoundaryId] = useState<number | null>(null);
+  const [transitionBusy, setTransitionBusy] = useState(false);
   const [videoMaterials, setVideoMaterials] = useState<AiHighlightCandidate[]>([]);
   const [loadingVideoMaterials, setLoadingVideoMaterials] = useState(false);
   const [timelineZoom, setTimelineZoom] = useState(50);
@@ -1624,17 +1639,58 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const previewAudioGainRef = useRef<GainNode | null>(null);
   const selected = detail.segments.find((segment) => segment.id === selectedId) ?? detail.segments[0] ?? null;
   const selectedIndex = selected ? detail.segments.findIndex((segment) => segment.id === selected.id) : -1;
-  const totalDuration = detail.segments.reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
+  const fallbackTimelineUnits = detail.segments.map((segment) => ({
+    key: `segment:${segment.id}`, kind: "segment" as const, projectStartMs: 0, projectEndMs: 0,
+    clipSegmentId: segment.id, boundaryId: null, title: segment.title, assetKey: null,
+    assetVersion: null, sourceStatus: null, previewStatus: null,
+  }));
+  let fallbackCursor = 0;
+  for (const unit of fallbackTimelineUnits) {
+    const segment = detail.segments.find((item) => item.id === unit.clipSegmentId)!;
+    unit.projectStartMs = fallbackCursor;
+    fallbackCursor += segment.sourceEndMs - segment.sourceStartMs;
+    unit.projectEndMs = fallbackCursor;
+  }
+  const timelineUnits = detail.timelineUnits?.length ? detail.timelineUnits : fallbackTimelineUnits;
+  const totalDuration = detail.projectDurationMs ?? fallbackCursor;
+  const selectedBoundary = selectedBoundaryId === null
+    ? null
+    : detail.boundaries?.find((boundary) => boundary.id === selectedBoundaryId) ?? null;
+  const selectedBoundaryUnit = selectedBoundaryId === null
+    ? null
+    : timelineUnits.find((unit) => unit.boundaryId === selectedBoundaryId) ?? null;
+  const selectedTransitionMaterial = selectedBoundary?.assetKey && selectedBoundary.assetVersion
+    ? transitionMaterials.find((material) => material.assetKey === selectedBoundary.assetKey && material.assetVersion === selectedBoundary.assetVersion) ?? null
+    : null;
+  const suggestedTransitionMaterial = selectedBoundary?.suggestedAssetKey && selectedBoundary.suggestedAssetVersion
+    ? transitionMaterials.find((material) => material.assetKey === selectedBoundary.suggestedAssetKey && material.assetVersion === selectedBoundary.suggestedAssetVersion) ?? null
+    : null;
+  const targetBoundary = selectedBoundary
+    ?? detail.boundaries?.find((boundary) => boundary.active && boundary.leftStableId === selected?.id)
+    ?? null;
   const currentSubtitleFrame = detail.subtitleFrames.find(
     (frame) => frame.projectStartMs <= timelinePositionMs && frame.projectEndMs > timelinePositionMs,
   ) ?? null;
   const currentSubtitle = currentSubtitleFrame
     ? detail.subtitles.find((subtitle) => subtitle.id === currentSubtitleFrame.subtitleId) ?? null
     : null;
-  const timelineStartMs = detail.segments
-    .slice(0, Math.max(selectedIndex, 0))
-    .reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
+  const timelineStartMs = timelineUnits.find((unit) => unit.clipSegmentId === selected?.id)?.projectStartMs ?? 0;
   const visibleEffects = clipEffects.filter((effect) => materialFilter === "all" || effect.category === materialFilter);
+  const transitionQuery = transitionSearch.trim().toLocaleLowerCase();
+  const filteredTransitionMaterials = transitionMaterials.filter((material) => {
+    if (transitionCategory !== "all" && material.category !== transitionCategory) return false;
+    if (!transitionQuery) return true;
+    return `${material.title} ${material.description} ${material.tags.join(" ")}`.toLocaleLowerCase().includes(transitionQuery);
+  });
+  const transitionCategories = Array.from(new Set(transitionMaterials.map((material) => material.category))).sort();
+  const transitionCatalogMessage = transitionCatalog ? ({
+    idle: "等待授权心跳发布素材目录版本",
+    checking: "正在检查转场素材目录",
+    syncing: "正在同步转场素材目录",
+    ready: `素材目录 v${transitionCatalog.localCatalogVersion} 已就绪`,
+    upgrade_required: `需要升级客户端后同步素材${transitionCatalog.minimumAppVersion ? `（最低 ${transitionCatalog.minimumAppVersion}）` : ""}`,
+    failed: transitionCatalog.lastErrorMessage || "素材目录同步失败",
+  } satisfies Record<TransitionCatalogState["status"], string>)[transitionCatalog.status] : null;
   const existingCandidateIds = new Set(detail.segments.map((segment) => segment.candidateId));
   const availableVideoMaterials = videoMaterials.filter((candidate) => !existingCandidateIds.has(candidate.id));
   const totalDurationSeconds = Math.max(0.001, totalDuration / 1_000);
@@ -1729,20 +1785,82 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     return () => { disposed = true; };
   }, [api, detail.project.highlightRunId]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const loadMaterials = () => api.listTransitionMaterials?.()
+      .then((materials) => { if (!disposed) setTransitionMaterials(materials); })
+      .catch((error) => { if (!disposed) setMessage(safeError(error, "无法读取本地转场素材目录")); });
+    void loadMaterials();
+    void api.getTransitionCatalogState?.()
+      .then((state) => { if (!disposed) setTransitionCatalog(state); })
+      .catch((error) => { if (!disposed) setMessage(safeError(error, "无法读取素材目录同步状态")); });
+    void api.subscribeTransitionCatalog?.((state) => {
+      if (disposed) return;
+      setTransitionCatalog(state);
+      if (state.status === "ready") void loadMaterials();
+    }).then((stop) => { if (disposed) stop(); else unlisten = stop; });
+    return () => { disposed = true; unlisten?.(); };
+  }, [api]);
+
+  useEffect(() => {
+    if (!api.requestTransitionMaterialThumbnail) return;
+    let disposed = false;
+    const pending = filteredTransitionMaterials
+      .filter((material) => material.thumbnailAvailable)
+      .filter((material) => !transitionThumbnails[`${material.assetKey}:${material.assetVersion}`])
+      .slice(0, 24);
+    for (const material of pending) {
+      const key = `${material.assetKey}:${material.assetVersion}`;
+      void api.requestTransitionMaterialThumbnail(material.assetKey, material.assetVersion)
+        .then((snapshot) => { if (!disposed) setTransitionThumbnails((current) => ({ ...current, [key]: snapshot })); })
+        .catch(() => undefined);
+    }
+    return () => { disposed = true; };
+  }, [api, filteredTransitionMaterials, transitionThumbnails]);
+
   const selectSegment = useCallback((segmentId: number, resume = false) => {
     const nextIndex = detail.segments.findIndex((segment) => segment.id === segmentId);
     if (nextIndex < 0) return;
-    const nextStart = detail.segments
-      .slice(0, nextIndex)
-      .reduce((total, segment) => total + segment.sourceEndMs - segment.sourceStartMs, 0);
+    const nextStart = timelineUnits.find((unit) => unit.clipSegmentId === segmentId)?.projectStartMs ?? 0;
     pendingSeekSourceMsRef.current = detail.segments[nextIndex].sourceStartMs;
+    setSelectedBoundaryId(null);
+    setTransitionPreview(null);
+    setPropertyMode("segment");
     setSelectedId(segmentId);
     setTimelinePositionMs(nextStart);
     setResumeAfterSegment(resume);
-  }, [detail.segments]);
+  }, [detail.segments, timelineUnits]);
+
+  const selectBoundary = useCallback((boundary: ClipTransitionBoundary, resume = false, offsetMs = 0) => {
+    const unit = timelineUnits.find((item) => item.boundaryId === boundary.id);
+    const left = detail.segments.find((segment) => segment.id === boundary.leftStableId);
+    if (left) setSelectedId(left.id);
+    pendingSeekSourceMsRef.current = Math.max(0, offsetMs);
+    setSelectedBoundaryId(boundary.id);
+    const boundaryStartMs = unit?.projectStartMs
+      ?? timelineUnits.find((item) => item.clipSegmentId === boundary.leftStableId)?.projectEndMs
+      ?? 0;
+    setTimelinePositionMs(boundaryStartMs + Math.max(0, offsetMs));
+    setResumeAfterSegment(resume);
+    setPropertyMode("transition");
+  }, [detail.segments, timelineUnits]);
 
   useEffect(() => {
-    if (!selected || projectId <= 0) return;
+    if (!selectedBoundary?.assetKey || !selectedBoundary.assetVersion || !api.requestTransitionMaterialPreview) {
+      setTransitionPreview(null);
+      return;
+    }
+    let disposed = false;
+    setTransitionPreview(null);
+    void api.requestTransitionMaterialPreview(selectedBoundary.assetKey, selectedBoundary.assetVersion)
+      .then((snapshot) => { if (!disposed) setTransitionPreview(snapshot); })
+      .catch((error) => { if (!disposed) setMessage(safeError(error, "无法准备转场素材预览")); });
+    return () => { disposed = true; };
+  }, [api, selectedBoundary?.assetKey, selectedBoundary?.assetVersion]);
+
+  useEffect(() => {
+    if (!selected || projectId <= 0 || selectedBoundaryId !== null) return;
     let disposed = false;
     setPreview(null);
     setPreviewInputId(null);
@@ -1756,11 +1874,11 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
       })
       .catch((error) => { if (!disposed) setMessage(safeError(error, "无法准备剪辑预览")); });
     return () => { disposed = true; };
-  }, [api, projectId, selected?.inputId]);
+  }, [api, projectId, selected?.inputId, selectedBoundaryId]);
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !selected || previewInputId !== selected.inputId || preview?.state !== "ready" || !preview.media) return;
+    if (!video || !selected || selectedBoundaryId !== null || previewInputId !== selected.inputId || preview?.state !== "ready" || !preview.media) return;
     const seekAndResume = () => {
       const requestedSourceMs = pendingSeekSourceMsRef.current;
       const currentSourceMs = video.currentTime * 1_000;
@@ -1791,14 +1909,37 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     }
     video.addEventListener("loadedmetadata", seekAndResume, { once: true });
     return () => video.removeEventListener("loadedmetadata", seekAndResume);
-  }, [applyPreviewVolume, preview, previewInputId, resumeAfterSegment, selected?.id, selected?.inputId, selected?.volumePercent]);
+  }, [applyPreviewVolume, preview, previewInputId, resumeAfterSegment, selected?.id, selected?.inputId, selected?.volumePercent, selectedBoundaryId]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !selectedBoundaryUnit || transitionPreview?.state !== "ready" || !transitionPreview.mediaUrl) return;
+    const seekAndResume = () => {
+      const offset = Math.min(
+        selectedBoundaryUnit.projectEndMs - selectedBoundaryUnit.projectStartMs,
+        Math.max(0, pendingSeekSourceMsRef.current ?? 0),
+      );
+      pendingSeekSourceMsRef.current = null;
+      video.currentTime = offset / 1_000;
+      applyPreviewVolume(video, 100);
+      if (resumeAfterSegment) {
+        setResumeAfterSegment(false);
+        void video.play().catch(() => setIsPlaying(false));
+      }
+    };
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) seekAndResume();
+    else {
+      video.addEventListener("loadedmetadata", seekAndResume, { once: true });
+      return () => video.removeEventListener("loadedmetadata", seekAndResume);
+    }
+  }, [applyPreviewVolume, resumeAfterSegment, selectedBoundaryUnit, transitionPreview]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (video && selected) {
-      applyPreviewVolume(video, selected.volumePercent);
+      applyPreviewVolume(video, selectedBoundaryId === null ? selected.volumePercent : 100);
     }
-  }, [applyPreviewVolume, selected?.id, selected?.volumePercent]);
+  }, [applyPreviewVolume, selected?.id, selected?.volumePercent, selectedBoundaryId]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.muted = isMuted;
@@ -1826,26 +1967,28 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const seekProjectTime = (requestedMs: number, resume = false) => {
-    if (detail.segments.length === 0) return;
+    if (timelineUnits.length === 0) return;
     const clampedMs = Math.min(Math.max(requestedMs, 0), totalDuration);
-    let projectStartMs = 0;
-    let target = detail.segments[detail.segments.length - 1];
-    for (const segment of detail.segments) {
-      const duration = segment.sourceEndMs - segment.sourceStartMs;
-      if (clampedMs < projectStartMs + duration || segment.id === detail.segments[detail.segments.length - 1].id) {
-        target = segment;
-        break;
-      }
-      projectStartMs += duration;
-    }
+    const unit = timelineUnits.find((item, index) =>
+      clampedMs < item.projectEndMs || index === timelineUnits.length - 1,
+    ) ?? timelineUnits[timelineUnits.length - 1];
     const offsetMs = Math.min(
-      target.sourceEndMs - target.sourceStartMs,
-      Math.max(0, clampedMs - projectStartMs),
+      unit.projectEndMs - unit.projectStartMs,
+      Math.max(0, clampedMs - unit.projectStartMs),
     );
+    if (unit.kind === "bridge" && unit.boundaryId !== null) {
+      const boundary = detail.boundaries?.find((item) => item.id === unit.boundaryId);
+      if (boundary) selectBoundary(boundary, resume, offsetMs);
+      return;
+    }
+    const target = detail.segments.find((segment) => segment.id === unit.clipSegmentId);
+    if (!target) return;
     const sourceMs = target.sourceStartMs + offsetMs;
     pendingSeekSourceMsRef.current = sourceMs;
     setTimelinePositionMs(clampedMs);
     setResumeAfterSegment(resume);
+    setSelectedBoundaryId(null);
+    setTransitionPreview(null);
     if (target.id !== selected?.id) {
       setSelectedId(target.id);
       return;
@@ -2137,6 +2280,100 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     } catch (error) { setMessage(safeError(error, "移除片段失败")); }
   };
 
+  const reloadTransitions = async (boundaryId?: number) => {
+    if (!api.getAiClipProject) return;
+    const next = await api.getAiClipProject(detail.project.id);
+    setDetail(next);
+    if (boundaryId && next.boundaries?.some((boundary) => boundary.id === boundaryId && boundary.active)) {
+      setSelectedBoundaryId(boundaryId);
+      setPropertyMode("transition");
+    }
+    if (api.listTransitionMaterials) setTransitionMaterials(await api.listTransitionMaterials());
+  };
+
+  const retryTransitionCatalog = async () => {
+    if (!api.retryTransitionCatalogSync || transitionCatalogRetrying) return;
+    setTransitionCatalogRetrying(true);
+    setMessage(null);
+    try {
+      setTransitionCatalog(await api.retryTransitionCatalogSync());
+    } catch (error) {
+      setMessage(safeError(error, "重试素材目录同步失败"));
+    } finally {
+      setTransitionCatalogRetrying(false);
+    }
+  };
+
+  const applyTransitionMaterial = async (material: TransitionMaterial) => {
+    if (!targetBoundary || !api.applyAiClipTransition || versionMutationLocked) {
+      setMessage("请先在时间轴选择一个片段边界");
+      return;
+    }
+    setTransitionBusy(true);
+    setMessage(null);
+    try {
+      await api.applyAiClipTransition(targetBoundary.id, material.assetKey, material.assetVersion, true);
+      await reloadTransitions(targetBoundary.id);
+      setMessage(`已应用转场素材“${material.title}”`);
+    } catch (error) {
+      setMessage(safeError(error, "应用转场素材失败"));
+    } finally {
+      setTransitionBusy(false);
+    }
+  };
+
+  const previewTransitionMaterial = async (material: TransitionMaterial) => {
+    if (!api.requestTransitionMaterialPreview) return;
+    setTransitionBusy(true);
+    setMessage(null);
+    try {
+      setPreviewingTransition(material);
+      setSelectedBoundaryId(null);
+      setTransitionPreview(await api.requestTransitionMaterialPreview(material.assetKey, material.assetVersion));
+    } catch (error) {
+      setMessage(safeError(error, "预览转场素材失败"));
+    } finally {
+      setTransitionBusy(false);
+    }
+  };
+
+  const matchTransitions = async (boundaryId?: number) => {
+    if (!api.matchAiClipTransitions || versionMutationLocked) return;
+    setTransitionBusy(true);
+    setMessage(null);
+    try {
+      const summary = await api.matchAiClipTransitions(detail.project.id, boundaryId ?? null);
+      await reloadTransitions(boundaryId);
+      setMessage(`智能匹配完成：自动应用 ${summary.autoApplied} 个，建议 ${summary.suggestions} 个`);
+    } catch (error) {
+      setMessage(safeError(error, "智能匹配转场失败"));
+    } finally {
+      setTransitionBusy(false);
+    }
+  };
+
+  const removeTransition = async (lockEmpty = true) => {
+    if (!selectedBoundary || !api.applyAiClipTransition || versionMutationLocked) return;
+    setTransitionBusy(true);
+    try {
+      await api.applyAiClipTransition(selectedBoundary.id, null, null, lockEmpty);
+      await reloadTransitions(selectedBoundary.id);
+      setMessage(lockEmpty ? "已保留无转场并锁定该边界" : "已移除转场");
+    } catch (error) { setMessage(safeError(error, "移除转场失败")); }
+    finally { setTransitionBusy(false); }
+  };
+
+  const unlockTransition = async () => {
+    if (!selectedBoundary || !api.unlockAiClipTransition) return;
+    setTransitionBusy(true);
+    try {
+      await api.unlockAiClipTransition(selectedBoundary.id);
+      await reloadTransitions(selectedBoundary.id);
+      setMessage("已解除人工锁，可重新智能匹配");
+    } catch (error) { setMessage(safeError(error, "解除人工锁失败")); }
+    finally { setTransitionBusy(false); }
+  };
+
   const exportVideo = async () => {
     if (!api.startAiClipExport || hasUnsavedSubtitles || subtitleMutationPending) return;
     try {
@@ -2156,28 +2393,39 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   };
 
   const updateTimelinePosition = (video: HTMLVideoElement) => {
+    if (previewingTransition && !selectedBoundaryUnit) return;
+    if (selectedBoundaryUnit) {
+      const duration = selectedBoundaryUnit.projectEndMs - selectedBoundaryUnit.projectStartMs;
+      const elapsed = Math.min(Math.max(Math.round(video.currentTime * 1_000), 0), duration);
+      setTimelinePositionMs(selectedBoundaryUnit.projectStartMs + elapsed);
+      if (elapsed + 50 < duration) return;
+      video.pause();
+      setIsPlaying(false);
+      seekProjectTime(selectedBoundaryUnit.projectEndMs, true);
+      return;
+    }
     if (!selected || selectedIndex < 0) return;
     const duration = selected.sourceEndMs - selected.sourceStartMs;
     const elapsed = Math.min(Math.max(Math.round(video.currentTime * 1_000) - selected.sourceStartMs, 0), duration);
     setTimelinePositionMs(timelineStartMs + elapsed);
     if (video.currentTime * 1_000 + 50 < selected.sourceEndMs) return;
-    const next = detail.segments[selectedIndex + 1];
     video.pause();
     setIsPlaying(false);
-    if (next) {
-      selectSegment(next.id, true);
-    }
+    if (timelineStartMs + duration < totalDuration) seekProjectTime(timelineStartMs + duration, true);
   };
 
   const playheadPercent = totalDuration > 0
     ? Math.min(100, Math.max(0, (timelinePositionMs / totalDuration) * 100))
     : 0;
-  const selectedDuration = selected ? selected.sourceEndMs - selected.sourceStartMs : 0;
-  const selectedElapsed = Math.min(Math.max(timelinePositionMs - timelineStartMs, 0), selectedDuration);
+  const selectedDuration = selectedBoundaryUnit
+    ? selectedBoundaryUnit.projectEndMs - selectedBoundaryUnit.projectStartMs
+    : selected ? selected.sourceEndMs - selected.sourceStartMs : 0;
+  const activeUnitStartMs = selectedBoundaryUnit?.projectStartMs ?? timelineStartMs;
+  const selectedElapsed = Math.min(Math.max(timelinePositionMs - activeUnitStartMs, 0), selectedDuration);
   const fadeMs = Math.min(350, Math.max(10, selectedDuration));
   const fadeInOpacity = Math.min(1, selectedElapsed / fadeMs);
   const fadeOutOpacity = Math.min(1, (selectedDuration - selectedElapsed) / fadeMs);
-  const previewVideoOpacity = selected?.effect === "fade_in"
+  const previewVideoOpacity = selectedBoundaryUnit ? 1 : selected?.effect === "fade_in"
     ? fadeInOpacity
     : selected?.effect === "fade_out"
       ? fadeOutOpacity
@@ -2201,6 +2449,12 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
         : detail.project.exportStatus === "cancelled"
           ? "导出已取消"
           : "工程已保存";
+  const transitionPreviewReady = transitionPreview?.state === "ready" && Boolean(transitionPreview.mediaUrl);
+  const originalPreviewReady = preview?.state === "ready" && Boolean(preview.media) && previewInputId === selected?.inputId;
+  const activePreviewReady = transitionPreviewReady || originalPreviewReady;
+  const activePreviewUrl = transitionPreviewReady
+    ? transitionPreview!.mediaUrl!
+    : preview?.media ? mediaUrl(preview.media.path) : "";
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -2247,10 +2501,18 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
 
     <div className="clip-editor-grid">
       <aside ref={materialsRef} tabIndex={-1} className="clip-materials" aria-label="视频与动画素材库">
-        <header><p className="section-kicker">MATERIALS</p><h3><Sparkles size={15} />素材库</h3></header>
+        <header><div><p className="section-kicker">MATERIALS</p><h3><Sparkles size={15} />素材库</h3></div><button className="icon-button" aria-label="智能匹配全部转场" title="智能匹配全部转场" disabled={transitionBusy || versionMutationLocked || detail.segments.length < 2} onClick={() => void matchTransitions()}><Sparkles size={15} /></button></header>
         <nav className="clip-material-tabs" aria-label="素材分类">
           {([ ["all", "全部"], ["video", "视频"], ["animation", "动画"], ["transition", "转场"] ] as Array<[ClipMaterialFilter, string]>).map(([value, label]) => <button key={value} className={materialFilter === value ? "active" : ""} onClick={() => setMaterialFilter(value)}>{label}</button>)}
         </nav>
+        {(materialFilter === "all" || materialFilter === "transition") && <div className="clip-transition-filters">
+          <label><Search size={12} /><input aria-label="搜索转场素材" type="search" value={transitionSearch} onChange={(event) => setTransitionSearch(event.target.value)} placeholder="搜索标题、描述或标签" /></label>
+          <select aria-label="转场素材分类" value={transitionCategory} onChange={(event) => setTransitionCategory(event.target.value)}><option value="all">全部分类</option>{transitionCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select>
+        </div>}
+        {(materialFilter === "all" || materialFilter === "transition") && transitionCatalog && transitionCatalog.status !== "ready" && <div className={`clip-transition-catalog-state ${transitionCatalog.status}`}>
+          <span>{transitionCatalogMessage}</span>
+          {transitionCatalog.status === "failed" && <button className="icon-button" aria-label="重试素材目录同步" title="重试素材目录同步" disabled={transitionCatalogRetrying} onClick={() => void retryTransitionCatalog()}><RefreshCw size={13} /></button>}
+        </div>}
         <div className="clip-effect-list">
           {(materialFilter === "all" || materialFilter === "video") && availableVideoMaterials.map((candidate) => <button
             key={`video-${candidate.id}`}
@@ -2277,28 +2539,44 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               onDragEnd={() => setDraggedEffect(null)}
             ><span className={`clip-effect-swatch ${effect.value}`}><Icon size={22} /></span><strong>{effect.label}</strong><small>{effect.description}</small></button>;
           })}
+          {(materialFilter === "all" || materialFilter === "transition") && filteredTransitionMaterials.map((material) => {
+            const key = `${material.assetKey}:${material.assetVersion}`;
+            const thumbnail = transitionThumbnails[key];
+            const applied = targetBoundary?.assetKey === material.assetKey && targetBoundary.assetVersion === material.assetVersion;
+            const stateLabel = material.download.sourceStatus === "ready" ? "已就绪" : material.download.sourceStatus === "downloading" ? "下载中" : material.download.sourceStatus === "transcoding" ? "转码中" : material.download.sourceStatus === "failed" ? "失败" : "未下载";
+            return <article key={key} className={`clip-transition-material ${applied ? "active" : ""}`}>
+              <button className="clip-transition-thumb" aria-label={`预览转场：${material.title}`} onClick={() => void previewTransitionMaterial(material)} disabled={transitionBusy}>
+                {thumbnail?.state === "ready" && thumbnail.mediaUrl ? <img src={thumbnail.mediaUrl} alt="" /> : <Blend size={22} />}
+                <Play size={13} />
+              </button>
+              <div><strong>{material.title}</strong><small>{formatDuration(material.durationMs)} · {stateLabel}</small><p>{material.description}</p><span>{material.tags.slice(0, 3).join(" · ") || material.category}</span></div>
+              <button className="clip-transition-apply" disabled={!targetBoundary || transitionBusy || versionMutationLocked} onClick={() => void applyTransitionMaterial(material)}>{applied ? "已应用" : "应用"}</button>
+            </article>;
+          })}
           {materialFilter === "video" && !loadingVideoMaterials && availableVideoMaterials.length === 0 && <p className="clip-material-empty">待切片视频均已进入时间轴</p>}
           {materialFilter === "video" && loadingVideoMaterials && <p className="clip-material-empty">正在读取待切片视频…</p>}
+          {(materialFilter === "all" || materialFilter === "transition") && transitionMaterials.length === 0 && <p className="clip-material-empty">本地转场目录为空，请等待心跳同步后重试</p>}
+          {(materialFilter === "all" || materialFilter === "transition") && transitionMaterials.length > 0 && filteredTransitionMaterials.length === 0 && <p className="clip-material-empty">没有匹配的转场素材</p>}
         </div>
         <p className="clip-material-note">视频可点击追加或拖到时间轴间隙；动画与转场可点击应用，或拖到片段及相邻间隙。</p>
       </aside>
 
       <section className="clip-center">
         <div className="clip-preview-stage">
-          {preview?.state === "ready" && preview.media && previewInputId === selected?.inputId
+          {activePreviewReady
             ? <div className={`clip-preview-frame ${previewDimensions?.portrait === false ? "landscape" : "portrait"}`} style={{ "--clip-preview-aspect": previewDimensions?.aspectRatio ?? 9 / 16 } as CSSProperties}>
               <video
                 ref={videoRef}
-                src={mediaUrl(preview.media.path)}
+                src={activePreviewUrl}
                 style={{ opacity: previewVideoOpacity }}
                 onClick={togglePlayback}
                 onLoadedMetadata={(event) => { const { videoWidth, videoHeight } = event.currentTarget; if (videoWidth > 0 && videoHeight > 0) setPreviewDimensions({ aspectRatio: videoWidth / videoHeight, portrait: videoHeight >= videoWidth }); }}
-                onPlay={(event) => { applyPreviewVolume(event.currentTarget, selected?.volumePercent ?? 100); resumePreviewAudio(); setIsPlaying(true); }}
+                onPlay={(event) => { applyPreviewVolume(event.currentTarget, transitionPreviewReady ? 100 : selected?.volumePercent ?? 100); resumePreviewAudio(); setIsPlaying(true); }}
                 onPause={() => setIsPlaying(false)}
                 onTimeUpdate={(event) => updateTimelinePosition(event.currentTarget)}
               />
-              {previewOverlay && <i className={`clip-preview-effect ${previewOverlay.color}`} style={{ opacity: previewOverlay.opacity }} aria-hidden="true" />}
-              {currentSubtitle && currentSubtitleFrame && <div
+              {!transitionPreviewReady && previewOverlay && <i className={`clip-preview-effect ${previewOverlay.color}`} style={{ opacity: previewOverlay.opacity }} aria-hidden="true" />}
+              {!transitionPreviewReady && currentSubtitle && currentSubtitleFrame && <div
                 className="clip-subtitle-overlay"
                 aria-label="播放器字幕"
                 aria-live="polite"
@@ -2307,13 +2585,13 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                 <button className="icon-button" aria-label={isPlaying ? "暂停视频" : "播放视频"} title={`${isPlaying ? "暂停" : "播放"}（Space）`} onClick={togglePlayback}>{isPlaying ? <Pause size={17} /> : <Play size={17} />}</button>
                 <button className="icon-button" aria-label="上一帧" title="上一帧（←）" onClick={() => stepFrame(-1)}><SkipBack size={16} /></button>
                 <button className="icon-button" aria-label="下一帧" title="下一帧（→）" onClick={() => stepFrame(1)}><SkipForward size={16} /></button>
-                <input aria-label="片段播放进度" type="range" min="0" max="100" step="0.1" value={playerProgressPercent} onChange={(event) => seekProjectTime(timelineStartMs + selectedDuration * Number(event.target.value) / 100)} />
+                <input aria-label="片段播放进度" type="range" min="0" max="100" step="0.1" value={playerProgressPercent} onChange={(event) => selectedBoundaryUnit ? seekProjectTime(activeUnitStartMs + selectedDuration * Number(event.target.value) / 100) : previewingTransition ? undefined : seekProjectTime(timelineStartMs + selectedDuration * Number(event.target.value) / 100)} />
                 <time>{formatDuration(timelinePositionMs)} / {formatDuration(totalDuration)}</time>
                 <button className="icon-button" aria-label={isMuted ? "取消静音" : "静音"} title={`${isMuted ? "取消静音" : "静音"}（M）`} onClick={toggleMuted}>{isMuted ? <VolumeX size={17} /> : <Volume2 size={17} />}</button>
                 <button className="icon-button" aria-label="全屏预览" title="全屏预览" onClick={openFullscreen}><Maximize2 size={17} /></button>
               </div>
             </div>
-            : <div className="clip-preview-placeholder"><Video size={36} /><strong>正在准备片段预览</strong><small>{preview?.errorMessage ?? "预览不会修改原始录像"}</small></div>}
+            : <div className="clip-preview-placeholder"><Video size={36} /><strong>正在准备片段预览</strong><small>{transitionPreview?.errorMessage ?? preview?.errorMessage ?? "预览不会修改原始录像"}</small></div>}
         </div>
 
         <section className="clip-timeline" aria-label="单轨时间轴">
@@ -2339,6 +2617,9 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                   {detail.segments.map((segment, index) => {
                     const duration = segment.sourceEndMs - segment.sourceStartMs;
                     const effect = clipEffects.find((item) => item.value === segment.effect) ?? clipEffects[0];
+                    const right = detail.segments[index + 1];
+                    const boundary = right ? detail.boundaries?.find((item) => item.active && item.leftStableId === segment.id && item.rightStableId === right.id) : null;
+                    const bridgeUnit = boundary ? timelineUnits.find((unit) => unit.boundaryId === boundary.id) : null;
                     return <Fragment key={segment.id}>
                       <button
                         className={`clip-insert-gap ${activeDropIndex === index ? "active" : ""}`}
@@ -2359,6 +2640,14 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                         onDragOver={(event) => { if (draggedEffect) event.preventDefault(); }}
                         onDrop={(event) => applyDraggedEffect(event, segment)}
                       ><GripVertical size={12} /><span>{index + 1}</span><strong>{segment.title}</strong><small>{formatDuration(duration)}</small>{segment.effect !== "none" && <em>{effect.label}</em>}</button>
+                      {boundary && (bridgeUnit ? <button
+                        type="button"
+                        className={`clip-bridge-unit ${selectedBoundaryId === boundary.id ? "active" : ""} ${bridgeUnit.sourceStatus ?? "missing"}`}
+                        style={{ width: `${Math.max(2, (bridgeUnit.projectEndMs - bridgeUnit.projectStartMs) / Math.max(totalDuration, 1) * 100)}%` }}
+                        aria-label={`转场素材：${bridgeUnit.title}`}
+                        onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); selectBoundary(boundary, isPlaying); }}
+                      ><Blend size={12} /><strong>{bridgeUnit.title}</strong><small>{formatDuration(bridgeUnit.projectEndMs - bridgeUnit.projectStartMs)}</small></button>
+                        : <button type="button" className={`clip-boundary-slot ${selectedBoundaryId === boundary.id ? "active" : ""} ${boundary.stale ? "stale" : ""}`} aria-label={`选择 ${segment.title} 与 ${right.title} 之间的转场`} title={boundary.stale ? "需要重新匹配" : "添加转场"} onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); selectBoundary(boundary); }}><Plus size={10} /></button>)}
                     </Fragment>;
                   })}
                   <button
@@ -2398,6 +2687,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
         <header><p className="section-kicker">PROPERTIES</p><h3>属性</h3></header>
         <nav className="clip-property-tabs" aria-label="属性类型">
           <button aria-label="片段属性" aria-pressed={propertyMode === "segment"} className={propertyMode === "segment" ? "active" : ""} onClick={() => setPropertyMode("segment")}>片段</button>
+          <button aria-label="转场属性" aria-pressed={propertyMode === "transition"} className={propertyMode === "transition" ? "active" : ""} onClick={() => setPropertyMode("transition")}>转场</button>
           <button
             aria-label="字幕属性"
             aria-pressed={propertyMode === "subtitle"}
@@ -2437,6 +2727,26 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               <button className="icon-button danger" aria-label="移除片段" title="移除片段" disabled={versionMutationLocked} onClick={() => void remove()}><Trash2 size={15} /></button>
             </div>
           </> : <p className="clip-property-empty">没有可编辑片段</p>}
+        </div> : propertyMode === "transition" ? <div className="clip-property-panel clip-transition-properties">
+          {selectedBoundary ? <>
+            <section className="clip-property-group">
+              <h4>边界状态</h4>
+              <dl><div><dt>位置</dt><dd>{selectedBoundary.leftStableId} → {selectedBoundary.rightStableId}</dd></div><div><dt>来源</dt><dd>{selectedBoundary.selectionSource === "manual" ? "人工选择" : selectedBoundary.selectionSource === "agent" ? "智能匹配" : "未匹配"}</dd></div><div><dt>人工锁</dt><dd>{selectedBoundary.manuallyLocked ? "已锁定" : "未锁定"}</dd></div><div><dt>状态</dt><dd>{selectedBoundary.stale ? "需要重新匹配" : "有效"}</dd></div></dl>
+            </section>
+            {selectedTransitionMaterial ? <section className="clip-property-group">
+              <h4>已应用素材</h4><strong>{selectedTransitionMaterial.title}</strong>
+              <p>{selectedTransitionMaterial.description}</p>
+              <dl><div><dt>版本</dt><dd>v{selectedTransitionMaterial.assetVersion}</dd></div><div><dt>时长</dt><dd>{formatDuration(selectedTransitionMaterial.durationMs)}</dd></div><div><dt>准备状态</dt><dd>{selectedTransitionMaterial.download.sourceStatus}</dd></div><div><dt>匹配分数</dt><dd>{selectedBoundary.confidence === null ? "人工" : `${Math.round(selectedBoundary.confidence * 100)}%`}</dd></div></dl>
+              {selectedBoundary.reason && <p>{selectedBoundary.reason}</p>}
+            </section> : <section className="clip-property-group"><h4>已应用素材</h4><p>当前边界没有转场素材</p></section>}
+            {(suggestedTransitionMaterial || selectedBoundary.suggestionNone) && <section className="clip-property-group clip-transition-suggestion"><h4>智能建议</h4><strong>{selectedBoundary.suggestionNone ? "建议不使用转场" : suggestedTransitionMaterial?.title}</strong><p>{selectedBoundary.suggestionReason}</p><span>{selectedBoundary.suggestionConfidence === null ? "" : `${Math.round(selectedBoundary.suggestionConfidence * 100)}%`}</span>{suggestedTransitionMaterial && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void applyTransitionMaterial(suggestedTransitionMaterial)}>应用建议</button>}</section>}
+            <div className="clip-transition-actions">
+              <button className="secondary-button" disabled={transitionBusy || versionMutationLocked || selectedBoundary.manuallyLocked} onClick={() => void matchTransitions(selectedBoundary.id)}><Sparkles size={13} />重新匹配</button>
+              {selectedBoundary.manuallyLocked && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void unlockTransition()}><RotateCcw size={13} />解除锁定</button>}
+              <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void removeTransition(true)}><CircleOff size={13} />保留无转场</button>
+              {selectedBoundary.assetKey && <button className="danger-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void removeTransition(false)}><Trash2 size={13} />移除</button>}
+            </div>
+          </> : <p className="clip-property-empty">请点击时间轴片段之间的转场位置</p>}
         </div> : <div className="clip-subtitle-panel">
           <div className="clip-subtitle-tools">
             <div className="clip-subtitle-scope" role="group" aria-label="字幕列表范围">

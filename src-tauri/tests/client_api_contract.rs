@@ -73,7 +73,7 @@ fn api_client(base_url: String) -> ApiClient {
         ApiConfig {
             base_url,
             timeout: Duration::from_secs(3),
-            client_version: "0.2.0".to_owned(),
+            client_version: "0.3.0".to_owned(),
             platform: "mac".to_owned(),
         },
         Arc::new(PlainJsonCodec),
@@ -91,15 +91,54 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
         }),
         json!({
             "code": 201,
-            "data": {"revoked": true, "state": "DISABLED", "reason": "disabled", "serverTime": 43, "max_screen_limit": 6},
+            "data": {"revoked": true, "state": "DISABLED", "reason": "disabled", "serverTime": 43, "max_screen_limit": 6, "transitionMaterials": {"catalogVersion": 2, "minimumAppVersion": "0.3.0"}},
             "msg": "强制下线"
         }),
         json!({
             "code": 200,
-            "data": {"modelId": "model-a", "modelAsr": "asr-a", "version": "1.0.0", "url": "https://cdn.example/app", "signature": null, "minClientVersion": "0.2.0", "force": false, "max_screen_limit": 8},
+            "data": {"modelId": "model-a", "modelAsr": "asr-a", "version": "1.0.0", "url": "https://cdn.example/app", "signature": null, "minClientVersion": "0.3.0", "force": false, "max_screen_limit": 8},
             "msg": "success"
         }),
         json!({"code": 200, "data": {"accepted": 1, "rejected": 0}, "msg": "已上报"}),
+        json!({
+            "code": 200,
+            "data": {
+                "catalogVersion": 2,
+                "changed": true,
+                "cdnBaseUrl": "https://cdn.example/materials/",
+                "materials": [{
+                    "assetKey": "tm_example",
+                    "assetVersion": 1,
+                    "title": "震惊",
+                    "description": "用于意外消息",
+                    "tags": ["震惊", "反应"],
+                    "category": "neutral",
+                    "renderMode": "bridge",
+                    "videoPath": "https://cdn.example/assets/example.mp4",
+                    "previewPath": null,
+                    "coverPath": null,
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "sizeBytes": 1024,
+                    "durationMs": 2000,
+                    "width": 1280,
+                    "height": 720,
+                    "fps": 30,
+                    "videoCodec": "h264",
+                    "hasAudio": true,
+                    "sortOrder": 1
+                }]
+            },
+            "msg": "success"
+        }),
+        json!({
+            "code": 200,
+            "data": {
+                "catalogVersion": 2,
+                "changed": false,
+                "cdnBaseUrl": "https://cdn.example/materials/"
+            },
+            "msg": "success"
+        }),
     ];
     let (base_url, server) = spawn_server(responses);
     let client = api_client(base_url);
@@ -112,6 +151,10 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
         .unwrap();
     assert!(heartbeat.revoked);
     assert_eq!(heartbeat.max_screen_limit, Some(6));
+    assert_eq!(
+        heartbeat.transition_materials.unwrap().minimum_app_version,
+        "0.3.0"
+    );
     let app_start = client.app_start().await.unwrap().unwrap();
     assert_eq!(app_start.model_id, "model-a");
     assert_eq!(app_start.max_screen_limit, Some(8));
@@ -121,7 +164,7 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
             .as_object()
             .unwrap()
             .clone(),
-        "0.2.0",
+        "0.3.0",
     )
     .unwrap();
     let telemetry = client
@@ -129,9 +172,21 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
         .await
         .unwrap();
     assert_eq!(telemetry.accepted, 1);
+    let changed = client
+        .transition_materials("DY-DEVICE", "ACTIVATE-CODE", 1)
+        .await
+        .unwrap();
+    assert!(changed.changed);
+    assert_eq!(changed.materials.unwrap().len(), 1);
+    let unchanged = client
+        .transition_materials("DY-DEVICE", "ACTIVATE-CODE", 2)
+        .await
+        .unwrap();
+    assert!(!unchanged.changed);
+    assert!(unchanged.materials.is_none());
 
     let requests = server.join().unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 6);
     assert!(
         requests[0]
             .request_line
@@ -163,7 +218,7 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
             .starts_with("GET /api/client/app-start ")
     );
     assert_eq!(requests[2].headers.get("platform").unwrap(), "mac");
-    assert_eq!(requests[2].headers.get("client_version").unwrap(), "0.2.0");
+    assert_eq!(requests[2].headers.get("client_version").unwrap(), "0.3.0");
 
     assert!(
         requests[3]
@@ -176,6 +231,20 @@ async fn client_api_matches_activation_heartbeat_app_start_and_telemetry_contrac
     assert_eq!(events[0]["event"], "feature_use");
     assert_eq!(events[0]["props"], json!({"feature": "monitor"}));
     assert!(events[0]["props"].get("localPath").is_none());
+
+    for (index, catalog_version) in [(4, 1), (5, 2)] {
+        assert!(requests[index].request_line.starts_with(&format!(
+            "GET /api/v1/transition-materials?clientVersion={catalog_version} "
+        )));
+        assert_eq!(
+            requests[index].headers.get("device_id").unwrap(),
+            "DY-DEVICE"
+        );
+        assert_eq!(
+            requests[index].headers.get("activate_code").unwrap(),
+            "ACTIVATE-CODE"
+        );
+    }
 }
 
 #[test]

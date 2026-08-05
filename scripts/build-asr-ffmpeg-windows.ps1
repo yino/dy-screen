@@ -151,7 +151,9 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
     foreach ($encoder in @("aac", "h264_mf", "mjpeg", "pcm_s16le")) {
         if ($listings.encoders -notmatch "(?m)^\s*[VAS]\S*\s+$([Regex]::Escape($encoder))\s+") { throw "FFmpeg 缺少 $encoder encoder。" }
     }
-    if ($listings.decoders -notmatch "(?m)^\s*[VAS]\S*\s+png\s+") { throw "FFmpeg 缺少 PNG decoder。" }
+    foreach ($decoder in @("aac", "h264", "hevc", "png")) {
+        if ($listings.decoders -notmatch "(?m)^\s*[VAS]\S*\s+$([Regex]::Escape($decoder))\s+") { throw "FFmpeg 缺少 $decoder decoder。" }
+    }
     foreach ($filter in @("aformat", "asetpts", "concat", "fade", "format", "overlay", "pad", "scale", "setsar", "setpts", "volume")) {
         if ($listings.filters -notmatch "(?m)^\s*\S+\s+$([Regex]::Escape($filter))\s+") { throw "FFmpeg 缺少 $filter 滤镜。" }
     }
@@ -170,7 +172,8 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
         "toolchain=msys2-ucrt64"
         "runtime_dependencies=windows-system-only"
         "recording=https-flv-hls-segment-matroska"
-        "clip_export=h264_mf-aac-png-concat-overlay"
+        "preview=mov-h264-hevc-aac-h264_mf-mjpeg"
+        "clip_export=h264-hevc-aac-decode-h264_mf-aac-mp4-png-concat-overlay"
     ) | Set-Content -LiteralPath (Join-Path $OutputRoot "build-record.txt") -Encoding utf8
 
     Write-Host "Windows x64 FFmpeg 已构建到受控输出目录。"

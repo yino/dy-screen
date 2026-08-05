@@ -1,6 +1,6 @@
 {
   "name": "dy-screen-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Tauri 2.0 抖音主播自动监听与录制客户端",
   "type": "module",

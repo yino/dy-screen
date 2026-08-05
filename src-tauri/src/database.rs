@@ -238,6 +238,7 @@ impl Database {
         migrate_ai_replay_directory_v15(&mut connection)?;
         crate::ai::migrate_ai_v16(&mut connection)?;
         migrate_recording_priority_v17(&mut connection)?;
+        crate::transition_materials::migrate_transition_materials_v18(&mut connection)?;
 
         let applied = connection
             .query_row(

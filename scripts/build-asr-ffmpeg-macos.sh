@@ -149,10 +149,12 @@ for demuxer in concat flv hls image2 matroska mov mpegts; do
     exit 1
   }
 done
-printf '%s\n' "$DECODERS_OUTPUT" | rg -q '^ [VAS][A-Z.]{5} png +' || {
-  printf '%s\n' '错误：运行时 FFmpeg 缺少 png decoder。' >&2
-  exit 1
-}
+for decoder in aac h264 hevc png; do
+  printf '%s\n' "$DECODERS_OUTPUT" | rg -q "^ [VAS][A-Z.]{5} $decoder +" || {
+    printf '错误：运行时 FFmpeg 缺少 %s decoder。\n' "$decoder" >&2
+    exit 1
+  }
+done
 for muxer in segment matroska mov mp4 image2 wav; do
   printf '%s\n' "$MUXERS_OUTPUT" | rg -q "^  E +$muxer( |,)" || {
     printf '错误：运行时 FFmpeg 缺少 %s muxer。\n' "$muxer" >&2
@@ -178,8 +180,8 @@ printf '%s\n' \
   'license=LGPL-2.1-or-later' \
   'network=enabled-for-recording' \
   'recording=https-flv-hls-segment-matroska' \
-  'preview=mov-aac-h264_videotoolbox-mjpeg' \
-  'clip-export=h264_videotoolbox-aac-png-concat-overlay' \
+  'preview=mov-h264-hevc-aac-h264_videotoolbox-mjpeg' \
+  'clip-export=h264-hevc-aac-decode-h264_videotoolbox-aac-mp4-png-concat-overlay' \
   > "$OUTPUT_ROOT/build-record.txt"
 
 printf 'macOS arm64 应用运行时 FFmpeg 已构建到：%s\n' "$OUTPUT_ROOT"

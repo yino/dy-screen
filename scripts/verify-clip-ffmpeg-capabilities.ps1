@@ -33,7 +33,9 @@ $muxers = Get-FfmpegCapabilities "-muxers"
 $filters = Get-FfmpegCapabilities "-filters"
 $encoders = Get-FfmpegCapabilities "-encoders"
 
-Assert-Matches $decoders '^\s*[VAS]\S*\s+png\s+' "FFmpeg 缺少 PNG 解码器。"
+foreach ($decoder in @("h264", "hevc", "aac", "png")) {
+    Assert-Matches $decoders ("^\s*[VAS]\S*\s+" + [Regex]::Escape($decoder) + "\s+") "FFmpeg 缺少 $decoder 解码器。"
+}
 foreach ($demuxer in @("concat", "image2")) {
     Assert-Matches $demuxers ("^\s*D\s+" + [Regex]::Escape($demuxer) + "(?:\s|,)") "FFmpeg 缺少 $demuxer demuxer。"
 }
@@ -44,4 +46,4 @@ foreach ($filter in @("aformat", "asetpts", "concat", "fade", "format", "overlay
 Assert-Matches $encoders '^\s*[VAS]\S*\s+aac\s+' "FFmpeg 缺少 AAC 编码器。"
 Assert-Matches $encoders '^\s*[VAS]\S*\s+(?:h264_videotoolbox|h264_mf|libx264)\s+' "FFmpeg 没有受支持的 H.264 编码器。"
 
-Write-Host "带 ASR 字幕的剪辑导出能力检查通过。"
+Write-Host "H.264/HEVC 桥接素材预览和带 ASR 字幕的剪辑导出能力检查通过。"

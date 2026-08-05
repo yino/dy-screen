@@ -176,6 +176,58 @@ pub struct HeartbeatResponse {
     pub allow_custom_api_key: Option<i64>,
     #[serde(rename = "max_screen_limit", default)]
     pub max_screen_limit: Option<i64>,
+    #[serde(default)]
+    pub transition_materials: Option<TransitionMaterialSignal>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionMaterialSignal {
+    pub catalog_version: i64,
+    pub minimum_app_version: String,
+}
+
+impl TransitionMaterialSignal {
+    pub fn is_valid(&self) -> bool {
+        self.catalog_version > 0 && is_semantic_version(&self.minimum_app_version)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionMaterialCatalogResponse {
+    pub catalog_version: i64,
+    pub changed: bool,
+    pub cdn_base_url: String,
+    #[serde(default)]
+    pub materials: Option<Vec<TransitionMaterialResponse>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransitionMaterialResponse {
+    pub asset_key: String,
+    pub asset_version: i64,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub category: String,
+    pub render_mode: String,
+    pub video_path: String,
+    #[serde(default)]
+    pub preview_path: Option<String>,
+    #[serde(default)]
+    pub cover_path: Option<String>,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub duration_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub video_codec: String,
+    pub has_audio: bool,
+    pub sort_order: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,6 +310,31 @@ impl ApiClient {
         let headers = client_headers(device_id, activate_code)?;
         self.post_json("client/heartbeat", serde_json::json!({}), headers, true)
             .await
+    }
+
+    pub async fn transition_materials(
+        &self,
+        device_id: &str,
+        activate_code: &str,
+        catalog_version: i64,
+    ) -> Result<TransitionMaterialCatalogResponse, ApiError> {
+        if catalog_version < 0 {
+            return Err(ApiError::Configuration);
+        }
+        let headers = client_headers(device_id, activate_code)?;
+        let mut url = reqwest::Url::parse(&self.endpoint("v1/transition-materials"))
+            .map_err(|_| ApiError::Configuration)?;
+        url.query_pairs_mut()
+            .append_pair("clientVersion", &catalog_version.to_string());
+        let response = self
+            .client
+            .get(url)
+            .headers(headers)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        self.decode_envelope_with_force(response, false).await
     }
 
     pub async fn app_start(&self) -> Result<Option<AppStartResponse>, ApiError> {
@@ -379,6 +456,23 @@ fn safe_business_message(message: String) -> String {
     }
 }
 
+fn is_semantic_version(value: &str) -> bool {
+    let core = value
+        .trim()
+        .split_once('+')
+        .map_or(value.trim(), |(core, _)| core);
+    let core = core.split_once('-').map_or(core, |(core, _)| core);
+    let mut parts = core.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .filter(|part| !part.is_empty())
+            .and_then(|part| part.parse::<u64>().ok())
+            .is_some()
+    });
+    valid && parts.next().is_none()
+}
+
 fn decode_envelope_payload<T: DeserializeOwned>(
     payload: Value,
     allow_force_offline: bool,
@@ -439,6 +533,7 @@ mod tests {
         )
         .unwrap();
         assert!(!active.revoked);
+        assert!(active.transition_materials.is_none());
 
         let revoked: HeartbeatResponse = decode_envelope_payload(
             serde_json::json!({
@@ -458,6 +553,41 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), Some(1003));
         assert_eq!(error.safe_message(), "服务端业务错误（1003）：激活码不存在");
+    }
+
+    #[test]
+    fn validates_optional_transition_material_signal_without_affecting_heartbeat_decode() {
+        let heartbeat: HeartbeatResponse = decode_envelope_payload(
+            serde_json::json!({
+                "code": 200,
+                "data": {
+                    "revoked": false,
+                    "state": "ACTIVE",
+                    "reason": "ok",
+                    "serverTime": 42,
+                    "transitionMaterials": {
+                        "catalogVersion": 2,
+                        "minimumAppVersion": "0.3.0"
+                    }
+                }
+            }),
+            true,
+        )
+        .unwrap();
+        assert!(heartbeat.transition_materials.unwrap().is_valid());
+
+        for signal in [
+            TransitionMaterialSignal {
+                catalog_version: 0,
+                minimum_app_version: "0.3.0".to_owned(),
+            },
+            TransitionMaterialSignal {
+                catalog_version: 2,
+                minimum_app_version: "not-a-version".to_owned(),
+            },
+        ] {
+            assert!(!signal.is_valid());
+        }
     }
 
     #[test]

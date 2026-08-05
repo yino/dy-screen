@@ -764,17 +764,27 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .clip-materials { display: flex; flex-direction: column; border-right: 1px solid #223a30; outline: none; }
 .clip-properties { padding: 0; display: flex; flex-direction: column; overflow: hidden; border-left: 1px solid #223a30; }
 .clip-materials > header, .clip-properties > header { min-height: 52px; padding: 10px 14px; border-bottom: 1px solid #223a30; }
+.clip-materials > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.clip-materials > header .icon-button { width: 28px; height: 28px; flex: 0 0 auto; color: #9fc6b7; border: 1px solid #315044; background: #182e25; }
 .clip-materials h3, .clip-properties h3 { margin: 3px 0 0; display: flex; align-items: center; gap: 6px; color: #d7e7df; font-size: 12px; }
 .clip-materials .section-kicker, .clip-properties .section-kicker { color: #6e9b89; }
 .clip-material-tabs { min-height: 40px; padding: 7px 10px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; border-bottom: 1px solid #223a30; }
 .clip-material-tabs button { min-width: 0; border: 0; border-radius: 4px; color: #7f9a8e; background: transparent; cursor: pointer; font-size: 9px; font-weight: 700; }
 .clip-material-tabs button:hover { color: #e2f5ed; background: #1c352b; }
 .clip-material-tabs button.active { color: #fff; background: #078f72; }
+.clip-transition-filters { padding: 8px 10px; display: grid; gap: 6px; border-bottom: 1px solid #223a30; }
+.clip-transition-filters label { min-width: 0; height: 30px; padding: 0 8px; display: flex; align-items: center; gap: 6px; border: 1px solid #2c4b3f; border-radius: 5px; color: #718f82; background: #172c24; }
+.clip-transition-filters input, .clip-transition-filters select { min-width: 0; width: 100%; height: 28px; border: 0; outline: 0; color: #dce9e3; background: transparent; font-size: 8px; }
+.clip-transition-filters select { padding: 0 8px; border: 1px solid #2c4b3f; border-radius: 5px; }
+.clip-transition-catalog-state { min-height: 34px; padding: 6px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid #2c4b3f; color: #9db6aa; background: #172c24; font-size: 8px; line-height: 1.45; }
+.clip-transition-catalog-state span { min-width: 0; overflow-wrap: anywhere; }
+.clip-transition-catalog-state.failed, .clip-transition-catalog-state.upgrade_required { color: #efb7ae; background: #32201e; }
+.clip-transition-catalog-state .icon-button { width: 26px; height: 26px; flex: 0 0 auto; }
 .clip-effect-list { padding: 10px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 8px; }
-.clip-effect-list button { position: relative; min-width: 0; aspect-ratio: 1.42; padding: 0; display: grid; grid-template-rows: 1fr auto; overflow: hidden; border: 1px solid #29473b; border-radius: 6px; color: #dbeae3; background: #172c24; cursor: grab; }
-.clip-effect-list button:hover { border-color: #65b89a; transform: scale(1.025); box-shadow: 0 7px 16px rgba(0, 0, 0, .2); }
-.clip-effect-list button.active { border-color: #41c39c; box-shadow: inset 0 0 0 1px #41c39c; }
-.clip-effect-list button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
+.clip-effect-list > button { position: relative; min-width: 0; aspect-ratio: 1.42; padding: 0; display: grid; grid-template-rows: 1fr auto; overflow: hidden; border: 1px solid #29473b; border-radius: 6px; color: #dbeae3; background: #172c24; cursor: grab; }
+.clip-effect-list > button:hover { border-color: #65b89a; transform: scale(1.025); box-shadow: 0 7px 16px rgba(0, 0, 0, .2); }
+.clip-effect-list > button.active { border-color: #41c39c; box-shadow: inset 0 0 0 1px #41c39c; }
+.clip-effect-list > button:disabled { cursor: not-allowed; opacity: .48; transform: none; }
 .clip-effect-swatch { width: 100%; min-height: 45px; display: grid; place-items: center; color: #fff; background: #71857b; }
 .clip-effect-swatch.none { color: #698078; background: #e8efeb; }
 .clip-effect-swatch.fade_in { background: linear-gradient(135deg, #245c4c, #61c5a5); }
@@ -783,8 +793,20 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .clip-effect-swatch.flash { color: #805f12; background: #f3d674; }
 .clip-effect-swatch.black { background: #24322c; }
 .clip-effect-swatch.video { background: linear-gradient(135deg, #175b84, #238ca5); }
-.clip-effect-list strong { min-width: 0; padding: 6px 5px 2px; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.clip-effect-list small { padding: 0 5px 6px; overflow: hidden; color: #8aa398; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
+.clip-effect-list > button strong { min-width: 0; padding: 6px 5px 2px; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.clip-effect-list > button small { padding: 0 5px 6px; overflow: hidden; color: #8aa398; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
+.clip-transition-material { grid-column: 1 / -1; min-width: 0; min-height: 76px; padding: 7px; display: grid; grid-template-columns: 68px minmax(0, 1fr) 42px; align-items: center; gap: 7px; border: 1px solid #29473b; border-radius: 6px; background: #172c24; }
+.clip-transition-material.active { border-color: #41c39c; box-shadow: inset 3px 0 #41c39c; }
+.clip-transition-thumb { position: relative; width: 68px; height: 50px; padding: 0; display: grid; place-items: center; overflow: hidden; border: 0; border-radius: 4px; color: #d7eee5; background: #24443a; cursor: pointer; }
+.clip-transition-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.clip-transition-thumb svg:last-child { position: relative; z-index: 1; width: 22px; height: 22px; padding: 5px; border-radius: 50%; color: #fff; background: rgba(4, 28, 21, .72); }
+.clip-transition-material > div { min-width: 0; }
+.clip-transition-material > div strong, .clip-transition-material > div small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clip-transition-material > div strong { color: #dbeae3; font-size: 9px; }
+.clip-transition-material > div small, .clip-transition-material > div span { color: #78968a; font-size: 7px; }
+.clip-transition-material > div p { margin: 3px 0; overflow: hidden; color: #9eb2aa; font-size: 7px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.clip-transition-apply { min-width: 0; min-height: 28px; padding: 0 6px; border: 1px solid #3f6b5b; border-radius: 5px; color: #cfe3da; background: #1b392e; cursor: pointer; font-size: 8px; white-space: nowrap; }
+.clip-transition-apply:disabled { opacity: .42; cursor: not-allowed; }
 .clip-material-empty { grid-column: 1 / -1; margin: 10px 0; color: #7f988c; font-size: 9px; line-height: 1.6; text-align: center; }
 .clip-material-note { margin: auto 10px 12px; padding: 9px; border: 1px dashed #335e4d; border-radius: 6px; color: #8ca89b; background: #162b23; font-size: 8px; line-height: 1.55; }
 .clip-center { min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(240px, 1fr) 280px; overflow: hidden; }
@@ -845,6 +867,11 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .clip-track-items > button strong { font-size: 8px; }
 .clip-track-items > button small { color: #bfe2d6; font-size: 7px; }
 .clip-track-items > button em { position: absolute; right: 4px; top: 4px; max-width: 55%; padding: 2px 4px; overflow: hidden; border-radius: 3px; color: #5f480d; background: #f0d67e; font-size: 6px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.clip-track-items > button.clip-bridge-unit { min-width: 46px; border-color: #a77d35; color: #fff7dd; background: #725621; cursor: pointer; }
+.clip-track-items > button.clip-bridge-unit.downloading, .clip-track-items > button.clip-bridge-unit.transcoding { border-style: dashed; background: #594c2d; }
+.clip-track-items > button.clip-bridge-unit.failed { border-color: #b75e55; background: #6a302d; }
+.clip-track-items > button.clip-boundary-slot { min-width: 24px; width: 24px; padding: 0; display: grid; place-items: center; border: 1px dashed #557466; color: #91aa9f; background: #1a3027; cursor: pointer; }
+.clip-track-items > button.clip-boundary-slot.stale { border-color: #b7904e; color: #e4bd73; }
 .clip-insert-gap { width: 7px; min-width: 7px; height: 100%; padding: 0; border: 0; border-radius: 3px; background: transparent; cursor: copy; transition: width .12s ease, background .12s ease; }
 .clip-insert-gap.active { width: 13px; min-width: 13px; border: 1px dashed #79c8ad; background: rgba(57, 174, 137, .22); }
 .clip-playhead { position: absolute; z-index: 5; top: 0; bottom: 0; width: 2px; pointer-events: none; transform: translateX(-1px); background: #f0cf68; box-shadow: 0 0 0 1px rgba(10, 31, 23, .4); }
@@ -857,7 +884,7 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .clip-subtitle-track > button.hidden { color: #7f9a91; border-style: dashed; border-color: #526e63; background: #22382f; opacity: .72; }
 .clip-subtitle-track > button span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .clip-timeline > footer { min-height: 25px; padding: 0 12px; display: flex; justify-content: flex-end; align-items: center; gap: 12px; border-top: 1px solid #29463b; color: #8da69a; font-size: 7px; }
-.clip-property-tabs { margin: 9px 14px 0; min-height: 32px; padding: 3px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; border: 1px solid #2b493d; border-radius: 6px; background: #0e1d17; }
+.clip-property-tabs { margin: 9px 14px 0; min-height: 32px; padding: 3px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; border: 1px solid #2b493d; border-radius: 6px; background: #0e1d17; }
 .clip-property-tabs button, .clip-subtitle-scope button { min-width: 0; border: 0; border-radius: 4px; color: #829b90; background: transparent; cursor: pointer; font-size: 9px; font-weight: 700; white-space: nowrap; }
 .clip-property-tabs button.active, .clip-subtitle-scope button.active { color: #fff; background: #078f72; }
 .clip-property-panel { min-width: 0; min-height: 0; padding: 0 14px 14px; flex: 1; overflow-y: auto; overscroll-behavior: contain; }
@@ -879,6 +906,12 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .clip-segment-actions { margin-top: 14px; display: flex; gap: 6px; }
 .clip-segment-actions .icon-button { border: 1px solid #315044; border-radius: 6px; color: #b5c9bf; background: #182e25; }
 .clip-segment-actions .icon-button.danger { margin-left: auto; color: #a54a41; }
+.clip-transition-properties > .clip-property-group > strong { color: #dce9e3; font-size: 10px; }
+.clip-transition-suggestion { position: relative; }
+.clip-transition-suggestion > span { position: absolute; top: 12px; right: 0; color: #e0b45d; font-size: 10px; font-weight: 700; }
+.clip-transition-suggestion .secondary-button { width: 100%; min-height: 30px; margin-top: 10px; font-size: 8px; }
+.clip-transition-actions { padding-top: 12px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.clip-transition-actions button { min-width: 0; min-height: 30px; padding: 0 6px; font-size: 8px; white-space: nowrap; }
 .clip-subtitle-panel { min-width: 0; min-height: 0; padding-top: 9px; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .clip-subtitle-tools { padding: 0 14px 9px; flex: 0 0 auto; border-bottom: 1px solid #233a31; }
 .clip-subtitle-scope { min-height: 28px; padding: 3px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; border: 1px solid #2b493d; border-radius: 5px; background: #0e1d17; }

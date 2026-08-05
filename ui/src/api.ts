@@ -39,6 +39,11 @@ import type {
   ThumbnailEvent,
   ThumbnailSnapshot,
   VideoPage,
+  TransitionMaterial,
+  TransitionCatalogState,
+  MaterialAssetSnapshot,
+  TransitionMatchSummary,
+  ClipTransitionBoundary,
 } from "./types";
 
 const defaultSettings: AppSettings = {
@@ -203,6 +208,25 @@ const tauriApi: ClientApi = {
     invoke("ai_reorder_clip_segments", { clipProjectId, orderedIds }),
   removeAiClipSegment: (clipProjectId, segmentId) =>
     invoke("ai_remove_clip_segment", { clipProjectId, segmentId }),
+  getTransitionCatalogState: () => invoke<TransitionCatalogState>("get_transition_catalog_state"),
+  retryTransitionCatalogSync: () => invoke<TransitionCatalogState>("retry_transition_catalog_sync"),
+  subscribeTransitionCatalog: async (listener) => {
+    const unlisten = await listen<TransitionCatalogState>("transition-material-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
+  listTransitionMaterials: () => invoke<TransitionMaterial[]>("list_transition_materials"),
+  requestTransitionMaterialPreview: (assetKey, assetVersion) =>
+    invoke<MaterialAssetSnapshot>("request_transition_material_preview", { assetKey, assetVersion }),
+  requestTransitionMaterialThumbnail: (assetKey, assetVersion) =>
+    invoke<MaterialAssetSnapshot>("request_transition_material_thumbnail", { assetKey, assetVersion }),
+  matchAiClipTransitions: (clipProjectId, boundaryId = null) =>
+    invoke<TransitionMatchSummary>("ai_match_clip_transitions", { clipProjectId, boundaryId }),
+  applyAiClipTransition: (boundaryId, assetKey, assetVersion, lockEmpty = true) =>
+    invoke<ClipTransitionBoundary>("ai_apply_clip_transition", { boundaryId, assetKey, assetVersion, lockEmpty }),
+  unlockAiClipTransition: (boundaryId) =>
+    invoke<ClipTransitionBoundary>("ai_unlock_clip_transition", { boundaryId }),
   startAiClipExport: (clipProjectId) => invoke("ai_start_clip_export", { clipProjectId }),
   cancelAiClipExport: (clipProjectId) => invoke("ai_cancel_clip_export", { clipProjectId }),
   requestAiInputPreview: (projectId, inputId) =>

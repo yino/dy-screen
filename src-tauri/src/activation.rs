@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{ApiClient, ApiError, TelemetryEvent};
 use crate::database::{ClientActivationRecord, Database};
 use crate::domain::DEFAULT_MAX_SCREEN_LIMIT;
+use crate::transition_materials::TransitionCatalogCoordinator;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(90);
 pub const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -100,6 +101,7 @@ pub struct ActivationService {
     cancellation: CancellationToken,
     development_bypass: bool,
     recording_limit: ServerRecordingLimit,
+    transition_catalog: Arc<Mutex<Option<TransitionCatalogCoordinator>>>,
 }
 
 impl ActivationService {
@@ -119,6 +121,7 @@ impl ActivationService {
             cancellation: CancellationToken::new(),
             development_bypass: false,
             recording_limit: ServerRecordingLimit::default(),
+            transition_catalog: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -150,6 +153,17 @@ impl ActivationService {
 
     pub fn apply_app_start_limit(&self, value: Option<i64>) -> Option<usize> {
         self.recording_limit.apply(value, "app_start")
+    }
+
+    pub fn set_transition_catalog_coordinator(
+        &self,
+        coordinator: TransitionCatalogCoordinator,
+    ) -> Result<(), String> {
+        *self
+            .transition_catalog
+            .lock()
+            .map_err(|_| "素材目录协调器状态锁已损坏".to_owned())? = Some(coordinator);
+        Ok(())
     }
 
     pub fn state(&self) -> ActivationStateView {
@@ -228,6 +242,26 @@ impl ActivationService {
             }
             Ok(response) => {
                 let now = Utc::now();
+                if let Some(signal) = response.transition_materials.clone() {
+                    if signal.is_valid() {
+                        if let Some(coordinator) = self
+                            .transition_catalog
+                            .lock()
+                            .ok()
+                            .and_then(|value| value.clone())
+                        {
+                            coordinator.notify(signal, &record.device_id, &record.activate_code);
+                        }
+                    } else {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "component": "transition_materials",
+                                "event": "invalid_catalog_signal",
+                            })
+                        );
+                    }
+                }
                 self.recording_limit
                     .apply(response.max_screen_limit, "heartbeat");
                 if let Some(token) = response.token {

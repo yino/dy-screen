@@ -12,6 +12,9 @@ pub mod streamer_service;
 pub mod supervisor;
 pub mod tauri_browser;
 pub mod thumbnail;
+pub mod transition_assets;
+pub mod transition_matching;
+pub mod transition_materials;
 
 pub fn run() {
     app::run();

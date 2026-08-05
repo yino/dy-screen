@@ -631,7 +631,30 @@ pub struct AiClipSubtitleFrame {
     pub hidden_text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiClipTimelineUnitKind {
+    Segment,
+    Bridge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiClipTimelineUnit {
+    pub key: String,
+    pub kind: AiClipTimelineUnitKind,
+    pub project_start_ms: u64,
+    pub project_end_ms: u64,
+    pub clip_segment_id: Option<i64>,
+    pub boundary_id: Option<i64>,
+    pub title: String,
+    pub asset_key: Option<String>,
+    pub asset_version: Option<i64>,
+    pub source_status: Option<crate::transition_materials::MaterialDownloadStatus>,
+    pub preview_status: Option<crate::transition_materials::MaterialDownloadStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AiClipProjectDetail {
     pub project: AiClipProject,
@@ -639,6 +662,9 @@ pub struct AiClipProjectDetail {
     pub subtitles: Vec<AiClipSubtitle>,
     pub subtitle_frames: Vec<AiClipSubtitleFrame>,
     pub subtitles_complete: bool,
+    pub boundaries: Vec<crate::transition_materials::ClipTransitionBoundary>,
+    pub project_duration_ms: u64,
+    pub timeline_units: Vec<AiClipTimelineUnit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

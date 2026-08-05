@@ -77,6 +77,18 @@ pub fn validate_export_sources(sources: &[ClipExportSource]) -> Result<(), ClipE
                 "来源视频在加入 AI 项目后发生变化，已拒绝导出以避免错剪",
             ));
         }
+        if let Some(bridge) = &source.bridge_after {
+            let bridge_path = Path::new(&bridge.source_path);
+            if !bridge_path.is_file() || bridge.duration_ms == 0 {
+                return Err(failure(
+                    "transition_material_unavailable",
+                    format!(
+                        "转场素材 {} v{} 尚未准备完成，请重试素材下载",
+                        bridge.asset_key, bridge.asset_version
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -147,10 +159,12 @@ pub fn build_export_plan(
         "-hide_banner".to_owned(),
         "-nostdin".to_owned(),
     ];
-    let mut filter_parts = Vec::with_capacity(sources.len() * 2 + 1);
+    let mut filter_parts = Vec::with_capacity(sources.len() * 4 + 2);
     let mut concat_inputs = String::new();
     let mut total_duration_ms = 0_u64;
-    for (index, source) in sources.iter().enumerate() {
+    let mut input_index = 0_usize;
+    let mut unit_index = 0_usize;
+    for source in sources {
         let duration_ms = source
             .segment
             .source_end_ms
@@ -168,17 +182,52 @@ pub fn build_export_plan(
         let duration_seconds = duration_ms as f64 / 1_000.0;
         let effect_filter = visual_filter(source.segment.effect, duration_seconds);
         filter_parts.push(format!(
-            "[{index}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p{effect_filter}[v{index}]",
+            "[{input_index}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p{effect_filter}[v{unit_index}]",
             width = output_dimensions.width,
             height = output_dimensions.height,
         ));
         filter_parts.push(format!(
-            "[{index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,volume={:.2}[a{index}]",
+            "[{input_index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,volume={:.2}[a{unit_index}]",
             source.segment.volume_percent as f64 / 100.0,
         ));
-        concat_inputs.push_str(&format!("[v{index}][a{index}]"));
+        concat_inputs.push_str(&format!("[v{unit_index}][a{unit_index}]"));
+        input_index += 1;
+        unit_index += 1;
+
+        if let Some(bridge) = &source.bridge_after {
+            total_duration_ms = total_duration_ms.saturating_add(bridge.duration_ms);
+            let bridge_input_index = input_index;
+            arguments.extend(["-i".to_owned(), bridge.source_path.clone()]);
+            input_index += 1;
+            filter_parts.push(format!(
+                "[{bridge_input_index}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v{unit_index}]",
+                width = output_dimensions.width,
+                height = output_dimensions.height,
+            ));
+            if bridge.has_audio {
+                filter_parts.push(format!(
+                    "[{bridge_input_index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,volume=1.00[a{unit_index}]"
+                ));
+            } else {
+                let silent_input_index = input_index;
+                arguments.extend([
+                    "-f".to_owned(),
+                    "lavfi".to_owned(),
+                    "-t".to_owned(),
+                    format_seconds(bridge.duration_ms),
+                    "-i".to_owned(),
+                    "anullsrc=r=48000:cl=stereo".to_owned(),
+                ]);
+                input_index += 1;
+                filter_parts.push(format!(
+                    "[{silent_input_index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[a{unit_index}]"
+                ));
+            }
+            concat_inputs.push_str(&format!("[v{unit_index}][a{unit_index}]"));
+            unit_index += 1;
+        }
     }
-    let subtitle_input_index = sources.len();
+    let subtitle_input_index = input_index;
     arguments.extend([
         "-f".to_owned(),
         "concat".to_owned(),
@@ -189,7 +238,7 @@ pub fn build_export_plan(
     ]);
     filter_parts.push(format!(
         "{concat_inputs}concat=n={}:v=1:a=1[vjoined][aout]",
-        sources.len(),
+        unit_index,
     ));
     filter_parts.push(format!(
         "[{subtitle_input_index}:v]format=rgba,setpts=PTS-STARTPTS[subtitles]"
@@ -367,7 +416,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiClipEffect, AiClipSegment};
+    use crate::ai::{AiClipEffect, AiClipSegment, ClipExportBridge};
     #[cfg(unix)]
     use crate::ai::{AiClipSubtitle, build_clip_subtitle_frames, render_clip_subtitle_assets};
 
@@ -393,6 +442,7 @@ mod tests {
                 video_id: None,
             },
             subtitles: Vec::new(),
+            bridge_after: None,
         }
     }
 
@@ -451,6 +501,46 @@ mod tests {
     }
 
     #[test]
+    fn bridge_is_a_complete_timeline_unit_with_original_audio() {
+        let mut first = source(AiClipEffect::None);
+        first.bridge_after = Some(ClipExportBridge {
+            boundary_id: 7,
+            asset_key: "reaction_laugh".to_owned(),
+            asset_version: 2,
+            source_path: "/safe/bridge.mp4".to_owned(),
+            duration_ms: 1_500,
+            has_audio: true,
+        });
+        let plan = build_export_plan(
+            &[first, source(AiClipEffect::None)],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1920,
+                height: 1080,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .unwrap();
+        assert_eq!(plan.total_duration_ms, 5_500);
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|value| value == "/safe/bridge.mp4")
+        );
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|value| value.contains("concat=n=3:v=1:a=1"))
+        );
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|value| value.contains("[1:a]") && value.contains("volume=1.00"))
+        );
+    }
+
+    #[test]
     fn normalizes_odd_output_dimensions_for_yuv420() {
         assert_eq!(normalize_dimension(1919).unwrap(), 1920);
         assert_eq!(normalize_dimension(1080).unwrap(), 1080);
@@ -495,7 +585,9 @@ mod tests {
         use std::io::BufReader as StdBufReader;
         use std::process::Command as ProcessCommand;
 
-        let fixture_ffmpeg = PathBuf::from("ffmpeg");
+        let fixture_ffmpeg = std::env::var_os("DY_SCREEN_FIXTURE_FFMPEG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
         let runtime_ffmpeg = std::env::var_os("DY_SCREEN_CLIP_FFMPEG")
             .map(PathBuf::from)
             .unwrap_or_else(|| fixture_ffmpeg.clone());
@@ -521,6 +613,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let horizontal = directory.path().join("horizontal.mp4");
         let vertical = directory.path().join("vertical.mp4");
+        let hevc_bridge = directory.path().join("bridge-hevc.mp4");
         for (path, color, size) in [
             (&horizontal, "red", "320x240"),
             (&vertical, "blue", "240x320"),
@@ -551,6 +644,43 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+        let available_fixture_encoders = ProcessCommand::new(&fixture_ffmpeg)
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .unwrap();
+        if !String::from_utf8_lossy(&available_fixture_encoders.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some("libx265"))
+        {
+            return;
+        }
+        let status = ProcessCommand::new(&fixture_ffmpeg)
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=blue:s=320x240:r=24:d=0.8",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000:duration=0.8",
+                "-shortest",
+                "-c:v",
+                "libx265",
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&hevc_bridge)
+            .status()
+            .unwrap();
+        assert!(status.success());
 
         let mut first = source(AiClipEffect::None);
         first.source_path = horizontal.to_string_lossy().into_owned();
@@ -586,26 +716,50 @@ mod tests {
                 project_end_ms: 600,
             },
         ];
+        first.bridge_after = Some(ClipExportBridge {
+            boundary_id: 1,
+            asset_key: "controlled_hevc_bridge".to_owned(),
+            asset_version: 1,
+            source_path: hevc_bridge.to_string_lossy().into_owned(),
+            duration_ms: 800,
+            has_audio: true,
+        });
         let mut second = source(AiClipEffect::FadeInOut);
         second.segment.id = 2;
         second.segment.position = 1;
         second.source_path = vertical.to_string_lossy().into_owned();
         second.segment.source_start_ms = 100;
         second.segment.source_end_ms = 900;
-        second.subtitles = vec![AiClipSubtitle {
-            id: 2,
-            clip_project_id: 1,
-            stable_segment_id: "seg-second".to_owned(),
-            clip_segment_id: second.segment.id,
-            input_id: second.segment.input_id,
-            original_text: "第二段中文字幕。".to_owned(),
-            text: "第二段中文字幕。".to_owned(),
-            hidden: true,
-            source_start_ms: 100,
-            source_end_ms: 900,
-            project_start_ms: 800,
-            project_end_ms: 1_600,
-        }];
+        second.subtitles = vec![
+            AiClipSubtitle {
+                id: 2,
+                clip_project_id: 1,
+                stable_segment_id: "seg-second-hidden".to_owned(),
+                clip_segment_id: second.segment.id,
+                input_id: second.segment.input_id,
+                original_text: "隐藏字幕。".to_owned(),
+                text: "隐藏字幕。".to_owned(),
+                hidden: true,
+                source_start_ms: 100,
+                source_end_ms: 400,
+                project_start_ms: 1_600,
+                project_end_ms: 1_900,
+            },
+            AiClipSubtitle {
+                id: 4,
+                clip_project_id: 1,
+                stable_segment_id: "seg-second-visible".to_owned(),
+                clip_segment_id: second.segment.id,
+                input_id: second.segment.input_id,
+                original_text: "桥接结束后的字幕。".to_owned(),
+                text: "桥接结束后的字幕。".to_owned(),
+                hidden: false,
+                source_start_ms: 400,
+                source_end_ms: 900,
+                project_start_ms: 1_900,
+                project_end_ms: 2_400,
+            },
+        ];
         let output = directory.path().join("mixed.part.mp4");
         let output_dimensions = probe_output_dimensions(&runtime_ffprobe, &horizontal)
             .await
@@ -616,11 +770,21 @@ mod tests {
             .flat_map(|source| source.subtitles.iter().cloned())
             .collect::<Vec<_>>();
         validate_export_subtitles(&sources).unwrap();
-        let display_frames = build_clip_subtitle_frames(&subtitles, output_dimensions, 1_600);
+        let display_frames = build_clip_subtitle_frames(&subtitles, output_dimensions, 2_400);
         assert!(display_frames.iter().any(|frame| {
             frame.project_start_ms <= 300 && frame.project_end_ms > 300 && frame.subtitle_id == 3
         }));
         assert!(!display_frames.iter().any(|frame| frame.subtitle_id == 2));
+        assert!(
+            !display_frames
+                .iter()
+                .any(|frame| { frame.project_start_ms < 1_600 && frame.project_end_ms > 800 })
+        );
+        assert!(display_frames.iter().any(|frame| {
+            frame.subtitle_id == 4
+                && frame.project_start_ms >= 1_900
+                && frame.project_end_ms <= 2_400
+        }));
         let mut missing_subtitles = sources.clone();
         missing_subtitles[1].subtitles.clear();
         assert_eq!(
@@ -630,7 +794,7 @@ mod tests {
             "subtitles_incomplete"
         );
         let subtitle_assets =
-            render_clip_subtitle_assets(&subtitles, output_dimensions, 1_600).unwrap();
+            render_clip_subtitle_assets(&subtitles, output_dimensions, 2_400).unwrap();
         let available_encoders = ProcessCommand::new(&runtime_ffmpeg)
             .args(["-hide_banner", "-encoders"])
             .output()
@@ -692,6 +856,24 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "aac");
+        let output = ProcessCommand::new(&runtime_ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+            ])
+            .arg(&exported)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let duration = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .unwrap();
+        assert!((2.30..=2.55).contains(&duration));
 
         let frame = directory.path().join("subtitle-frame.png");
         let status = ProcessCommand::new(&fixture_ffmpeg)
@@ -743,7 +925,7 @@ mod tests {
             .flat_map(|source| source.subtitles.iter().cloned())
             .collect::<Vec<_>>();
         let hidden_assets =
-            render_clip_subtitle_assets(&all_hidden_subtitles, output_dimensions, 1_600).unwrap();
+            render_clip_subtitle_assets(&all_hidden_subtitles, output_dimensions, 2_400).unwrap();
         let hidden_output = directory.path().join("all-hidden.part.mp4");
         let hidden_plan = build_export_plan(
             &all_hidden_sources,

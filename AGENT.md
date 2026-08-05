@@ -11,9 +11,10 @@
 - 主播开播后自动录制包含视频和声音的 MKV 分片；
 - 保存录制会话和视频元数据；
 - 在客户端中浏览、预览和管理历史视频；
-- 为后续 ASR、NLP、高光识别和视频切片保留扩展空间。
+- 对已完成视频执行本地 ASR、DeepSeek 高光分析、字幕校对和 MP4 导出；
+- 同步版本化转场素材目录，并通过受限 Agent 匹配相邻高光的带声桥接素材。
 
-当前项目优先保证录制、监听、数据持久化和视频预览的可靠性。AI 剪辑、ASR 和内容分析必须以对应 OpenSpec 变更为准，不得仅根据占位界面推断其已经实现。
+当前桌面客户端版本为 `0.3.0`。录制、监听、数据持久化、ASR、AI 剪辑和转场素材能力都必须以代码、自动化测试及对应 OpenSpec 为准，不得根据界面占位或任务勾选推断功能已经实现。
 
 ## 2. 强制规则
 
@@ -55,7 +56,8 @@ dy-screen/
 ├── tests/                       Rust 核心集成测试和脱敏页面 fixture
 ├── ui/                          React + TypeScript + Vite 前端
 │   └── src/
-│       ├── App.tsx              监控中心、视频库、设置和 AI 占位页
+│       ├── App.tsx              监控中心、视频库、设置和 AI 工作区入口
+│       ├── AiWorkspace.tsx      ASR、高光候选、剪辑工作台和转场素材交互
 │       ├── api.ts               Tauri command 与浏览器演示 API
 │       ├── types.ts             前端领域类型
 │       └── styles.css           客户端样式
@@ -69,6 +71,10 @@ dy-screen/
 │   ├── src/database.rs          SQLite migration 和 repository
 │   ├── src/supervisor.rs        监听 worker、自动录制、重试和磁盘保护
 │   ├── src/preview.rs           MP4 预览转换、缓存和任务管理
+│   ├── src/transition_materials.rs 素材目录同步、SQLite 模型和工程边界
+│   ├── src/transition_assets.rs 素材下载、校验和 H.264 兼容预览
+│   ├── src/transition_matching.rs 受限 DeepSeek 转场匹配 Agent
+│   ├── src/ai/                  ASR、高光、字幕、时间轴和 FFmpeg 导出
 │   ├── src/domain.rs            Tauri 后端领域模型和 DTO
 │   └── tests/                   后端集成测试
 ├── openspec/                    中文规格、活动变更和归档变更
@@ -96,6 +102,8 @@ dy-screen/
 - 同一个主播最多只能存在一个有效监听 worker 和一个活动录制会话。
 - 桌面进程必须在打开 SQLite 和执行启动恢复前获取独占实例锁；第二实例不得访问业务数据库或启动后台任务。
 - `SIGTERM`、`SIGINT`、托盘和前端退出必须复用同一个幂等、有界关闭流程，禁止直接结束父进程后遗留 FFmpeg。
+- 授权心跳只发布素材目录版本信号；素材同步、下载或转码故障不得撤销授权或阻塞监听、录制、ASR 和普通剪辑。
+- 前端只能提交素材键、版本和工程边界 ID，不得提交任意下载 URL、本地路径、FFmpeg 参数或滤镜字符串。
 
 ### 4.3 React 前端
 
@@ -103,7 +111,7 @@ dy-screen/
 - Rust 使用 `camelCase` 输出时，前端不得自行猜测或重复转换字段。
 - Tauri 事件用于及时刷新状态，主动查询用于应用恢复和事件丢失后的最终一致性。
 - 浏览器演示模式只模拟界面行为，不得伪装真实主页解析、网络轮询、SQLite 或 FFmpeg 录制。
-- AI 剪辑页面在功能实现前只能展示规划内容，不得读取视频或创建虚假任务。
+- 转场素材列表必须只读取本地 SQLite DTO；同步状态通过类型化查询和 `transition-material-event` 恢复，不得在 WebView 直接访问素材 API 或 CDN。
 
 ## 5. 核心业务约束
 
@@ -143,6 +151,17 @@ dy-screen/
 - FFmpeg/FFprobe 必须通过参数数组调用，禁止拼接未经校验的 shell 命令。
 - 任务取消、应用退出或转换失败后必须清理 `.part` 等临时文件。
 - 签名流地址仅能在内存中用于当前解析和录制，不得持久化到 SQLite。
+
+### 5.5 转场素材和匹配 Agent
+
+- `(asset_key, asset_version)` 是不可变素材标识；目录更新不得覆盖历史工程固定引用或删除仍被引用的缓存。
+- 正式环境只接受 HTTPS；绝对素材 URL 必须与 `cdnBaseUrl` 同源，开发态 HTTP 只允许显式 localhost。
+- `changed=true` 的完整目录必须先全量校验，再在单个 SQLite 事务中发布；任一记录非法时继续使用上一目录。
+- 媒体只在预览、人工应用或 Agent 高置信度选中后下载，必须限制大小、校验 SHA-256、使用临时文件和原子发布。
+- HEVC 等 WebView 不兼容源只生成 H.264/AAC 预览缓存；最终导出使用已校验源文件。
+- 转场 Agent 只能接收有界相邻 ASR、主播标签和素材语义字段，候选最多 12 个；禁止发送 URL、路径、凭据、设备 ID、媒体或任意工具权限。
+- 只有合法且置信度不低于 `0.75` 的当前 `bridge` 候选可以自动应用；低分只保存建议，人工锁始终优先。
+- 桥接素材是独立时间轴单元，保留原声并增加总时长；桥接期间不得显示或烧录来源字幕。
 
 ## 6. 标准开发流程
 
@@ -259,6 +278,9 @@ make test-migration           # SQLite 身份 migration 测试
 make test-supervisor-profile  # 个人主页/直播间双阶段状态机测试
 make test-preview             # 视频预览服务和前端播放器测试
 make test-preview-integration # 使用真实 FFmpeg 样本验证预览转换
+make clip-subtitle-doctor     # 审计 H.264/HEVC/AAC 和桥接导出 FFmpeg 能力
+make test-clip-transition-integration FFMPEG=... FFPROBE=... FFMPEG_FIXTURE_GENERATOR=... # 真实带声小样验收
+make test-transition-catalog-fixture TRANSITION_CATALOG_FIXTURE=... # 服务端 33 条目录验收
 make test-browser-access      # 双通道解析、WebView、安全日志和前端聚焦测试
 make test-app-lifecycle      # 单实例锁和幂等关闭领取测试
 make accept-access-fixtures  # 本地支持页/验证页 stderr 与 JSONL 验收
@@ -271,6 +293,7 @@ make accept-access-fixtures  # 本地支持页/验证页 stderr 与 JSONL 验收
 - 修改 Tauri/SQLite/supervisor：运行对应 `src-tauri` 测试，再执行 `make check`。
 - 修改 React/TypeScript：执行 `npm test`、`npm run build`，最终执行 `make check`。
 - 修改预览或 FFmpeg 行为：执行 `make test-preview`；环境具备 FFmpeg 时执行 `make test-preview-integration`。
+- 修改转场目录、素材预览或剪辑导出：运行目录/repository 目标测试、`make clip-subtitle-doctor` 和 `make test-clip-transition-integration`；服务端样例变化时额外执行 `make test-transition-catalog-fixture`。
 - 修改发布、配置或桌面生命周期：执行 `make verify`。
 - 录制期间禁止使用 Tauri Rust watcher；项目开发入口必须保持 `--no-watch`，Rust 改动后先等待 `shutdown_completed` 再重启。
 
@@ -325,6 +348,8 @@ AI 标识统一使用以下格式：
 - 禁止绕过付费、私密直播、DRM、地区限制或其他权限控制。
 - 页面要求登录、验证码或额外访问权限时，应返回脱敏错误并按策略重试或停止。
 - 不得将主播信息、视频元数据、录像、日志或设置上传到外部服务，除非后续规格和用户明确授权。
+- DeepSeek 高光和转场匹配只接收用户授权的最小文本字段；禁止发送激活码、设备 ID、Cookie、下载 URL、本地路径、视频或音频。
+- 远程素材 URL、激活请求头和绝对缓存路径必须留在 Rust；前端只接收素材语义 DTO、状态和不可逆预览句柄。
 - 不得在日志、事件、SQLite、README、测试输出或提交信息中泄露签名流查询参数。
 - 录像和内容处理必须遵守平台规则、版权要求、隐私要求及适用法律。
 

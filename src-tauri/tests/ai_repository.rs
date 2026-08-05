@@ -185,6 +185,11 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         "ai_clip_projects",
         "ai_clip_segments",
         "ai_clip_subtitles",
+        "transition_catalog_state",
+        "transition_materials",
+        "transition_material_downloads",
+        "ai_clip_transition_boundaries",
+        "ai_transition_match_runs",
         "client_activation",
     ] {
         assert_eq!(
@@ -229,6 +234,16 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         connection
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 16",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 18",
                 [],
                 |row| row.get::<_, i64>(0),
             )

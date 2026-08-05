@@ -37,10 +37,12 @@ ENCODERS=$($FFMPEG -hide_banner -encoders 2>&1) || {
   exit 1
 }
 
-printf '%s\n' "$DECODERS" | grep -Eq '^ [VAS][A-Z.]{5} png +' || {
-  printf '%s\n' '错误：当前 FFmpeg 缺少 PNG 解码器。' >&2
-  exit 1
-}
+for decoder in h264 hevc aac png; do
+  printf '%s\n' "$DECODERS" | grep -Eq "^ [VAS][A-Z.]{5} $decoder +" || {
+    printf '错误：当前 FFmpeg 缺少 %s 解码器。\n' "$decoder" >&2
+    exit 1
+  }
+done
 for demuxer in concat image2; do
   printf '%s\n' "$DEMUXERS" | grep -Eq "^ D +$demuxer( |,)" || {
     printf '错误：当前 FFmpeg 缺少 %s demuxer。\n' "$demuxer" >&2
@@ -66,4 +68,4 @@ printf '%s\n' "$ENCODERS" | grep -Eq '^ [VAS][A-Z.]{5} (h264_videotoolbox|h264_m
   exit 1
 }
 
-printf '%s\n' '带 ASR 字幕的剪辑导出能力检查通过。'
+printf '%s\n' 'H.264/HEVC 桥接素材预览和带 ASR 字幕的剪辑导出能力检查通过。'

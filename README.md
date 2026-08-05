@@ -2,7 +2,7 @@
 
 切片智能体是一个基于 Tauri 2.0、React、TypeScript、Rust 和 SQLite 的本地桌面客户端，用于通过公开抖音个人主页或直播间入口同时监听多个主播，在开播后自动保存包含视频和声音的 MKV 分片，并允许用户主动把多个视频转换为带时间戳的本地语音转写。
 
-当前版本交付“可靠录制 + 用户触发的本地 ASR + 高光候选分析 + 可校对逐字字幕的本地单轨剪辑导出”能力。高光分析通过 Rust 中的受限 Agent 工作流调用 DeepSeek，只发送用户授权的规范化转写、时间戳、标签和分析目标；用户显式选择高光后可编排并导出新的 MP4，字幕可在当前剪辑工程中独立校对并默认烧录到成品画面，多轨和自动切片仍属于后续独立能力。
+当前桌面客户端版本为 `0.3.0`，交付“可靠录制 + 用户触发的本地 ASR + 高光候选分析 + 可校对逐字字幕的单轨剪辑 + 同步转场素材”能力。高光和转场匹配通过 Rust 中的受限 Agent 工作流调用 DeepSeek，只发送用户授权的规范化转写、时间戳、标签、分析目标和本地素材语义；用户可编排原始片段与带声桥接素材并导出新的 H.264/AAC MP4，多轨和自动切片仍属于后续独立能力。
 
 ## 已实现功能
 
@@ -45,7 +45,9 @@
 - AI 工作区支持标签/分析目标快照、队列中的“下一个处理”和“立即切换”，并在 ASR 完成后按用户授权运行候选发现 Agent 与评分 Agent；合格/优秀阈值默认分别为 70/80，合格候选按页展示且不设数量上限，优秀候选首次分析完成时自动选中；
 - 设置页支持 DeepSeek 模型、超时和系统凭据状态；API Key 只保存到操作系统凭据库，连接诊断使用固定提示，不保存原始响应；
 - 高光分析使用版本化通用、带货、搞笑、知识和故事 Skills，未知标签只作为数据，不可改变 Agent 工具边界；
-- 原始转写和录像保持只读、不生成 SRT/ASS，也不会覆盖原视频；已选择高光可进入单轨剪辑页，在工程副本中校对或隐藏字幕并导出带逐字烧录字幕的新 MP4，但仍不提供波形、多轨、关键帧、外部素材或字幕样式配置；
+- 授权心跳发布转场素材目录版本，客户端独立同步元数据到 SQLite；视频和缩略图只在预览、人工应用或 Agent 高分选中后按需下载并校验大小与 SHA-256；
+- 剪辑工作台支持搜索、预览、应用、替换或移除版本化带声桥接素材；DeepSeek 根据相邻 ASR 和主播标签在本地候选中匹配，置信度达到 `0.75` 才自动应用，人工锁定不会被批量匹配覆盖；
+- 原始转写和录像保持只读、不生成 SRT/ASS，也不会覆盖原视频；已选择高光可进入单轨剪辑页，在工程副本中校对或隐藏字幕并导出带逐字烧录字幕的新 MP4，但仍不提供波形、多轨、关键帧、用户自定义素材或字幕样式配置；
 - 主播、设置、视频、ASR 和高光结果均保存在本机；客户端只向授权运营服务上报白名单启动/功能/错误埋点，不上传媒体、ASR 文本、本地路径、Cookie 或直播页面正文。
 
 ## 录制方式
@@ -82,6 +84,9 @@ dy-screen/
 │   ├── src/preview.rs           预览队列、FFmpeg 转换、缓存和状态模型
 │   ├── src/thumbnail.rs         首帧封面、分页批次、JPEG 缓存和生命周期
 │   ├── src/ai/                  AI 项目、命令、调度、恢复和本地 ASR 运行时
+│   ├── src/transition_materials.rs 转场目录同步、SQLite 模型和工程边界
+│   ├── src/transition_assets.rs 素材下载、完整性校验和兼容预览
+│   ├── src/transition_matching.rs 受限转场匹配 Agent
 │   ├── src/api.rs               激活、心跳、AppStart、埋点统一服务端 API 客户端
 │   ├── src/activation.rs        SQLite 激活摘要、心跳和埋点生命周期
 │   ├── src/app.rs               command、事件、托盘和桌面生命周期
@@ -153,6 +158,8 @@ cp .env.example .env
 ```
 
 `make app-dev`、`make app-build` 和正式资源构建都会把 `DY_SCREEN_API_BASE_URL` 传给 Tauri。发布环境必须显式配置正式 HTTPS 地址；所有请求都由 `src-tauri/src/api.rs` 统一处理，当前使用明文 JSON，并已预留后续请求/响应加解密 codec。
+
+素材目录复用同一服务端和激活凭据。心跳成功响应可选返回 `transitionMaterials.catalogVersion` 与 `transitionMaterials.minimumAppVersion`；客户端只把合法版本信号交给独立同步任务，再请求 `GET /api/v1/transition-materials?clientVersion=<本地目录版本>`。Rust 自动附带 `device_id`、`activate_code`、客户端版本和平台请求头，这些值、目录下载 URL 及本地绝对路径均不会进入 WebView。服务端返回 `changed=false` 时保留本地快照；返回完整新目录时，全部记录校验成功后才在一个 SQLite 事务中发布。
 
 启动 Tauri 桌面客户端：
 
@@ -229,6 +236,50 @@ ASR 完成后，打开设置页填写 DeepSeek 模型和 API Key，点击“测�
 
 `AsrEngine` 是业务层依赖的中立接口，输入包含准备后的音频、语言提示、热词和时间戳策略，输出包含引擎/模型身份、语言、句段时间、原始文本、可选置信信息和警告。第一版只有 `WhisperCppEngine`，后续增加云端或其他本地引擎时应新增 Adapter，不修改项目、缓存、时间轴和 UI 契约；本版不会自动上传或自动回退云端。
 
+### 转场素材同步与智能匹配
+
+素材目录同步与授权心跳解耦：心跳只发布版本信号，独立协调器串行检查、去重和退避。同步失败不会撤销授权，也不会停止监听、录制、ASR 或普通剪辑；客户端低于 `minimumAppVersion` 时只暂停应用新目录，上一版本仍可离线使用。剪辑工作台会显示正在检查、正在同步、需要升级或失败原因，失败状态可手动重试。
+
+使用方式：
+
+1. 保持客户端激活并等待一次成功心跳；
+2. 打开包含至少两个原始片段的剪辑工程，在左侧选择“转场”；
+3. 按标题、描述、标签或分类搜索本地 SQLite 目录；
+4. 点击素材缩略图按需下载并预览；HEVC 源会生成 H.264/AAC 兼容预览，但最终导出仍使用已校验源文件；
+5. 先在时间轴选择两个片段之间的边界，再人工应用素材，或点击“智能匹配全部”；
+6. Agent 只在 Rust 召回的当前目录候选中选择，`confidence >= 0.75` 才自动应用，低分结果只显示建议；
+7. 人工应用或“保留无转场”会锁定边界，需显式解除后 Agent 才能再次修改；
+8. 导出前所有已应用素材必须下载完成并通过大小、SHA-256 和媒体检查，否则导出会被阻止并要求重试。
+
+桥接素材作为独立时间轴单元完整插入，保留原声并增加工程总时长。桥接期间不显示来源 ASR 字幕，右侧原始片段及其字幕统一顺延。片段重排、插入或删除只使受影响的自动结果失效，不会自动调用 DeepSeek。
+
+隐私边界：转场 Agent 只能接收相邻片段末尾/开头的有界 ASR、主播标签以及素材键、版本、标题、描述、标签和分类；不会接收媒体、下载 URL、本地路径、Cookie、激活码、设备 ID，也没有网络或文件工具权限。模型返回的素材键、版本、置信度和理由仍由 Rust 对本地目录进行二次校验。
+
+macOS 的素材源文件、兼容预览和缩略图默认位于：
+
+```text
+~/Library/Application Support/com.yino.dyscreen/transition-materials/<asset-key>/<asset-version>/
+```
+
+Windows 位于 `%APPDATA%\com.yino.dyscreen\transition-materials\`。目录元数据、下载状态和工程固定引用保存在同目录的 `dy-screen.sqlite3` 中；不要手动修改数据库或缓存。历史工程引用的旧版本不会因新目录发布而立即删除。
+
+开发和发行验收：
+
+```bash
+# 检查 H.264、HEVC、AAC、滤镜、H.264/AAC 编码与 MP4 能力
+make clip-subtitle-doctor FFMPEG=/absolute/path/to/ffmpeg
+
+# 用运行时生成的 H.264/HEVC 带声小样验证预览、桥接导出、时长和字幕映射
+make test-clip-transition-integration \
+  FFMPEG=/absolute/path/to/runtime/ffmpeg \
+  FFPROBE=/absolute/path/to/runtime/ffprobe \
+  FFMPEG_FIXTURE_GENERATOR=/absolute/path/to/development/ffmpeg
+
+# 用服务端完整 JSON 验证 33 条目录；JSON 只用于本地测试，不提交远程媒体
+make test-transition-catalog-fixture \
+  TRANSITION_CATALOG_FIXTURE=/absolute/path/to/transition-materials.json
+```
+
 ### ASR 资源与性能
 
 - 最低基线为 8 GB 物理内存，任务前还会检查当前可用内存和至少 2 GB 临时磁盘余量；
@@ -281,7 +332,7 @@ src-tauri/target/release/bundle/macos/切片智能体.app
 
 ### Runtime Resource Pack 发行与首次启动
 
-资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证。`asr-bundle stage` 会同时生成 `runtime-manifest.json`，清单采用 v2 结构，记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。带字幕剪辑要求 FFmpeg 同时具备 PNG 解码、`concat`/`image2` demuxer、`overlay` 等受控滤镜以及平台 H.264/AAC 编码器，`make runtime-resource-verify` 和正式发行验收会逐项检查，旧资源包不满足时必须升级后才能导出。
+资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证。`asr-bundle stage` 会同时生成 `runtime-manifest.json`，清单采用 v2 结构，记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。带声桥接素材和字幕导出要求 FFmpeg 同时具备 H.264、HEVC、AAC、PNG 解码，`concat`/`image2` demuxer，`scale`、`pad`、`format`、`aformat`、`volume`、`concat`、`overlay` 等受控滤镜，以及平台 H.264/AAC 编码器和 MP4 muxer。`make runtime-resource-verify` 和正式发行验收会逐项检查，旧资源包不满足时必须升级后才能预览或导出。
 
 ```bash
 # 生成并校验 macOS arm64 随包资源
@@ -294,14 +345,14 @@ make app-build-resources ASR_SOURCE=/absolute/path/to/resources
 # 生成自有 HTTPS 静态托管目录（上传前必须用正式 Ed25519 私钥签署清单）
 make runtime-resource-publish \
   ASR_STAGE=resources/asr-stage \
-  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/ \
+  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/aarch64/2026.07.4/ \
   RESOURCE_RELEASE_DIR=dist/runtime-resources
 ```
 
 托管目录约定为 `channel/appVersion/platform/arch/bundleVersion/`，并在同一固定地址提供 `runtime-manifest.json` 及清单声明的资源文件。服务器应支持 HTTPS、Range 和大文件缓存；应用不会上传视频、音频、转写、主播信息、Cookie 或本地数据库。用户安装后如果资源未就绪，只能在资源页查看版本/大小/组件、下载、取消、重试或重新检测，监控、录制、视频库和 AI 剪辑保持锁定。
 
 当前 macOS arm64 发行构建使用的固定资源基地址为：
-`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.2.0/macos/aarch64/2026.07.4/`。
+`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/aarch64/2026.07.4/`。
 `index.json` 仅用于发布目录索引，不能直接作为下载基地址。
 
 macOS 的 ASR 专用 FFmpeg 应从锁定的官方 `ffmpeg-8.1.2.tar.xz` 构建：
@@ -312,7 +363,7 @@ make asr-ffmpeg-macos \
   FFMPEG_ASR_OUTPUT=/absolute/path/to/output
 ```
 
-脚本校验源码 SHA-256，只启用录制、预览、封面、ASR 和剪辑导出需要的协议、容器、PNG、滤镜及系统 VideoToolbox 编码器，仍禁用 GPL/nonfree 与第三方编码器；输出使用 LGPL-2.1-or-later，携带完整许可证，并把 dylib 改写为包内相对路径。Homebrew 常规 FFmpeg 启用了 GPL 外部组件且依赖开发机动态库，不能直接复制进正式安装包。
+脚本校验源码 SHA-256，只启用录制、预览、封面、ASR、H.264/HEVC/AAC 解码和桥接剪辑导出需要的协议、容器、滤镜及系统 VideoToolbox 编码器，仍禁用 GPL/nonfree 与第三方编码器；输出使用 LGPL-2.1-or-later，携带完整许可证，并把 dylib 改写为包内相对路径。Homebrew 常规 FFmpeg 启用了 GPL 外部组件且依赖开发机动态库，不能直接复制进正式安装包。
 
 macOS Whisper sidecar 应使用静态、可移植构建：
 
@@ -340,7 +391,7 @@ make windows-build-doctor
 make asr-ffmpeg-windows
 make asr-whisper-windows
 make asr-prepare-windows VC_REDIST_SOURCE=C:/inputs/vc_redist.x64.exe VC_REDIST_LICENSE=C:/inputs/Microsoft-VCRedist.txt
-make app-build-windows-dev WINDOWS_ASR_SOURCE=resources/asr-source-windows RESOURCE_CHANNEL=development WINDOWS_RESOURCE_BASE_URL=https://resources.example/development/0.2.0/windows/x86_64/2026.07.4/
+make app-build-windows-dev WINDOWS_ASR_SOURCE=resources/asr-source-windows RESOURCE_CHANNEL=development WINDOWS_RESOURCE_BASE_URL=https://resources.example/development/0.3.0/windows/x86_64/2026.07.4/
 ```
 
 开发 NSIS 可以无签名，但无签名资源不能发布到 `stable`。正式发行要求项目 PE/DLL 先完成
@@ -448,6 +499,8 @@ macOS 默认位于 Tauri 应用数据目录：
 - `transcript_segments`：稳定句段 ID、源内时间戳、原始/规范化文本和可选置信信息；
 - `llm_provider_settings`：Provider、模型、超时、Prompt 版本等非敏感设置；API Key 不在 SQLite 中；
 - `ai_highlight_runs`、`ai_highlight_chunks`、`ai_highlight_candidates`：高光运行快照、分块状态、结构化评分和用户选择；
+- `transition_catalog_state`、`transition_materials`、`transition_material_downloads`：素材目录版本、版本化元数据和源文件/预览下载状态；
+- `ai_clip_transition_boundaries`、`ai_transition_match_runs`：相邻片段边界的固定素材版本、人工锁、Agent 建议和脱敏运行审计；
 - `settings`：录像目录、质量、协议、旧版并发兼容值、FFmpeg 和桌面设置；旧版并发值不参与当前录制调度；
 - `schema_migrations`：数据库迁移版本。
 
@@ -621,6 +674,9 @@ make help
 | `make test-core` | 执行录制核心测试 |
 | `make test-app` | 执行 SQLite、supervisor 和预览服务测试 |
 | `make preview-doctor` | 检查 FFmpeg/FFprobe 和可用 H.264 编码器 |
+| `make clip-subtitle-doctor` | 审计 H.264/HEVC/AAC 解码、桥接规范化、连接、H.264/AAC MP4 编码能力 |
+| `make test-clip-transition-integration ...` | 生成 H.264/HEVC 带声小样并验证兼容预览、桥接导出、总时长和字幕映射 |
+| `make test-transition-catalog-fixture TRANSITION_CATALOG_FIXTURE=...` | 使用服务端完整 JSON 验证 33 条目录的 SQLite 发布和前端隐私 DTO |
 | `make test-preview` | 执行预览 Rust 测试和播放器组件测试 |
 | `make test-preview-integration` | 使用真实 FFmpeg 样本验证重封装、回退转码和无音轨视频 |
 | `make thumbnail-doctor` | 检查 FFmpeg/FFprobe 和 JPEG 封面编码能力 |

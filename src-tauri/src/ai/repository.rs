@@ -14,12 +14,12 @@ use crate::database::{Database, DatabaseError};
 
 use super::domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
-    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate, AiHighlightCandidate,
-    AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress, AiHighlightRun,
-    AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail,
-    AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk, NewAiHighlightRun,
-    NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint,
-    TranscriptSegment, TranscriptSegmentDraft,
+    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate, AiClipTimelineUnit,
+    AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk,
+    AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
+    AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk,
+    NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary,
+    SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
 };
 
 use super::llm::{HighlightCandidateDraft, HighlightCandidateScore, LlmProviderSettings};
@@ -60,6 +60,17 @@ pub struct ClipExportSource {
     pub source_path: String,
     pub source_fingerprint: SourceFingerprint,
     pub subtitles: Vec<AiClipSubtitle>,
+    pub bridge_after: Option<ClipExportBridge>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipExportBridge {
+    pub boundary_id: i64,
+    pub asset_key: String,
+    pub asset_version: i64,
+    pub source_path: String,
+    pub duration_ms: u64,
+    pub has_audio: bool,
 }
 
 pub fn project_clip_subtitles(
@@ -1315,10 +1326,33 @@ impl AiRepository {
         seed_clip_subtitle_snapshots(&transaction, project_id, None)?;
         transaction.commit()?;
         drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(project_id)
     }
 
     pub fn get_clip_project(&self, clip_project_id: i64) -> Result<AiClipProjectDetail> {
+        let transition_repository =
+            crate::transition_materials::TransitionMaterialRepository::new(self.database.clone());
+        let boundaries = transition_repository
+            .list_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+        let mut bridge_materials = HashMap::new();
+        for boundary in boundaries.iter().filter(|item| item.active && !item.stale) {
+            if let (Some(key), Some(version)) = (&boundary.asset_key, boundary.asset_version) {
+                let material = transition_repository
+                    .material(key, version)
+                    .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+                let download = transition_repository
+                    .download(key, version)
+                    .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+                bridge_materials.insert(
+                    (boundary.left_stable_id, boundary.right_stable_id),
+                    (boundary.id, material, download),
+                );
+            }
+        }
         let mut connection = self.database.connection()?;
         {
             let transaction = connection.transaction()?;
@@ -1354,13 +1388,48 @@ impl AiRepository {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut project_cursor_ms = 0_u64;
         let mut segment_offsets = HashMap::new();
-        for segment in &segments {
+        let mut timeline_units = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let segment_start = project_cursor_ms;
             segment_offsets.insert(segment.id, (project_cursor_ms, segment.source_start_ms));
             project_cursor_ms = project_cursor_ms.saturating_add(
                 segment
                     .source_end_ms
                     .saturating_sub(segment.source_start_ms),
             );
+            timeline_units.push(AiClipTimelineUnit {
+                key: format!("segment:{}", segment.id),
+                kind: AiClipTimelineUnitKind::Segment,
+                project_start_ms: segment_start,
+                project_end_ms: project_cursor_ms,
+                clip_segment_id: Some(segment.id),
+                boundary_id: None,
+                title: segment.title.clone(),
+                asset_key: None,
+                asset_version: None,
+                source_status: None,
+                preview_status: None,
+            });
+            if let Some(right) = segments.get(index + 1)
+                && let Some((boundary_id, material, download)) =
+                    bridge_materials.get(&(segment.id, right.id))
+            {
+                let bridge_start = project_cursor_ms;
+                project_cursor_ms = project_cursor_ms.saturating_add(material.duration_ms);
+                timeline_units.push(AiClipTimelineUnit {
+                    key: format!("bridge:{boundary_id}"),
+                    kind: AiClipTimelineUnitKind::Bridge,
+                    project_start_ms: bridge_start,
+                    project_end_ms: project_cursor_ms,
+                    clip_segment_id: None,
+                    boundary_id: Some(*boundary_id),
+                    title: material.title.clone(),
+                    asset_key: Some(material.asset_key.clone()),
+                    asset_version: Some(material.asset_version),
+                    source_status: Some(download.source_status),
+                    preview_status: Some(download.preview_status),
+                });
+            }
         }
         for subtitle in &mut subtitles {
             let Some((cursor, segment_start_ms)) = segment_offsets.get(&subtitle.clip_segment_id)
@@ -1392,6 +1461,9 @@ impl AiRepository {
             subtitles,
             subtitle_frames,
             subtitles_complete,
+            boundaries,
+            project_duration_ms: project_cursor_ms,
+            timeline_units,
         })
     }
 
@@ -1420,6 +1492,9 @@ impl AiRepository {
         mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(clip_project_id)
     }
 
@@ -1492,6 +1567,9 @@ impl AiRepository {
         mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(clip_project_id)
     }
 
@@ -1573,6 +1651,9 @@ impl AiRepository {
         mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(clip_project_id)
     }
 
@@ -1608,6 +1689,9 @@ impl AiRepository {
         mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(clip_project_id)
     }
 
@@ -1652,6 +1736,9 @@ impl AiRepository {
         mark_clip_project_edited(&transaction, clip_project_id, &now)?;
         transaction.commit()?;
         drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(clip_project_id)
     }
 
@@ -1796,6 +1883,7 @@ impl AiRepository {
                     source_path,
                     source_fingerprint,
                     subtitles,
+                    bridge_after: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

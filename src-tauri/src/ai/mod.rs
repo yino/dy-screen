@@ -35,11 +35,11 @@ pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRunti
 pub use domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
     AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleFrame, AiClipSubtitleUpdate,
-    AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress,
-    AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject,
-    AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk,
-    NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary,
-    SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
+    AiClipTimelineUnit, AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage,
+    AiHighlightChunk, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind,
+    AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact,
+    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
+    RecoverySummary, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
@@ -53,7 +53,8 @@ pub use llm::{
     FakeHighlightProvider, HighlightAgentProvider, HighlightCandidateDraft,
     HighlightCandidateScore, LlmError, LlmProviderSettings, MAX_AGENT_TURNS, MemoryCredentialStore,
     PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest,
-    RigDeepSeekProvider, SystemCredentialStore,
+    RigDeepSeekProvider, SystemCredentialStore, TransitionAgentMatch, TransitionAgentOutput,
+    TransitionAgentProvider, TransitionAgentRequest,
 };
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
@@ -63,7 +64,8 @@ pub use projection::{
     AiTranscriptSegmentProjection,
 };
 pub use repository::{
-    AiRepository, AiRepositoryError, ClipExportSource, Result, project_clip_subtitles,
+    AiRepository, AiRepositoryError, ClipExportBridge, ClipExportSource, Result,
+    project_clip_subtitles,
 };
 pub use service::{
     AiPreflight, AiProjectService, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionOption,
