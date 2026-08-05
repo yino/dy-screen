@@ -17,6 +17,7 @@ beforeEach(async () => {
     } satisfies Storage,
   });
   window.localStorage.clear();
+  window.history.replaceState(null, "", "/");
   ({ createBrowserApi } = await import("./api"));
 });
 
@@ -126,6 +127,29 @@ describe("浏览器演示公开页访问会话 API", () => {
     await expect(api.showDouyinVerification()).rejects.toThrow("真实访问验证仅桌面端可用");
     await expect(api.recheckDouyinAccess()).rejects.toThrow("真实访问验证仅桌面端可用");
     await expect(api.clearDouyinSession(true)).rejects.toThrow("真实访问验证仅桌面端可用");
+  });
+
+  it("只在显式视觉验收状态返回长访问、Provider 与资源失败信息", async () => {
+    window.history.replaceState(null, "", "/?visual-qa=settings");
+    const settingsApi = createBrowserApi();
+
+    await expect(settingsApi.getBrowserAccessState()).resolves.toMatchObject({
+      status: "verification_required",
+      lastReason: expect.stringContaining("开发态长文本"),
+    });
+    await expect(settingsApi.getAiLlmSettings?.()).resolves.toMatchObject({ keyConfigured: true });
+    await expect(settingsApi.diagnoseAiLlmProvider?.()).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringContaining("Provider"),
+    });
+
+    window.history.replaceState(null, "", "/?visual-qa=resources");
+    await expect(createBrowserApi().runtimeResourceStatus?.()).resolves.toMatchObject({
+      status: "failed",
+      ready: false,
+      errorCode: "integrity_check_failed",
+      errorMessage: expect.stringContaining("开发态长文本"),
+    });
   });
 });
 

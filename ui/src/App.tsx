@@ -871,10 +871,17 @@ export function App({ api }: AppProps) {
                 .then(setActivation)
                 .catch((error) => setNotice(errorMessage(error, "无法清除客户端激活状态")));
             }}
-            onSave={(next) => void action(async () => {
-              await api.saveSettings(next);
-              setSettings(next);
-            }, "设置已保存，新录制会话将使用最新配置")}
+            onSave={async (next) => {
+              try {
+                await api.saveSettings(next);
+                setSettings(next);
+                setNotice("设置已保存，新录制会话将使用最新配置");
+                await refreshDashboard();
+              } catch (error) {
+                setNotice(errorMessage(error, "设置保存失败，请重试"));
+                throw error;
+              }
+            }}
           />
         )}
       </main>
@@ -1630,7 +1637,22 @@ function ActivationModal({ state, onActivate }: { state: ActivationState | null;
   );
 }
 
-function SettingsPage({ api, settings, maxScreenLimit, environment, browserAccess, accessBusy, activation, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onClearActivation, onSave }: {
+type SettingsSaveState = "idle" | "saving" | "saved" | "error";
+
+function sameAppSettings(left: AppSettings, right: AppSettings): boolean {
+  return left.outputRoot === right.outputRoot
+    && left.quality === right.quality
+    && left.protocol === right.protocol
+    && left.segmentSeconds === right.segmentSeconds
+    && left.maxConcurrentRecordings === right.maxConcurrentRecordings
+    && left.asrDuringRecording === right.asrDuringRecording
+    && left.ffmpegPath === right.ffmpegPath
+    && left.ffprobePath === right.ffprobePath
+    && left.notificationsEnabled === right.notificationsEnabled
+    && left.autostartEnabled === right.autostartEnabled;
+}
+
+export function SettingsPage({ api, settings, maxScreenLimit, environment, browserAccess, accessBusy, activation, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onClearActivation, onSave }: {
   api: ClientApi;
   settings: AppSettings;
   maxScreenLimit: number;
@@ -1644,47 +1666,222 @@ function SettingsPage({ api, settings, maxScreenLimit, environment, browserAcces
   onRecheckAccess: () => void;
   onClearAccess: () => void;
   onClearActivation: () => void;
-  onSave: (settings: AppSettings) => void;
+  onSave: (settings: AppSettings) => Promise<void>;
 }) {
   const [form, setForm] = useState(settings);
+  const [baseline, setBaseline] = useState(settings);
+  const [saveState, setSaveState] = useState<SettingsSaveState>("idle");
   const [llm, setLlm] = useState<LlmProviderSettings | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [llmMessage, setLlmMessage] = useState<string | null>(null);
-  const [llmDiagnosing, setLlmDiagnosing] = useState(false);
+  const [llmBusy, setLlmBusy] = useState<"save" | "diagnose" | "clear" | null>(null);
+  const dirty = !sameAppSettings(form, baseline);
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
+  useEffect(() => {
+    setBaseline(settings);
+    if (!dirtyRef.current) setForm(settings);
+  }, [settings]);
   useEffect(() => { void api.getAiLlmSettings?.().then(setLlm).catch(() => setLlm(null)); }, [api]);
-  const submit = (event: FormEvent) => { event.preventDefault(); onSave(form); };
+
+  const updateForm = (values: Partial<AppSettings>) => {
+    setForm((current) => ({ ...current, ...values }));
+    if (saveState !== "saving") setSaveState("idle");
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!dirty || saveState === "saving") return;
+    const submitted = form;
+    setSaveState("saving");
+    try {
+      await onSave(submitted);
+      setBaseline(submitted);
+      setSaveState("saved");
+    } catch {
+      setSaveState("error");
+    }
+  };
+
   const saveLlm = async () => {
-    if (!llm || !api.saveAiLlmSettings) return;
+    if (!llm || !api.saveAiLlmSettings || llmBusy !== null) return;
     if (!Number.isInteger(llm.qualifiedScore) || !Number.isInteger(llm.excellentScore) || llm.qualifiedScore < 0 || llm.excellentScore > 100 || llm.excellentScore < llm.qualifiedScore) {
       setLlmMessage("合格/优秀片段阈值必须在 0 到 100 之间，且优秀阈值不能低于合格阈值");
       return;
     }
-    try { setLlm(await api.saveAiLlmSettings(llm, apiKey.trim() || undefined)); setApiKey(""); setLlmMessage("DeepSeek 设置已保存，Key 只存入系统凭据库"); }
-    catch (error) { setLlmMessage(error instanceof Error ? error.message : "无法保存 DeepSeek 设置"); }
+    setLlmBusy("save");
+    try {
+      setLlm(await api.saveAiLlmSettings(llm, apiKey.trim() || undefined));
+      setApiKey("");
+      setLlmMessage("DeepSeek 设置已保存，Key 只存入系统凭据库");
+    } catch (error) {
+      setLlmMessage(errorMessage(error, "无法保存 DeepSeek 设置"));
+    } finally {
+      setLlmBusy(null);
+    }
   };
+
   const diagnoseLlm = async () => {
-    if (!llm || !api.diagnoseAiLlmProvider) return;
-    setLlmDiagnosing(true);
+    if (!llm || !api.diagnoseAiLlmProvider || llmBusy !== null) return;
+    setLlmBusy("diagnose");
     try {
       const result = await api.diagnoseAiLlmProvider();
       setLlmMessage(result.ok ? `连接成功：${result.message}` : `连接失败：${result.message}`);
     } catch (error) {
-      setLlmMessage(error instanceof Error ? error.message : "无法测试 DeepSeek 连接");
+      setLlmMessage(errorMessage(error, "无法测试 DeepSeek 连接"));
     } finally {
-      setLlmDiagnosing(false);
+      setLlmBusy(null);
     }
   };
+
+  const clearLlmKey = async () => {
+    if (!llm?.keyConfigured || !api.clearAiLlmKey || llmBusy !== null) return;
+    setLlmBusy("clear");
+    try {
+      await api.clearAiLlmKey();
+      setLlm((current) => current ? { ...current, keyConfigured: false } : current);
+      setLlmMessage("Key 已从系统凭据库清除");
+    } catch (error) {
+      setLlmMessage(errorMessage(error, "无法清除 DeepSeek Key"));
+    } finally {
+      setLlmBusy(null);
+    }
+  };
+
+  const saveMessage = saveState === "saving"
+    ? "正在保存设置"
+    : saveState === "error"
+      ? "保存失败，输入已保留，请重试"
+      : dirty
+        ? "有未保存的更改"
+        : saveState === "saved"
+          ? "设置已保存"
+          : "所有更改均已保存";
+
   return (
-    <form className="page-content settings-page" onSubmit={submit}>
+    <form className="page-content settings-page" data-save-state={saveState} onSubmit={(event) => void submit(event)}>
       <div className="settings-layout">
-        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div><HardDrive size={22} /></div><label>录像保存目录<input value={form.outputRoot} onChange={(event) => setForm({ ...form, outputRoot: event.target.value })} /><small>默认位于下载目录，修改后只影响新录制。</small></label><div className="form-grid"><label>清晰度<select value={form.quality} onChange={(event) => setForm({ ...form, quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label><label>协议<select value={form.protocol} onChange={(event) => setForm({ ...form, protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label><label>分片时长（秒）<input type="number" min="60" value={form.segmentSeconds} onChange={(event) => setForm({ ...form, segmentSeconds: Number(event.target.value) })} /></label><div className="server-limit-field" aria-label={`服务端录制额度 ${maxScreenLimit} 路`}><span>服务端录制额度</span><strong>{maxScreenLimit} 路</strong></div></div></section>
-        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div><button type="button" className="secondary-button" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button></div><p className="muted-copy">FFmpeg 和 FFprobe 由已校验的运行资源包管理，不能从设置中替换为任意程序。</p><div className="diagnostic-list"><div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未就绪"}</b></div><div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未就绪"}</b></div></div></section>
-        <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DESKTOP</p><h2>桌面行为</h2></div><Settings size={22} /></div><label className="switch-row"><div><strong>录制时并行处理 ASR</strong><small>已完成且文件稳定的视频可在直播录制期间进行识别。关闭后恢复录制优先。</small></div><input type="checkbox" checked={form.asrDuringRecording} onChange={(event) => setForm({ ...form, asrDuringRecording: event.target.checked })} /></label><label className="switch-row"><div><strong>系统通知</strong><small>开播、录制结束、失败和磁盘不足时提醒。</small></div><input type="checkbox" checked={form.notificationsEnabled} onChange={(event) => setForm({ ...form, notificationsEnabled: event.target.checked })} /></label><label className="switch-row"><div><strong>开机自动启动</strong><small>登录系统后恢复已启用的监听任务。</small></div><input type="checkbox" checked={form.autostartEnabled} onChange={(event) => setForm({ ...form, autostartEnabled: event.target.checked })} /></label><button type="button" className="secondary-button full" onClick={onOpenLogs}><FolderOpen size={16} />打开日志目录</button><p className="tray-note">关闭主窗口后应用会驻留系统托盘；请通过托盘菜单显式退出。</p></section>
-        <section className="panel settings-card activation-settings-card"><div className="panel-header"><div><p className="section-kicker">LICENSE</p><h2>客户端授权</h2></div><KeyRound size={22} /></div><div className="access-session-summary"><StatusBadge kind={activation?.active ? "live" : "error"}>{activationStatusLabel(activation)}</StatusBadge>{activation?.message && <p>{activation.message}</p>}<small>设备 {activation?.deviceIdHint ?? "正在识别"} · 最近心跳 {formatDate(activation?.lastHeartbeatAt ?? null)}</small></div><div className="access-settings-actions"><button type="button" className="danger-button" onClick={onClearActivation}>重新激活</button></div></section>
-        <section className="panel settings-card access-settings-card"><div className="panel-header"><div><p className="section-kicker">DOUYIN ACCESS</p><h2>抖音访问会话</h2></div><ShieldCheck size={22} /></div><div className="access-session-summary"><StatusBadge kind={browserAccess?.status === "verification_required" || browserAccess?.status === "session_expired" ? "error" : "neutral"}>{browserAccess ? accessStatusLabel(browserAccess) : "正在读取"}</StatusBadge>{browserAccess?.lastReason && <p>{browserAccess.lastReason}</p>}<small>会话仅保存在系统 WebView 中；清除操作不会影响主播和录像。</small></div><div className="access-settings-actions"><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onRecheckAccess}>{accessBusy === "check" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}检查访问状态</button><button type="button" className="secondary-button" disabled={accessBusy !== null} onClick={onVerifyAccess}>{accessBusy === "verify" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重新验证</button><button type="button" className="danger-button" disabled={accessBusy !== null} onClick={onClearAccess}>{accessBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}清除抖音会话</button></div></section>
-        {llm && <section className="panel settings-card"><div className="panel-header"><div><p className="section-kicker">DEEPSEEK</p><h2>高光分析 Provider</h2></div><Sparkles size={22} /></div><label>模型 ID<input value={llm.modelId} onChange={(event) => setLlm({ ...llm, modelId: event.target.value })} /></label><label>API Key（留空表示不替换）<input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label><label>请求超时（毫秒）<input type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => setLlm({ ...llm, timeoutMs: Number(event.target.value) })} /></label><div className="form-grid"><label>合格片段阈值<input aria-label="合格片段阈值" type="number" min="0" max="100" value={llm.qualifiedScore} onChange={(event) => setLlm({ ...llm, qualifiedScore: Number(event.target.value) })} /></label><label>优秀片段阈值<input aria-label="优秀片段阈值" type="number" min="0" max="100" value={llm.excellentScore} onChange={(event) => setLlm({ ...llm, excellentScore: Number(event.target.value) })} /></label></div><small>达到合格阈值的片段会显示在高光候选；达到优秀阈值的片段会在首次分析完成时自动选中。每次高光分析会冻结当时的阈值。</small><div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>{llmMessage && <p className="form-error">{llmMessage}</p>}<div className="settings-inline-actions"><button type="button" className="secondary-button" onClick={() => void saveLlm()}>保存 Provider</button><button type="button" className="secondary-button" disabled={!llm.keyConfigured || llmDiagnosing} onClick={() => void diagnoseLlm()}>{llmDiagnosing ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}测试连接</button><button type="button" className="ghost-button" disabled={!llm.keyConfigured} onClick={() => void api.clearAiLlmKey?.().then(() => { setLlm({ ...llm, keyConfigured: false }); setLlmMessage("Key 已从系统凭据库清除"); })}>清除 Key</button></div><small>测试只发送固定诊断提示；分析时仅发送规范化转写与标签，不发送视频、音频、本地路径或 Cookie。</small></section>}
+        <div className="settings-column" data-testid="settings-column-primary">
+          <section className="panel settings-card recording-settings-card">
+            <div className="panel-header">
+              <div><p className="section-kicker">RECORDING</p><h2>录像设置</h2></div>
+              <HardDrive size={21} />
+            </div>
+            <label htmlFor="settings-output-root">
+              录像保存目录
+              <input id="settings-output-root" aria-label="录像保存目录" value={form.outputRoot} onChange={(event) => updateForm({ outputRoot: event.target.value })} />
+              <small>默认位于下载目录，修改后只影响新录制。</small>
+            </label>
+            <div className="form-grid">
+              <label htmlFor="settings-quality">清晰度<select id="settings-quality" value={form.quality} onChange={(event) => updateForm({ quality: event.target.value })}><option>FULL_HD1</option><option>HD1</option><option>SD1</option><option>SD2</option></select></label>
+              <label htmlFor="settings-protocol">协议<select id="settings-protocol" value={form.protocol} onChange={(event) => updateForm({ protocol: event.target.value })}><option value="flv">FLV</option><option value="hls">HLS</option></select></label>
+              <label htmlFor="settings-segment-seconds">分片时长（秒）<input id="settings-segment-seconds" type="number" min="60" value={form.segmentSeconds} onChange={(event) => updateForm({ segmentSeconds: Number(event.target.value) })} /></label>
+              <div className="server-limit-field" aria-label={`服务端录制额度 ${maxScreenLimit} 路`}><span>服务端录制额度</span><strong>{maxScreenLimit} 路</strong></div>
+            </div>
+          </section>
+
+          <section className="panel settings-card desktop-settings-card">
+            <div className="panel-header">
+              <div><p className="section-kicker">DESKTOP</p><h2>桌面行为</h2></div>
+              <Settings size={21} />
+            </div>
+            <label className="switch-row">
+              <div><strong>录制时并行处理 ASR</strong><small>已完成且文件稳定的视频可在直播录制期间进行识别。关闭后恢复录制优先。</small></div>
+              <input aria-label="录制时并行处理 ASR" type="checkbox" checked={form.asrDuringRecording} onChange={(event) => updateForm({ asrDuringRecording: event.target.checked })} />
+            </label>
+            <label className="switch-row">
+              <div><strong>系统通知</strong><small>开播、录制结束、失败和磁盘不足时提醒。</small></div>
+              <input aria-label="系统通知" type="checkbox" checked={form.notificationsEnabled} onChange={(event) => updateForm({ notificationsEnabled: event.target.checked })} />
+            </label>
+            <label className="switch-row">
+              <div><strong>开机自动启动</strong><small>登录系统后恢复已启用的监听任务。</small></div>
+              <input aria-label="开机自动启动" type="checkbox" checked={form.autostartEnabled} onChange={(event) => updateForm({ autostartEnabled: event.target.checked })} />
+            </label>
+            <div className="settings-card-actions"><button type="button" className="secondary-button" onClick={onOpenLogs}><FolderOpen size={16} />打开日志目录</button></div>
+            <p className="tray-note">关闭主窗口后应用会驻留系统托盘；请通过托盘菜单显式退出。</p>
+          </section>
+
+          <section className="panel settings-card access-settings-card">
+            <div className="panel-header">
+              <div><p className="section-kicker">DOUYIN ACCESS</p><h2>抖音访问会话</h2></div>
+              <ShieldCheck size={21} />
+            </div>
+            <div className="access-session-summary">
+              <StatusBadge kind={browserAccess?.status === "verification_required" || browserAccess?.status === "session_expired" ? "error" : "neutral"}>{browserAccess ? accessStatusLabel(browserAccess) : "正在读取"}</StatusBadge>
+              {browserAccess?.lastReason && <p>{browserAccess.lastReason}</p>}
+              <small>会话仅保存在系统 WebView 中；清除操作不会影响主播和录像。</small>
+            </div>
+            <div className="access-settings-actions">
+              <button type="button" className="secondary-button compact" disabled={accessBusy !== null} onClick={onRecheckAccess}>{accessBusy === "check" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}检查访问状态</button>
+              <button type="button" className="secondary-button compact" disabled={accessBusy !== null} onClick={onVerifyAccess}>{accessBusy === "verify" ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}重新验证</button>
+              <button type="button" className="danger-button compact" disabled={accessBusy !== null} onClick={onClearAccess}>{accessBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}清除抖音会话</button>
+            </div>
+          </section>
+        </div>
+
+        <div className="settings-column" data-testid="settings-column-secondary">
+          <section className="panel settings-card environment-settings-card">
+            <div className="panel-header">
+              <div><p className="section-kicker">ENVIRONMENT</p><h2>运行环境</h2></div>
+              <button type="button" className="secondary-button compact" onClick={onDiagnose}><RefreshCw size={15} />重新诊断</button>
+            </div>
+            <p className="muted-copy">FFmpeg 和 FFprobe 由已校验的运行资源包管理，不能从设置中替换为任意程序。</p>
+            <div className="diagnostic-list">
+              <div><span className={environment?.ffmpeg ? "diagnostic ok" : "diagnostic"}>{environment?.ffmpeg ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFmpeg</span><b>{environment?.ffmpeg ? "可用" : "未就绪"}</b></div>
+              <div><span className={environment?.ffprobe ? "diagnostic ok" : "diagnostic"}>{environment?.ffprobe ? <CheckCircle2 size={16} /> : <CircleOff size={16} />}FFprobe</span><b>{environment?.ffprobe ? "可用" : "未就绪"}</b></div>
+            </div>
+          </section>
+
+          <section className="panel settings-card activation-settings-card">
+            <div className="panel-header">
+              <div><p className="section-kicker">LICENSE</p><h2>客户端授权</h2></div>
+              <KeyRound size={21} />
+            </div>
+            <div className="access-session-summary">
+              <StatusBadge kind={activation?.active ? "live" : "error"}>{activationStatusLabel(activation)}</StatusBadge>
+              {activation?.message && <p>{activation.message}</p>}
+              <small>设备 {activation?.deviceIdHint ?? "正在识别"} · 最近心跳 {formatDate(activation?.lastHeartbeatAt ?? null)}</small>
+            </div>
+            <div className="access-settings-actions"><button type="button" className="danger-button compact" onClick={onClearActivation}><KeyRound size={15} />重新激活</button></div>
+          </section>
+
+          {llm && (
+            <section className="panel settings-card provider-settings-card">
+              <div className="panel-header">
+                <div><p className="section-kicker">DEEPSEEK</p><h2>高光分析 Provider</h2></div>
+                <Sparkles size={21} />
+              </div>
+              <label htmlFor="settings-llm-model">模型 ID<input id="settings-llm-model" value={llm.modelId} onChange={(event) => setLlm({ ...llm, modelId: event.target.value })} /></label>
+              <label htmlFor="settings-llm-key">API Key（留空表示不替换）<input id="settings-llm-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label>
+              <label htmlFor="settings-llm-timeout">请求超时（毫秒）<input id="settings-llm-timeout" type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => setLlm({ ...llm, timeoutMs: Number(event.target.value) })} /></label>
+              <div className="form-grid">
+                <label htmlFor="settings-qualified-score">合格片段阈值<input id="settings-qualified-score" aria-label="合格片段阈值" type="number" min="0" max="100" value={llm.qualifiedScore} onChange={(event) => setLlm({ ...llm, qualifiedScore: Number(event.target.value) })} /></label>
+                <label htmlFor="settings-excellent-score">优秀片段阈值<input id="settings-excellent-score" aria-label="优秀片段阈值" type="number" min="0" max="100" value={llm.excellentScore} onChange={(event) => setLlm({ ...llm, excellentScore: Number(event.target.value) })} /></label>
+              </div>
+              <p className="settings-help">达到合格阈值的片段会显示在高光候选；达到优秀阈值的片段会在首次分析完成时自动选中。每次高光分析会冻结当时的阈值。</p>
+              <div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>
+              {llmMessage && <p className="form-error provider-message" role="status" aria-live="polite">{llmMessage}</p>}
+              <div className="settings-inline-actions">
+                <button type="button" className="secondary-button compact" disabled={llmBusy !== null} onClick={() => void saveLlm()}>{llmBusy === "save" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{llmBusy === "save" ? "正在保存" : "保存 Provider"}</button>
+                <button type="button" className="secondary-button compact" disabled={!llm.keyConfigured || llmBusy !== null} onClick={() => void diagnoseLlm()}>{llmBusy === "diagnose" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}{llmBusy === "diagnose" ? "正在测试" : "测试连接"}</button>
+                <button type="button" className="ghost-button compact" disabled={!llm.keyConfigured || llmBusy !== null} onClick={() => void clearLlmKey()}>{llmBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{llmBusy === "clear" ? "正在清除" : "清除 Key"}</button>
+              </div>
+              <p className="settings-help settings-help-last">测试只发送固定诊断提示；分析时仅发送规范化转写与标签，不发送视频、音频、本地路径或 Cookie。</p>
+            </section>
+          )}
+        </div>
       </div>
-      <div className="save-bar"><span><CheckCircle2 size={16} />数据库和录像均保存在本地</span><button className="primary-button" type="submit"><Save size={17} />保存设置</button></div>
+      <div className={`save-bar ${dirty ? "is-dirty" : "is-pristine"} ${saveState === "error" ? "has-error" : ""}`} aria-busy={saveState === "saving"}>
+        <span role="status" aria-label="设置保存状态" aria-live="polite">
+          {saveState === "saving" ? <LoaderCircle className="spin" size={16} /> : saveState === "error" ? <CircleOff size={16} /> : dirty ? <Save size={16} /> : <CheckCircle2 size={16} />}
+          {saveMessage}
+        </span>
+        <button className="primary-button" type="submit" disabled={!dirty || saveState === "saving"}>
+          {saveState === "saving" ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />}
+          {saveState === "saving" ? "正在保存" : "保存设置"}
+        </button>
+      </div>
     </form>
   );
 }

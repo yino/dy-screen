@@ -277,13 +277,20 @@ export function createBrowserApi(): ClientApi {
   let settings = defaultSettings;
   const developmentActivationBypass = import.meta.env.DEV
     && import.meta.env.VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION !== "1";
+  const visualQaState = import.meta.env.DEV
+    ? new URLSearchParams(window.location.search).get("visual-qa")
+    : null;
+  const visualQaSettings = visualQaState === "settings";
+  const visualQaResources = visualQaState === "resources";
   const thumbnailBatches = new Map<string, ThumbnailBatch>();
   const desktopAccessUnavailable = (): BrowserAccessState => ({
-    status: "session_expired",
+    status: visualQaSettings ? "verification_required" : "session_expired",
     pendingCount: 0,
     activeStreamerId: null,
     currentWebRid: null,
-    lastReason: "真实访问验证仅桌面端可用",
+    lastReason: visualQaSettings
+      ? "检测到访问会话需要重新验证：当前浏览器凭据已经失效，且连续检查返回受限页面。请完成验证码后重新检查；此段开发态长文本用于验证窄窗口和字体放大时能自然换行，不会覆盖下方操作。"
+      : "真实访问验证仅桌面端可用",
     updatedAt: new Date().toISOString(),
   });
   const rejectDesktopAccess = (): Promise<never> =>
@@ -293,7 +300,9 @@ export function createBrowserApi(): ClientApi {
     active: developmentActivationBypass,
     status: developmentActivationBypass ? "development_bypass" : "missing",
     message: developmentActivationBypass
-      ? "浏览器开发模式已跳过客户端激活"
+      ? visualQaSettings
+        ? "客户端授权仍然有效，但最近一次心跳返回了较长的服务端维护说明：录制功能可继续使用，授权状态将在网络恢复后自动重试；此段开发态长文本用于检查布局换行和操作区域稳定性。"
+        : "浏览器开发模式已跳过客户端激活"
       : "浏览器演示模式已启用激活流程回归",
     deviceIdHint: "…browser",
     lastHeartbeatAt: null,
@@ -342,6 +351,43 @@ export function createBrowserApi(): ClientApi {
     activeRecordings: streamers.filter((item) => item.monitorStatus === "recording").length,
     currentVideoCount: streamers.reduce((total, item) => total + item.currentVideoCount, 0),
     maxScreenLimit: 4,
+  });
+
+  const demoRuntimeResources = (): RuntimeResourceView => visualQaResources ? ({
+    status: "failed",
+    ready: false,
+    bundleVersion: "2026.08-browser-qa",
+    platform: "darwin-aarch64",
+    appMinVersion: "0.2.0",
+    manifestSha256: null,
+    components: [
+      { id: "ffmpeg", version: "7.1", required: true, fileCount: 2, sizeBytes: 128_000_000 },
+      { id: "whisper-small", version: "v1.9.1", required: true, fileCount: 3, sizeBytes: 512_000_000 },
+    ],
+    totalSizeBytes: 640_000_000,
+    minimumFreeDiskBytes: 2_000_000_000,
+    minimumMemoryBytes: 4_000_000_000,
+    source: "开发态视觉验收资源镜像",
+    downloadedBytes: 0,
+    errorCode: "integrity_check_failed",
+    errorMessage: "运行资源完整性校验失败：下载的 FFmpeg 与语音识别模型清单不一致，应用已停止加载这些文件。请检查网络代理或磁盘空间后重新下载；现有录像和数据库不会被删除。此段开发态长文本用于检查错误区域在窄窗口及字体放大时是否完整换行。",
+    updatedAt: new Date().toISOString(),
+  }) : ({
+    status: "ready",
+    ready: true,
+    bundleVersion: "browser-demo",
+    platform: "browser-demo",
+    appMinVersion: "0.2.0",
+    manifestSha256: null,
+    components: [],
+    totalSizeBytes: 0,
+    minimumFreeDiskBytes: 0,
+    minimumMemoryBytes: 0,
+    source: "浏览器演示模式",
+    downloadedBytes: 0,
+    errorCode: null,
+    errorMessage: null,
+    updatedAt: new Date().toISOString(),
   });
 
   const normalizeTags = (tags: StreamerTagInput[]): StreamerTag[] => {
@@ -623,27 +669,11 @@ export function createBrowserApi(): ClientApi {
       ffmpeg: false,
       ffprobe: false,
     }),
-    runtimeResourceStatus: async (): Promise<RuntimeResourceView> => ({
-      status: "ready",
-      ready: true,
-      bundleVersion: "browser-demo",
-      platform: "browser-demo",
-      appMinVersion: "0.2.0",
-      manifestSha256: null,
-      components: [],
-      totalSizeBytes: 0,
-      minimumFreeDiskBytes: 0,
-      minimumMemoryBytes: 0,
-      source: "浏览器演示模式",
-      downloadedBytes: 0,
-      errorCode: null,
-      errorMessage: null,
-      updatedAt: new Date().toISOString(),
-    }),
-    runtimeResourceManifest: async () => (await (createBrowserApi() as ClientApi).runtimeResourceStatus!()),
+    runtimeResourceStatus: async (): Promise<RuntimeResourceView> => demoRuntimeResources(),
+    runtimeResourceManifest: async () => demoRuntimeResources(),
     runtimeResourceDownload: async () => { throw new Error("浏览器演示模式不下载桌面运行资源"); },
     runtimeResourceCancel: async () => undefined,
-    runtimeResourceRecheck: async () => (await (createBrowserApi() as ClientApi).runtimeResourceStatus!()),
+    runtimeResourceRecheck: async () => demoRuntimeResources(),
     runtimeResourceSource: async () => "浏览器演示模式",
     subscribeRuntimeResources: async () => () => undefined,
     getBrowserAccessState: async () => desktopAccessUnavailable(),
@@ -725,14 +755,20 @@ export function createBrowserApi(): ClientApi {
       promptVersion: "highlight-v1",
       qualifiedScore: 70,
       excellentScore: 80,
-      keyConfigured: false,
+      keyConfigured: visualQaSettings,
       updatedAt: null,
     }),
     saveAiLlmSettings: async () => {
       throw new Error("浏览器演示模式不会保存 API Key");
     },
   clearAiLlmKey: async () => undefined,
-  diagnoseAiLlmProvider: async () => ({ ok: false, category: "browser_demo", message: "浏览器演示模式不会调用 DeepSeek" }),
+  diagnoseAiLlmProvider: async () => ({
+    ok: false,
+    category: "browser_demo",
+    message: visualQaSettings
+      ? "连接测试未通过：Provider 在等待响应时超过了当前超时限制，且返回内容不包含可用的诊断标识。请检查网络代理、模型 ID 和服务端额度后重试；已保存的 Key 不会显示或写入普通设置。"
+      : "浏览器演示模式不会调用 DeepSeek",
+  }),
     startAiHighlightAnalysis: async () => {
       throw new Error("浏览器演示模式不会调用 DeepSeek");
     },

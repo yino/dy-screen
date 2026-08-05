@@ -1,11 +1,12 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { App } from "./App";
+import { App, SettingsPage } from "./App";
 import type {
   AiEnvironmentDiagnostic,
   AiProject,
   AiProjectDetail,
+  AppSettings,
   ActivationState,
   BrowserAccessState,
   ClientApi,
@@ -110,6 +111,19 @@ const activeActivation: ActivationState = {
   nextHeartbeatAt: "2026-07-27T00:01:30Z",
 };
 
+const appSettings: AppSettings = {
+  outputRoot: "~/Downloads/dy-screen",
+  quality: "HD1",
+  protocol: "flv",
+  segmentSeconds: 900,
+  maxConcurrentRecordings: 4,
+  asrDuringRecording: true,
+  ffmpegPath: "ffmpeg",
+  ffprobePath: "ffprobe",
+  notificationsEnabled: true,
+  autostartEnabled: false,
+};
+
 const readyRuntimeStatus: RuntimeResourceView = {
   status: "ready",
   ready: true,
@@ -162,18 +176,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       return { items: filtered, total: filtered.length, page, pageSize };
     }),
     listCurrentVideos: vi.fn().mockResolvedValue({ items: videos, total: videos.length, page: 1, pageSize: 50 }),
-    getSettings: vi.fn().mockResolvedValue({
-      outputRoot: "~/Downloads/dy-screen",
-      quality: "HD1",
-      protocol: "flv",
-      segmentSeconds: 900,
-      maxConcurrentRecordings: 4,
-      asrDuringRecording: true,
-      ffmpegPath: "ffmpeg",
-      ffprobePath: "ffprobe",
-      notificationsEnabled: true,
-      autostartEnabled: false,
-    }),
+    getSettings: vi.fn().mockResolvedValue(appSettings),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     requestVideoPreview: vi.fn().mockRejectedValue("测试未配置视频预览"),
     retryVideoPreview: vi.fn().mockRejectedValue("测试未配置视频预览重试"),
@@ -247,6 +250,19 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     exportAiTxt: vi.fn().mockResolvedValue({ saved: true }),
     exportAiJson: vi.fn().mockResolvedValue({ saved: true }),
     diagnoseAiEnvironment: vi.fn().mockResolvedValue(readyAiEnvironment),
+    getAiLlmSettings: vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      qualifiedScore: 70,
+      excellentScore: 80,
+      keyConfigured: true,
+      updatedAt: "2026-07-27T00:00:00Z",
+    }),
+    saveAiLlmSettings: vi.fn().mockImplementation(async (settings) => settings),
+    clearAiLlmKey: vi.fn().mockResolvedValue(undefined),
+    diagnoseAiLlmProvider: vi.fn().mockResolvedValue({ ok: true, category: "ready", message: "连接可用" }),
     requestAiInputPreview: vi.fn().mockRejectedValue("测试未配置 AI 视频预览"),
     retryAiInputPreview: vi.fn().mockRejectedValue("测试未配置 AI 视频预览重试"),
     requestExit: vi.fn().mockResolvedValue(undefined),
@@ -581,6 +597,126 @@ describe("App", () => {
     expect(await screen.findByLabelText("服务端录制额度 7 路")).toHaveTextContent("7 路");
     expect(screen.queryByLabelText("最大并发录制")).not.toBeInTheDocument();
     expect(screen.queryByText("最大并发录制")).not.toBeInTheDocument();
+  });
+
+  it("设置页按独立左右列展示稳定的业务分组", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi()} />);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("heading", { name: "高光分析 Provider" });
+
+    const primaryColumn = screen.getByTestId("settings-column-primary");
+    const secondaryColumn = screen.getByTestId("settings-column-secondary");
+    expect(within(primaryColumn).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
+      "录像设置",
+      "桌面行为",
+      "抖音访问会话",
+    ]);
+    expect(within(secondaryColumn).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
+      "运行环境",
+      "客户端授权",
+      "高光分析 Provider",
+    ]);
+  });
+
+  it("普通设置从未修改进入保存中并在成功后重置状态", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    let resolveSave: (() => void) | undefined;
+    api.saveSettings = vi.fn().mockImplementation(() => new Promise<void>((resolve) => { resolveSave = resolve; }));
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const save = await screen.findByRole("button", { name: "保存设置" });
+    expect(save).toBeDisabled();
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("所有更改均已保存");
+
+    await user.clear(screen.getByLabelText("录像保存目录"));
+    await user.type(screen.getByLabelText("录像保存目录"), "/tmp/new-recordings");
+    expect(save).toBeEnabled();
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
+
+    await user.click(save);
+    expect(screen.getByRole("button", { name: "正在保存" })).toBeDisabled();
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("正在保存设置");
+    expect(api.saveSettings).toHaveBeenCalledTimes(1);
+
+    await act(async () => { resolveSave?.(); });
+    expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("设置已保存");
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+  });
+
+  it("普通设置保存失败后保留输入并允许重试", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.saveSettings = vi.fn().mockRejectedValue(new Error("磁盘暂时不可写"));
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const outputRoot = await screen.findByLabelText("录像保存目录");
+    await user.clear(outputRoot);
+    await user.type(outputRoot, "/tmp/keep-this-value");
+    await user.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("保存失败，输入已保留，请重试");
+    expect(outputRoot).toHaveValue("/tmp/keep-this-value");
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
+  });
+
+  it("外部设置刷新不会覆盖尚未保存的表单", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const props = {
+      api,
+      settings: appSettings,
+      maxScreenLimit: 4,
+      environment: { ffmpeg: true, ffprobe: true },
+      browserAccess: nativeAccessState,
+      accessBusy: null,
+      activation: activeActivation,
+      onOpenLogs: vi.fn(),
+      onDiagnose: vi.fn(),
+      onVerifyAccess: vi.fn(),
+      onRecheckAccess: vi.fn(),
+      onClearAccess: vi.fn(),
+      onClearActivation: vi.fn(),
+      onSave: vi.fn().mockResolvedValue(undefined),
+    } as const;
+    const view = render(<SettingsPage {...props} />);
+
+    const outputRoot = await screen.findByLabelText("录像保存目录");
+    await user.clear(outputRoot);
+    await user.type(outputRoot, "/tmp/local-unsaved");
+    view.rerender(<SettingsPage {...props} settings={{ ...appSettings, quality: "SD1" }} />);
+
+    expect(screen.getByLabelText("录像保存目录")).toHaveValue("/tmp/local-unsaved");
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
+  });
+
+  it("Provider 操作与普通设置提交和脏状态隔离", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "设置" }));
+    const modelId = await screen.findByLabelText("模型 ID");
+    const ordinarySave = screen.getByRole("button", { name: "保存设置" });
+    expect(ordinarySave).toBeDisabled();
+
+    await user.clear(modelId);
+    await user.type(modelId, "deepseek-reasoner");
+    await user.click(screen.getByRole("button", { name: "保存 Provider" }));
+    expect(api.saveAiLlmSettings).toHaveBeenCalledWith(expect.objectContaining({ modelId: "deepseek-reasoner" }), undefined);
+    expect(api.saveSettings).not.toHaveBeenCalled();
+    expect(ordinarySave).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(api.diagnoseAiLlmProvider).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "清除 Key" }));
+    expect(api.clearAiLlmKey).toHaveBeenCalledTimes(1);
+    expect(api.saveSettings).not.toHaveBeenCalled();
+    expect(ordinarySave).toBeDisabled();
   });
 
   it("首次启动时显示添加主播空状态", async () => {
