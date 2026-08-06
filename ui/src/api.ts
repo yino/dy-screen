@@ -275,8 +275,6 @@ const tauriApi: ClientApi = {
 export function createBrowserApi(): ClientApi {
   let streamers: Streamer[] = [];
   let settings = defaultSettings;
-  const developmentActivationBypass = import.meta.env.DEV
-    && import.meta.env.VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION !== "1";
   const visualQaState = import.meta.env.DEV
     ? new URLSearchParams(window.location.search).get("visual-qa")
     : null;
@@ -296,14 +294,10 @@ export function createBrowserApi(): ClientApi {
   const rejectDesktopAccess = (): Promise<never> =>
     Promise.reject(new Error("真实访问验证仅桌面端可用"));
   const demoActivation = (): ActivationState => ({
-    configured: developmentActivationBypass,
-    active: developmentActivationBypass,
-    status: developmentActivationBypass ? "development_bypass" : "missing",
-    message: developmentActivationBypass
-      ? visualQaSettings
-        ? "客户端授权仍然有效，但最近一次心跳返回了较长的服务端维护说明：录制功能可继续使用，授权状态将在网络恢复后自动重试；此段开发态长文本用于检查布局换行和操作区域稳定性。"
-        : "浏览器开发模式已跳过客户端激活"
-      : "浏览器演示模式已启用激活流程回归",
+    configured: false,
+    active: false,
+    status: "missing",
+    message: "浏览器演示模式不能连接激活服务，请使用 Tauri 客户端完成激活",
     deviceIdHint: "…browser",
     lastHeartbeatAt: null,
     nextHeartbeatAt: null,
@@ -417,7 +411,6 @@ export function createBrowserApi(): ClientApi {
   return {
     getActivationState: async () => demoActivation(),
     activateClient: async () => {
-      if (developmentActivationBypass) return demoActivation();
       throw new Error("浏览器演示模式不能连接激活服务");
     },
     clearActivation: async () => demoActivation(),

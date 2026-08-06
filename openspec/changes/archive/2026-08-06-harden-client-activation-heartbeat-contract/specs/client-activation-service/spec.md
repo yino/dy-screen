@@ -1,9 +1,4 @@
-# 客户端激活服务规格
-
-## Purpose
-
-定义桌面客户端与授权运营服务端之间的统一 API、激活门禁、心跳续约、强制下线、启动登记和安全埋点边界。
-## Requirements
+## ADDED Requirements
 
 ### Requirement: 在系统安全存储中保存授权秘密
 系统 SHALL 通过可测试的安全凭据存储边界保存完整设备 ID、激活码和离线 token，并 MUST 在 macOS 和 Windows 生产构建中使用操作系统安全凭据存储；SQLite MUST NOT 在迁移完成后保存完整设备 ID、激活码、token 或其他授权秘密。本期继续使用明文 JSON API，系统 MUST NOT 因此生成、保存或伪装使用尚未实现的设备签名私钥或 `encKey`。
@@ -43,6 +38,8 @@
 - **WHEN** 激活和心跳之外的客户端 API 正常完成
 - **THEN** 系统不输出逐请求成功日志；发生失败时只输出相同脱敏结构的错误摘要
 
+## MODIFIED Requirements
+
 ### Requirement: 统一封装客户端授权 API
 系统 SHALL 在 Rust 中提供单一 API 客户端封装，集中读取 `DY_SCREEN_API_BASE_URL`、规范化 `/api/` 前缀、处理 HTTP 恒 200 的业务 `code`、超时、请求关联头和脱敏错误；激活、心跳、AppStart、埋点及其他需授权 API 的业务代码 MUST NOT 直接创建 HTTP 客户端。客户端 SHALL 在所有需授权请求中同时发送权威 `device_id`、`activate_code` 请求头和兼容 `device-id`、`activate-code` 别名。本期 SHALL 保持明文 JSON 编解码，不实现信封加密、请求签名或 `encKey` 轮换。
 
@@ -59,10 +56,10 @@
 - **THEN** API 客户端返回稳定的请求头契约错误分类和关联 ID，提示检查代理下划线请求头配置，不把该结果伪装成普通网络错误
 
 #### Scenario: 服务端返回业务错误
-- **WHEN** HTTP 状态为 200 但响应 `code` 不是成功码
-- **THEN** API 客户端返回包含稳定错误分类和中文消息的错误，不把原始响应正文传播到前端
+- **WHEN** HTTP 状态为 200但响应 `code` 不是允许的成功或强制下线码
+- **THEN** API 客户端返回包含业务码、稳定错误分类、中文安全消息和请求关联 ID 的错误，不把原始响应正文传播到前端
 
-#### Scenario: API 请求编解码
+#### Scenario: 保持明文 JSON 编解码
 - **WHEN** 激活、心跳或其他客户端接口编码请求并解析响应
 - **THEN** 系统使用现有明文 JSON codec，且不得发送未完整实现的信封头、设备签名或伪造的加密正文
 
@@ -112,7 +109,7 @@
 - **WHEN** 心跳返回缺少 `activate_code` 的 `1001` 或缺少 `device_id` 的 `2001`
 - **THEN** 客户端进入 `contract_error`、暂停授权依赖任务并显示代理部署诊断，不把重复输入同一激活码描述为必然可修复该问题
 
-#### Scenario: 暂时网络失败
+#### Scenario: 暂时网络或服务端失败
 - **WHEN** 心跳请求因网络、超时、`1007`、`9000` 或无效响应失败
 - **THEN** 客户端保留宽限期内的本地授权秘密和元数据，按有界退避重试并展示“正在重试”，不泄露请求地址或凭据
 
@@ -123,72 +120,3 @@
 #### Scenario: 信封完整性错误出现在明文兼容期
 - **WHEN** 心跳返回 `9101~9103`
 - **THEN** 客户端记录协议不兼容诊断并有界重试一次，仍失败时锁定主功能并要求重新激活，不伪装已启用信封协议
-
-### Requirement: 调用 AppStart 与安全埋点
-系统 SHALL 在启动时 best-effort 调用免鉴权 AppStart，并 SHALL 上报白名单 `app_open`、`feature_use`、`export`、`ai_call`、`error` 事件；埋点 MUST 仅包含允许属性，不得包含媒体内容、ASR 文本、Cookie、激活码或未经脱敏的本地路径。
-
-#### Scenario: AppStart 无可用版本
-- **WHEN** AppStart 返回成功且 `data=null`
-- **THEN** 客户端继续启动并将“无可用更新”作为非阻断结果处理
-
-#### Scenario: 埋点服务不可用
-- **WHEN** 埋点请求失败或服务端不可达
-- **THEN** 客户端丢弃或延迟有限事件队列，不阻塞激活、监听、录制和退出
-
-#### Scenario: 埋点属性超出白名单
-- **WHEN** 调用方传入不在 `feature/action/result/duration/platform/count/source` 中的属性
-- **THEN** API 客户端在发送前剔除该属性，并保持事件本身可 best-effort 上报
-
-### Requirement: 从服务端授权生命周期接收录制额度
-系统 SHALL 在 AppStart 和心跳响应中兼容可选的 snake_case 整数字段 `max_screen_limit`，并 SHALL 将任一接口最新返回的合法正整数作为当前进程唯一的录制额度；在当前进程从未收到合法字段时额度 MUST 默认为 4，客户端 MUST NOT 使用本地设置替代服务端额度。
-
-#### Scenario: AppStart 下发额度
-- **WHEN** AppStart 成功响应的 `data.max_screen_limit` 为合法正整数
-- **THEN** API 客户端按精确 snake_case 字段解析该值，授权生命周期立即把它应用到 Supervisor 并发布最新只读额度状态
-
-#### Scenario: 心跳更新额度
-- **WHEN** 后续成功心跳响应携带与当前值不同的合法 `max_screen_limit`
-- **THEN** 客户端在保持既有授权续约行为的同时立即更新 Supervisor 额度并触发录制目标重算
-
-#### Scenario: 两个接口中只有一个携带字段
-- **WHEN** AppStart 或心跳之一已经返回合法额度，而另一个成功响应未包含 `max_screen_limit`
-- **THEN** 客户端保留最近一次合法额度，不因可选字段缺失回退到 4
-
-#### Scenario: 从未收到额度字段
-- **WHEN** AppStart 返回 `data=null`，或所有成功的 AppStart 与心跳响应均未包含 `max_screen_limit`
-- **THEN** 客户端继续使用默认额度 4，且启动、监听和授权续约均不被阻断
-
-#### Scenario: 服务端额度无效
-- **WHEN** 响应字段不是可表示的正整数
-- **THEN** API 客户端不应用该值，保留最近合法额度或默认值 4，并只记录不含响应正文的脱敏诊断
-
-#### Scenario: 额度请求暂时失败
-- **WHEN** AppStart 或心跳发生超时、网络错误或服务端业务错误
-- **THEN** 客户端保持当前额度并沿用既有重试或 best-effort 行为，不停止现有录制或改用本地设置
-
-### Requirement: 从授权心跳发布转场素材目录信号
-系统 SHALL 在成功心跳响应中兼容可选的 camelCase 对象 `transitionMaterials`，其中包含正整数 `catalogVersion` 和语义版本 `minimumAppVersion`。授权生命周期 MUST 只把合法值发布给独立素材目录协调器；字段缺失、字段非法、版本门禁或后续素材同步失败 MUST NOT 改变心跳成功结论、令牌续约、激活状态或授权依赖后台任务。
-
-#### Scenario: 心跳发布新的素材目录版本
-- **WHEN** 成功心跳携带合法 `transitionMaterials` 且 `catalogVersion` 与本地目录版本不同
-- **THEN** 授权生命周期保持正常续约，并向单实例素材协调器发布去重后的版本检查信号
-
-#### Scenario: 心跳重复相同目录版本
-- **WHEN** 连续成功心跳携带相同 `catalogVersion` 和 `minimumAppVersion`
-- **THEN** 素材协调器不得为同一版本并发或重复启动全量同步，但可更新最后发现时间
-
-#### Scenario: 心跳没有素材字段
-- **WHEN** 成功心跳未包含 `transitionMaterials`
-- **THEN** 客户端保留本地目录和素材同步状态，授权续约及监听任务继续运行
-
-#### Scenario: 素材字段非法
-- **WHEN** `catalogVersion` 不是正整数或 `minimumAppVersion` 不是可解析的语义版本
-- **THEN** 客户端忽略该素材信号、记录不含响应正文的脱敏诊断，并继续按成功心跳处理授权
-
-#### Scenario: 客户端低于最低版本
-- **WHEN** 当前客户端版本低于心跳发布的 `minimumAppVersion`
-- **THEN** 素材协调器进入 `upgrade_required`、停止应用新目录并展示升级要求，但不得撤销授权或删除上一可用目录
-
-#### Scenario: 素材同步失败
-- **WHEN** 心跳成功发布版本后，独立目录请求或 SQLite 事务失败
-- **THEN** 授权状态、令牌、监听、录制和心跳周期保持不变，只有素材同步状态进入可重试失败

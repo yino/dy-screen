@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod activation_secret;
 pub mod ai;
 pub mod api;
 pub mod app_lifecycle;

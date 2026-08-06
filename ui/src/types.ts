@@ -190,7 +190,14 @@ export interface BrowserAccessState {
   updatedAt: string;
 }
 
-export type ActivationStatus = "missing" | "active" | "retrying" | "revoked" | "invalid" | "development_bypass";
+export type ActivationStatus =
+  | "missing"
+  | "verifying"
+  | "active"
+  | "retrying"
+  | "revoked"
+  | "invalid"
+  | "contract_error";
 
 export interface ActivationState {
   configured: boolean;

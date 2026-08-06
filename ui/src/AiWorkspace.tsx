@@ -1691,6 +1691,10 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     upgrade_required: `需要升级客户端后同步素材${transitionCatalog.minimumAppVersion ? `（最低 ${transitionCatalog.minimumAppVersion}）` : ""}`,
     failed: transitionCatalog.lastErrorMessage || "素材目录同步失败",
   } satisfies Record<TransitionCatalogState["status"], string>)[transitionCatalog.status] : null;
+  const showTransitionCatalogState = Boolean(transitionCatalog)
+    && (transitionCatalog!.status !== "ready" || transitionMaterials.length === 0);
+  const canRetryTransitionCatalog = Boolean(transitionCatalog)
+    && (["idle", "failed", "ready"] as TransitionCatalogState["status"][]).includes(transitionCatalog!.status);
   const existingCandidateIds = new Set(detail.segments.map((segment) => segment.candidateId));
   const availableVideoMaterials = videoMaterials.filter((candidate) => !existingCandidateIds.has(candidate.id));
   const totalDurationSeconds = Math.max(0.001, totalDuration / 1_000);
@@ -2509,9 +2513,9 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
           <label><Search size={12} /><input aria-label="搜索转场素材" type="search" value={transitionSearch} onChange={(event) => setTransitionSearch(event.target.value)} placeholder="搜索标题、描述或标签" /></label>
           <select aria-label="转场素材分类" value={transitionCategory} onChange={(event) => setTransitionCategory(event.target.value)}><option value="all">全部分类</option>{transitionCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select>
         </div>}
-        {(materialFilter === "all" || materialFilter === "transition") && transitionCatalog && transitionCatalog.status !== "ready" && <div className={`clip-transition-catalog-state ${transitionCatalog.status}`}>
-          <span>{transitionCatalogMessage}</span>
-          {transitionCatalog.status === "failed" && <button className="icon-button" aria-label="重试素材目录同步" title="重试素材目录同步" disabled={transitionCatalogRetrying} onClick={() => void retryTransitionCatalog()}><RefreshCw size={13} /></button>}
+        {(materialFilter === "all" || materialFilter === "transition") && transitionCatalog && showTransitionCatalogState && <div className={`clip-transition-catalog-state ${transitionCatalog.status}`}>
+          <span>{transitionCatalog.status === "ready" && transitionMaterials.length === 0 ? "素材目录已就绪，但本地没有可用素材" : transitionCatalogMessage}</span>
+          {canRetryTransitionCatalog && <button className="icon-button" aria-label={transitionCatalog.status === "failed" ? "重试素材目录同步" : "同步素材目录"} title={transitionCatalog.status === "failed" ? "重试素材目录同步" : "同步素材目录"} disabled={transitionCatalogRetrying} onClick={() => void retryTransitionCatalog()}><RefreshCw size={13} /></button>}
         </div>}
         <div className="clip-effect-list">
           {(materialFilter === "all" || materialFilter === "video") && availableVideoMaterials.map((candidate) => <button

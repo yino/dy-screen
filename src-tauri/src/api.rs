@@ -5,8 +5,9 @@
 //! 当前请求体保持 JSON 明文，但 `RequestCodec` 为后续信封加密保留了替换点。
 
 use std::env;
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
@@ -71,18 +72,176 @@ pub enum ApiError {
     Business { code: i32, message: String },
     #[error("服务端配置无效")]
     Configuration,
+    #[error("{source}")]
+    Context {
+        #[source]
+        source: Box<ApiError>,
+        request_id: Option<String>,
+        trace_id: Option<String>,
+    },
 }
 
 impl ApiError {
     pub fn code(&self) -> Option<i32> {
         match self {
             Self::Business { code, .. } => Some(*code),
+            Self::Context { source, .. } => source.code(),
             _ => None,
+        }
+    }
+
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::InvalidResponse => "invalid_response",
+            Self::Timeout => "timeout",
+            Self::Configuration => "configuration",
+            Self::Business { code, .. } => business_error_category(*code),
+            Self::Context { source, .. } => source.category(),
+        }
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Context { request_id, .. } => request_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn trace_id(&self) -> Option<&str> {
+        match self {
+            Self::Context { trace_id, .. } => trace_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn with_context(self, metadata: &ResponseMetadata) -> Self {
+        if metadata.request_id.is_none() && metadata.trace_id.is_none() {
+            self
+        } else {
+            Self::Context {
+                source: Box::new(self),
+                request_id: metadata.request_id.clone(),
+                trace_id: metadata.trace_id.clone(),
+            }
         }
     }
 
     pub fn safe_message(&self) -> String {
         self.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiDiagnosticEvent {
+    pub component: &'static str,
+    pub event: &'static str,
+    pub operation: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+    pub duration_ms: Option<u64>,
+    pub http_status: Option<u16>,
+    pub business_code: Option<i32>,
+    pub error_category: Option<&'static str>,
+    pub state: Option<String>,
+    pub reason: Option<String>,
+    pub revoked: Option<bool>,
+    pub request_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub device_id_hint: Option<String>,
+    pub has_device_id: bool,
+    pub has_activate_code: bool,
+    pub request_fields: Vec<&'static str>,
+}
+
+pub trait ApiDiagnosticSink: Send + Sync {
+    fn emit(&self, event: ApiDiagnosticEvent);
+}
+
+#[derive(Debug, Default)]
+struct StderrApiDiagnosticSink;
+
+impl ApiDiagnosticSink for StderrApiDiagnosticSink {
+    fn emit(&self, event: ApiDiagnosticEvent) {
+        if let Ok(line) = serde_json::to_string(&event) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct MemoryApiDiagnosticSink {
+    events: Arc<Mutex<Vec<ApiDiagnosticEvent>>>,
+}
+
+impl MemoryApiDiagnosticSink {
+    pub fn events(&self) -> Vec<ApiDiagnosticEvent> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl ApiDiagnosticSink for MemoryApiDiagnosticSink {
+    fn emit(&self, event: ApiDiagnosticEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            events.push(event);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ResponseMetadata {
+    http_status: Option<u16>,
+    request_id: Option<String>,
+    trace_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct RequestDiagnostic {
+    operation: &'static str,
+    method: &'static str,
+    path: &'static str,
+    trace_success: bool,
+    device_id_hint: Option<String>,
+    has_device_id: bool,
+    has_activate_code: bool,
+    request_fields: Vec<&'static str>,
+}
+
+impl RequestDiagnostic {
+    fn public(operation: &'static str, method: &'static str, path: &'static str) -> Self {
+        Self {
+            operation,
+            method,
+            path,
+            trace_success: false,
+            device_id_hint: None,
+            has_device_id: false,
+            has_activate_code: false,
+            request_fields: Vec::new(),
+        }
+    }
+
+    fn authorized(
+        operation: &'static str,
+        method: &'static str,
+        path: &'static str,
+        device_id: &str,
+        activate_code: &str,
+    ) -> Self {
+        Self {
+            operation,
+            method,
+            path,
+            trace_success: matches!(operation, "activate" | "heartbeat"),
+            device_id_hint: Some(device_hint(device_id)),
+            has_device_id: !device_id.is_empty(),
+            has_activate_code: !activate_code.is_empty(),
+            request_fields: Vec::new(),
+        }
     }
 }
 
@@ -111,8 +270,6 @@ impl RequestCodec for PlainJsonCodec {
 struct ClientEnvelope<T> {
     code: i32,
     data: Option<T>,
-    #[serde(default)]
-    msg: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +413,7 @@ pub struct ApiClient {
     client: reqwest::Client,
     config: ApiConfig,
     codec: Arc<dyn RequestCodec>,
+    diagnostics: Arc<dyn ApiDiagnosticSink>,
 }
 
 impl ApiClient {
@@ -264,6 +422,14 @@ impl ApiClient {
     }
 
     pub fn new(config: ApiConfig, codec: Arc<dyn RequestCodec>) -> Result<Self, ApiError> {
+        Self::new_with_diagnostics(config, codec, Arc::new(StderrApiDiagnosticSink))
+    }
+
+    pub fn new_with_diagnostics(
+        config: ApiConfig,
+        codec: Arc<dyn RequestCodec>,
+        diagnostics: Arc<dyn ApiDiagnosticSink>,
+    ) -> Result<Self, ApiError> {
         let parsed = reqwest::Url::parse(&config.base_url).map_err(|_| ApiError::Configuration)?;
         if !matches!(parsed.scheme(), "http" | "https")
             || parsed.host_str().is_none()
@@ -274,14 +440,16 @@ impl ApiClient {
         {
             return Err(ApiError::Configuration);
         }
-        let client = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|_| ApiError::Configuration)?;
+        let mut builder = reqwest::Client::builder().timeout(config.timeout);
+        if endpoint_is_loopback(&parsed) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|_| ApiError::Configuration)?;
         Ok(Self {
             client,
             config,
             codec,
+            diagnostics,
         })
     }
 
@@ -298,8 +466,22 @@ impl ApiClient {
             "device_id": device_id,
             "activate_code": activate_code,
         });
-        self.post_json("client/activate", payload, HeaderMap::new(), false)
-            .await
+        let mut diagnostic = RequestDiagnostic::authorized(
+            "activate",
+            "POST",
+            "client/activate",
+            device_id,
+            activate_code,
+        );
+        diagnostic.request_fields = vec!["device_id", "activate_code"];
+        self.post_json(
+            "client/activate",
+            payload,
+            HeaderMap::new(),
+            false,
+            diagnostic,
+        )
+        .await
     }
 
     pub async fn heartbeat(
@@ -308,8 +490,20 @@ impl ApiClient {
         activate_code: &str,
     ) -> Result<HeartbeatResponse, ApiError> {
         let headers = client_headers(device_id, activate_code)?;
-        self.post_json("client/heartbeat", serde_json::json!({}), headers, true)
-            .await
+        self.post_json(
+            "client/heartbeat",
+            serde_json::json!({}),
+            headers,
+            true,
+            RequestDiagnostic::authorized(
+                "heartbeat",
+                "POST",
+                "client/heartbeat",
+                device_id,
+                activate_code,
+            ),
+        )
+        .await
     }
 
     pub async fn transition_materials(
@@ -321,6 +515,14 @@ impl ApiClient {
         if catalog_version < 0 {
             return Err(ApiError::Configuration);
         }
+        let started = Instant::now();
+        let diagnostic = RequestDiagnostic::authorized(
+            "transition_materials",
+            "GET",
+            "v1/transition-materials",
+            device_id,
+            activate_code,
+        );
         let headers = client_headers(device_id, activate_code)?;
         let mut url = reqwest::Url::parse(&self.endpoint("v1/transition-materials"))
             .map_err(|_| ApiError::Configuration)?;
@@ -333,11 +535,25 @@ impl ApiClient {
             .header(ACCEPT, "application/json")
             .send()
             .await
-            .map_err(map_reqwest_error)?;
-        self.decode_envelope_with_force(response, false).await
+            .map_err(|error| {
+                let error = map_reqwest_error(error);
+                self.emit_failure(
+                    &diagnostic,
+                    started,
+                    &ResponseMetadata::default(),
+                    &error,
+                    None,
+                );
+                error
+            })?;
+        self.decode_response(response, false, false, started, diagnostic)
+            .await?
+            .ok_or(ApiError::InvalidResponse)
     }
 
     pub async fn app_start(&self) -> Result<Option<AppStartResponse>, ApiError> {
+        let started = Instant::now();
+        let diagnostic = RequestDiagnostic::public("app_start", "GET", "client/app-start");
         let url = self.endpoint("client/app-start");
         let response = self
             .client
@@ -347,25 +563,19 @@ impl ApiClient {
             .header(ACCEPT, "application/json")
             .send()
             .await
-            .map_err(map_reqwest_error)?;
-        let payload = response
-            .json::<Value>()
+            .map_err(|error| {
+                let error = map_reqwest_error(error);
+                self.emit_failure(
+                    &diagnostic,
+                    started,
+                    &ResponseMetadata::default(),
+                    &error,
+                    None,
+                );
+                error
+            })?;
+        self.decode_response(response, false, true, started, diagnostic)
             .await
-            .map_err(|_| ApiError::InvalidResponse)?;
-        let payload = self.codec.decode_response(payload)?;
-        let envelope: ClientEnvelope<Value> =
-            serde_json::from_value(payload).map_err(|_| ApiError::InvalidResponse)?;
-        if envelope.code != 200 {
-            return Err(ApiError::Business {
-                code: envelope.code,
-                message: safe_business_message(envelope.msg),
-            });
-        }
-        envelope
-            .data
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|_| ApiError::InvalidResponse)
     }
 
     pub async fn telemetry(
@@ -385,7 +595,17 @@ impl ApiClient {
             headers = client_headers(device_id, activate_code)?;
         }
         let payload = serde_json::to_value(events).map_err(|_| ApiError::InvalidResponse)?;
-        self.post_json("client/telemetry", payload, headers, false)
+        let diagnostic = match (device_id, activate_code) {
+            (Some(device_id), Some(activate_code)) => RequestDiagnostic::authorized(
+                "telemetry",
+                "POST",
+                "client/telemetry",
+                device_id,
+                activate_code,
+            ),
+            _ => RequestDiagnostic::public("telemetry", "POST", "client/telemetry"),
+        };
+        self.post_json("client/telemetry", payload, headers, false, diagnostic)
             .await
     }
 
@@ -395,7 +615,18 @@ impl ApiClient {
         payload: Value,
         headers: HeaderMap,
         allow_force_offline: bool,
+        diagnostic: RequestDiagnostic,
     ) -> Result<T, ApiError> {
+        let started = Instant::now();
+        if diagnostic.trace_success {
+            self.diagnostics.emit(diagnostic_event(
+                &diagnostic,
+                "request_started",
+                None,
+                None,
+                None,
+            ));
+        }
         let payload = self.codec.encode_request(payload)?;
         let response = self
             .client
@@ -406,26 +637,262 @@ impl ApiClient {
             .json(&payload)
             .send()
             .await
-            .map_err(map_reqwest_error)?;
-        self.decode_envelope_with_force(response, allow_force_offline)
-            .await
+            .map_err(|error| {
+                let error = map_reqwest_error(error);
+                self.emit_failure(
+                    &diagnostic,
+                    started,
+                    &ResponseMetadata::default(),
+                    &error,
+                    None,
+                );
+                error
+            })?;
+        self.decode_response(response, allow_force_offline, false, started, diagnostic)
+            .await?
+            .ok_or(ApiError::InvalidResponse)
     }
 
-    async fn decode_envelope_with_force<T: DeserializeOwned>(
+    async fn decode_response<T: DeserializeOwned>(
         &self,
         response: reqwest::Response,
         allow_force_offline: bool,
-    ) -> Result<T, ApiError> {
-        let payload = response
-            .json::<Value>()
-            .await
-            .map_err(|_| ApiError::InvalidResponse)?;
-        let payload = self.codec.decode_response(payload)?;
-        decode_envelope_payload(payload, allow_force_offline)
+        allow_empty_data: bool,
+        started: Instant,
+        diagnostic: RequestDiagnostic,
+    ) -> Result<Option<T>, ApiError> {
+        let metadata = response_metadata(&response);
+        let payload = match response.json::<Value>().await {
+            Ok(payload) => payload,
+            Err(_) => {
+                let error = ApiError::InvalidResponse.with_context(&metadata);
+                self.emit_failure(&diagnostic, started, &metadata, &error, None);
+                return Err(error);
+            }
+        };
+        let payload = match self.codec.decode_response(payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let error = error.with_context(&metadata);
+                self.emit_failure(&diagnostic, started, &metadata, &error, None);
+                return Err(error);
+            }
+        };
+        let envelope = match serde_json::from_value::<ClientEnvelope<Value>>(payload) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                let error = ApiError::InvalidResponse.with_context(&metadata);
+                self.emit_failure(&diagnostic, started, &metadata, &error, None);
+                return Err(error);
+            }
+        };
+        let summary = ResponseSummary::from_data(envelope.data.as_ref());
+        if envelope.code != 200 && !(allow_force_offline && envelope.code == 201) {
+            let error = ApiError::Business {
+                code: envelope.code,
+                message: business_safe_message(envelope.code),
+            }
+            .with_context(&metadata);
+            self.emit_failure(&diagnostic, started, &metadata, &error, Some(&summary));
+            return Err(error);
+        }
+        let decoded = match envelope.data {
+            Some(data) => match serde_json::from_value::<T>(data) {
+                Ok(data) => Some(data),
+                Err(_) => {
+                    let error = ApiError::InvalidResponse.with_context(&metadata);
+                    self.emit_failure(&diagnostic, started, &metadata, &error, Some(&summary));
+                    return Err(error);
+                }
+            },
+            None if allow_empty_data => None,
+            None => {
+                let error = ApiError::InvalidResponse.with_context(&metadata);
+                self.emit_failure(&diagnostic, started, &metadata, &error, Some(&summary));
+                return Err(error);
+            }
+        };
+        if diagnostic.trace_success {
+            self.diagnostics.emit(diagnostic_event(
+                &diagnostic,
+                "request_completed",
+                Some(started.elapsed()),
+                Some((&metadata, Some(envelope.code))),
+                Some(&summary),
+            ));
+        }
+        Ok(decoded)
+    }
+
+    fn emit_failure(
+        &self,
+        diagnostic: &RequestDiagnostic,
+        started: Instant,
+        metadata: &ResponseMetadata,
+        error: &ApiError,
+        summary: Option<&ResponseSummary>,
+    ) {
+        let mut event = diagnostic_event(
+            diagnostic,
+            "request_failed",
+            Some(started.elapsed()),
+            Some((metadata, error.code())),
+            summary,
+        );
+        event.error_category = Some(error.category());
+        self.diagnostics.emit(event);
     }
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.config.base_url, path.trim_start_matches('/'))
+    }
+}
+
+fn endpoint_is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
+#[derive(Default)]
+struct ResponseSummary {
+    state: Option<String>,
+    reason: Option<String>,
+    revoked: Option<bool>,
+}
+
+impl ResponseSummary {
+    fn from_data(data: Option<&Value>) -> Self {
+        let Some(data) = data.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        Self {
+            state: data
+                .get("state")
+                .and_then(Value::as_str)
+                .and_then(safe_state),
+            reason: data
+                .get("reason")
+                .and_then(Value::as_str)
+                .and_then(safe_reason),
+            revoked: data.get("revoked").and_then(Value::as_bool),
+        }
+    }
+}
+
+fn diagnostic_event(
+    diagnostic: &RequestDiagnostic,
+    event: &'static str,
+    duration: Option<Duration>,
+    response: Option<(&ResponseMetadata, Option<i32>)>,
+    summary: Option<&ResponseSummary>,
+) -> ApiDiagnosticEvent {
+    let (metadata, business_code) = response
+        .map(|(metadata, code)| (Some(metadata), code))
+        .unwrap_or((None, None));
+    ApiDiagnosticEvent {
+        component: "client_api",
+        event,
+        operation: diagnostic.operation,
+        method: diagnostic.method,
+        path: diagnostic.path,
+        duration_ms: duration
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        http_status: metadata.and_then(|metadata| metadata.http_status),
+        business_code,
+        error_category: None,
+        state: summary.and_then(|summary| summary.state.clone()),
+        reason: summary.and_then(|summary| summary.reason.clone()),
+        revoked: summary.and_then(|summary| summary.revoked),
+        request_id: metadata.and_then(|metadata| metadata.request_id.clone()),
+        trace_id: metadata.and_then(|metadata| metadata.trace_id.clone()),
+        device_id_hint: diagnostic.device_id_hint.clone(),
+        has_device_id: diagnostic.has_device_id,
+        has_activate_code: diagnostic.has_activate_code,
+        request_fields: diagnostic.request_fields.clone(),
+    }
+}
+
+fn response_metadata(response: &reqwest::Response) -> ResponseMetadata {
+    ResponseMetadata {
+        http_status: Some(response.status().as_u16()),
+        request_id: response_header(response.headers(), "x-request-id"),
+        trace_id: response_header(response.headers(), "x-trace-id"),
+    }
+}
+
+fn response_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    (!value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
+}
+
+fn safe_state(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_uppercase();
+    matches!(
+        normalized.as_str(),
+        "ACTIVE" | "DISABLED" | "EXPIRED" | "INACTIVE"
+    )
+    .then_some(normalized)
+}
+
+fn safe_reason(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "ok" | "disabled" | "expired" | "unbound"
+    )
+    .then_some(normalized)
+}
+
+fn device_hint(device_id: &str) -> String {
+    if device_id.chars().count() <= 8 {
+        return "…本地设备".to_owned();
+    }
+    let suffix = device_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("…{suffix}")
+}
+
+fn business_error_category(code: i32) -> &'static str {
+    match code {
+        1001 | 2001 => "header_contract",
+        1002..=1006 | 2002..=2004 => "authorization_invalid",
+        1007 | 9000 => "retryable_service",
+        9101..=9105 => "protocol_recoverable",
+        _ => "business",
+    }
+}
+
+fn business_safe_message(code: i32) -> String {
+    match code {
+        1001 => "授权服务未收到 activate_code 请求头，请检查反向代理配置".to_owned(),
+        1002 => "激活码格式无效，请重新输入".to_owned(),
+        1003 => "激活码不存在，请重新输入".to_owned(),
+        1004 => "激活码已过期，请续费后重新激活".to_owned(),
+        1005 => "激活码已停用，请联系管理员".to_owned(),
+        1006 => "激活码已绑定其他设备，请联系管理员重置绑定".to_owned(),
+        1007 => "激活请求正在处理中，请稍后重试".to_owned(),
+        2001 => "授权服务未收到 device_id 请求头，请检查反向代理配置".to_owned(),
+        2002 => "设备标识无效，请重新激活".to_owned(),
+        2003 => "设备尚未绑定，请重新激活".to_owned(),
+        2004 => "设备与激活码绑定不匹配，请重新激活".to_owned(),
+        9000 => "授权服务暂时异常，请稍后重试".to_owned(),
+        9101 => "授权协议正文无效，请稍后重试".to_owned(),
+        9102 => "授权协议签名校验失败，请重新激活".to_owned(),
+        9103 => "授权请求被判定为重复请求，请稍后重试".to_owned(),
+        9104 => "客户端时间与服务端不同步，正在重新校准".to_owned(),
+        9105 => "授权会话状态不同步，正在重新确认".to_owned(),
+        _ => "服务端拒绝了本次请求".to_owned(),
     }
 }
 
@@ -434,8 +901,15 @@ fn client_headers(device_id: &str, activate_code: &str) -> Result<HeaderMap, Api
     let device_id = HeaderValue::try_from(device_id).map_err(|_| ApiError::Configuration)?;
     let activate_code =
         HeaderValue::try_from(activate_code).map_err(|_| ApiError::Configuration)?;
-    headers.insert(HeaderName::from_static("device_id"), device_id);
-    headers.insert(HeaderName::from_static("activate_code"), activate_code);
+    // Nginx 默认可能丢弃含下划线的请求头。保留既有服务端契约，同时发送
+    // 连字符别名，便于代理和服务端逐步迁移到标准 HTTP 头名称。
+    headers.insert(HeaderName::from_static("device_id"), device_id.clone());
+    headers.insert(HeaderName::from_static("device-id"), device_id);
+    headers.insert(
+        HeaderName::from_static("activate_code"),
+        activate_code.clone(),
+    );
+    headers.insert(HeaderName::from_static("activate-code"), activate_code);
     Ok(headers)
 }
 
@@ -447,6 +921,7 @@ fn map_reqwest_error(error: reqwest::Error) -> ApiError {
     }
 }
 
+#[cfg(test)]
 fn safe_business_message(message: String) -> String {
     let message = message.trim();
     if message.is_empty() || message.len() > 256 || message.chars().any(char::is_control) {
@@ -473,6 +948,7 @@ fn is_semantic_version(value: &str) -> bool {
     valid && parts.next().is_none()
 }
 
+#[cfg(test)]
 fn decode_envelope_payload<T: DeserializeOwned>(
     payload: Value,
     allow_force_offline: bool,
@@ -482,7 +958,7 @@ fn decode_envelope_payload<T: DeserializeOwned>(
     if envelope.code != 200 && !(allow_force_offline && envelope.code == 201) {
         return Err(ApiError::Business {
             code: envelope.code,
-            message: safe_business_message(envelope.msg),
+            message: business_safe_message(envelope.code),
         });
     }
     envelope.data.ok_or(ApiError::InvalidResponse)
@@ -552,7 +1028,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), Some(1003));
-        assert_eq!(error.safe_message(), "服务端业务错误（1003）：激活码不存在");
+        assert_eq!(
+            error.safe_message(),
+            "服务端业务错误（1003）：激活码不存在，请重新输入"
+        );
     }
 
     #[test]

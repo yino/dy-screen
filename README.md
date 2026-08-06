@@ -16,7 +16,7 @@
 - 多个主播共享同一浏览器会话，浏览器解析期间不会阻塞已经运行的 FFmpeg 录制；
 - 规范化来源链接、真实访问公开页面、提取身份并阻止重复主页或稳定直播入口；
 - 使用 SQLite 保存主播、监听状态、设置、录制会话和视频分片；
-- 使用 SQLite 保存当前设备的客户端激活状态；未激活时不恢复监听或录制，心跳确认停用、过期或解绑后立即暂停后台任务并要求重新激活；
+- 使用 macOS Keychain 或 Windows Credential Manager 保存完整设备号、激活码和离线 token，SQLite 只保存脱敏设备提示及授权状态；未激活时不恢复监听、录制或 AI 调度器，心跳确认停用、过期或解绑后立即暂停后台任务并要求重新激活；
 - 应用启动后自动恢复之前开启的监听任务；
 - 尚未发现直播入口的个人主页约每 60 秒加 0–10 秒抖动检查，错误按 60、120、300 秒退避；
 - 已发现且离线的直播入口按 60 秒基础周期加 0–15 秒抖动检查；所有公开页面访问至少间隔 5 秒；只有连续 3 次非法 URL、HTTP 404 或 410 才回查个人主页，普通离线、访问受限、页面结构变化和网络错误不会清除稳定入口；
@@ -88,7 +88,7 @@ dy-screen/
 │   ├── src/transition_assets.rs 素材下载、完整性校验和兼容预览
 │   ├── src/transition_matching.rs 受限转场匹配 Agent
 │   ├── src/api.rs               激活、心跳、AppStart、埋点统一服务端 API 客户端
-│   ├── src/activation.rs        SQLite 激活摘要、心跳和埋点生命周期
+│   ├── src/activation.rs        安全凭据、SQLite 激活摘要、心跳和埋点生命周期
 │   ├── src/app.rs               command、事件、托盘和桌面生命周期
 │   └── tests/                   数据库与状态机测试
 ├── openspec/                    中文 OpenSpec 规格和变更
@@ -157,9 +157,13 @@ cp .env.example .env
 # DY_SCREEN_API_BASE_URL=https://your-domain.example/api/
 ```
 
-`make app-dev`、`make app-build` 和正式资源构建都会把 `DY_SCREEN_API_BASE_URL` 传给 Tauri。发布环境必须显式配置正式 HTTPS 地址；所有请求都由 `src-tauri/src/api.rs` 统一处理，当前使用明文 JSON，并已预留后续请求/响应加解密 codec。
+`make app-dev`、`make app-build` 和正式资源构建都会把 `DY_SCREEN_API_BASE_URL` 传给 Tauri。发布环境必须显式配置正式 HTTPS 地址；所有请求都由 `src-tauri/src/api.rs` 统一处理。本版本按已确认的兼容边界继续发送和接收明文 JSON，不发送信封头、设备签名或伪加密正文，也不保存尚未使用的 `encKey`。HTTP 只允许本机开发服务，远程正式服务必须使用 HTTPS；后续启用信封加密需要单独的 OpenSpec 和完整双端实现。
 
-素材目录复用同一服务端和激活凭据。心跳成功响应可选返回 `transitionMaterials.catalogVersion` 与 `transitionMaterials.minimumAppVersion`；客户端只把合法版本信号交给独立同步任务，再请求 `GET /api/v1/transition-materials?clientVersion=<本地目录版本>`。Rust 自动附带 `device_id`、`activate_code`、客户端版本和平台请求头，这些值、目录下载 URL 及本地绝对路径均不会进入 WebView。服务端返回 `changed=false` 时保留本地快照；返回完整新目录时，全部记录校验成功后才在一个 SQLite 事务中发布。
+素材目录复用同一服务端和激活凭据。心跳成功响应可选返回 `transitionMaterials.catalogVersion` 与 `transitionMaterials.minimumAppVersion`；客户端只把合法版本信号交给独立同步任务，再请求 `GET /api/v1/transition-materials?clientVersion=<本地目录版本>`。所有需授权请求都由 Rust 的统一请求头构造器同时发送权威 `device_id`、`activate_code` 和代理友好的 `device-id`、`activate-code`；业务模块不得自行拼接或改写凭据。服务端鉴权中间件应兼容两种名称。若服务端只读取下划线名称，Nginx 必须在对应 `http` 或 `server` 块配置 `underscores_in_headers on;`，否则请求头会在到达应用前被丢弃。这些凭据、目录下载 URL 及本地绝对路径均不会进入 WebView。服务端返回 `changed=false` 时保留本地快照；返回完整新目录时，全部记录校验成功后才在一个 SQLite 事务中发布。
+
+激活接口返回 `code=200` 后，客户端仍保持不可关闭的激活门禁，并在同一次 command 内立即发送心跳。只有心跳同时满足 `code=200`、`revoked=false` 和 `state=ACTIVE` 才保存凭据、进入首页并恢复后台任务。`1001/2001` 会显示请求头/反向代理契约异常；确定的卡密或设备错误要求重新激活；网络、超时、`1007`、`9000` 和无效响应进入有界重试。激活和心跳在控制台输出白名单 JSONL 摘要，包含固定方法/路径、耗时、HTTP 状态、业务码和 `x-request-id`/`x-trace-id`，不会输出完整设备号、激活码、token、Cookie、原始正文、完整 URL 或本地路径。
+
+旧版 SQLite 明文授权记录升级时，客户端先写入系统安全凭据存储并回读校验，再事务发布不含秘密字段的新元数据表；安全存储不可用或迁移中断时保持门禁并保留唯一旧凭据，不回退到新的 SQLite 明文记录。生产包因此要求操作系统凭据服务可用。
 
 启动 Tauri 桌面客户端：
 
@@ -167,15 +171,11 @@ cp .env.example .env
 make app-dev
 ```
 
-开发构建默认跳过客户端激活，正式 `tauri build` 仍强制校验。需要在本地回归完整激活流程时运行：
-
-```bash
-make app-dev DEV_REQUIRE_ACTIVATION=1
-```
+开发构建与正式构建执行相同的客户端激活校验，不提供免激活开关。首次启动或清除授权后，必须先输入有效激活码；激活成功且心跳返回有效状态后，才会启动监听、录制和素材目录同步。
 
 首次启动后：
 
-1. 正式包首次启动时，在不可关闭的激活弹窗输入服务端签发的激活码；激活成功前不会启动监听或录制；
+1. 首次启动时，在不可关闭的激活弹窗输入服务端签发的激活码；激活与同步心跳确认完成前不会启动监听、录制或 AI 调度器；
 2. 点击“添加主播”；
 3. 可输入便于识别的主播名称；个人主页可留空；
 4. 输入公开个人主页，例如 `https://www.douyin.com/user/...`，或直播间链接，例如 `https://live.douyin.com/452086788686`；

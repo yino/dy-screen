@@ -61,9 +61,7 @@ pub struct RuntimeResourceRecord {
 /// 令牌被 Tauri command、事件或日志意外输出到前端。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientActivationRecord {
-    pub device_id: String,
-    pub activate_code: String,
-    pub token: Option<String>,
+    pub device_id_hint: String,
     pub expire_at: Option<i64>,
     pub grace_sec: Option<i64>,
     pub server_time_offset_sec: i64,
@@ -73,6 +71,14 @@ pub struct ClientActivationRecord {
     pub next_heartbeat_at: Option<String>,
     pub last_error: Option<String>,
     pub updated_at: String,
+}
+
+/// 仅用于把 v10 明文授权记录安全迁移到系统凭据存储。完成迁移后旧表会被删除。
+#[derive(Clone, PartialEq, Eq)]
+pub struct LegacyClientActivationRecord {
+    pub device_id: String,
+    pub activate_code: String,
+    pub token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -281,6 +287,7 @@ impl Database {
         if !applied || !activation_table_exists {
             migrate_client_activation_v10(&mut connection)?;
         }
+        migrate_client_activation_v19(&mut connection)?;
         drop(connection);
         self.ensure_default_settings()
     }
@@ -288,25 +295,23 @@ impl Database {
     pub fn client_activation(&self) -> Result<Option<ClientActivationRecord>> {
         self.connection()?
             .query_row(
-                r#"SELECT device_id, activate_code, token, expire_at, grace_sec,
-                          server_time_offset_sec, state, allow_custom_api_key,
-                          last_heartbeat_at, next_heartbeat_at, last_error, updated_at
+                r#"SELECT device_id_hint, expire_at, grace_sec, server_time_offset_sec,
+                          state, allow_custom_api_key, last_heartbeat_at,
+                          next_heartbeat_at, last_error, updated_at
                    FROM client_activation WHERE id = 1"#,
                 [],
                 |row| {
                     Ok(ClientActivationRecord {
-                        device_id: row.get(0)?,
-                        activate_code: row.get(1)?,
-                        token: row.get(2)?,
-                        expire_at: row.get(3)?,
-                        grace_sec: row.get(4)?,
-                        server_time_offset_sec: row.get(5)?,
-                        state: row.get(6)?,
-                        allow_custom_api_key: row.get::<_, i64>(7)? == 1,
-                        last_heartbeat_at: row.get(8)?,
-                        next_heartbeat_at: row.get(9)?,
-                        last_error: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        device_id_hint: row.get(0)?,
+                        expire_at: row.get(1)?,
+                        grace_sec: row.get(2)?,
+                        server_time_offset_sec: row.get(3)?,
+                        state: row.get(4)?,
+                        allow_custom_api_key: row.get::<_, i64>(5)? == 1,
+                        last_heartbeat_at: row.get(6)?,
+                        next_heartbeat_at: row.get(7)?,
+                        last_error: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 },
             )
@@ -317,14 +322,12 @@ impl Database {
     pub fn save_client_activation(&self, record: &ClientActivationRecord) -> Result<()> {
         self.connection()?.execute(
             r#"INSERT INTO client_activation(
-                    id, device_id, activate_code, token, expire_at, grace_sec,
-                    server_time_offset_sec, state, allow_custom_api_key,
-                    last_heartbeat_at, next_heartbeat_at, last_error, updated_at
-                ) VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    id, device_id_hint, expire_at, grace_sec, server_time_offset_sec,
+                    state, allow_custom_api_key, last_heartbeat_at,
+                    next_heartbeat_at, last_error, updated_at
+                ) VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(id) DO UPDATE SET
-                    device_id=excluded.device_id,
-                    activate_code=excluded.activate_code,
-                    token=excluded.token,
+                    device_id_hint=excluded.device_id_hint,
                     expire_at=excluded.expire_at,
                     grace_sec=excluded.grace_sec,
                     server_time_offset_sec=excluded.server_time_offset_sec,
@@ -335,9 +338,7 @@ impl Database {
                     last_error=excluded.last_error,
                     updated_at=excluded.updated_at"#,
             params![
-                record.device_id,
-                record.activate_code,
-                record.token,
+                record.device_id_hint,
                 record.expire_at,
                 record.grace_sec,
                 record.server_time_offset_sec,
@@ -349,6 +350,41 @@ impl Database {
                 record.updated_at,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn legacy_client_activation(&self) -> Result<Option<LegacyClientActivationRecord>> {
+        let connection = self.connection()?;
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'client_activation_legacy_v10'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        connection
+            .query_row(
+                "SELECT device_id, activate_code, token FROM client_activation_legacy_v10 WHERE id = 1",
+                [],
+                |row| {
+                    Ok(LegacyClientActivationRecord {
+                        device_id: row.get(0)?,
+                        activate_code: row.get(1)?,
+                        token: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn finalize_client_activation_secret_migration(&self) -> Result<()> {
+        self.connection()?
+            .execute_batch("DROP TABLE IF EXISTS client_activation_legacy_v10")?;
         Ok(())
     }
 
@@ -1905,6 +1941,69 @@ fn migrate_client_activation_v10(connection: &mut Connection) -> Result<()> {
     )?;
     transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(10, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_client_activation_v19(connection: &mut Connection) -> Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 19",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE client_activation RENAME TO client_activation_legacy_v10;
+
+        CREATE TABLE client_activation (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            device_id_hint TEXT NOT NULL,
+            expire_at INTEGER,
+            grace_sec INTEGER,
+            server_time_offset_sec INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL,
+            allow_custom_api_key INTEGER NOT NULL DEFAULT 0 CHECK(allow_custom_api_key IN (0, 1)),
+            last_heartbeat_at TEXT,
+            next_heartbeat_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        INSERT INTO client_activation(
+            id, device_id_hint, expire_at, grace_sec, server_time_offset_sec,
+            state, allow_custom_api_key, last_heartbeat_at, next_heartbeat_at,
+            last_error, updated_at
+        )
+        SELECT
+            id,
+            CASE
+                WHEN length(device_id) > 8 THEN '…' || substr(device_id, length(device_id) - 7)
+                ELSE '…迁移设备'
+            END,
+            expire_at,
+            grace_sec,
+            server_time_offset_sec,
+            state,
+            allow_custom_api_key,
+            last_heartbeat_at,
+            next_heartbeat_at,
+            last_error,
+            updated_at
+        FROM client_activation_legacy_v10;
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(19, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

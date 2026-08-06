@@ -296,10 +296,95 @@ describe("App", () => {
     expect(dialog).toHaveTextContent("激活切片智能体");
     expect(dialog).toHaveTextContent("未激活前不会启动监听或录制任务");
     expect(screen.queryByRole("button", { name: "关闭" })).not.toBeInTheDocument();
+    expect(api.getDashboard).not.toHaveBeenCalled();
+    expect(api.getSettings).not.toHaveBeenCalled();
+    expect(api.getBrowserAccessState).not.toHaveBeenCalled();
+    expect(api.subscribePreview).not.toHaveBeenCalled();
     await user.type(screen.getByLabelText("激活码"), "TEST-CODE-1234");
     await user.click(screen.getByRole("button", { name: "激活并进入" }));
     await waitFor(() => expect(api.activateClient).toHaveBeenCalledWith("TEST-CODE-1234"));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "客户端激活" })).not.toBeInTheDocument());
+    await waitFor(() => expect(api.getDashboard).toHaveBeenCalledTimes(1));
+  });
+
+  it("同步心跳确认期间保持独占门禁并禁止重复提交", async () => {
+    const user = userEvent.setup();
+    const api = createApi([streamer]);
+    api.getActivationState = vi.fn().mockResolvedValue({
+      ...activeActivation,
+      configured: false,
+      active: false,
+      status: "missing",
+      message: "请输入激活码后继续使用",
+    });
+    let resolveActivation: ((state: ActivationState) => void) | undefined;
+    api.activateClient = vi.fn().mockImplementation(() => new Promise<ActivationState>((resolve) => {
+      resolveActivation = resolve;
+    }));
+
+    render(<App api={api} />);
+    await user.type(await screen.findByLabelText("激活码"), "TEST-CODE-1234");
+    await user.click(screen.getByRole("button", { name: "激活并进入" }));
+
+    expect(await screen.findByRole("button", { name: "正在验证" })).toBeDisabled();
+    expect(screen.getByLabelText("激活码")).toBeDisabled();
+    expect(screen.getByText("激活请求已提交，正在通过心跳确认设备授权。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "监控中心" })).not.toBeInTheDocument();
+    expect(api.getDashboard).not.toHaveBeenCalled();
+
+    act(() => resolveActivation?.(activeActivation));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "客户端激活" })).not.toBeInTheDocument());
+    await waitFor(() => expect(api.getDashboard).toHaveBeenCalledTimes(1));
+    expect(api.activateClient).toHaveBeenCalledTimes(1);
+  });
+
+  it("请求头契约异常显示代理诊断并锁定全部业务导航", async () => {
+    const api = createApi([streamer]);
+    api.getActivationState = vi.fn().mockResolvedValue({
+      ...activeActivation,
+      active: false,
+      status: "contract_error",
+      message: "授权服务未收到 activate_code 请求头，请检查反向代理配置",
+      nextHeartbeatAt: null,
+    });
+
+    render(<App api={api} />);
+
+    const dialog = await screen.findByRole("dialog", { name: "客户端激活" });
+    expect(dialog).toHaveTextContent("授权服务未收到 activate_code 请求头");
+    expect(dialog).toHaveTextContent("客户端已发送两组兼容请求头");
+    for (const label of ["监控中心", "视频资料库", "AI 剪辑", "设置"]) {
+      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+    }
+    expect(api.getDashboard).not.toHaveBeenCalled();
+    expect(api.getBrowserAccessState).not.toHaveBeenCalled();
+  });
+
+  it("心跳通知激活码已禁用时立即重新显示激活门禁", async () => {
+    const api = createApi([streamer]);
+    let activationListener: ((state: ActivationState) => void) | undefined;
+    api.subscribeActivation = vi.fn().mockImplementation(async (listener) => {
+      activationListener = listener;
+      return () => undefined;
+    });
+
+    render(<App api={api} />);
+    await waitFor(() => expect(api.subscribeActivation).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("dialog", { name: "客户端激活" })).not.toBeInTheDocument();
+
+    act(() => activationListener?.({
+      ...activeActivation,
+      active: false,
+      status: "revoked",
+      message: "激活码已停用，请联系管理员",
+      nextHeartbeatAt: null,
+    }));
+
+    const dialog = await screen.findByRole("dialog", { name: "客户端激活" });
+    expect(dialog).toHaveTextContent("激活码已停用，请联系管理员");
+    expect(dialog).toHaveTextContent("未激活前不会启动监听或录制任务");
+    expect(screen.queryByRole("button", { name: "添加主播" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "监控中心" })).not.toBeInTheDocument();
   });
 
   it("资源未就绪时只显示准备页，下载完成后解锁监控导航", async () => {
@@ -321,10 +406,10 @@ describe("App", () => {
     render(<App api={api} />);
 
     expect(await screen.findByRole("heading", { name: "准备本地运行资源" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "监控中心" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "监控中心" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "下载并安装资源" }));
     expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "监控中心" })).not.toBeDisabled();
+    expect(await screen.findByRole("button", { name: "监控中心" })).not.toBeDisabled();
   });
 
   it("后台校验期间先显示可响应的状态页，完成后自动进入监控中心", async () => {
@@ -568,7 +653,7 @@ describe("App", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
 
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "设置" }));
     expect(await screen.findByText("抖音访问会话")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "检查访问状态" }));
@@ -592,7 +677,7 @@ describe("App", () => {
     });
 
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "设置" }));
 
     expect(await screen.findByLabelText("服务端录制额度 7 路")).toHaveTextContent("7 路");
     expect(screen.queryByLabelText("最大并发录制")).not.toBeInTheDocument();
@@ -603,7 +688,7 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App api={createApi()} />);
 
-    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "设置" }));
     await screen.findByRole("heading", { name: "高光分析 Provider" });
 
     const primaryColumn = screen.getByTestId("settings-column-primary");
@@ -627,7 +712,7 @@ describe("App", () => {
     api.saveSettings = vi.fn().mockImplementation(() => new Promise<void>((resolve) => { resolveSave = resolve; }));
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "设置" }));
     const save = await screen.findByRole("button", { name: "保存设置" });
     expect(save).toBeDisabled();
     expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("所有更改均已保存");
@@ -653,7 +738,7 @@ describe("App", () => {
     api.saveSettings = vi.fn().mockRejectedValue(new Error("磁盘暂时不可写"));
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "设置" }));
     const outputRoot = await screen.findByLabelText("录像保存目录");
     await user.clear(outputRoot);
     await user.type(outputRoot, "/tmp/keep-this-value");
@@ -699,7 +784,7 @@ describe("App", () => {
     const api = createApi();
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "设置" }));
+    await user.click(await screen.findByRole("button", { name: "设置" }));
     const modelId = await screen.findByLabelText("模型 ID");
     const ordinarySave = screen.getByRole("button", { name: "保存设置" });
     expect(ordinarySave).toBeDisabled();
@@ -902,7 +987,7 @@ describe("App", () => {
     const user = userEvent.setup();
     const api = createApi();
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     expect(await screen.findByText("还没有 AI 分析项目")).toBeInTheDocument();
     expect(screen.getByText("视频和转写全程保留在本机")).toBeInTheDocument();
     expect(api.pickAiLocalVideos).not.toHaveBeenCalled();
@@ -920,7 +1005,7 @@ describe("App", () => {
       message: "ASR 模型损坏，请重新安装应用",
     });
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     expect(await screen.findByText("ASR 模型损坏，请重新安装应用")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新检测" })).toBeInTheDocument();
     expect(screen.getByText("修复方式：重新安装当前版本应用")).toBeInTheDocument();
@@ -930,7 +1015,7 @@ describe("App", () => {
     const user = userEvent.setup();
     const api = createApi();
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     await user.click(await screen.findByRole("button", { name: "创建项目" }));
     await user.type(screen.getByLabelText("项目名称"), "  商品直播  ");
     await user.type(screen.getByLabelText("识别热词"), "主播名, 商品名");
@@ -977,7 +1062,7 @@ describe("App", () => {
       fullyImported: false,
     }], nextCursor: null });
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     await user.click(await screen.findByRole("button", { name: "添加本地视频" }));
     await waitFor(() => expect(api.importAiLocalGrants).toHaveBeenCalledWith(
       aiProject.id,
@@ -1027,7 +1112,7 @@ describe("App", () => {
     const missing = { ...complete, id: 2, path: "/tmp/missing.mkv", status: "missing" };
     render(<App api={createApi([streamer], [complete, missing])} />);
 
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     await screen.findByText("complete.mkv");
     await user.selectOptions(screen.getByLabelText("按状态筛选"), "missing");
 
@@ -1041,8 +1126,8 @@ describe("App", () => {
     render(<App api={api} />);
     await screen.findByText("还没有监控主播");
 
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
-    await user.click(screen.getByRole("button", { name: "监控中心" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "监控中心" }));
 
     expect(api.subscribe).toHaveBeenCalledTimes(1);
   });
@@ -1052,15 +1137,15 @@ describe("App", () => {
     const api = createApi();
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     await user.click(await screen.findByRole("button", { name: "创建项目" }));
     const projectName = screen.getByLabelText("项目名称");
     await user.type(projectName, "保留中的项目");
     await waitFor(() => expect(api.listAiProjects).toHaveBeenCalledTimes(1));
 
-    await user.click(screen.getByRole("button", { name: "监控中心" }));
+    await user.click(await screen.findByRole("button", { name: "监控中心" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
 
     expect(await screen.findByLabelText("项目名称")).toHaveValue("保留中的项目");
     expect(api.listAiProjects).toHaveBeenCalledTimes(1);
@@ -1090,7 +1175,7 @@ describe("App", () => {
     }));
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     await screen.findByText("page-1.mkv");
     await user.click(screen.getByRole("button", { name: "下一页" }));
 
@@ -1120,7 +1205,7 @@ describe("App", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     expect(await screen.findByText("会话 #9")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "删除会话 #9" }));
 
@@ -1409,7 +1494,7 @@ describe("App", () => {
     } as ClientApi;
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     await user.click(await screen.findByRole("button", { name: "预览 preview-source.mkv" }));
 
     expect(requestVideoPreview).toHaveBeenCalledWith(31);
@@ -1706,7 +1791,7 @@ describe("App", () => {
     });
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     expect(await screen.findByAltText("preview-source.mkv 封面")).toHaveAttribute("src", "/tmp/cache/cover.jpg");
     await user.click(screen.getByRole("button", { name: "预览 preview-source.mkv 封面" }));
 
@@ -1734,7 +1819,7 @@ describe("App", () => {
       return () => undefined;
     });
     render(<App api={api} />);
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     expect(await screen.findByLabelText("正在加载封面 preview-source.mkv")).toBeInTheDocument();
 
     await act(async () => {
@@ -1796,11 +1881,11 @@ describe("App", () => {
     });
     render(<App api={api} />);
 
-    await user.click(screen.getByRole("button", { name: "视频库" }));
+    await user.click(await screen.findByRole("button", { name: "视频库" }));
     await user.click(await screen.findByRole("button", { name: "重试封面 preview-source.mkv" }));
     expect(api.retryVideoThumbnail).toHaveBeenCalledWith("cover-failed", completedVideo.id);
 
-    await user.click(screen.getByRole("button", { name: "监控中心" }));
+    await user.click(await screen.findByRole("button", { name: "监控中心" }));
     await waitFor(() => expect(api.releaseVideoThumbnailBatch).toHaveBeenCalledWith("cover-failed"));
   });
 });

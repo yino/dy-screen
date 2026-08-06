@@ -320,6 +320,10 @@ export function App({ api }: AppProps) {
   );
 
   useEffect(() => {
+    if (activation?.active !== true) {
+      setLoading(false);
+      return undefined;
+    }
     void refreshDashboard();
     void api.getSettings().then(setSettings).catch(() => undefined);
     let disposed = false;
@@ -381,7 +385,7 @@ export function App({ api }: AppProps) {
       unsubscribe?.();
       resourceUnsubscribe?.();
     };
-  }, [api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
+  }, [activation?.active, api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
 
   useEffect(() => {
     let disposed = false;
@@ -451,6 +455,7 @@ export function App({ api }: AppProps) {
   };
 
   useEffect(() => {
+    if (activation?.active !== true) return undefined;
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
     const updateAccess = (state: BrowserAccessState) => {
@@ -470,9 +475,10 @@ export function App({ api }: AppProps) {
       disposed = true;
       unsubscribe?.();
     };
-  }, [acceptBrowserAccess, api, refreshDashboard]);
+  }, [acceptBrowserAccess, activation?.active, api, refreshDashboard]);
 
   useEffect(() => {
+    if (activation?.active !== true) return undefined;
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
     void api.subscribePreview((snapshot) => {
@@ -489,9 +495,10 @@ export function App({ api }: AppProps) {
       disposed = true;
       unsubscribe?.();
     };
-  }, [api]);
+  }, [activation?.active, api]);
 
   useEffect(() => {
+    if (activation?.active !== true) return undefined;
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
     void api.subscribeThumbnail((event) => {
@@ -517,9 +524,10 @@ export function App({ api }: AppProps) {
       disposed = true;
       unsubscribe?.();
     };
-  }, [api]);
+  }, [activation?.active, api]);
 
   useEffect(() => {
+    if (activation?.active !== true) return undefined;
     let disposed = false;
     let activeBatchId: string | null = null;
     setThumbnailBatch(null);
@@ -540,9 +548,10 @@ export function App({ api }: AppProps) {
       disposed = true;
       if (activeBatchId) void api.releaseVideoThumbnailBatch(activeBatchId);
     };
-  }, [api, historyVideos, page]);
+  }, [activation?.active, api, historyVideos, page]);
 
   useEffect(() => {
+    if (activation?.active !== true) return undefined;
     if (!thumbnailBatch?.items.some((item) => item.state === "queued")) return undefined;
     let disposed = false;
     const batchId = thumbnailBatch.batchId;
@@ -558,14 +567,16 @@ export function App({ api }: AppProps) {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [api, thumbnailBatch]);
+  }, [activation?.active, api, thumbnailBatch]);
 
   useEffect(() => {
+    if (activation?.active !== true) return;
     if (selectedId) void refreshCurrentVideos(selectedId);
     else setCurrentVideos([]);
-  }, [refreshCurrentVideos, selectedId]);
+  }, [activation?.active, refreshCurrentVideos, selectedId]);
 
   useEffect(() => {
+    if (activation?.active !== true) return;
     if (page === "library") {
       void refreshHistoryVideos(
         historyStreamerIdRef.current,
@@ -577,7 +588,7 @@ export function App({ api }: AppProps) {
       void api.getSettings().then(setSettings).catch(() => undefined);
       void api.diagnoseEnvironment().then(setEnvironment).catch(() => undefined);
     }
-  }, [api, page, refreshHistoryVideos]);
+  }, [activation?.active, api, page, refreshHistoryVideos]);
 
   const sortedStreamers = useMemo(
     () =>
@@ -718,8 +729,21 @@ export function App({ api }: AppProps) {
     }
   };
 
+  const activateAndEnter = (activationCode: string) => api.activateClient(activationCode).then((state) => {
+    setActivation(state);
+    return state;
+  });
+
+  if (activation?.active !== true) {
+    return (
+      <div className="app-shell activation-locked">
+        <ActivationModal state={activation} onActivate={activateAndEnter} />
+      </div>
+    );
+  }
+
   return (
-    <div className={activation?.active === true ? "app-shell" : "app-shell activation-locked"}>
+    <div className="app-shell">
       <Sidebar
         page={page}
         open={mobileNavOpen}
@@ -916,25 +940,16 @@ export function App({ api }: AppProps) {
         />
       )}
 
-      {activation?.active !== true && (
-        <ActivationModal
-          state={activation}
-          onActivate={(activationCode) => api.activateClient(activationCode).then((state) => {
-            setActivation(state);
-            void refreshDashboard();
-            return state;
-          })}
-        />
-      )}
     </div>
   );
 }
 
 function activationStatusLabel(state: ActivationState | null): string {
   if (!state) return "正在检查授权";
-  if (state.status === "development_bypass") return "开发模式 · 免激活";
+  if (state.status === "verifying") return "正在验证授权";
   if (state.status === "active") return "客户端已激活";
   if (state.status === "retrying") return "授权心跳重试中";
+  if (state.status === "contract_error") return "授权请求头异常";
   if (state.status === "revoked") return "授权已失效";
   return "等待客户端激活";
 }
@@ -1604,6 +1619,7 @@ function ActivationModal({ state, onActivate }: { state: ActivationState | null;
   const [activationCode, setActivationCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const verifying = submitting || state?.status === "verifying";
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const code = activationCode.trim();
@@ -1627,11 +1643,13 @@ function ActivationModal({ state, onActivate }: { state: ActivationState | null;
       <form className="modal activation-modal" role="dialog" aria-modal="true" aria-label="客户端激活" onSubmit={submit}>
         <div className="modal-header"><div className="modal-title-icon"><KeyRound size={21} /></div><div><h2>激活切片智能体</h2><p>当前设备 {state?.deviceIdHint ?? "正在识别"}</p></div></div>
         <div className="modal-body">
-          <label htmlFor="activation-code">激活码<input id="activation-code" type="password" autoComplete="off" autoFocus value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="请输入激活码" disabled={!state || submitting} /></label>
+          <label htmlFor="activation-code">激活码<input id="activation-code" type="password" autoComplete="off" autoFocus value={activationCode} onChange={(event) => setActivationCode(event.target.value)} placeholder="请输入激活码" disabled={!state || verifying} /></label>
           {(error || state?.message) && <p className="form-error" role="alert">{error || state?.message}</p>}
+          {verifying && <small>激活请求已提交，正在通过心跳确认设备授权。</small>}
           {state?.status === "retrying" && <small>服务端连接正在重试，您也可以重新提交激活码。</small>}
+          {state?.status === "contract_error" && <small>客户端已发送两组兼容请求头，请检查反向代理是否允许下划线请求头。</small>}
         </div>
-        <div className="modal-footer activation-footer"><span>未激活前不会启动监听或录制任务</span><button type="submit" className="primary-button" disabled={!state || submitting || activationCode.trim().length < 4}>{submitting ? <LoaderCircle className="spin" size={17} /> : <KeyRound size={17} />}{submitting ? "正在激活" : "激活并进入"}</button></div>
+        <div className="modal-footer activation-footer"><span>未激活前不会启动监听或录制任务</span><button type="submit" className="primary-button" disabled={!state || verifying || activationCode.trim().length < 4}>{verifying ? <LoaderCircle className="spin" size={17} /> : <KeyRound size={17} />}{verifying ? "正在验证" : "激活并进入"}</button></div>
       </form>
     </div>
   );

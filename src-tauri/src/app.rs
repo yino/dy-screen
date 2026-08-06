@@ -94,42 +94,42 @@ struct DesktopRoomResolutionPublisher {
 
 #[derive(Clone, Default)]
 struct VerificationPromptCoordinator {
-    active_cycle: Arc<AtomicBool>,
+    prompt_visible: Arc<AtomicBool>,
 }
 
 impl VerificationPromptCoordinator {
-    fn transition(&self, status: BrowserAccessStatus) -> bool {
-        if status == BrowserAccessStatus::VerificationRequired {
-            !self.active_cycle.swap(true, Ordering::SeqCst)
-        } else {
-            self.active_cycle.store(false, Ordering::SeqCst);
-            false
-        }
+    fn try_show(&self) -> bool {
+        self.prompt_visible
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
-    fn is_active(&self) -> bool {
-        self.active_cycle.load(Ordering::SeqCst)
+    fn release(&self) {
+        self.prompt_visible.store(false, Ordering::SeqCst);
     }
 }
 
 impl RoomResolutionPublisher for DesktopRoomResolutionPublisher {
     fn publish_access_state(&self, state: &BrowserAccessState) {
         let _ = self.app.emit("browser-access-event", state);
-        if self.verification_prompt.transition(state.status) {
+    }
+
+    fn publish_verification_cycle_started(&self) {
+        if self.verification_prompt.try_show() {
             self.show_verification_prompt();
-            if self
-                .database
-                .get_settings()
-                .is_ok_and(|settings| settings.notifications_enabled)
-            {
-                let _ = self
-                    .app
-                    .notification()
-                    .builder()
-                    .title("需要访问验证")
-                    .body("请打开切片智能体的抖音验证窗口")
-                    .show();
-            }
+        }
+        if self
+            .database
+            .get_settings()
+            .is_ok_and(|settings| settings.notifications_enabled)
+        {
+            let _ = self
+                .app
+                .notification()
+                .builder()
+                .title("需要访问验证")
+                .body("请打开切片智能体的抖音验证窗口")
+                .show();
         }
     }
 
@@ -152,12 +152,12 @@ impl DesktopRoomResolutionPublisher {
                 "稍后处理".to_owned(),
             ))
             .show(move |verify_now| {
+                coordinator.release();
                 let Some(state) = app.try_state::<AppState>() else {
                     return;
                 };
                 if !should_start_verification(
                     verify_now,
-                    coordinator.is_active(),
                     state.shutdown_gate.is_started(),
                     state.room_resolution.access_state().status,
                 ) {
@@ -179,14 +179,10 @@ impl DesktopRoomResolutionPublisher {
 
 fn should_start_verification(
     verify_now: bool,
-    active_cycle: bool,
     shutting_down: bool,
     status: BrowserAccessStatus,
 ) -> bool {
-    verify_now
-        && active_cycle
-        && !shutting_down
-        && status == BrowserAccessStatus::VerificationRequired
+    verify_now && !shutting_down && status == BrowserAccessStatus::VerificationRequired
 }
 
 #[cfg(test)]
@@ -194,40 +190,42 @@ mod verification_prompt_tests {
     use super::*;
 
     #[test]
-    fn verification_prompt_is_deduplicated_until_access_recovers() {
+    fn verification_prompt_does_not_stack_while_previous_dialog_is_open() {
         let coordinator = VerificationPromptCoordinator::default();
-        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
-        assert!(!coordinator.transition(BrowserAccessStatus::VerificationRequired));
-        assert!(coordinator.is_active());
+        assert!(coordinator.try_show());
+        assert!(!coordinator.try_show());
 
-        assert!(!coordinator.transition(BrowserAccessStatus::SessionReady));
-        assert!(!coordinator.is_active());
-        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
+        coordinator.release();
+        assert!(coordinator.try_show());
+    }
+
+    #[test]
+    fn verification_prompt_can_open_again_after_previous_dialog_finishes() {
+        let coordinator = VerificationPromptCoordinator::default();
+        assert!(coordinator.try_show());
+        coordinator.release();
+        assert!(coordinator.try_show());
     }
 
     #[test]
     fn verification_action_honors_later_stale_state_and_shutdown() {
         assert!(should_start_verification(
             true,
-            true,
             false,
             BrowserAccessStatus::VerificationRequired,
         ));
         assert!(!should_start_verification(
             false,
-            true,
             false,
             BrowserAccessStatus::VerificationRequired,
         ));
         assert!(!should_start_verification(
             true,
             true,
-            true,
             BrowserAccessStatus::VerificationRequired,
         ));
         assert!(!should_start_verification(
             true,
-            false,
             false,
             BrowserAccessStatus::Native,
         ));
@@ -340,7 +338,7 @@ fn spawn_activation_lifecycle(
             wait = match outcome {
                 HeartbeatOutcome::Active => HEARTBEAT_INTERVAL_FOR_APP,
                 HeartbeatOutcome::Retrying => HEARTBEAT_RETRY_INTERVAL_FOR_APP,
-                HeartbeatOutcome::Revoked => {
+                HeartbeatOutcome::Revoked | HeartbeatOutcome::ContractError => {
                     let _ = tokio::join!(
                         supervisor.pause_for_authorization(),
                         ai_runtime.pause_for_authorization()
@@ -380,6 +378,9 @@ async fn ensure_verified_runtime_active(
     supervisor: &Supervisor,
     activation: &ActivationService,
 ) -> Result<(), String> {
+    if !activation.is_active() {
+        return Ok(());
+    }
     if !ai_runtime.scheduler_ready() {
         let resource_root = runtime
             .current_root()
@@ -388,13 +389,11 @@ async fn ensure_verified_runtime_active(
             .activate_resource_root(resource_root)
             .map_err(|error| error.to_string())?;
     }
-    if activation.is_active() {
-        ai_runtime
-            .recover_startup_and_requeue()
-            .await
-            .map_err(|error| error.to_string())?;
-        supervisor.restore().await?;
-    }
+    ai_runtime
+        .recover_startup_and_requeue()
+        .await
+        .map_err(|error| error.to_string())?;
+    supervisor.restore().await?;
     Ok(())
 }
 
@@ -557,13 +556,16 @@ fn get_transition_catalog_state(
 }
 
 #[tauri::command]
-fn retry_transition_catalog_sync(
+async fn retry_transition_catalog_sync(
     state: State<'_, AppState>,
 ) -> Result<TransitionCatalogState, String> {
     state
-        .transition_catalog
-        .retry()
-        .map_err(|error| error.to_string())?;
+        .activation
+        .refresh_transition_catalog(true)
+        .await
+        .inspect_err(|error| {
+            let _ = state.transition_catalog.report_signal_failure(error);
+        })?;
     state
         .transition_catalog
         .state()
@@ -691,18 +693,22 @@ async fn activate_client(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ActivationStateView, String> {
-    let view = state.activation.activate(&activation_code).await?;
+    let view = match state.activation.activate(&activation_code).await {
+        Ok(view) => view,
+        Err(error) => {
+            let view = state.activation.state();
+            let _ = app.emit("activation-event", &view);
+            return Err(error);
+        }
+    };
     if state.runtime_resources.view().ready {
-        state
-            .ai_runtime
-            .resume_after_authorization()
-            .map_err(|error| error.to_string())?;
-        state
-            .ai_runtime
-            .recover_startup_and_requeue()
-            .await
-            .map_err(|error| error.to_string())?;
-        state.supervisor.restore().await?;
+        ensure_verified_runtime_active(
+            &state.runtime_resources,
+            &state.ai_runtime,
+            &state.supervisor,
+            &state.activation,
+        )
+        .await?;
     }
     state._telemetry.track(
         "app_open",
@@ -720,16 +726,13 @@ async fn clear_activation(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ActivationStateView, String> {
-    if state.activation.is_development_bypass() {
-        return Ok(state.activation.state());
-    }
     let (monitor_result, ai_result) = tokio::join!(
         state.supervisor.pause_for_authorization(),
         state.ai_runtime.pause_for_authorization()
     );
     monitor_result?;
     ai_result.map_err(|error| error.to_string())?;
-    let view = state.activation.clear()?;
+    let view = state.activation.clear().await?;
     let _ = app.emit("activation-event", &view);
     Ok(view)
 }
@@ -776,13 +779,13 @@ async fn runtime_resource_download(
     }
     runtime.finish_download();
     let result = result.map_err(|error| error.to_string())?;
-    let resource_root = runtime
-        .current_root()
-        .ok_or_else(|| "资源已下载但未找到原子安装目录".to_owned())?;
-    ai_runtime
-        .activate_resource_root(resource_root)
-        .map_err(|error| error.to_string())?;
     if app_state.activation.is_active() {
+        let resource_root = runtime
+            .current_root()
+            .ok_or_else(|| "资源已下载但未找到原子安装目录".to_owned())?;
+        ai_runtime
+            .activate_resource_root(resource_root)
+            .map_err(|error| error.to_string())?;
         ai_runtime
             .recover_startup_and_requeue()
             .await
@@ -1772,8 +1775,7 @@ pub fn run() {
             let api_client = ApiClient::from_env()
                 .map_err(|error| std::io::Error::other(error.safe_message()))?;
             let activation = ActivationService::new(database.clone(), api_client, &app_data_dir)
-                .map_err(std::io::Error::other)?
-                .with_development_bypass();
+                .map_err(std::io::Error::other)?;
             let transition_catalog = TransitionCatalogCoordinator::spawn(
                 TransitionMaterialRepository::new(database.clone()),
                 activation.api().clone(),
@@ -2360,13 +2362,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn access_verification_notification_is_deduplicated_until_session_recovers() {
+    fn verification_prompt_visibility_is_not_reset_by_access_state_churn() {
         let coordinator = VerificationPromptCoordinator::default();
 
-        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
-        assert!(!coordinator.transition(BrowserAccessStatus::VerificationRequired));
-        assert!(!coordinator.transition(BrowserAccessStatus::SessionReady));
-        assert!(coordinator.transition(BrowserAccessStatus::VerificationRequired));
+        assert!(coordinator.try_show());
+        assert!(!coordinator.try_show());
+        assert!(!coordinator.try_show());
     }
 
     #[test]

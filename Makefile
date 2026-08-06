@@ -43,6 +43,7 @@ ASR_APP ?=
 ASR_DMG ?=
 ASR_RELEASE_EVIDENCE ?=
 ASR_BUNDLES ?= app
+TAURI_BUILD_ARGS ?=
 EXECUTABLE_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
 ASR_BUNDLE_BINARY ?= target/release/asr-bundle$(EXECUTABLE_SUFFIX)
 ASR_INSTALLER ?=
@@ -83,7 +84,6 @@ RUNTIME_MANIFEST_SIGNATURE ?=
 WINDOWS_CERTIFICATE_THUMBPRINT ?=
 WINDOWS_TIMESTAMP_URL ?=
 DY_SCREEN_API_BASE_URL ?= http://localhost/api/
-DEV_REQUIRE_ACTIVATION ?= 0
 TRANSITION_CATALOG_FIXTURE ?=
 
 BINARY ?= target/release/dy-screen$(EXECUTABLE_SUFFIX)
@@ -94,7 +94,7 @@ JSON_ARG = $(if $(filter 1 true yes on,$(JSON)),--json,)
 ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
 ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(ASR_RESOURCE_ROOT)",)
 
-.PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build core-build \
+.PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build-mac-release build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor clip-subtitle-doctor test-clip-subtitle test-clip-subtitle-integration test-clip-transition-integration test-transition-catalog-fixture test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
@@ -121,6 +121,7 @@ help:
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端（禁用强制结束录制的 Rust watcher）' \
 		'  make app-build       构建 macOS .app 安装产物' \
+		'  make build-mac-release DY_SCREEN_API_BASE_URL=... 构建 macOS arm64 .app/.dmg 发布候选包' \
 		'  make app-build-resources ASR_SOURCE=... 构建强制携带运行资源的发行包（缺资源直接失败）' \
 		'  make app-build-resources-windows ASR_SOURCE=... 构建 Windows x64 强制资源发行包' \
 		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL 应用运行时 FFmpeg' \
@@ -254,7 +255,7 @@ install:
 	"$(NPM)" install
 
 web-dev:
-	VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION="$(DEV_REQUIRE_ACTIVATION)" "$(NPM)" run dev
+	"$(NPM)" run dev
 
 typecheck:
 	"$(NPM)" run typecheck
@@ -263,17 +264,25 @@ frontend-build:
 	"$(NPM)" run build
 
 app-dev:
-	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_DEV_REQUIRE_ACTIVATION="$(DEV_REQUIRE_ACTIVATION)" VITE_DY_SCREEN_DEV_REQUIRE_ACTIVATION="$(DEV_REQUIRE_ACTIVATION)" "$(NPM)" run tauri:dev
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" "$(NPM)" run tauri:dev
 
 app-build:
 	@printf '%s\n' '普通开发构建：不携带发行运行资源；正式发布请使用 make app-build-resources。'
 	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" "$(NPM)" run tauri:build
 
+build-mac-release:
+	@test "$$(uname -s)" = "Darwin" || { printf '%s\n' '错误：build-mac-release 只能在 macOS 上运行。' >&2; exit 2; }
+	@test "$$(uname -m)" = "arm64" || { printf '%s\n' '错误：当前发行资源仅支持 macOS arm64。' >&2; exit 2; }
+	@test -n "$(DY_SCREEN_API_BASE_URL)" || { printf '%s\n' '错误：必须设置 DY_SCREEN_API_BASE_URL。' >&2; exit 2; }
+	@test "$(DY_SCREEN_API_BASE_URL)" != "http://localhost/api/" || { printf '%s\n' '错误：macOS 发布构建不能使用默认 localhost API。' >&2; exit 2; }
+	@printf '%s\n' '构建 macOS arm64 .app/.dmg 发布候选包；CI 模式会跳过 Finder 窗口排版。'
+	"$(MAKE)" app-build-resources ASR_BUNDLES=app,dmg TAURI_BUILD_ARGS=--ci
+
 app-build-resources: asr-stage-macos
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
 	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
 	"$(MAKE)" runtime-resource-verify ASR_STAGE="$(ASR_STAGE)"
-	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- $(TAURI_BUILD_ARGS) --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
 
 app-build-resources-windows: app-build-windows-release
 

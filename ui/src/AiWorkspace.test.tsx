@@ -1385,6 +1385,37 @@ describe("AiWorkspace", () => {
     expect(await screen.findByText("正在检查转场素材目录")).toBeInTheDocument();
   });
 
+  it("素材目录尚未收到版本时也允许手动同步", async () => {
+    const { api } = createKeyboardClipFixture();
+    api.listTransitionMaterials = vi.fn().mockResolvedValue([]);
+    api.getTransitionCatalogState = vi.fn().mockResolvedValue({
+      localCatalogVersion: 0,
+      remoteCatalogVersion: null,
+      minimumAppVersion: null,
+      status: "idle",
+      lastCheckedAt: null,
+      lastSuccessAt: null,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+    });
+    api.retryTransitionCatalogSync = vi.fn().mockResolvedValue({
+      localCatalogVersion: 0,
+      remoteCatalogVersion: 2,
+      minimumAppVersion: "0.3.0",
+      status: "checking",
+      lastCheckedAt: "2026-08-05T00:00:01Z",
+      lastSuccessAt: null,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+    });
+    api.subscribeTransitionCatalog = vi.fn().mockResolvedValue(() => undefined);
+
+    const { user } = await openKeyboardClipEditor(api);
+    expect(await screen.findByText("等待授权心跳发布素材目录版本")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "同步素材目录" }));
+    await waitFor(() => expect(api.retryTransitionCatalogSync).toHaveBeenCalledTimes(1));
+  });
+
   it("离开剪辑页后清理快捷键监听", async () => {
     const { api } = createKeyboardClipFixture();
     const { unmount, video } = await openKeyboardClipEditor(api);
