@@ -73,6 +73,7 @@ pub struct TransitionCatalogCoordinator {
     latest_request: Arc<Mutex<Option<CatalogSyncRequest>>>,
     last_signal: Arc<Mutex<Option<(i64, String)>>>,
     repository: TransitionMaterialRepository,
+    publisher: Arc<dyn TransitionCatalogPublisher>,
 }
 
 impl TransitionCatalogCoordinator {
@@ -88,6 +89,7 @@ impl TransitionCatalogCoordinator {
             latest_request: Arc::new(Mutex::new(None)),
             last_signal: Arc::new(Mutex::new(None)),
             repository: repository.clone(),
+            publisher: publisher.clone(),
         };
         tauri::async_runtime::spawn(run_catalog_coordinator(
             receiver,
@@ -148,6 +150,17 @@ impl TransitionCatalogCoordinator {
 
     pub fn state(&self) -> Result<TransitionCatalogState> {
         self.repository.catalog_state()
+    }
+
+    pub fn report_signal_failure(&self, message: &str) -> Result<TransitionCatalogState> {
+        let state = self.repository.set_catalog_status(
+            CatalogSyncStatus::Failed,
+            None,
+            None,
+            Some(("catalog_signal_failed", message)),
+        )?;
+        self.publisher.publish(&state);
+        Ok(state)
     }
 }
 

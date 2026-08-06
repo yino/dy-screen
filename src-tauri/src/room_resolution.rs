@@ -127,6 +127,7 @@ pub trait BrowserPageDriver: Send + Sync {
 pub trait RoomResolutionPublisher: Send + Sync {
     fn publish_access_state(&self, state: &BrowserAccessState);
     fn publish_diagnostic(&self, entry: &AccessDiagnosticEntry);
+    fn publish_verification_cycle_started(&self) {}
 }
 
 pub struct NoopRoomResolutionPublisher;
@@ -625,6 +626,7 @@ impl RoomResolutionService {
         context: &RoomResolutionContext,
     ) {
         if let Ok(mut runtime) = self.runtime.lock() {
+            let starts_cycle = runtime.verification_target.is_none();
             runtime.verification_target = Some(VerificationTarget {
                 room_url: room_url.to_owned(),
                 request_generation,
@@ -644,6 +646,9 @@ impl RoomResolutionService {
             let state = runtime.access.clone();
             drop(runtime);
             self.publisher.publish_access_state(&state);
+            if starts_cycle {
+                self.publisher.publish_verification_cycle_started();
+            }
         }
     }
 

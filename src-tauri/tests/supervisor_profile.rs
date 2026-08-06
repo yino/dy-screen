@@ -249,6 +249,23 @@ struct BlockingFirstPublisher {
     release: Semaphore,
 }
 
+#[derive(Default)]
+struct CountingPublisher {
+    notifications: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl MonitorPublisher for CountingPublisher {
+    async fn publish(&self, _event: MonitorEvent) {}
+
+    async fn notify(&self, title: &str, body: &str) {
+        self.notifications
+            .lock()
+            .unwrap()
+            .push((title.to_owned(), body.to_owned()));
+    }
+}
+
 impl Default for BlockingFirstPublisher {
     fn default() -> Self {
         Self {
@@ -616,9 +633,10 @@ async fn browser_verification_wait_preserves_binding_without_scheduling_dense_re
         ))
         .unwrap();
     let delay = Arc::new(ControlledDelay::default());
+    let publisher = Arc::new(CountingPublisher::default());
     let supervisor = Supervisor::with_dependencies(
         database.clone(),
-        Arc::new(NoopPublisher),
+        publisher.clone(),
         4,
         Arc::new(FakeProfileDiscovery::new([])),
         Arc::new(FakeRoomDiscovery::new([RoomReply::VerificationRequired])),
@@ -643,6 +661,14 @@ async fn browser_verification_wait_preserves_binding_without_scheduling_dense_re
     assert_eq!(
         delay.durations.lock().unwrap()[0],
         Duration::from_secs(60 * 60)
+    );
+    assert!(
+        publisher
+            .notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(title, _)| title != "需要访问验证")
     );
     supervisor.shutdown().await;
 }
@@ -1087,9 +1113,10 @@ async fn recording_waits_for_browser_verification_without_consuming_retry_budget
         ])
         .with_access_changes(1),
     );
+    let publisher = Arc::new(CountingPublisher::default());
     let supervisor = Supervisor::with_dependencies(
         database.clone(),
-        Arc::new(NoopPublisher),
+        publisher.clone(),
         4,
         Arc::new(FakeProfileDiscovery::new([])),
         room.clone(),
@@ -1109,5 +1136,13 @@ async fn recording_waits_for_browser_verification_without_consuming_retry_budget
     assert_eq!(session.status, "completed");
     assert_eq!(session.retry_count, 0);
     assert!(room.calls.lock().unwrap().len() >= 5);
+    assert!(
+        publisher
+            .notifications
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(title, _)| title != "需要访问验证")
+    );
     supervisor.shutdown().await;
 }

@@ -1398,9 +1398,6 @@ impl Supervisor {
                         None,
                     );
                     self.emit("streamer_changed", Some(streamer_id)).await;
-                    self.publisher
-                        .notify("需要访问验证", "请在切片智能体中完成抖音访问验证")
-                        .await;
                     VERIFICATION_WAIT_INTERVAL.as_secs()
                 }
                 ResolveAttempt::LayoutChanged(safe_error, http_status) => {
@@ -1767,9 +1764,6 @@ impl Supervisor {
                             retries,
                         );
                         self.emit("streamer_changed", Some(streamer.id)).await;
-                        self.publisher
-                            .notify("需要访问验证", "完成验证后将继续当前录制会话")
-                            .await;
                         if !self.room_discovery.wait_for_access_change(&token).await {
                             break 'recording SessionEnd::Cancelled;
                         }

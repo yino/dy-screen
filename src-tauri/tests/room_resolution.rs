@@ -351,6 +351,7 @@ impl BrowserPageDriver for FakeBrowserDriver {
 struct CapturingPublisher {
     states: Mutex<Vec<dy_screen_app_lib::domain::BrowserAccessState>>,
     diagnostics: Mutex<Vec<dy_screen::access::AccessDiagnosticEntry>>,
+    verification_cycles: AtomicUsize,
 }
 
 impl RoomResolutionPublisher for CapturingPublisher {
@@ -360,6 +361,10 @@ impl RoomResolutionPublisher for CapturingPublisher {
 
     fn publish_diagnostic(&self, entry: &dy_screen::access::AccessDiagnosticEntry) {
         self.diagnostics.lock().unwrap().push(entry.clone());
+    }
+
+    fn publish_verification_cycle_started(&self) {
+        self.verification_cycles.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -764,10 +769,11 @@ async fn verification_keeps_the_target_but_allows_native_success_for_another_roo
         NativeReply::Live,
     ]));
     let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
+    let publisher = Arc::new(CapturingPublisher::default());
     let service = RoomResolutionService::with_policy(
         native.clone(),
         browser.clone(),
-        Arc::new(NoopRoomResolutionPublisher),
+        publisher.clone(),
         short_policy(),
     );
 
@@ -797,6 +803,119 @@ async fn verification_keeps_the_target_but_allows_native_success_for_another_roo
     assert_eq!(access.status, BrowserAccessStatus::VerificationRequired);
     assert_eq!(access.active_streamer_id, Some(6));
     assert_eq!(access.current_web_rid.as_deref(), Some("292895634635"));
+    assert_eq!(publisher.verification_cycles.load(Ordering::SeqCst), 1);
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn repeated_checks_keep_one_notification_cycle_until_verification_recovers() {
+    let native = Arc::new(FakeNativeResolver::new([
+        NativeReply::AccessRestricted,
+        NativeReply::AccessRestricted,
+    ]));
+    let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
+    let publisher = Arc::new(CapturingPublisher::default());
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        publisher.clone(),
+        short_policy(),
+    );
+
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+    service
+        .show_verification()
+        .await
+        .expect("重复检查仍保留当前验证目标");
+    service
+        .recheck()
+        .await
+        .expect("重新检查不会开启新的验证周期");
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    assert_eq!(publisher.verification_cycles.load(Ordering::SeqCst), 1);
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovered_session_can_start_a_new_notification_cycle() {
+    let native = Arc::new(FakeNativeResolver::new([
+        NativeReply::AccessRestricted,
+        NativeReply::AccessRestricted,
+        NativeReply::AccessRestricted,
+    ]));
+    let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
+    let publisher = Arc::new(CapturingPublisher::default());
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        publisher.clone(),
+        short_policy(),
+    );
+
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+    browser.replace_snapshot(browser_snapshot(false));
+    service.recheck().await.expect("验证恢复");
+    assert_eq!(
+        service.access_state().status,
+        BrowserAccessStatus::SessionReady
+    );
+
+    browser.replace_snapshot(browser_snapshot(true));
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+
+    assert_eq!(publisher.verification_cycles.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn clearing_session_ends_the_notification_cycle() {
+    let native = Arc::new(FakeNativeResolver::new([
+        NativeReply::AccessRestricted,
+        NativeReply::AccessRestricted,
+    ]));
+    let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot(true)));
+    let publisher = Arc::new(CapturingPublisher::default());
+    let service = RoomResolutionService::with_policy(
+        native,
+        browser.clone(),
+        publisher.clone(),
+        short_policy(),
+    );
+
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+    assert_eq!(publisher.verification_cycles.load(Ordering::SeqCst), 1);
+
+    service.clear_session().await.expect("清除浏览器会话");
+    assert!(matches!(
+        service
+            .inspect_with_context("https://live.douyin.com/292895634635", context())
+            .await,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+
+    assert_eq!(publisher.verification_cycles.load(Ordering::SeqCst), 2);
+    assert_eq!(browser.show_count.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
