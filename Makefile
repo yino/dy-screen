@@ -276,7 +276,7 @@ build-mac-release:
 	@test -n "$(DY_SCREEN_API_BASE_URL)" || { printf '%s\n' '错误：必须设置 DY_SCREEN_API_BASE_URL。' >&2; exit 2; }
 	@test "$(DY_SCREEN_API_BASE_URL)" != "http://localhost/api/" || { printf '%s\n' '错误：macOS 发布构建不能使用默认 localhost API。' >&2; exit 2; }
 	@printf '%s\n' '构建 macOS arm64 .app/.dmg 发布候选包；CI 模式会跳过 Finder 窗口排版。'
-	"$(MAKE)" app-build-resources ASR_BUNDLES=app,dmg TAURI_BUILD_ARGS=--ci
+	CI=1 "$(MAKE)" app-build-resources ASR_BUNDLES=app,dmg TAURI_BUILD_ARGS=--ci
 
 app-build-resources: asr-stage-macos
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
