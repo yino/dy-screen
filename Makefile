@@ -44,6 +44,9 @@ ASR_DMG ?=
 ASR_RELEASE_EVIDENCE ?=
 ASR_BUNDLES ?= app
 TAURI_BUILD_ARGS ?=
+MACOS_RELEASE_APP ?= src-tauri/target/release/bundle/macos/切片智能体.app
+MACOS_RELEASE_DMG ?= src-tauri/target/release/bundle/dmg/切片智能体_$(RESOURCE_APP_VERSION)_aarch64.dmg
+MACOS_RELEASE_VOLUME_NAME ?= 切片智能体
 EXECUTABLE_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
 ASR_BUNDLE_BINARY ?= target/release/asr-bundle$(EXECUTABLE_SUFFIX)
 ASR_INSTALLER ?=
@@ -121,7 +124,7 @@ help:
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端（禁用强制结束录制的 Rust watcher）' \
 		'  make app-build       构建 macOS .app 安装产物' \
-		'  make build-mac-release DY_SCREEN_API_BASE_URL=... 构建 macOS arm64 .app/.dmg 发布候选包' \
+		'  make build-mac-release DY_SCREEN_API_BASE_URL=... 构建无 Finder 依赖的 macOS arm64 .app/.dmg 发布候选包' \
 		'  make app-build-resources ASR_SOURCE=... 构建强制携带运行资源的发行包（缺资源直接失败）' \
 		'  make app-build-resources-windows ASR_SOURCE=... 构建 Windows x64 强制资源发行包' \
 		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL 应用运行时 FFmpeg' \
@@ -275,8 +278,9 @@ build-mac-release:
 	@test "$$(uname -m)" = "arm64" || { printf '%s\n' '错误：当前发行资源仅支持 macOS arm64。' >&2; exit 2; }
 	@test -n "$(DY_SCREEN_API_BASE_URL)" || { printf '%s\n' '错误：必须设置 DY_SCREEN_API_BASE_URL。' >&2; exit 2; }
 	@test "$(DY_SCREEN_API_BASE_URL)" != "http://localhost/api/" || { printf '%s\n' '错误：macOS 发布构建不能使用默认 localhost API。' >&2; exit 2; }
-	@printf '%s\n' '构建 macOS arm64 .app/.dmg 发布候选包；CI 模式会跳过 Finder 窗口排版。'
-	CI=1 "$(MAKE)" app-build-resources ASR_BUNDLES=app,dmg TAURI_BUILD_ARGS=--ci
+	@printf '%s\n' '构建 macOS arm64 .app/.dmg 发布候选包；DMG 使用无 Finder、无挂载的直接压缩流程。'
+	CI=1 "$(MAKE)" app-build-resources ASR_BUNDLES=app TAURI_BUILD_ARGS=--ci
+	./scripts/build-macos-dmg.sh "$(MACOS_RELEASE_APP)" "$(MACOS_RELEASE_DMG)" "$(MACOS_RELEASE_VOLUME_NAME)"
 
 app-build-resources: asr-stage-macos
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
