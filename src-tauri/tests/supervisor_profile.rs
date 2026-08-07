@@ -15,7 +15,7 @@ use dy_screen_app_lib::domain::{
 };
 use dy_screen_app_lib::supervisor::{
     DelayStrategy, JitterSource, MonitorPublisher, NoopPublisher, ProfileDiscovery, RoomDiscovery,
-    Supervisor, profile_backoff_seconds,
+    Supervisor, offline_backoff_seconds, profile_backoff_seconds,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -328,6 +328,15 @@ fn profile_retry_backoff_uses_sixty_one_twenty_and_three_hundred_seconds() {
     assert_eq!(profile_backoff_seconds(20), 300);
 }
 
+#[test]
+fn offline_backoff_uses_five_ten_twenty_and_thirty_minutes() {
+    assert_eq!(offline_backoff_seconds(0), 5 * 60);
+    assert_eq!(offline_backoff_seconds(1), 10 * 60);
+    assert_eq!(offline_backoff_seconds(2), 20 * 60);
+    assert_eq!(offline_backoff_seconds(3), 30 * 60);
+    assert_eq!(offline_backoff_seconds(20), 30 * 60);
+}
+
 #[tokio::test]
 async fn public_page_checks_are_serialized_across_streamers() {
     let database = Database::open_in_memory().unwrap();
@@ -460,7 +469,7 @@ async fn exiting_old_worker_does_not_remove_a_resumed_worker_for_the_same_stream
 }
 
 #[tokio::test]
-async fn offline_profile_uses_sixty_seconds_plus_jitter() {
+async fn offline_profile_starts_with_five_minute_backoff() {
     let database = Database::open_in_memory().unwrap();
     database.migrate().unwrap();
     let streamer_id = waiting_profile(&database, "profile-jitter", true);
@@ -480,7 +489,10 @@ async fn offline_profile_uses_sixty_seconds_plus_jitter() {
     supervisor.start(streamer_id).unwrap();
     wait_until(|| !delay.durations.lock().unwrap().is_empty()).await;
 
-    assert_eq!(delay.durations.lock().unwrap()[0], Duration::from_secs(67));
+    assert_eq!(
+        delay.durations.lock().unwrap()[0],
+        Duration::from_secs(5 * 60)
+    );
     assert_eq!(
         database.get_streamer(streamer_id).unwrap().live_status,
         "offline"
@@ -585,7 +597,7 @@ async fn three_entry_invalid_results_clear_binding_and_return_to_profile_discove
 }
 
 #[tokio::test]
-async fn offline_room_updates_current_room_id_without_changing_stable_identity() {
+async fn offline_room_starts_with_five_minute_backoff_and_updates_current_room_id() {
     let database = Database::open_in_memory().unwrap();
     database.migrate().unwrap();
     let streamer = database
@@ -616,7 +628,52 @@ async fn offline_room_updates_current_room_id_without_changing_stable_identity()
     let saved = database.get_streamer(streamer.id).unwrap();
     assert_eq!(saved.web_rid.as_deref(), Some("701"));
     assert_eq!(saved.room_id.as_deref(), Some("new-room-id"));
-    assert_eq!(delay.durations.lock().unwrap()[0], Duration::from_secs(67));
+    assert_eq!(
+        delay.durations.lock().unwrap()[0],
+        Duration::from_secs(5 * 60)
+    );
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn repeated_offline_room_checks_back_off_to_thirty_minute_cap() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room("离线退避主播", "702", "room-702", true))
+        .unwrap();
+    let room = Arc::new(FakeRoomDiscovery::new([
+        RoomReply::Offline("room-702"),
+        RoomReply::Offline("room-702"),
+        RoomReply::Offline("room-702"),
+        RoomReply::Offline("room-702"),
+        RoomReply::Offline("room-702"),
+    ]));
+    let delay = Arc::new(ControlledDelay::default());
+    let supervisor = Supervisor::with_dependencies(
+        database,
+        Arc::new(NoopPublisher),
+        4,
+        Arc::new(FakeProfileDiscovery::new([])),
+        room,
+        Arc::new(FixedJitter(7)),
+        delay.clone(),
+    );
+
+    supervisor.start(streamer.id).unwrap();
+    for (index, expected) in [5 * 60, 10 * 60, 20 * 60, 30 * 60, 30 * 60]
+        .into_iter()
+        .enumerate()
+    {
+        wait_until(|| delay.durations.lock().unwrap().len() > index).await;
+        assert_eq!(
+            delay.durations.lock().unwrap()[index],
+            Duration::from_secs(expected)
+        );
+        if index < 4 {
+            delay.advance();
+        }
+    }
     supervisor.shutdown().await;
 }
 

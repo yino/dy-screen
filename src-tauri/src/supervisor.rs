@@ -33,6 +33,7 @@ use crate::room_resolution::{
 use crate::runtime_resource_state::RuntimeResourceState;
 
 const VERIFICATION_WAIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const LIVE_RECHECK_BASE_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorState {
@@ -65,6 +66,13 @@ pub fn backoff_seconds(failure_count: usize) -> u64 {
 
 pub fn profile_backoff_seconds(failure_count: usize) -> u64 {
     [60, 120, 300].get(failure_count).copied().unwrap_or(300)
+}
+
+pub fn offline_backoff_seconds(offline_count: usize) -> u64 {
+    [5 * 60, 10 * 60, 20 * 60, 30 * 60]
+        .get(offline_count)
+        .copied()
+        .unwrap_or(30 * 60)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,6 +1047,7 @@ impl Supervisor {
     ) {
         let mut room_failures = 0usize;
         let mut profile_failures = 0usize;
+        let mut consecutive_offline_checks = 0usize;
         let mut entry_invalid_count = 0usize;
         let mut restored_failure_count = false;
         loop {
@@ -1090,6 +1099,7 @@ impl Supervisor {
                 match inspection {
                     Ok(ProfileInspection::Offline { .. }) => {
                         profile_failures = 0;
+                        consecutive_offline_checks = consecutive_offline_checks.saturating_add(1);
                         let _ = self.database.update_streamer_status(
                             streamer_id,
                             "offline",
@@ -1097,7 +1107,8 @@ impl Supervisor {
                             None,
                         );
                         self.emit("streamer_changed", Some(streamer_id)).await;
-                        let wait = 60 + self.jitter.profile_seconds().min(10);
+                        let wait =
+                            offline_backoff_seconds(consecutive_offline_checks.saturating_sub(1));
                         if !self
                             .wait_for_next(
                                 Duration::from_secs(wait),
@@ -1112,6 +1123,7 @@ impl Supervisor {
                     }
                     Ok(ProfileInspection::Live { room, .. }) => {
                         profile_failures = 0;
+                        consecutive_offline_checks = 0;
                         match self.database.bind_discovered_room(
                             streamer_id,
                             &room.web_rid,
@@ -1165,6 +1177,7 @@ impl Supervisor {
                     }
                     Err(error) => {
                         profile_failures += 1;
+                        consecutive_offline_checks = 0;
                         let safe_error = error.safe_message();
                         let wait = profile_backoff_seconds(profile_failures.saturating_sub(1));
                         let _ = self.database.update_streamer_failure(
@@ -1225,6 +1238,7 @@ impl Supervisor {
             {
                 ResolveAttempt::Live(room) => {
                     room_failures = 0;
+                    consecutive_offline_checks = 0;
                     entry_invalid_count = 0;
                     if let Some(web_rid) = streamer.web_rid.as_deref()
                         && let Ok(DiscoveryBinding::Bound(updated)) =
@@ -1298,11 +1312,12 @@ impl Supervisor {
                             self.publisher.notify("录制异常", &error).await;
                         }
                     }
-                    60 + self.jitter.room_seconds().min(15)
+                    LIVE_RECHECK_BASE_SECONDS + self.jitter.room_seconds().min(15)
                 }
                 ResolveAttempt::Offline { room_id } => {
                     self.unregister_live_candidate(streamer_id, generation);
                     room_failures = 0;
+                    consecutive_offline_checks = consecutive_offline_checks.saturating_add(1);
                     entry_invalid_count = 0;
                     if let (Some(web_rid), Some(room_id)) =
                         (streamer.web_rid.as_deref(), room_id.as_deref())
@@ -1329,10 +1344,11 @@ impl Supervisor {
                         0,
                         None,
                     );
-                    60 + self.jitter.room_seconds().min(15)
+                    offline_backoff_seconds(consecutive_offline_checks.saturating_sub(1))
                 }
                 ResolveAttempt::Retryable(safe_error, http_status) => {
                     self.unregister_live_candidate(streamer_id, generation);
+                    consecutive_offline_checks = 0;
                     entry_invalid_count = 0;
                     room_failures += 1;
                     let wait = backoff_seconds(room_failures.saturating_sub(1));
@@ -1358,6 +1374,7 @@ impl Supervisor {
                 }
                 ResolveAttempt::AccessRestricted(safe_error, http_status) => {
                     self.unregister_live_candidate(streamer_id, generation);
+                    consecutive_offline_checks = 0;
                     entry_invalid_count = 0;
                     room_failures += 1;
                     let wait = backoff_seconds(room_failures.saturating_sub(1));
@@ -1383,6 +1400,7 @@ impl Supervisor {
                 }
                 ResolveAttempt::VerificationRequired(safe_error) => {
                     self.unregister_live_candidate(streamer_id, generation);
+                    consecutive_offline_checks = 0;
                     entry_invalid_count = 0;
                     let _ = self.database.update_streamer_verification_required(
                         streamer_id,
@@ -1402,6 +1420,7 @@ impl Supervisor {
                 }
                 ResolveAttempt::LayoutChanged(safe_error, http_status) => {
                     self.unregister_live_candidate(streamer_id, generation);
+                    consecutive_offline_checks = 0;
                     entry_invalid_count = 0;
                     room_failures += 1;
                     let wait = backoff_seconds(room_failures.saturating_sub(1));
@@ -1427,6 +1446,7 @@ impl Supervisor {
                 }
                 ResolveAttempt::EntryInvalid(safe_error, http_status) => {
                     self.unregister_live_candidate(streamer_id, generation);
+                    consecutive_offline_checks = 0;
                     room_failures = 0;
                     entry_invalid_count = entry_invalid_count.saturating_add(1);
                     if streamer.source_kind == StreamerSourceKind::Profile

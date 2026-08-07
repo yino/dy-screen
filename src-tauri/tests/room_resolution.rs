@@ -112,6 +112,7 @@ fn challenged_offline_browser_snapshot_for(web_rid: &str) -> BrowserPageSnapshot
 
 enum NativeReply {
     Live,
+    Offline,
     AccessRestricted,
     Retryable,
 }
@@ -198,6 +199,13 @@ impl NativeRoomResolver for FakeNativeResolver {
             NativeReply::Live => (
                 Ok(RoomInspection::Live(live_room())),
                 RoomDiagnosticClassification::Live,
+                false,
+            ),
+            NativeReply::Offline => (
+                Ok(RoomInspection::Offline {
+                    room_id: "292895634635".to_owned(),
+                }),
+                RoomDiagnosticClassification::Offline,
                 false,
             ),
             NativeReply::AccessRestricted => (
@@ -760,6 +768,60 @@ async fn manual_recheck_uses_recovered_native_channel_before_reloading_verificat
     assert_eq!(access.active_streamer_id, None);
     assert_eq!(native.calls.load(Ordering::SeqCst), 2);
     assert_eq!(browser.navigations.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn offline_native_recovery_keeps_verified_browser_sticky_mode() {
+    let native = Arc::new(FakeNativeResolver::new([
+        NativeReply::AccessRestricted,
+        NativeReply::Offline,
+    ]));
+    let browser = Arc::new(FakeBrowserDriver::new(browser_snapshot_for(
+        "168376497175",
+        true,
+    )));
+    let service = RoomResolutionService::with_policy(
+        native.clone(),
+        browser.clone(),
+        Arc::new(NoopRoomResolutionPublisher),
+        short_policy(),
+    );
+    let context = RoomResolutionContext {
+        streamer_id: Some(8),
+        web_rid: Some("168376497175".to_owned()),
+        ..context()
+    };
+
+    let initial = service
+        .inspect_with_context("https://live.douyin.com/168376497175", context.clone())
+        .await;
+    assert!(matches!(
+        initial,
+        Err(RecorderError::RoomAccessVerificationRequired)
+    ));
+
+    browser.replace_snapshot(offline_browser_snapshot_for("168376497175"));
+
+    let access = service
+        .recheck()
+        .await
+        .expect("native offline recovery clears the verification target");
+
+    assert_eq!(access.status, BrowserAccessStatus::SessionReady);
+    assert_eq!(native.calls.load(Ordering::SeqCst), 2);
+
+    let inspection = service
+        .inspect_with_context("https://live.douyin.com/168376497175", context)
+        .await
+        .expect("the next check uses the verified browser session");
+    assert_eq!(
+        inspection,
+        RoomInspection::Offline {
+            room_id: "168376497175".to_owned(),
+        }
+    );
+    assert_eq!(native.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(browser.navigations.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

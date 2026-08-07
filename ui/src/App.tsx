@@ -1159,7 +1159,7 @@ function MonitorPage({
       )}
       <section className="summary-grid">
         <SummaryCard icon={Radio} label="监控主播" value={dashboard.streamers.length} hint="已配置的活动主播" tone="green" />
-        <SummaryCard icon={Wifi} label="正在直播" value={liveCount} hint="离线约 60 秒刷新" tone="orange" />
+        <SummaryCard icon={Wifi} label="正在直播" value={liveCount} hint="未开播按 5~30 分钟退避" tone="orange" />
         <SummaryCard icon={Video} label="活动录制" value={dashboard.activeRecordings} hint={`服务端额度 ${dashboard.maxScreenLimit} 路`} tone="blue" />
         <SummaryCard icon={Clock3} label="等待开播" value={waitingCount} hint="应用关闭窗口后继续" tone="purple" />
       </section>
@@ -2056,7 +2056,7 @@ function AddStreamerModal({ api, initial, onClose, onSubmit }: { api: ClientApi;
             {tags.length >= 10 && <p className="tag-limit">已达到每个主播 10 个标签的上限</p>}
             <p className="tag-reservation-note">标签仅为未来切片上下文预留，本版本不生成 Prompt、不调用 LLM。{"__TAURI_INTERNALS__" in window ? "" : " 浏览器演示模式仅保存到 localStorage，不写入 SQLite。"}</p>
           </section>
-          <label className="switch-row boxed"><div><strong>添加后立即监听</strong><small>主页未发现入口时约每 60 秒检查；发现后每 30 秒检查直播间。</small></div><input type="checkbox" checked={monitorEnabled} onChange={(event) => setMonitorEnabled(event.target.checked)} /></label>
+          <label className="switch-row boxed"><div><strong>添加后立即监听</strong><small>未开播后按 5、10、20、30 分钟逐级退避，最长每 30 分钟检查一次。</small></div><input type="checkbox" checked={monitorEnabled} onChange={(event) => setMonitorEnabled(event.target.checked)} /></label>
           {error && <div className="form-error">{error}</div>}
         </div>
         <div className="modal-footer"><button type="button" className="ghost-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" size={17} /> : <Radio size={17} />}{initial ? "保存修改" : "保存并监听"}</button></div>

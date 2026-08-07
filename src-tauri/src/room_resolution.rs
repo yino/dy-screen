@@ -485,9 +485,10 @@ impl RoomResolutionService {
             next_action,
         );
 
+        let restore_native = matches!(&attempt.inspection, Ok(RoomInspection::Live(_)));
         match attempt.inspection {
             Ok(_) => {
-                self.complete_native_verification(target.request_generation)
+                self.complete_native_verification(target.request_generation, restore_native)
                     .await;
                 Ok(true)
             }
@@ -515,7 +516,7 @@ impl RoomResolutionService {
         }
     }
 
-    async fn complete_native_verification(&self, request_generation: u64) {
+    async fn complete_native_verification(&self, request_generation: u64, restore_native: bool) {
         let mut completed = false;
         if let Ok(mut runtime) = self.runtime.lock()
             && runtime
@@ -523,10 +524,24 @@ impl RoomResolutionService {
                 .as_ref()
                 .is_some_and(|pending| pending.request_generation == request_generation)
         {
-            runtime.mode = ResolutionMode::NativePreferred;
+            runtime.mode = if restore_native {
+                ResolutionMode::NativePreferred
+            } else {
+                // An offline native result can be genuine while the native channel
+                // remains challenge-prone. Keep using the verified browser session
+                // for the next worker wake-up instead of immediately re-triggering
+                // the same native challenge page.
+                ResolutionMode::BrowserSticky {
+                    until: Instant::now() + self.policy.browser_sticky_for,
+                }
+            };
             runtime.verification_target = None;
             runtime.last_browser_probe = None;
-            runtime.access.status = BrowserAccessStatus::Native;
+            runtime.access.status = if restore_native {
+                BrowserAccessStatus::Native
+            } else {
+                BrowserAccessStatus::SessionReady
+            };
             runtime.access.active_streamer_id = None;
             runtime.access.current_web_rid = None;
             runtime.access.last_reason = None;
