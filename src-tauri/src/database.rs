@@ -73,7 +73,16 @@ pub struct ClientActivationRecord {
     pub updated_at: String,
 }
 
-/// 仅用于把 v10 明文授权记录安全迁移到系统凭据存储。完成迁移后旧表会被删除。
+/// 仅供 Rust 授权服务使用的本地凭据记录。该类型不实现 Serialize，避免完整
+/// 设备号、激活码或令牌被 Tauri command、事件或日志意外输出到前端。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientActivationSecretsRecord {
+    pub device_id: String,
+    pub activate_code: String,
+    pub token: Option<String>,
+}
+
+/// 仅用于把 v10 明文授权记录迁移到独立的本地凭据表。完成迁移后旧表会被删除。
 #[derive(Clone, PartialEq, Eq)]
 pub struct LegacyClientActivationRecord {
     pub device_id: String,
@@ -288,6 +297,7 @@ impl Database {
             migrate_client_activation_v10(&mut connection)?;
         }
         migrate_client_activation_v19(&mut connection)?;
+        migrate_client_activation_secrets_v20(&mut connection)?;
         drop(connection);
         self.ensure_default_settings()
     }
@@ -350,6 +360,53 @@ impl Database {
                 record.updated_at,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn client_activation_secrets(&self) -> Result<Option<ClientActivationSecretsRecord>> {
+        self.connection()?
+            .query_row(
+                r#"SELECT device_id, activate_code, token
+                   FROM client_activation_secrets WHERE id = 1"#,
+                [],
+                |row| {
+                    Ok(ClientActivationSecretsRecord {
+                        device_id: row.get(0)?,
+                        activate_code: row.get(1)?,
+                        token: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::from)
+    }
+
+    pub fn save_client_activation_secrets(
+        &self,
+        record: &ClientActivationSecretsRecord,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            r#"INSERT INTO client_activation_secrets(
+                    id, device_id, activate_code, token, updated_at
+                ) VALUES(1, ?1, ?2, ?3, ?4)
+                ON CONFLICT(id) DO UPDATE SET
+                    device_id=excluded.device_id,
+                    activate_code=excluded.activate_code,
+                    token=excluded.token,
+                    updated_at=excluded.updated_at"#,
+            params![
+                record.device_id,
+                record.activate_code,
+                record.token,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_client_activation_secrets(&self) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM client_activation_secrets WHERE id = 1", [])?;
         Ok(())
     }
 
@@ -2004,6 +2061,27 @@ fn migrate_client_activation_v19(connection: &mut Connection) -> Result<()> {
     )?;
     transaction.execute(
         "INSERT INTO schema_migrations(version, applied_at) VALUES(19, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_client_activation_secrets_v20(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS client_activation_secrets (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            device_id TEXT NOT NULL,
+            activate_code TEXT NOT NULL,
+            token TEXT,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(20, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

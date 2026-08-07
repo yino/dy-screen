@@ -1149,8 +1149,6 @@ dependencies = [
  "rig-core",
  "rusqlite",
  "schemars 1.2.1",
- "security-framework",
- "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",

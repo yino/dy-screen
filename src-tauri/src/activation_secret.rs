@@ -1,16 +1,15 @@
-//! 客户端授权秘密的系统安全存储边界。
+//! 客户端授权秘密的本地存储边界。
 //!
-//! 完整设备号、激活码和离线令牌只能通过本模块进出。生产实现使用
-//! macOS Keychain 或 Windows Credential Manager，绝不回退到 SQLite 或明文文件。
+//! 完整设备号、激活码和离线令牌只能通过本模块进出。生产实现使用独立的
+//! SQLite 表，避免这些字段出现在前端状态、事件或日志中。
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const SERVICE_NAME: &str = "com.yino.clip-agent.activation";
+use crate::database::{ClientActivationSecretsRecord, Database};
+
 const MAX_SECRET_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,11 +33,11 @@ impl ActivationSecrets {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ActivationSecretError {
-    #[error("系统安全凭据存储不可用")]
+    #[error("本地激活凭据存储不可用")]
     Unavailable,
-    #[error("系统安全凭据内容无效")]
+    #[error("本地激活凭据内容无效")]
     Invalid,
-    #[error("系统安全凭据操作失败")]
+    #[error("本地激活凭据操作失败")]
     Operation,
 }
 
@@ -124,187 +123,50 @@ impl ActivationSecretStore for MemoryActivationSecretStore {
 }
 
 #[derive(Clone)]
-pub struct SystemActivationSecretStore {
-    service: String,
-    account: String,
+pub struct SqliteActivationSecretStore {
+    database: Database,
 }
 
-impl SystemActivationSecretStore {
-    pub fn for_app_data_dir(app_data_dir: &Path) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"clip-agent-activation-account-v1\0");
-        hasher.update(app_data_dir.to_string_lossy().as_bytes());
-        let digest = hex::encode(hasher.finalize());
-        Self {
-            service: SERVICE_NAME.to_owned(),
-            account: format!("primary-{}", &digest[..16]),
-        }
-    }
-
-    fn encode(secrets: &ActivationSecrets) -> Result<Vec<u8>, ActivationSecretError> {
-        secrets.validate()?;
-        let payload = serde_json::to_vec(secrets).map_err(|_| ActivationSecretError::Invalid)?;
-        if payload.len() > MAX_SECRET_BYTES {
-            return Err(ActivationSecretError::Invalid);
-        }
-        Ok(payload)
-    }
-
-    fn decode(payload: &[u8]) -> Result<ActivationSecrets, ActivationSecretError> {
-        if payload.is_empty() || payload.len() > MAX_SECRET_BYTES {
-            return Err(ActivationSecretError::Invalid);
-        }
-        let secrets = serde_json::from_slice::<ActivationSecrets>(payload)
-            .map_err(|_| ActivationSecretError::Invalid)?;
-        secrets.validate()?;
-        Ok(secrets)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_target(&self) -> Vec<u16> {
-        format!("{}.{}", self.service, self.account)
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_account(&self) -> Vec<u16> {
-        self.account
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect()
+impl SqliteActivationSecretStore {
+    pub fn new(database: Database) -> Self {
+        Self { database }
     }
 }
 
-impl ActivationSecretStore for SystemActivationSecretStore {
+impl ActivationSecretStore for SqliteActivationSecretStore {
     fn load(&self) -> Result<Option<ActivationSecrets>, ActivationSecretError> {
-        #[cfg(target_os = "macos")]
-        {
-            use security_framework::passwords::get_generic_password;
-            use security_framework_sys::base::errSecItemNotFound;
-
-            match get_generic_password(&self.service, &self.account) {
-                Ok(payload) => Self::decode(&payload).map(Some),
-                Err(error) if error.code() == errSecItemNotFound => Ok(None),
-                Err(_) => Err(ActivationSecretError::Operation),
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            use std::ptr::null_mut;
-            use std::slice;
-            use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-            use windows_sys::Win32::Security::Credentials::{
-                CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-            };
-
-            let target = self.windows_target();
-            let mut credential: *mut CREDENTIALW = null_mut();
-            if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
-                return match unsafe { GetLastError() } {
-                    ERROR_NOT_FOUND => Ok(None),
-                    _ => Err(ActivationSecretError::Operation),
+        let record = self
+            .database
+            .client_activation_secrets()
+            .map_err(|_| ActivationSecretError::Operation)?;
+        record
+            .map(|record| {
+                let secrets = ActivationSecrets {
+                    device_id: record.device_id,
+                    activate_code: record.activate_code,
+                    token: record.token,
                 };
-            }
-            if credential.is_null() {
-                return Err(ActivationSecretError::Operation);
-            }
-            let result = unsafe {
-                let credential = &*credential;
-                if credential.CredentialBlobSize == 0 || credential.CredentialBlob.is_null() {
-                    Err(ActivationSecretError::Invalid)
-                } else {
-                    let payload = slice::from_raw_parts(
-                        credential.CredentialBlob,
-                        credential.CredentialBlobSize as usize,
-                    );
-                    Self::decode(payload).map(Some)
-                }
-            };
-            unsafe { CredFree(credential.cast()) };
-            return result;
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            Err(ActivationSecretError::Unavailable)
-        }
+                secrets.validate()?;
+                Ok(secrets)
+            })
+            .transpose()
     }
 
     fn store(&self, secrets: &ActivationSecrets) -> Result<(), ActivationSecretError> {
-        let payload = Self::encode(secrets)?;
-        #[cfg(target_os = "macos")]
-        {
-            use security_framework::passwords::set_generic_password;
-
-            set_generic_password(&self.service, &self.account, &payload)
-                .map_err(|_| ActivationSecretError::Operation)
-        }
-        #[cfg(target_os = "windows")]
-        {
-            use std::ptr::null_mut;
-            use windows_sys::Win32::Security::Credentials::{
-                CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
-            };
-
-            let mut payload = payload;
-            let mut target = self.windows_target();
-            let mut account = self.windows_account();
-            let credential = CREDENTIALW {
-                Type: CRED_TYPE_GENERIC,
-                TargetName: target.as_mut_ptr(),
-                CredentialBlobSize: payload.len() as u32,
-                CredentialBlob: payload.as_mut_ptr(),
-                Persist: CRED_PERSIST_LOCAL_MACHINE,
-                UserName: account.as_mut_ptr(),
-                Comment: null_mut(),
-                TargetAlias: null_mut(),
-                Attributes: null_mut(),
-                ..CREDENTIALW::default()
-            };
-            return if unsafe { CredWriteW(&credential, 0) } == 0 {
-                Err(ActivationSecretError::Operation)
-            } else {
-                Ok(())
-            };
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let _ = payload;
-            Err(ActivationSecretError::Unavailable)
-        }
+        secrets.validate()?;
+        self.database
+            .save_client_activation_secrets(&ClientActivationSecretsRecord {
+                device_id: secrets.device_id.clone(),
+                activate_code: secrets.activate_code.clone(),
+                token: secrets.token.clone(),
+            })
+            .map_err(|_| ActivationSecretError::Operation)
     }
 
     fn delete(&self) -> Result<(), ActivationSecretError> {
-        #[cfg(target_os = "macos")]
-        {
-            use security_framework::passwords::delete_generic_password;
-            use security_framework_sys::base::errSecItemNotFound;
-
-            match delete_generic_password(&self.service, &self.account) {
-                Ok(()) => Ok(()),
-                Err(error) if error.code() == errSecItemNotFound => Ok(()),
-                Err(_) => Err(ActivationSecretError::Operation),
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, GetLastError};
-            use windows_sys::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
-
-            let target = self.windows_target();
-            if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } != 0 {
-                return Ok(());
-            }
-            return match unsafe { GetLastError() } {
-                ERROR_NOT_FOUND => Ok(()),
-                _ => Err(ActivationSecretError::Operation),
-            };
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            Err(ActivationSecretError::Unavailable)
-        }
+        self.database
+            .clear_client_activation_secrets()
+            .map_err(|_| ActivationSecretError::Operation)
     }
 }
 

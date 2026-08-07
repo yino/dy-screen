@@ -5,6 +5,7 @@ use std::time::Duration;
 use dy_screen_app_lib::activation::ActivationService;
 use dy_screen_app_lib::activation_secret::{
     ActivationSecretStore, ActivationSecrets, MemoryActivationSecretStore,
+    SqliteActivationSecretStore,
 };
 use dy_screen_app_lib::api::{ApiClient, ApiConfig, PlainJsonCodec};
 use dy_screen_app_lib::database::{ClientActivationRecord, Database};
@@ -77,6 +78,18 @@ fn activation_columns(path: &Path) -> Vec<String> {
         .collect()
 }
 
+fn activation_secret_columns(path: &Path) -> Vec<String> {
+    let connection = Connection::open(path).unwrap();
+    let mut statement = connection
+        .prepare("PRAGMA table_info(client_activation_secrets)")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 #[test]
 fn activation_migration_and_repository_are_idempotent() {
     let database = Database::open_in_memory().expect("打开内存数据库");
@@ -119,6 +132,83 @@ fn fresh_database_uses_metadata_only_activation_schema() {
     for forbidden in ["device_id", "activate_code", "token", "enc_key"] {
         assert!(!columns.iter().any(|column| column == forbidden));
     }
+    assert_eq!(
+        activation_secret_columns(&path),
+        ["id", "device_id", "activate_code", "token", "updated_at"]
+    );
+    let migration_count: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version = 20",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_count, 1);
+}
+
+#[test]
+fn sqlite_secret_store_supports_restart_replace_and_idempotent_delete() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("sqlite-secrets.sqlite3");
+    let database = Database::open(&path).unwrap();
+    database.migrate().unwrap();
+    let store = SqliteActivationSecretStore::new(database.clone());
+    let initial = ActivationSecrets {
+        device_id: "DY-SQLITE-DEVICE".to_owned(),
+        activate_code: "TEST-SQLITE-ACTIVATION-CODE".to_owned(),
+        token: Some("TEST-SQLITE-OFFLINE-TOKEN".to_owned()),
+    };
+
+    assert!(store.load().unwrap().is_none());
+    store.store(&initial).unwrap();
+    assert!(store.load().unwrap().as_ref() == Some(&initial));
+
+    drop(store);
+    drop(database);
+    let reopened = Database::open(&path).unwrap();
+    reopened.migrate().unwrap();
+    let restarted_store = SqliteActivationSecretStore::new(reopened);
+    assert!(restarted_store.load().unwrap().as_ref() == Some(&initial));
+
+    let replacement = ActivationSecrets {
+        activate_code: "TEST-REPLACEMENT-CODE".to_owned(),
+        token: None,
+        ..initial
+    };
+    restarted_store.store(&replacement).unwrap();
+    assert!(restarted_store.load().unwrap().as_ref() == Some(&replacement));
+    restarted_store.delete().unwrap();
+    restarted_store.delete().unwrap();
+    assert!(restarted_store.load().unwrap().is_none());
+}
+
+#[test]
+fn production_service_migrates_v10_credentials_into_sqlite() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("legacy-to-sqlite.sqlite3");
+    prepare_v10_database(&path);
+    let database = Database::open(&path).unwrap();
+    database.migrate().unwrap();
+
+    let service = ActivationService::new(database.clone(), test_api(), temporary.path()).unwrap();
+    assert!(service.state().active);
+    let migrated = SqliteActivationSecretStore::new(database.clone())
+        .load()
+        .unwrap();
+    assert!(
+        migrated.as_ref()
+            == Some(&ActivationSecrets {
+                device_id: "DY-LEGACY-DEVICE-12345678".to_owned(),
+                activate_code: "TEST-LEGACY-ACTIVATION-CODE".to_owned(),
+                token: Some("TEST-LEGACY-OFFLINE-TOKEN".to_owned()),
+            })
+    );
+    assert!(database.legacy_client_activation().unwrap().is_none());
+
+    drop(service);
+    let restarted = ActivationService::new(database, test_api(), temporary.path()).unwrap();
+    assert!(restarted.state().active);
 }
 
 #[test]
@@ -221,7 +311,7 @@ fn secure_store_read_failure_keeps_the_legacy_record_and_gate_closed() {
             .state()
             .message
             .unwrap()
-            .contains("无法读取系统安全凭据")
+            .contains("无法读取本地激活凭据")
     );
     assert!(database.legacy_client_activation().unwrap().is_some());
 }
@@ -246,7 +336,7 @@ async fn failed_secret_delete_remains_gated_and_can_be_retried_idempotently() {
     store.fail_delete(true);
     let blocked = service.clear().await.unwrap();
     assert!(!blocked.active);
-    assert!(blocked.message.unwrap().contains("无法清除系统安全凭据"));
+    assert!(blocked.message.unwrap().contains("无法清除本地激活凭据"));
     store.fail_delete(false);
     assert!(store.load().unwrap().is_some());
 

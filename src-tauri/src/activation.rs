@@ -1,6 +1,6 @@
 //! 客户端激活状态、心跳和安全埋点生命周期。
 //!
-//! 完整设备号、激活码与令牌只存在于本模块和系统安全凭据存储中；前端
+//! 完整设备号、激活码与令牌只存在于本模块和本地 SQLite 凭据表中；前端
 //! 得到的始终是 `ActivationStateView` 摘要。网络调用全部委托给 `api.rs`。
 
 use std::path::Path;
@@ -16,7 +16,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::activation_secret::{
-    ActivationSecretStore, ActivationSecrets, SystemActivationSecretStore,
+    ActivationSecretStore, ActivationSecrets, SqliteActivationSecretStore,
 };
 use crate::api::{ApiClient, ApiError, TelemetryEvent};
 use crate::database::{ClientActivationRecord, Database};
@@ -112,12 +112,8 @@ pub struct ActivationService {
 
 impl ActivationService {
     pub fn new(database: Database, api: ApiClient, app_data_dir: &Path) -> Result<Self, String> {
-        Self::new_with_secret_store(
-            database,
-            api,
-            app_data_dir,
-            Arc::new(SystemActivationSecretStore::for_app_data_dir(app_data_dir)),
-        )
+        let secret_store = Arc::new(SqliteActivationSecretStore::new(database.clone()));
+        Self::new_with_secret_store(database, api, app_data_dir, secret_store)
     }
 
     pub fn new_with_secret_store(
@@ -320,7 +316,7 @@ impl ActivationService {
                     let _ = self.lock_authorization(
                         record,
                         "invalid",
-                        "无法更新系统安全凭据，请重新激活".to_owned(),
+                        "无法更新本地激活凭据，请重新激活".to_owned(),
                         false,
                     );
                     return HeartbeatOutcome::Revoked;
@@ -419,7 +415,7 @@ impl ActivationService {
             updated_at: now.to_rfc3339(),
         };
         if self.secret_store.delete().is_err() {
-            record.last_error = Some("无法清除系统安全凭据，请重新提交激活码覆盖旧凭据".to_owned());
+            record.last_error = Some("无法清除本地激活凭据，请重新提交激活码覆盖旧凭据".to_owned());
         }
         *self
             .secrets
@@ -452,13 +448,13 @@ impl ActivationService {
     fn persist_secrets(&self, secrets: &ActivationSecrets) -> Result<(), String> {
         self.secret_store
             .store(secrets)
-            .map_err(|_| "无法写入系统安全凭据，请检查系统权限后重试".to_owned())?;
+            .map_err(|_| "无法写入本地激活凭据，请重试".to_owned())?;
         let persisted = self
             .secret_store
             .load()
-            .map_err(|_| "无法读取系统安全凭据，请检查系统权限后重试".to_owned())?;
+            .map_err(|_| "无法读取本地激活凭据，请重试".to_owned())?;
         if persisted.as_ref() != Some(secrets) {
-            return Err("系统安全凭据回读校验失败，请重试".to_owned());
+            return Err("本地激活凭据回读校验失败，请重试".to_owned());
         }
         *self
             .secrets
@@ -603,7 +599,7 @@ fn load_and_migrate_secrets(
             return Ok((
                 None,
                 legacy.as_ref().map(|record| record.device_id.clone()),
-                Some("无法读取系统安全凭据，请检查系统权限后重新激活".to_owned()),
+                Some("无法读取本地激活凭据，请重新激活".to_owned()),
             ));
         }
     };
@@ -632,7 +628,7 @@ fn load_and_migrate_secrets(
             return Ok((
                 Some(stored),
                 Some(legacy.device_id),
-                Some("系统安全凭据与旧版授权记录不一致，请重新激活".to_owned()),
+                Some("本地激活凭据与旧版授权记录不一致，请重新激活".to_owned()),
             ));
         }
         database
@@ -645,7 +641,7 @@ fn load_and_migrate_secrets(
         return Ok((
             None,
             Some(legacy.device_id),
-            Some("无法迁移旧版授权凭据到系统安全存储，请检查系统权限".to_owned()),
+            Some("无法迁移旧版授权凭据到本地存储，请重新激活".to_owned()),
         ));
     }
     match secret_store.load() {

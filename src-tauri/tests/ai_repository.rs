@@ -191,6 +191,7 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         "ai_clip_transition_boundaries",
         "ai_transition_match_runs",
         "client_activation",
+        "client_activation_secrets",
     ] {
         assert_eq!(
             connection
