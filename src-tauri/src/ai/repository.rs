@@ -73,6 +73,27 @@ pub struct ClipExportBridge {
     pub has_audio: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipTextCorrectionTarget {
+    pub subtitle_id: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipTextCorrectionPlan {
+    pub project_version: u32,
+    pub targets: Vec<ClipTextCorrectionTarget>,
+    pub skipped_manual: usize,
+    pub skipped_hidden: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipTextCorrectionUpdate {
+    pub subtitle_id: i64,
+    pub expected_text: String,
+    pub corrected_text: String,
+}
+
 pub fn project_clip_subtitles(
     clip_segments: &[AiClipSegment],
     transcripts_by_input: &HashMap<i64, Vec<TranscriptSegment>>,
@@ -632,7 +653,7 @@ impl AiRepository {
         let connection = self.database.connection()?;
         let row = connection
             .query_row(
-                "SELECT provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, updated_at FROM llm_provider_settings WHERE id = 1",
+                "SELECT provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, transition_auto_apply_score, updated_at FROM llm_provider_settings WHERE id = 1",
                 [],
                 |row| {
                     Ok((
@@ -642,7 +663,8 @@ impl AiRepository {
                         row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
@@ -660,13 +682,14 @@ impl AiRepository {
             .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         let now = Utc::now().to_rfc3339();
         self.database.connection()?.execute(
-            r#"INSERT INTO llm_provider_settings(id, provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, updated_at)
-               VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            r#"INSERT INTO llm_provider_settings(id, provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, transition_auto_apply_score, updated_at)
+               VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model_id=excluded.model_id,
                    timeout_ms=excluded.timeout_ms, prompt_version=excluded.prompt_version,
                    qualified_score=excluded.qualified_score, excellent_score=excluded.excellent_score,
+                   transition_auto_apply_score=excluded.transition_auto_apply_score,
                    updated_at=excluded.updated_at"#,
-            params![settings.provider, settings.model_id.trim(), settings.timeout_ms as i64, settings.prompt_version, settings.qualified_score, settings.excellent_score, now],
+            params![settings.provider, settings.model_id.trim(), settings.timeout_ms as i64, settings.prompt_version, settings.qualified_score, settings.excellent_score, settings.transition_auto_apply_score, now],
         )?;
         self.get_llm_provider_settings(settings.key_configured)
     }
@@ -1571,6 +1594,241 @@ impl AiRepository {
             .reconcile_boundaries(clip_project_id)
             .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(clip_project_id)
+    }
+
+    pub fn prepare_clip_text_correction(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+    ) -> Result<ClipTextCorrectionPlan> {
+        let connection = self.database.connection()?;
+        let (status, version) = connection
+            .query_row(
+                "SELECT export_status, version FROM ai_clip_projects WHERE id = ?1",
+                [clip_project_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+        if status == AiClipExportStatus::Exporting.as_str() {
+            return Err(AiRepositoryError::ClipExportInProgress);
+        }
+        if version != i64::from(expected_project_version) {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        let mut statement = connection.prepare(
+            r#"SELECT subtitle.id, subtitle.original_text, subtitle.text, subtitle.hidden
+               FROM ai_clip_subtitles subtitle
+               JOIN ai_clip_segments segment ON segment.id = subtitle.clip_segment_id
+               WHERE subtitle.clip_project_id = ?1
+               ORDER BY segment.position, subtitle.source_start_ms, subtitle.id"#,
+        )?;
+        let rows = statement
+            .query_map([clip_project_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut targets = Vec::new();
+        let mut skipped_manual = 0;
+        let mut skipped_hidden = 0;
+        for (subtitle_id, original_text, text, hidden) in rows {
+            if hidden {
+                skipped_hidden += 1;
+            } else if text != original_text {
+                skipped_manual += 1;
+            } else {
+                targets.push(ClipTextCorrectionTarget { subtitle_id, text });
+            }
+        }
+        Ok(ClipTextCorrectionPlan {
+            project_version: u32::try_from(version)
+                .map_err(|_| AiRepositoryError::Integrity("剪辑工程版本无效".to_owned()))?,
+            targets,
+            skipped_manual,
+            skipped_hidden,
+        })
+    }
+
+    pub fn apply_clip_text_corrections(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+        updates: &[ClipTextCorrectionUpdate],
+    ) -> Result<(AiClipProjectDetail, usize)> {
+        let normalized = updates
+            .iter()
+            .map(|update| {
+                Ok((
+                    update,
+                    normalize_clip_subtitle_text(&update.corrected_text)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let version = ensure_clip_project_editable(&transaction, clip_project_id)?;
+        if version != expected_project_version {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut changed_items = 0;
+        for (update, corrected_text) in normalized {
+            let current = transaction
+                .query_row(
+                    r#"SELECT original_text, text, hidden
+                       FROM ai_clip_subtitles
+                       WHERE id = ?1 AND clip_project_id = ?2"#,
+                    params![update.subtitle_id, clip_project_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or(AiRepositoryError::NotFound("工程字幕"))?;
+            if current.2 || current.0 != current.1 || current.1 != update.expected_text {
+                return Err(AiRepositoryError::ClipVersionConflict);
+            }
+            if corrected_text != current.1 {
+                transaction.execute(
+                    r#"UPDATE ai_clip_subtitles SET text = ?1, updated_at = ?2
+                       WHERE id = ?3 AND clip_project_id = ?4"#,
+                    params![corrected_text, now, update.subtitle_id, clip_project_id],
+                )?;
+                changed_items += 1;
+            }
+        }
+        if changed_items > 0 {
+            mark_clip_project_edited(&transaction, clip_project_id, &now)?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        Ok((self.get_clip_project(clip_project_id)?, changed_items))
+    }
+
+    pub fn begin_clip_text_correction_run(
+        &self,
+        clip_project_id: i64,
+        project_version: u32,
+        model_id: &str,
+        prompt_version: &str,
+        input_fingerprint: &str,
+        total_items: usize,
+        skipped_manual: usize,
+        skipped_hidden: usize,
+        total_batches: usize,
+    ) -> Result<i64> {
+        let connection = self.database.connection()?;
+        connection.execute(
+            r#"INSERT INTO ai_clip_text_correction_runs(
+                   clip_project_id, project_version, status, stage, model_id,
+                   prompt_version, input_fingerprint, total_items, skipped_manual,
+                   skipped_hidden, total_batches, created_at, updated_at
+               ) VALUES(?1, ?2, 'running', 'correcting', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)"#,
+            params![
+                clip_project_id,
+                project_version,
+                model_id,
+                prompt_version,
+                input_fingerprint,
+                i64::try_from(total_items).unwrap_or(i64::MAX),
+                i64::try_from(skipped_manual).unwrap_or(i64::MAX),
+                i64::try_from(skipped_hidden).unwrap_or(i64::MAX),
+                i64::try_from(total_batches).unwrap_or(i64::MAX),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn update_clip_text_correction_run(
+        &self,
+        run_id: i64,
+        stage: &str,
+        completed_batches: usize,
+        processed_items: usize,
+        token_usage: u64,
+    ) -> Result<()> {
+        let changed = self.database.connection()?.execute(
+            r#"UPDATE ai_clip_text_correction_runs
+               SET stage = ?1, completed_batches = ?2, processed_items = ?3,
+                   token_usage = ?4, updated_at = ?5
+               WHERE id = ?6 AND status = 'running'"#,
+            params![
+                stage,
+                i64::try_from(completed_batches).unwrap_or(i64::MAX),
+                i64::try_from(processed_items).unwrap_or(i64::MAX),
+                i64::try_from(token_usage).unwrap_or(i64::MAX),
+                Utc::now().to_rfc3339(),
+                run_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("文本纠错运行"));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_clip_text_correction_run(
+        &self,
+        run_id: i64,
+        status: &str,
+        stage: &str,
+        processed_items: usize,
+        changed_items: usize,
+        unchanged_items: usize,
+        completed_batches: usize,
+        token_usage: u64,
+        error: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let (error_code, error_message) = error
+            .map(|(code, message)| {
+                (
+                    Some(code.to_owned()),
+                    Some(
+                        message
+                            .trim()
+                            .chars()
+                            .filter(|character| !character.is_control())
+                            .take(256)
+                            .collect::<String>(),
+                    ),
+                )
+            })
+            .unwrap_or((None, None));
+        let changed = self.database.connection()?.execute(
+            r#"UPDATE ai_clip_text_correction_runs
+               SET status = ?1, stage = ?2, processed_items = ?3,
+                   changed_items = ?4, unchanged_items = ?5, completed_batches = ?6,
+                   token_usage = ?7, error_code = ?8, error_message = ?9, updated_at = ?10
+               WHERE id = ?11 AND status = 'running'"#,
+            params![
+                status,
+                stage,
+                i64::try_from(processed_items).unwrap_or(i64::MAX),
+                i64::try_from(changed_items).unwrap_or(i64::MAX),
+                i64::try_from(unchanged_items).unwrap_or(i64::MAX),
+                i64::try_from(completed_batches).unwrap_or(i64::MAX),
+                i64::try_from(token_usage).unwrap_or(i64::MAX),
+                error_code,
+                error_message,
+                Utc::now().to_rfc3339(),
+                run_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("文本纠错运行"));
+        }
+        Ok(())
     }
 
     pub fn insert_clip_candidate(
@@ -2920,6 +3178,194 @@ pub(crate) fn migrate_ai_v16(connection: &mut Connection) -> crate::database::Re
     )?;
     transaction.execute(
         "INSERT INTO schema_migrations(version, applied_at) VALUES(16, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// v21 增加剪辑字幕纠错审计、两阶段转场评分和独立自动应用阈值。
+pub(crate) fn migrate_ai_v21(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 21",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    for (table, column, definition) in [
+        (
+            "llm_provider_settings",
+            "transition_auto_apply_score",
+            "INTEGER NOT NULL DEFAULT 8 CHECK(transition_auto_apply_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "score",
+            "REAL CHECK(score IS NULL OR score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "scene_score",
+            "REAL CHECK(scene_score IS NULL OR scene_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "continuity_score",
+            "REAL CHECK(continuity_score IS NULL OR continuity_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "rhythm_score",
+            "REAL CHECK(rhythm_score IS NULL OR rhythm_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "material_score",
+            "REAL CHECK(material_score IS NULL OR material_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "suggestion_score",
+            "REAL CHECK(suggestion_score IS NULL OR suggestion_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "suggestion_scene_score",
+            "REAL CHECK(suggestion_scene_score IS NULL OR suggestion_scene_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "suggestion_continuity_score",
+            "REAL CHECK(suggestion_continuity_score IS NULL OR suggestion_continuity_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "suggestion_rhythm_score",
+            "REAL CHECK(suggestion_rhythm_score IS NULL OR suggestion_rhythm_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_clip_transition_boundaries",
+            "suggestion_material_score",
+            "REAL CHECK(suggestion_material_score IS NULL OR suggestion_material_score BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "project_version",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(project_version >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "model_id",
+            "TEXT NOT NULL DEFAULT 'deepseek-chat'",
+        ),
+        (
+            "ai_transition_match_runs",
+            "match_prompt_version",
+            "TEXT NOT NULL DEFAULT 'transition-match-v2'",
+        ),
+        (
+            "ai_transition_match_runs",
+            "score_prompt_version",
+            "TEXT NOT NULL DEFAULT 'transition-score-v1'",
+        ),
+        (
+            "ai_transition_match_runs",
+            "threshold",
+            "INTEGER NOT NULL DEFAULT 8 CHECK(threshold BETWEEN 0 AND 10)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "stage",
+            "TEXT NOT NULL DEFAULT 'matching'",
+        ),
+        (
+            "ai_transition_match_runs",
+            "total_boundaries",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(total_boundaries >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "matched_boundaries",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(matched_boundaries >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "auto_applied",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(auto_applied >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "suggestions",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(suggestions >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "none_suggestions",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(none_suggestions >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "failed_boundaries",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(failed_boundaries >= 0)",
+        ),
+        (
+            "ai_transition_match_runs",
+            "token_usage",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(token_usage >= 0)",
+        ),
+    ] {
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            transaction.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_clip_text_correction_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clip_project_id INTEGER NOT NULL REFERENCES ai_clip_projects(id) ON DELETE CASCADE,
+            project_version INTEGER NOT NULL CHECK(project_version >= 0),
+            status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'cancelled', 'failed')),
+            stage TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            total_items INTEGER NOT NULL DEFAULT 0 CHECK(total_items >= 0),
+            processed_items INTEGER NOT NULL DEFAULT 0 CHECK(processed_items >= 0),
+            changed_items INTEGER NOT NULL DEFAULT 0 CHECK(changed_items >= 0),
+            unchanged_items INTEGER NOT NULL DEFAULT 0 CHECK(unchanged_items >= 0),
+            skipped_manual INTEGER NOT NULL DEFAULT 0 CHECK(skipped_manual >= 0),
+            skipped_hidden INTEGER NOT NULL DEFAULT 0 CHECK(skipped_hidden >= 0),
+            total_batches INTEGER NOT NULL DEFAULT 0 CHECK(total_batches >= 0),
+            completed_batches INTEGER NOT NULL DEFAULT 0 CHECK(completed_batches >= 0),
+            token_usage INTEGER NOT NULL DEFAULT 0 CHECK(token_usage >= 0),
+            error_code TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_clip_text_correction_runs_project
+            ON ai_clip_text_correction_runs(clip_project_id, created_at DESC);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(21, ?1)",
         [Utc::now().to_rfc3339()],
     )?;
     transaction.commit()?;

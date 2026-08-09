@@ -14,6 +14,7 @@ import type {
   AiTranscriptProjection,
   AiTranscriptSegment,
   ClientApi,
+  ClipWorkflowProgress,
   PreviewSnapshot,
   TransitionMaterial,
 } from "./types";
@@ -316,11 +317,54 @@ function createKeyboardClipFixture() {
     subtitlesComplete: false,
   };
   const api = createAiApi();
+  api.getAiLlmSettings = vi.fn().mockResolvedValue({
+    provider: "deepseek",
+    modelId: "deepseek-chat",
+    timeoutMs: 30_000,
+    promptVersion: "highlight-v1",
+    qualifiedScore: 70,
+    excellentScore: 80,
+    transitionAutoApplyScore: 8,
+    keyConfigured: true,
+    updatedAt: "2026-08-08T00:00:00Z",
+  });
   api.getLatestAiHighlightRun = vi.fn().mockResolvedValue(completedHighlightRun);
   api.listQualifiedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
   api.listSelectedAiHighlightCandidates = vi.fn().mockResolvedValue(candidatePage);
   api.openAiClipProject = vi.fn().mockResolvedValue(clip);
   api.getAiClipProject = vi.fn().mockResolvedValue(clip);
+  api.listTransitionMaterials = vi.fn().mockResolvedValue([{
+    assetKey: "keyboard_transition",
+    assetVersion: 1,
+    title: "快捷转场",
+    description: "用于工作台 Agent 测试",
+    tags: ["通用"],
+    category: "general",
+    renderMode: "bridge",
+    durationMs: 1_000,
+    width: 1920,
+    height: 1080,
+    fps: 30,
+    videoCodec: "h264",
+    hasAudio: false,
+    sortOrder: 1,
+    thumbnailAvailable: false,
+    download: {
+      assetKey: "keyboard_transition",
+      assetVersion: 1,
+      sourceStatus: "ready",
+      sourceRelativePath: "keyboard-transition.mp4",
+      previewStatus: "ready",
+      previewRelativePath: "keyboard-transition-preview.mp4",
+      validatedSizeBytes: 1_024,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      updatedAt: "2026-08-08T00:00:00Z",
+    },
+  }]);
+  api.subscribeClipWorkflow = vi.fn().mockResolvedValue(() => undefined);
+  api.cancelAiClipTransitionAgent = vi.fn().mockResolvedValue(undefined);
+  api.cancelAiClipTextCorrection = vi.fn().mockResolvedValue(undefined);
   return { api, clip };
 }
 
@@ -754,6 +798,7 @@ describe("AiWorkspace", () => {
       promptVersion: "highlight-v1",
       qualifiedScore: 70,
       excellentScore: 80,
+      transitionAutoApplyScore: 8,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });
@@ -826,6 +871,7 @@ describe("AiWorkspace", () => {
       promptVersion: "highlight-v1",
       qualifiedScore: 70,
       excellentScore: 80,
+      transitionAutoApplyScore: 8,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });
@@ -884,6 +930,7 @@ describe("AiWorkspace", () => {
       promptVersion: "highlight-v1",
       qualifiedScore: 50,
       excellentScore: 80,
+      transitionAutoApplyScore: 8,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });
@@ -1288,6 +1335,449 @@ describe("AiWorkspace", () => {
     editable.remove();
   });
 
+  it("从剪辑工作台直接运行一键 Agent 和一键文本纠错", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const reviewedBoundary = {
+      id: 771,
+      clipProjectId: clip.project.id,
+      leftClipSegmentId: clip.segments[0].id,
+      rightClipSegmentId: clip.segments[1].id,
+      leftStableId: clip.segments[0].id,
+      rightStableId: clip.segments[1].id,
+      assetKey: null,
+      assetVersion: null,
+      selectionSource: "none" as const,
+      confidence: null,
+      score: null,
+      sceneScore: null,
+      continuityScore: null,
+      rhythmScore: null,
+      materialScore: null,
+      reason: null,
+      suggestedAssetKey: "keyboard_transition",
+      suggestedAssetVersion: 1,
+      suggestionConfidence: null,
+      suggestionScore: 7.6,
+      suggestionSceneScore: 8.4,
+      suggestionContinuityScore: 7.2,
+      suggestionRhythmScore: 7.8,
+      suggestionMaterialScore: 7.0,
+      suggestionReason: "场景相关，但节奏衔接仍需人工确认",
+      suggestionNone: false,
+      manuallyLocked: false,
+      stale: false,
+      active: true,
+      updatedAt: "2026-08-08T00:00:00Z",
+    };
+    clip.boundaries = [reviewedBoundary];
+    api.matchAiClipTransitions = vi.fn().mockResolvedValue({
+      runId: 44,
+      threshold: 8,
+      matched: 1,
+      autoApplied: 0,
+      suggestions: 1,
+      noneSuggestions: 0,
+      tokenUsage: 120,
+      boundaries: [reviewedBoundary],
+    });
+    const corrected = {
+      ...clip,
+      project: { ...clip.project, version: 2 },
+      subtitles: clip.subtitles.map((subtitle) => ({ ...subtitle, text: "快捷键输入已保护。" })),
+    };
+    api.correctAiClipText = vi.fn().mockResolvedValue({
+      runId: 45,
+      processed: 1,
+      changed: 1,
+      unchanged: 0,
+      skippedManual: 0,
+      skippedHidden: 0,
+      totalBatches: 1,
+      tokenUsage: 60,
+      detail: corrected,
+    });
+    const restored = {
+      ...corrected,
+      project: { ...corrected.project, version: 3 },
+      subtitles: corrected.subtitles.map((subtitle) => ({ ...subtitle, text: subtitle.originalText })),
+    };
+    api.resetAiClipSubtitle = vi.fn().mockResolvedValue(restored);
+    const { user } = await openKeyboardClipEditor(api);
+
+    await user.click(screen.getByRole("button", { name: "一键 Agent" }));
+    await waitFor(() => expect(api.matchAiClipTransitions).toHaveBeenCalledWith(clip.project.id, null));
+    expect(await screen.findByText("Agent 完成（阈值 8 分）：自动应用 0 个，低分建议 1 个，无需转场 0 个")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Agent 结果" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("低于 8.0 分阈值，未自动应用")).toBeInTheDocument();
+    expect(screen.getByText("场景相关，但节奏衔接仍需人工确认")).toBeInTheDocument();
+    expect(screen.getByText("8.4")).toBeInTheDocument();
+
+    const correctionButton = screen.getByRole("button", { name: "一键文本纠错" });
+    await user.click(correctionButton);
+    await waitFor(() => expect(api.correctAiClipText).toHaveBeenCalledWith(clip.project.id, 1));
+    expect(await screen.findByText(/文本纠错完成：修改 1 条/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文本纠错结果" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("纠错前：快捷键输入保护。；纠错后：快捷键输入已保护。")).toBeInTheDocument();
+    expect(screen.getByText("已")).toHaveProperty("tagName", "INS");
+    expect(screen.getByRole("complementary", { name: "剪辑属性" })).toHaveFocus();
+
+    await user.click(screen.getByRole("button", { name: "恢复 ASR 原文" }));
+    await waitFor(() => expect(api.resetAiClipSubtitle).toHaveBeenCalledWith(clip.project.id, clip.subtitles[0].id, 2));
+    expect(await screen.findByRole("button", { name: "已恢复原文" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "关闭 AI 结果审阅" }));
+    const properties = screen.getByRole("complementary", { name: "剪辑属性" });
+    const reopen = within(properties).getByRole("button", { name: "查看 AI 结果，共 2 项" });
+    await user.click(reopen);
+    expect(screen.getByRole("button", { name: "文本纠错结果" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "关闭 AI 结果审阅" }));
+    await user.click(screen.getByRole("button", { name: /本次文本纠错已修改/ }));
+    expect(screen.getByRole("button", { name: "文本纠错结果" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("从转场素材预览定位纠错字幕后继续推进播放头和逐字字幕", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const correctedText = "快捷键输入已保护。";
+    const corrected = {
+      ...clip,
+      project: { ...clip.project, version: 2 },
+      subtitles: clip.subtitles.map((subtitle) => ({ ...subtitle, text: correctedText })),
+      subtitleFrames: [{
+        ...clip.subtitleFrames[0],
+        projectEndMs: 250,
+        pageText: correctedText,
+        visibleText: "快",
+        hiddenText: "捷键输入已保护。",
+      }, {
+        ...clip.subtitleFrames[0],
+        projectStartMs: 250,
+        pageText: correctedText,
+        visibleText: correctedText,
+        hiddenText: "",
+      }],
+    };
+    api.correctAiClipText = vi.fn().mockResolvedValue({
+      runId: 45,
+      processed: 1,
+      changed: 1,
+      unchanged: 0,
+      skippedManual: 0,
+      skippedHidden: 0,
+      totalBatches: 1,
+      tokenUsage: 60,
+      detail: corrected,
+    });
+    api.requestTransitionMaterialPreview = vi.fn().mockResolvedValue({
+      assetKey: "keyboard_transition",
+      assetVersion: 1,
+      state: "ready",
+      mediaUrl: "asset://localhost/keyboard-transition-preview.mp4",
+      generated: false,
+      errorCode: null,
+      errorMessage: null,
+    });
+
+    const { user, editor } = await openKeyboardClipEditor(api);
+    await user.click(screen.getByRole("button", { name: "一键文本纠错" }));
+    expect(await screen.findByLabelText("播放器字幕")).toHaveTextContent("快");
+
+    await user.click(screen.getByRole("button", { name: "预览转场：快捷转场" }));
+    await waitFor(() => expect(api.requestTransitionMaterialPreview).toHaveBeenCalledWith("keyboard_transition", 1));
+    await user.click(screen.getByRole("button", { name: "定位" }));
+
+    const video = editor.querySelector<HTMLVideoElement>("video")!;
+    fireEvent.play(video);
+    video.currentTime = 1.5;
+    fireEvent.timeUpdate(video);
+
+    expect(screen.getByLabelText("播放器字幕")).toHaveTextContent(correctedText);
+    expect(screen.getByLabelText("片段播放进度")).toHaveValue("25");
+  });
+
+  it("在 Agent 审阅栏筛选并应用低分建议", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const boundary = {
+      id: 771,
+      clipProjectId: clip.project.id,
+      leftClipSegmentId: clip.segments[0].id,
+      rightClipSegmentId: clip.segments[1].id,
+      leftStableId: clip.segments[0].id,
+      rightStableId: clip.segments[1].id,
+      assetKey: null,
+      assetVersion: null,
+      selectionSource: "none" as const,
+      confidence: null,
+      score: null,
+      sceneScore: null,
+      continuityScore: null,
+      rhythmScore: null,
+      materialScore: null,
+      reason: null,
+      suggestedAssetKey: "keyboard_transition",
+      suggestedAssetVersion: 1,
+      suggestionConfidence: null,
+      suggestionScore: 7.6,
+      suggestionSceneScore: 8.4,
+      suggestionContinuityScore: 7.2,
+      suggestionRhythmScore: 7.8,
+      suggestionMaterialScore: 7.0,
+      suggestionReason: "建议人工检查后再应用",
+      suggestionNone: false,
+      manuallyLocked: false,
+      stale: false,
+      active: true,
+      updatedAt: "2026-08-08T00:00:00Z",
+    };
+    const appliedBoundary = {
+      ...boundary,
+      assetKey: "keyboard_transition",
+      assetVersion: 1,
+      selectionSource: "manual" as const,
+      score: 7.6,
+      sceneScore: 8.4,
+      continuityScore: 7.2,
+      rhythmScore: 7.8,
+      materialScore: 7.0,
+      reason: boundary.suggestionReason,
+      manuallyLocked: true,
+    };
+    clip.boundaries = [boundary];
+    api.matchAiClipTransitions = vi.fn().mockResolvedValue({
+      runId: 46,
+      threshold: 8,
+      matched: 1,
+      autoApplied: 0,
+      suggestions: 1,
+      noneSuggestions: 0,
+      tokenUsage: 80,
+      boundaries: [boundary],
+    });
+    api.applyAiClipTransition = vi.fn().mockResolvedValue(appliedBoundary);
+    api.getAiClipProject = vi.fn()
+      .mockResolvedValueOnce(clip)
+      .mockResolvedValue({ ...clip, boundaries: [appliedBoundary] });
+
+    const { user } = await openKeyboardClipEditor(api);
+    await user.click(screen.getByRole("button", { name: "一键 Agent" }));
+    expect(await screen.findByRole("button", { name: "待确认 1" })).toHaveAttribute("aria-pressed", "true");
+    await user.click(screen.getByRole("button", { name: "已应用 0" }));
+    expect(screen.getByText("当前筛选下没有结果")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "待确认 1" }));
+    await user.click(screen.getByRole("button", { name: "应用建议" }));
+    await waitFor(() => expect(api.applyAiClipTransition).toHaveBeenCalledWith(771, "keyboard_transition", 1, true));
+    const appliedFilter = await screen.findByRole("button", { name: "已应用 1" });
+    await user.click(appliedFilter);
+    expect(screen.getByRole("button", { name: /审阅边界：快捷键第一段 到 快捷键第二段，已应用，7.6 分/ })).toBeInTheDocument();
+  });
+
+  it("新前端连接旧桌面后端时提示安全重启而不是暴露命令名", async () => {
+    const { api } = createKeyboardClipFixture();
+    api.correctAiClipText = vi.fn().mockRejectedValue(
+      new Error("Command ai_correct_clip_text not found"),
+    );
+
+    const { user } = await openKeyboardClipEditor(api);
+    await user.click(screen.getByRole("button", { name: "一键文本纠错" }));
+
+    expect(await screen.findByText(
+      "当前桌面后端版本过旧，未包含一键文本纠错。请安全退出并重新启动最新客户端",
+    )).toBeInTheDocument();
+    expect(screen.queryByText("Command ai_correct_clip_text not found")).not.toBeInTheDocument();
+  });
+
+  it("未配置 Key 时同时禁用两个 LLM 工作流", async () => {
+    const { api } = createKeyboardClipFixture();
+    api.getAiLlmSettings = vi.fn().mockResolvedValue({
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      timeoutMs: 30_000,
+      promptVersion: "highlight-v1",
+      qualifiedScore: 70,
+      excellentScore: 80,
+      transitionAutoApplyScore: 8,
+      keyConfigured: false,
+      updatedAt: "2026-08-08T00:00:00Z",
+    });
+    api.matchAiClipTransitions = vi.fn();
+    api.correctAiClipText = vi.fn();
+
+    await openKeyboardClipEditor(api);
+
+    const agent = screen.getByRole("button", { name: "一键 Agent" });
+    const correction = screen.getByRole("button", { name: "一键文本纠错" });
+    await waitFor(() => expect(agent).toHaveAttribute("title", "请先在设置中配置 DeepSeek API Key"));
+    expect(agent).toBeDisabled();
+    expect(correction).toBeDisabled();
+    expect(correction).toHaveAttribute("title", "请先在设置中配置 DeepSeek API Key");
+  });
+
+  it("素材目录为空时只禁用一键 Agent", async () => {
+    const { api } = createKeyboardClipFixture();
+    api.listTransitionMaterials = vi.fn().mockResolvedValue([]);
+    api.matchAiClipTransitions = vi.fn();
+    api.correctAiClipText = vi.fn();
+
+    await openKeyboardClipEditor(api);
+
+    const agent = screen.getByRole("button", { name: "一键 Agent" });
+    await waitFor(() => expect(agent).toHaveAttribute("title", "本地转场目录为空，请先同步素材"));
+    expect(agent).toBeDisabled();
+    expect(screen.getByRole("button", { name: "一键文本纠错" })).toBeEnabled();
+  });
+
+  it("重启后恢复已锁定的 Agent 审阅并可从结果中解除锁定", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    const lockedBoundary = {
+      id: 771,
+      clipProjectId: clip.project.id,
+      leftClipSegmentId: clip.segments[0].id,
+      rightClipSegmentId: clip.segments[1].id,
+      leftStableId: clip.segments[0].id,
+      rightStableId: clip.segments[1].id,
+      assetKey: "keyboard_transition",
+      assetVersion: 1,
+      selectionSource: "manual" as const,
+      confidence: null,
+      score: 8.6,
+      sceneScore: 9.0,
+      continuityScore: 8.4,
+      rhythmScore: 8.2,
+      materialScore: 8.8,
+      reason: "已应用后由用户确认并锁定",
+      suggestedAssetKey: "keyboard_transition",
+      suggestedAssetVersion: 1,
+      suggestionConfidence: null,
+      suggestionScore: 8.6,
+      suggestionSceneScore: 9.0,
+      suggestionContinuityScore: 8.4,
+      suggestionRhythmScore: 8.2,
+      suggestionMaterialScore: 8.8,
+      suggestionReason: "已应用后由用户确认并锁定",
+      suggestionNone: false,
+      manuallyLocked: true,
+      stale: false,
+      active: true,
+      updatedAt: "2026-08-08T00:00:00Z",
+    };
+    const unlockedBoundary = { ...lockedBoundary, manuallyLocked: false };
+    clip.boundaries = [lockedBoundary];
+    api.getLatestAiClipTransitionReview = vi.fn().mockResolvedValue({
+      runId: 46,
+      threshold: 8,
+      matched: 1,
+      autoApplied: 1,
+      suggestions: 0,
+      noneSuggestions: 0,
+      tokenUsage: 80,
+      boundaries: [lockedBoundary],
+    });
+    api.matchAiClipTransitions = vi.fn();
+    api.unlockAiClipTransition = vi.fn().mockResolvedValue(unlockedBoundary);
+    api.getAiClipProject = vi.fn().mockResolvedValue({ ...clip, boundaries: [unlockedBoundary] });
+
+    const { user } = await openKeyboardClipEditor(api);
+    const agent = screen.getByRole("button", { name: "一键 Agent" });
+    await waitFor(() => expect(agent).toHaveAttribute(
+      "title",
+      "所有转场边界已人工锁定；请在右侧 AI 结果中解除锁定",
+    ));
+    expect(agent).toBeDisabled();
+
+    const properties = screen.getByRole("complementary", { name: "剪辑属性" });
+    const reviewEntry = await within(properties).findByRole("button", { name: "查看 AI 结果，共 1 项" });
+    await user.click(reviewEntry);
+    await user.click(await screen.findByRole("button", { name: "解除锁定" }));
+
+    await waitFor(() => expect(api.unlockAiClipTransition).toHaveBeenCalledWith(lockedBoundary.id));
+    await waitFor(() => expect(agent).toBeEnabled());
+    expect(screen.getByText("已解除人工锁，可重新智能匹配")).toBeInTheDocument();
+  });
+
+  it("没有合格字幕时禁用一键文本纠错", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    clip.subtitles = clip.subtitles.map((subtitle) => ({
+      ...subtitle,
+      text: "人工修改后保留。",
+    }));
+    api.correctAiClipText = vi.fn();
+
+    await openKeyboardClipEditor(api);
+
+    const correction = screen.getByRole("button", { name: "一键文本纠错" });
+    expect(correction).toBeDisabled();
+    expect(correction).toHaveAttribute("title", "没有未隐藏且未经人工修改的字幕");
+    expect(api.correctAiClipText).not.toHaveBeenCalled();
+  });
+
+  it("显示文本纠错阶段、允许取消并在失败时保留当前工程", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    let progressListener: ((progress: ClipWorkflowProgress) => void) | undefined;
+    let rejectCorrection: ((reason: Error) => void) | undefined;
+    api.subscribeClipWorkflow = vi.fn(async (listener) => {
+      progressListener = listener;
+      return () => undefined;
+    });
+    api.correctAiClipText = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      rejectCorrection = reject;
+    }));
+
+    const { user } = await openKeyboardClipEditor(api);
+    const correction = screen.getByRole("button", { name: "一键文本纠错" });
+    await user.click(correction);
+    await waitFor(() => expect(api.correctAiClipText).toHaveBeenCalledWith(clip.project.id, 1));
+    act(() => progressListener?.({
+      workflow: "textCorrection",
+      clipProjectId: clip.project.id,
+      runId: 45,
+      stage: "saving",
+      completed: 1,
+      total: 1,
+      message: "正在校验并保存工程字幕",
+    }));
+    expect(correction).toHaveTextContent("保存纠错中");
+
+    await user.click(correction);
+    expect(api.cancelAiClipTextCorrection).toHaveBeenCalledWith(clip.project.id);
+    expect(await screen.findByText("正在取消一键文本纠错")).toBeInTheDocument();
+    act(() => rejectCorrection?.(new Error("用户已取消")));
+    expect(await screen.findByText("一键文本纠错已取消，工程字幕未修改")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `字幕：${clip.subtitles[0].text}` })).toBeInTheDocument();
+  });
+
+  it("显示 Agent 评分阶段并允许取消后续编排", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    let progressListener: ((progress: ClipWorkflowProgress) => void) | undefined;
+    let rejectAgent: ((reason: Error) => void) | undefined;
+    api.subscribeClipWorkflow = vi.fn(async (listener) => {
+      progressListener = listener;
+      return () => undefined;
+    });
+    api.matchAiClipTransitions = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      rejectAgent = reject;
+    }));
+
+    const { user } = await openKeyboardClipEditor(api);
+    const agent = screen.getByRole("button", { name: "一键 Agent" });
+    await user.click(agent);
+    await waitFor(() => expect(api.matchAiClipTransitions).toHaveBeenCalledWith(clip.project.id, null));
+    act(() => progressListener?.({
+      workflow: "transitionAgent",
+      clipProjectId: clip.project.id,
+      runId: 44,
+      stage: "scoring",
+      completed: 0,
+      total: 1,
+      message: "正在评分候选素材",
+    }));
+    expect(agent).toHaveTextContent("候选评分中");
+
+    await user.click(agent);
+    expect(api.cancelAiClipTransitionAgent).toHaveBeenCalledWith(clip.project.id);
+    expect(await screen.findByText("正在取消一键 Agent")).toBeInTheDocument();
+    act(() => rejectAgent?.(new Error("Agent 已取消")));
+    expect(await screen.findByText("Agent 已取消")).toBeInTheDocument();
+  });
+
   it("本地搜索转场素材并对明确边界执行人工应用和智能匹配", async () => {
     const { api, clip } = createKeyboardClipFixture();
     const boundary = {
@@ -1301,10 +1791,20 @@ describe("AiWorkspace", () => {
       assetVersion: null,
       selectionSource: "none" as const,
       confidence: null,
+      score: null,
+      sceneScore: null,
+      continuityScore: null,
+      rhythmScore: null,
+      materialScore: null,
       reason: null,
       suggestedAssetKey: null,
       suggestedAssetVersion: null,
       suggestionConfidence: null,
+      suggestionScore: null,
+      suggestionSceneScore: null,
+      suggestionContinuityScore: null,
+      suggestionRhythmScore: null,
+      suggestionMaterialScore: null,
       suggestionReason: null,
       suggestionNone: false,
       manuallyLocked: false,
@@ -1337,7 +1837,7 @@ describe("AiWorkspace", () => {
     };
     api.listTransitionMaterials = vi.fn().mockResolvedValue([material]);
     api.applyAiClipTransition = vi.fn().mockResolvedValue({ ...boundary, assetKey: material.assetKey, assetVersion: material.assetVersion, selectionSource: "manual", manuallyLocked: true });
-    api.matchAiClipTransitions = vi.fn().mockResolvedValue({ matched: 1, autoApplied: 0, suggestions: 1, noneSuggestions: 0, boundaries: [boundary] });
+    api.matchAiClipTransitions = vi.fn().mockResolvedValue({ runId: 45, threshold: 8, matched: 1, autoApplied: 0, suggestions: 1, noneSuggestions: 0, tokenUsage: 80, boundaries: [boundary] });
     api.unlockAiClipTransition = vi.fn().mockResolvedValue(boundary);
 
     const { user } = await openKeyboardClipEditor(api);
@@ -1349,7 +1849,7 @@ describe("AiWorkspace", () => {
     await user.click(screen.getByRole("button", { name: /选择 快捷键第一段 与 快捷键第二段 之间的转场/ }));
     await user.click(screen.getByRole("button", { name: "应用" }));
     await waitFor(() => expect(api.applyAiClipTransition).toHaveBeenCalledWith(771, "reaction_laugh", 2, true));
-    await user.click(screen.getByRole("button", { name: "智能匹配全部转场" }));
+    await user.click(screen.getByRole("button", { name: "一键 Agent" }));
     await waitFor(() => expect(api.matchAiClipTransitions).toHaveBeenCalledWith(clip.project.id, null));
   });
 
@@ -1889,6 +2389,7 @@ describe("AiWorkspace", () => {
       promptVersion: "highlight-v1",
       qualifiedScore: 70,
       excellentScore: 80,
+      transitionAutoApplyScore: 8,
       keyConfigured: true,
       updatedAt: "2026-07-22T00:00:00Z",
     });

@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use dy_screen_app_lib::ai::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipSegment, AiClipSegmentUpdate,
     AiClipSubtitleUpdate, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus,
-    AiRepository, HighlightCandidateDraft, HighlightCandidateScore, NewAiHighlightChunk,
-    NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile, SourceFingerprint,
-    TranscriptSegment, TranscriptSegmentDraft, project_clip_subtitles,
+    AiRepository, ClipTextCorrectionUpdate, HighlightCandidateDraft, HighlightCandidateScore,
+    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
+    SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft, project_clip_subtitles,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
@@ -1170,6 +1170,40 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
     }));
     let reopened_again = repository.get_clip_project(clip.project.id).unwrap();
     assert_eq!(reopened_again.subtitles, reopened.subtitles);
+    let correction_plan = repository
+        .prepare_clip_text_correction(clip.project.id, reopened.project.version)
+        .unwrap();
+    assert_eq!(correction_plan.targets.len(), 2);
+    assert_eq!(correction_plan.skipped_manual, 0);
+    assert_eq!(correction_plan.skipped_hidden, 0);
+    let atomic_failure = repository.apply_clip_text_corrections(
+        clip.project.id,
+        reopened.project.version,
+        &[
+            ClipTextCorrectionUpdate {
+                subtitle_id: correction_plan.targets[0].subtitle_id,
+                expected_text: correction_plan.targets[0].text.clone(),
+                corrected_text: "第一条纠错结果。".to_owned(),
+            },
+            ClipTextCorrectionUpdate {
+                subtitle_id: correction_plan.targets[1].subtitle_id,
+                expected_text: "已经变化的文本".to_owned(),
+                corrected_text: "第二条纠错结果。".to_owned(),
+            },
+        ],
+    );
+    assert!(atomic_failure.is_err());
+    let after_atomic_failure = repository.get_clip_project(clip.project.id).unwrap();
+    assert_eq!(
+        after_atomic_failure.project.version,
+        reopened.project.version
+    );
+    assert_eq!(after_atomic_failure.subtitles, reopened.subtitles);
+    assert!(
+        repository
+            .prepare_clip_text_correction(clip.project.id, reopened.project.version + 1)
+            .is_err()
+    );
     let original_subtitle = reopened.subtitles[0].clone();
     let edited = repository
         .update_clip_subtitle(
@@ -1190,6 +1224,12 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
     assert_eq!(edited_subtitle.original_text, "原始字幕。");
     assert_eq!(edited_subtitle.text, "修正后的字幕。");
     assert_eq!(edited.project.version, reopened.project.version + 1);
+    let after_manual_edit = repository
+        .prepare_clip_text_correction(clip.project.id, edited.project.version)
+        .unwrap();
+    assert_eq!(after_manual_edit.targets.len(), 1);
+    assert_eq!(after_manual_edit.skipped_manual, 1);
+    assert_eq!(after_manual_edit.skipped_hidden, 0);
     assert!(
         repository
             .update_clip_subtitle(
@@ -1264,6 +1304,12 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
             .iter()
             .all(|subtitle| subtitle.hidden)
     );
+    let after_hiding = repository
+        .prepare_clip_text_correction(clip.project.id, hidden_detail.project.version)
+        .unwrap();
+    assert!(after_hiding.targets.is_empty());
+    assert_eq!(after_hiding.skipped_manual, 0);
+    assert_eq!(after_hiding.skipped_hidden, 2);
     repository
         .set_clip_export_state(
             clip.project.id,

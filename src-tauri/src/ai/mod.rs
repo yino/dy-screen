@@ -5,6 +5,7 @@
 
 mod clip_export;
 mod clip_subtitle;
+mod clip_text_correction;
 mod commands;
 mod desktop_runtime;
 mod domain;
@@ -25,6 +26,9 @@ pub use clip_export::{
 pub use clip_subtitle::{
     ClipSubtitleAssets, build_clip_subtitle_frames, render_clip_subtitle_assets,
 };
+pub use clip_text_correction::{
+    CLIP_TEXT_CORRECTION_PROMPT_VERSION, ClipTextCorrectionError, ClipTextCorrectionWorkflow,
+};
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiProjectDetailView,
@@ -38,8 +42,9 @@ pub use domain::{
     AiClipTimelineUnit, AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage,
     AiHighlightChunk, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind,
     AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact,
-    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
-    RecoverySummary, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
+    ClipTextCorrectionSummary, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput,
+    NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
+    TranscriptSegmentDraft,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
@@ -50,11 +55,13 @@ pub use lifecycle::{AiLifecycle, AiLifecycleError, AiRecoveryReport};
 pub use llm::{
     CandidateAgentOutput, CandidateAgentRequest, CredentialError, CredentialStore,
     DEEPSEEK_BASE_URL, DEFAULT_EXCELLENT_SCORE, DEFAULT_MODEL_ID, DEFAULT_QUALIFIED_SCORE,
-    FakeHighlightProvider, HighlightAgentProvider, HighlightCandidateDraft,
-    HighlightCandidateScore, LlmError, LlmProviderSettings, MAX_AGENT_TURNS, MemoryCredentialStore,
-    PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest,
-    RigDeepSeekProvider, SystemCredentialStore, TransitionAgentMatch, TransitionAgentOutput,
-    TransitionAgentProvider, TransitionAgentRequest,
+    DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider, HighlightAgentProvider,
+    HighlightCandidateDraft, HighlightCandidateScore, LlmError, LlmProviderSettings,
+    MAX_AGENT_TURNS, MemoryCredentialStore, PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput,
+    RankingAgentRequest, RigDeepSeekProvider, SubtitleCorrectionItem, SubtitleCorrectionOutput,
+    SubtitleCorrectionProvider, SubtitleCorrectionRequest, SystemCredentialStore,
+    TransitionAgentCandidate, TransitionAgentMatch, TransitionAgentOutput, TransitionAgentProvider,
+    TransitionAgentRequest, TransitionAgentScore, TransitionScoreOutput, TransitionScoreRequest,
 };
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
@@ -64,8 +71,8 @@ pub use projection::{
     AiTranscriptSegmentProjection,
 };
 pub use repository::{
-    AiRepository, AiRepositoryError, ClipExportBridge, ClipExportSource, Result,
-    project_clip_subtitles,
+    AiRepository, AiRepositoryError, ClipExportBridge, ClipExportSource, ClipTextCorrectionPlan,
+    ClipTextCorrectionTarget, ClipTextCorrectionUpdate, Result, project_clip_subtitles,
 };
 pub use service::{
     AiPreflight, AiProjectService, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionOption,
@@ -76,5 +83,5 @@ pub use service::{
 
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
-    migrate_ai_v16,
+    migrate_ai_v16, migrate_ai_v21,
 };

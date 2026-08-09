@@ -44,6 +44,7 @@ import type {
   MaterialAssetSnapshot,
   TransitionMatchSummary,
   ClipTransitionBoundary,
+  ClipWorkflowProgress,
 } from "./types";
 
 const defaultSettings: AppSettings = {
@@ -223,6 +224,20 @@ const tauriApi: ClientApi = {
     invoke<MaterialAssetSnapshot>("request_transition_material_thumbnail", { assetKey, assetVersion }),
   matchAiClipTransitions: (clipProjectId, boundaryId = null) =>
     invoke<TransitionMatchSummary>("ai_match_clip_transitions", { clipProjectId, boundaryId }),
+  getLatestAiClipTransitionReview: (clipProjectId) =>
+    invoke<TransitionMatchSummary | null>("ai_get_latest_clip_transition_review", { clipProjectId }),
+  cancelAiClipTransitionAgent: (clipProjectId) =>
+    invoke<void>("ai_cancel_clip_transition_agent", { clipProjectId }),
+  correctAiClipText: (clipProjectId, expectedProjectVersion) =>
+    invoke("ai_correct_clip_text", { clipProjectId, expectedProjectVersion }),
+  cancelAiClipTextCorrection: (clipProjectId) =>
+    invoke<void>("ai_cancel_clip_text_correction", { clipProjectId }),
+  subscribeClipWorkflow: async (listener) => {
+    const unlisten = await listen<ClipWorkflowProgress>("ai-clip-workflow-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
   applyAiClipTransition: (boundaryId, assetKey, assetVersion, lockEmpty = true) =>
     invoke<ClipTransitionBoundary>("ai_apply_clip_transition", { boundaryId, assetKey, assetVersion, lockEmpty }),
   unlockAiClipTransition: (boundaryId) =>
@@ -748,6 +763,7 @@ export function createBrowserApi(): ClientApi {
       promptVersion: "highlight-v1",
       qualifiedScore: 70,
       excellentScore: 80,
+      transitionAutoApplyScore: 8,
       keyConfigured: visualQaSettings,
       updatedAt: null,
     }),
@@ -755,7 +771,7 @@ export function createBrowserApi(): ClientApi {
       throw new Error("浏览器演示模式不会保存 API Key");
     },
   clearAiLlmKey: async () => undefined,
-  diagnoseAiLlmProvider: async () => ({
+    diagnoseAiLlmProvider: async () => ({
     ok: false,
     category: "browser_demo",
     message: visualQaSettings
@@ -775,6 +791,10 @@ export function createBrowserApi(): ClientApi {
       failedBatches: 0,
       candidateCount: 0,
     }),
+    correctAiClipText: async () => { throw new Error("浏览器演示模式不会调用 DeepSeek 纠错"); },
+    cancelAiClipTextCorrection: async () => undefined,
+    cancelAiClipTransitionAgent: async () => undefined,
+    subscribeClipWorkflow: async () => () => undefined,
     resumeAiHighlightAnalysis: async () => {
       throw new Error("浏览器演示模式不会恢复 DeepSeek 分析");
     },

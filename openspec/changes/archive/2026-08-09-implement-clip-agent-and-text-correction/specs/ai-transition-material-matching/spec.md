@@ -1,22 +1,4 @@
-# ai-transition-material-matching Specification
-
-## Purpose
-TBD - created by archiving change add-synced-ai-transition-materials. Update Purpose after archive.
-## Requirements
-### Requirement: 从本地目录构建受限匹配上下文
-系统 SHALL 只从当前剪辑工程相邻高光片段、主播标签和本地已提交素材目录构建匹配上下文。每个边界的输入 MUST 仅包含前一片段尾部和后一片段头部的有界 ASR、素材键与版本、标题、描述、标签和分类；MUST NOT 包含下载 URL、本地路径、Cookie、激活码、设备 ID、视频或音频。
-
-#### Scenario: 为相邻高光构建候选
-- **WHEN** 用户对包含两个或更多片段的工程启动智能匹配
-- **THEN** Rust 为每个未人工锁定的有效边界生成有界语义上下文，并从当前本地目录确定性召回有界素材候选
-
-#### Scenario: 工程只有一个片段
-- **WHEN** 工程不存在相邻片段边界
-- **THEN** 系统不调用 LLM，并提示当前工程没有可匹配转场的位置
-
-#### Scenario: 本地目录不可用
-- **WHEN** 没有已提交目录或当前目录没有受支持的 `bridge` 素材
-- **THEN** 系统不调用 LLM，保留工程不变并提供同步素材目录的入口
+## MODIFIED Requirements
 
 ### Requirement: 使用结构化 Agent 选择目录内素材
 系统 SHALL 通过现有 DeepSeek Provider 运行两个不具备工具权限的受限 Agent 阶段。场景匹配 Agent SHALL 只在 Rust 为每个边界确定性召回的当前 `bridge` 素材中返回最多三个有序候选或 `none`；评分 Agent SHALL 只对通过本地校验的候选返回边界 ID、素材键与版本、0–10 总分、场景适配、衔接、节奏、素材适配和简短理由。Rust MUST 校验边界仍有效、候选集合完整、分数范围合法、素材版本存在于当前目录且 `renderMode=bridge`，不得接受模型虚构的素材、URL、路径或渲染参数。
@@ -44,6 +26,8 @@ TBD - created by archiving change add-synced-ai-transition-materials. Update Pur
 #### Scenario: 用户取消两阶段运行
 - **WHEN** 用户在匹配、评分或应用完成前取消一键 Agent
 - **THEN** Rust 停止后续调用、忽略迟到响应且不覆盖人工锁定或运行开始后变化的边界
+
+## ADDED Requirements
 
 ### Requirement: 按冻结评分阈值应用匹配结果
 系统 SHALL 在一键 Agent 运行开始时冻结当前 0–10 转场自动应用阈值、模型和两个阶段的 prompt 版本。最佳合法候选的总分 `score >= threshold` 时，系统 SHALL 将其自动写入仍未锁定的有效边界并触发按需下载；低于阈值的结果 MUST 只作为建议展示，不得自动改变时间轴。默认阈值 MUST 为 8 分，模型不得自行调整阈值。
@@ -79,32 +63,9 @@ TBD - created by archiving change add-synced-ai-transition-materials. Update Pur
 - **WHEN** 已创建的一键 Agent 运行未到终态且客户端异常退出
 - **THEN** 系统把运行恢复为可诊断的中断状态且不自动重发 LLM 请求或改变工程
 
-### Requirement: 人工边界选择优先于 Agent
-系统 SHALL 在用户手动应用、替换或明确移除边界素材后保存人工锁定状态。批量智能匹配 MUST 跳过人工锁定边界；只有用户显式解除锁定并发起重新匹配时，Agent 才可修改该边界。
+## REMOVED Requirements
 
-#### Scenario: 用户手动替换自动结果
-- **WHEN** 用户在素材库选择另一个有效素材应用到边界
-- **THEN** 系统固定新素材版本、设置 `manuallyLocked=true` 并阻止后续批量匹配覆盖
+### Requirement: 按置信度应用匹配结果
+**Reason**: 单阶段模型自报的 0–1 置信度无法表达独立复评过程，也不能满足用户配置 0–10 分自动应用阈值的需求。
 
-#### Scenario: 用户明确保留无转场
-- **WHEN** 用户移除边界素材并选择人工保持空白
-- **THEN** 系统保存人工空值锁，后续批量匹配跳过该边界
-
-#### Scenario: 用户重新允许智能匹配
-- **WHEN** 用户解除人工锁并对该边界点击重新匹配
-- **THEN** 系统以最新相邻 ASR 和当前目录运行一次新匹配，旧结果保留审计但不再应用
-
-### Requirement: 在工程结构变化后局部失效结果
-系统 SHALL 使用左右片段稳定 ID 定位边界。片段重排、插入或删除后，系统 MUST 保留邻接关系未变的选择，并只把受影响的自动结果标记为失效；结构变化 MUST NOT 自动调用 LLM。
-
-#### Scenario: 重排改变两个边界
-- **WHEN** 用户移动片段导致部分左右邻接关系变化
-- **THEN** 系统保留仍有效边界，只将变化边界标记为需要重新匹配并更新工程时间映射
-
-#### Scenario: 删除片段使人工边界消失
-- **WHEN** 用户删除人工锁定边界的一侧片段
-- **THEN** 系统保留该选择的审计记录但不参与工程，并提示新边界需要用户决定是否匹配
-
-#### Scenario: 用户确认重新匹配失效边界
-- **WHEN** 用户对一个或全部失效自动边界执行重新匹配
-- **THEN** 系统只为当前有效且未锁定的目标边界调用 Agent，不重算其他边界
+**Migration**: 历史工程继续读取既有 `confidence` 和选择结果；所有新的一键 Agent 运行改用独立评分字段与运行冻结的 `transitionAutoApplyScore`。

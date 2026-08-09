@@ -44,6 +44,8 @@ pub enum TransitionMaterialError {
     ClipExportInProgress,
     #[error("该边界已由用户锁定")]
     ManuallyLocked,
+    #[error("转场 Agent 运行审计无效")]
+    InvalidRunAudit,
 }
 
 pub type Result<T> = std::result::Result<T, TransitionMaterialError>;
@@ -476,16 +478,59 @@ pub struct ClipTransitionBoundary {
     pub asset_version: Option<i64>,
     pub selection_source: BoundarySelectionSource,
     pub confidence: Option<f64>,
+    pub score: Option<f64>,
+    pub scene_score: Option<f64>,
+    pub continuity_score: Option<f64>,
+    pub rhythm_score: Option<f64>,
+    pub material_score: Option<f64>,
     pub reason: Option<String>,
     pub suggested_asset_key: Option<String>,
     pub suggested_asset_version: Option<i64>,
     pub suggestion_confidence: Option<f64>,
+    pub suggestion_score: Option<f64>,
+    pub suggestion_scene_score: Option<f64>,
+    pub suggestion_continuity_score: Option<f64>,
+    pub suggestion_rhythm_score: Option<f64>,
+    pub suggestion_material_score: Option<f64>,
     pub suggestion_reason: Option<String>,
     pub suggestion_none: bool,
     pub manually_locked: bool,
     pub stale: bool,
     pub active: bool,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundaryAgentScoreInput<'a> {
+    pub asset_key: &'a str,
+    pub asset_version: i64,
+    pub total_score: f64,
+    pub scene_score: f64,
+    pub continuity_score: f64,
+    pub rhythm_score: f64,
+    pub material_score: f64,
+    pub reason: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransitionMatchRunOutcome {
+    pub matched_boundaries: usize,
+    pub auto_applied: usize,
+    pub suggestions: usize,
+    pub none_suggestions: usize,
+    pub failed_boundaries: usize,
+    pub token_usage: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionMatchRunReview {
+    pub run_id: i64,
+    pub threshold: u8,
+    pub matched: usize,
+    pub auto_applied: usize,
+    pub suggestions: usize,
+    pub none_suggestions: usize,
+    pub token_usage: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -929,7 +974,9 @@ impl TransitionMaterialRepository {
         transaction.execute(
             r#"UPDATE ai_clip_transition_boundaries
                SET asset_key = ?1, asset_version = ?2, selection_source = ?3,
-                   confidence = ?4, reason = ?5, manually_locked = ?6,
+                   confidence = ?4, score = NULL, scene_score = NULL,
+                   continuity_score = NULL, rhythm_score = NULL, material_score = NULL,
+                   reason = ?5, manually_locked = ?6,
                    stale = 0, updated_at = ?7
                WHERE id = ?8"#,
             params![
@@ -949,16 +996,26 @@ impl TransitionMaterialRepository {
         self.boundary(current.id)
     }
 
-    pub fn save_agent_suggestion(
+    pub fn save_agent_score_suggestion(
         &self,
         boundary_id: i64,
-        asset: Option<(&str, i64)>,
+        score: Option<&BoundaryAgentScoreInput<'_>>,
         none: bool,
-        confidence: f64,
         reason: &str,
         auto_apply: bool,
     ) -> Result<ClipTransitionBoundary> {
-        if !(0.0..=1.0).contains(&confidence) || (none && asset.is_some()) {
+        let valid_score = score.is_none_or(|item| {
+            [
+                item.total_score,
+                item.scene_score,
+                item.continuity_score,
+                item.rhythm_score,
+                item.material_score,
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && (0.0..=10.0).contains(&value))
+        });
+        if !valid_score || (none && score.is_some()) || (!none && score.is_none()) {
             return Err(TransitionMaterialError::InvalidBoundary);
         }
         let mut connection = self.database.connection()?;
@@ -975,13 +1032,13 @@ impl TransitionMaterialRepository {
         if current.manually_locked {
             return Err(TransitionMaterialError::ManuallyLocked);
         }
-        if let Some((asset_key, asset_version)) = asset {
+        if let Some(score) = score {
             let valid = transaction
                 .query_row(
                     r#"SELECT 1 FROM transition_materials
                        WHERE asset_key = ?1 AND asset_version = ?2
                          AND is_current = 1 AND render_mode = 'bridge'"#,
-                    params![asset_key, asset_version],
+                    params![score.asset_key, score.asset_version],
                     |_| Ok(()),
                 )
                 .optional()?
@@ -990,24 +1047,38 @@ impl TransitionMaterialRepository {
                 return Err(TransitionMaterialError::MaterialNotFound);
             }
         }
-        let (suggested_key, suggested_version) = asset
-            .map(|(key, version)| (Some(key), Some(version)))
+        let (suggested_key, suggested_version) = score
+            .map(|item| (Some(item.asset_key), Some(item.asset_version)))
             .unwrap_or((None, None));
+        let total_score = score.map(|item| item.total_score);
+        let scene_score = score.map(|item| item.scene_score);
+        let continuity_score = score.map(|item| item.continuity_score);
+        let rhythm_score = score.map(|item| item.rhythm_score);
+        let material_score = score.map(|item| item.material_score);
+        let score_reason = score.map(|item| item.reason).unwrap_or(reason);
         let now = Utc::now().to_rfc3339();
         if auto_apply && !none {
             transaction.execute(
                 r#"UPDATE ai_clip_transition_boundaries
                    SET asset_key = ?1, asset_version = ?2, selection_source = 'agent',
-                       confidence = ?3, reason = ?4, stale = 0,
+                       confidence = NULL, score = ?3, scene_score = ?4,
+                       continuity_score = ?5, rhythm_score = ?6, material_score = ?7,
+                       reason = ?8, stale = 0,
                        suggested_asset_key = ?1, suggested_asset_version = ?2,
-                       suggestion_confidence = ?3, suggestion_reason = ?4,
-                       suggestion_none = 0, updated_at = ?5
-                   WHERE id = ?6"#,
+                       suggestion_confidence = NULL, suggestion_score = ?3,
+                       suggestion_scene_score = ?4, suggestion_continuity_score = ?5,
+                       suggestion_rhythm_score = ?6, suggestion_material_score = ?7,
+                       suggestion_reason = ?8, suggestion_none = 0, updated_at = ?9
+                   WHERE id = ?10"#,
                 params![
                     suggested_key,
                     suggested_version,
-                    confidence,
-                    bounded_message(reason),
+                    total_score,
+                    scene_score,
+                    continuity_score,
+                    rhythm_score,
+                    material_score,
+                    bounded_message(score_reason),
                     now,
                     boundary_id,
                 ],
@@ -1017,14 +1088,21 @@ impl TransitionMaterialRepository {
             transaction.execute(
                 r#"UPDATE ai_clip_transition_boundaries
                    SET suggested_asset_key = ?1, suggested_asset_version = ?2,
-                       suggestion_confidence = ?3, suggestion_reason = ?4,
-                       suggestion_none = ?5, stale = 0, updated_at = ?6
-                   WHERE id = ?7"#,
+                       suggestion_confidence = NULL, suggestion_score = ?3,
+                       suggestion_scene_score = ?4, suggestion_continuity_score = ?5,
+                       suggestion_rhythm_score = ?6, suggestion_material_score = ?7,
+                       suggestion_reason = ?8, suggestion_none = ?9,
+                       stale = 0, updated_at = ?10
+                   WHERE id = ?11"#,
                 params![
                     suggested_key,
                     suggested_version,
-                    confidence,
-                    bounded_message(reason),
+                    total_score,
+                    scene_score,
+                    continuity_score,
+                    rhythm_score,
+                    material_score,
+                    bounded_message(score_reason),
                     i64::from(none),
                     now,
                     boundary_id,
@@ -1087,20 +1165,92 @@ impl TransitionMaterialRepository {
             .ok_or(TransitionMaterialError::InvalidBoundary)
     }
 
+    pub fn latest_completed_match_run(
+        &self,
+        clip_project_id: i64,
+    ) -> Result<Option<TransitionMatchRunReview>> {
+        let row = self
+            .database
+            .connection()?
+            .query_row(
+                r#"SELECT id, threshold, matched_boundaries, auto_applied,
+                          suggestions, none_suggestions, token_usage
+                   FROM ai_transition_match_runs
+                   WHERE clip_project_id = ?1 AND status = 'completed'
+                   ORDER BY id DESC
+                   LIMIT 1"#,
+                [clip_project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(
+                run_id,
+                threshold,
+                matched,
+                auto_applied,
+                suggestions,
+                none_suggestions,
+                token_usage,
+            )| {
+                Ok(TransitionMatchRunReview {
+                    run_id,
+                    threshold: u8::try_from(threshold)
+                        .map_err(|_| TransitionMaterialError::InvalidRunAudit)?,
+                    matched: usize::try_from(matched)
+                        .map_err(|_| TransitionMaterialError::InvalidRunAudit)?,
+                    auto_applied: usize::try_from(auto_applied)
+                        .map_err(|_| TransitionMaterialError::InvalidRunAudit)?,
+                    suggestions: usize::try_from(suggestions)
+                        .map_err(|_| TransitionMaterialError::InvalidRunAudit)?,
+                    none_suggestions: usize::try_from(none_suggestions)
+                        .map_err(|_| TransitionMaterialError::InvalidRunAudit)?,
+                    token_usage: u64::try_from(token_usage)
+                        .map_err(|_| TransitionMaterialError::InvalidRunAudit)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
     pub fn begin_match_run(
         &self,
         clip_project_id: i64,
+        project_version: u32,
         provider: &str,
+        model_id: &str,
+        match_prompt_version: &str,
+        score_prompt_version: &str,
+        threshold: u8,
+        total_boundaries: usize,
         input_fingerprint: &str,
     ) -> Result<i64> {
         let connection = self.database.connection()?;
         connection.execute(
             r#"INSERT INTO ai_transition_match_runs(
-                   clip_project_id, provider, input_fingerprint, status, created_at, updated_at
-               ) VALUES(?1, ?2, ?3, 'running', ?4, ?4)"#,
+                   clip_project_id, project_version, provider, model_id,
+                   match_prompt_version, score_prompt_version, threshold,
+                   total_boundaries, input_fingerprint, status, stage, created_at, updated_at
+               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', 'matching', ?10, ?10)"#,
             params![
                 clip_project_id,
+                project_version,
                 provider,
+                model_id,
+                match_prompt_version,
+                score_prompt_version,
+                threshold,
+                i64::try_from(total_boundaries).unwrap_or(i64::MAX),
                 input_fingerprint,
                 Utc::now().to_rfc3339()
             ],
@@ -1108,19 +1258,56 @@ impl TransitionMaterialRepository {
         Ok(connection.last_insert_rowid())
     }
 
+    pub fn update_match_run_stage(
+        &self,
+        run_id: i64,
+        stage: &str,
+        matched_boundaries: usize,
+        token_usage: u64,
+    ) -> Result<()> {
+        let changed = self.database.connection()?.execute(
+            r#"UPDATE ai_transition_match_runs
+               SET stage = ?1, matched_boundaries = ?2, token_usage = ?3, updated_at = ?4
+               WHERE id = ?5 AND status = 'running'"#,
+            params![
+                stage,
+                i64::try_from(matched_boundaries).unwrap_or(i64::MAX),
+                i64::try_from(token_usage).unwrap_or(i64::MAX),
+                Utc::now().to_rfc3339(),
+                run_id,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(TransitionMaterialError::InvalidBoundary);
+        }
+        Ok(())
+    }
+
     pub fn finish_match_run(
         &self,
         run_id: i64,
         success: bool,
+        final_stage: &str,
+        outcome: TransitionMatchRunOutcome,
         error: Option<(&str, &str)>,
     ) -> Result<()> {
         let (error_code, error_message) = normalized_error(error);
         let changed = self.database.connection()?.execute(
             r#"UPDATE ai_transition_match_runs
-               SET status = ?1, error_code = ?2, error_message = ?3, updated_at = ?4
-               WHERE id = ?5 AND status = 'running'"#,
+               SET status = ?1, stage = ?2, matched_boundaries = ?3,
+                   auto_applied = ?4, suggestions = ?5, none_suggestions = ?6,
+                   failed_boundaries = ?7, token_usage = ?8,
+                   error_code = ?9, error_message = ?10, updated_at = ?11
+               WHERE id = ?12 AND status = 'running'"#,
             params![
                 if success { "completed" } else { "failed" },
+                final_stage,
+                i64::try_from(outcome.matched_boundaries).unwrap_or(i64::MAX),
+                i64::try_from(outcome.auto_applied).unwrap_or(i64::MAX),
+                i64::try_from(outcome.suggestions).unwrap_or(i64::MAX),
+                i64::try_from(outcome.none_suggestions).unwrap_or(i64::MAX),
+                i64::try_from(outcome.failed_boundaries).unwrap_or(i64::MAX),
+                i64::try_from(outcome.token_usage).unwrap_or(i64::MAX),
                 error_code,
                 error_message,
                 Utc::now().to_rfc3339(),
@@ -1617,8 +1804,11 @@ fn bounded_message(value: &str) -> String {
 fn boundary_select() -> &'static str {
     r#"SELECT id, clip_project_id, left_clip_segment_id, right_clip_segment_id,
               left_stable_id, right_stable_id, asset_key, asset_version,
-              selection_source, confidence, reason,
+              selection_source, confidence, score, scene_score, continuity_score,
+              rhythm_score, material_score, reason,
               suggested_asset_key, suggested_asset_version, suggestion_confidence,
+              suggestion_score, suggestion_scene_score, suggestion_continuity_score,
+              suggestion_rhythm_score, suggestion_material_score,
               suggestion_reason, suggestion_none,
               manually_locked, stale, active, updated_at
        FROM ai_clip_transition_boundaries"#
@@ -1636,16 +1826,26 @@ fn map_boundary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipTransitionBound
         asset_version: row.get(7)?,
         selection_source: BoundarySelectionSource::parse(&row.get::<_, String>(8)?),
         confidence: row.get(9)?,
-        reason: row.get(10)?,
-        suggested_asset_key: row.get(11)?,
-        suggested_asset_version: row.get(12)?,
-        suggestion_confidence: row.get(13)?,
-        suggestion_reason: row.get(14)?,
-        suggestion_none: row.get(15)?,
-        manually_locked: row.get(16)?,
-        stale: row.get(17)?,
-        active: row.get(18)?,
-        updated_at: row.get(19)?,
+        score: row.get(10)?,
+        scene_score: row.get(11)?,
+        continuity_score: row.get(12)?,
+        rhythm_score: row.get(13)?,
+        material_score: row.get(14)?,
+        reason: row.get(15)?,
+        suggested_asset_key: row.get(16)?,
+        suggested_asset_version: row.get(17)?,
+        suggestion_confidence: row.get(18)?,
+        suggestion_score: row.get(19)?,
+        suggestion_scene_score: row.get(20)?,
+        suggestion_continuity_score: row.get(21)?,
+        suggestion_rhythm_score: row.get(22)?,
+        suggestion_material_score: row.get(23)?,
+        suggestion_reason: row.get(24)?,
+        suggestion_none: row.get(25)?,
+        manually_locked: row.get(26)?,
+        stale: row.get(27)?,
+        active: row.get(28)?,
+        updated_at: row.get(29)?,
     })
 }
 
@@ -2127,31 +2327,50 @@ mod tests {
             .into_iter()
             .find(|item| item.left_stable_id == 12 && item.right_stable_id == 13)
             .unwrap();
+        let low_score = BoundaryAgentScoreInput {
+            asset_key: "tm_test",
+            asset_version: 1,
+            total_score: 7.4,
+            scene_score: 7.5,
+            continuity_score: 7.3,
+            rhythm_score: 7.2,
+            material_score: 7.6,
+            reason: "分数不足，仅建议",
+        };
         let suggestion = repository
-            .save_agent_suggestion(
+            .save_agent_score_suggestion(
                 automatic_boundary.id,
-                Some(("tm_test", 1)),
+                Some(&low_score),
                 false,
-                0.74,
-                "分数不足，仅建议",
+                low_score.reason,
                 false,
             )
             .unwrap();
         assert_eq!(suggestion.asset_key, None);
         assert_eq!(suggestion.suggested_asset_key.as_deref(), Some("tm_test"));
-        assert_eq!(suggestion.suggestion_confidence, Some(0.74));
+        assert_eq!(suggestion.suggestion_confidence, None);
+        assert_eq!(suggestion.suggestion_score, Some(7.4));
+        let high_score = BoundaryAgentScoreInput {
+            total_score: 8.0,
+            scene_score: 8.1,
+            continuity_score: 8.0,
+            rhythm_score: 7.9,
+            material_score: 8.2,
+            reason: "达到冻结阈值",
+            ..low_score
+        };
         let applied = repository
-            .save_agent_suggestion(
+            .save_agent_score_suggestion(
                 automatic_boundary.id,
-                Some(("tm_test", 1)),
+                Some(&high_score),
                 false,
-                0.75,
-                "达到固定阈值",
+                high_score.reason,
                 true,
             )
             .unwrap();
         assert_eq!(applied.asset_key.as_deref(), Some("tm_test"));
         assert_eq!(applied.selection_source, BoundarySelectionSource::Agent);
+        assert_eq!(applied.score, Some(8.0));
 
         database
             .connection()
@@ -2164,5 +2383,77 @@ mod tests {
         assert_eq!(audit.left_clip_segment_id, None);
         assert_eq!(audit.left_stable_id, 11);
         assert_eq!(audit.asset_key.as_deref(), Some("tm_test"));
+    }
+
+    #[test]
+    fn latest_completed_match_run_ignores_newer_failed_audit() {
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        seed_clip_project(&database);
+        let repository = TransitionMaterialRepository::new(database);
+
+        let first = repository
+            .begin_match_run(1, 1, "deepseek", "model", "match-v1", "score-v1", 7, 2, "first")
+            .unwrap();
+        repository
+            .finish_match_run(
+                first,
+                true,
+                "completed",
+                TransitionMatchRunOutcome {
+                    matched_boundaries: 1,
+                    auto_applied: 0,
+                    suggestions: 1,
+                    none_suggestions: 0,
+                    failed_boundaries: 0,
+                    token_usage: 40,
+                },
+                None,
+            )
+            .unwrap();
+        let latest_completed = repository
+            .begin_match_run(1, 2, "deepseek", "model", "match-v1", "score-v1", 8, 2, "second")
+            .unwrap();
+        repository
+            .finish_match_run(
+                latest_completed,
+                true,
+                "completed",
+                TransitionMatchRunOutcome {
+                    matched_boundaries: 2,
+                    auto_applied: 1,
+                    suggestions: 1,
+                    none_suggestions: 0,
+                    failed_boundaries: 0,
+                    token_usage: 80,
+                },
+                None,
+            )
+            .unwrap();
+        let failed = repository
+            .begin_match_run(1, 3, "deepseek", "model", "match-v1", "score-v1", 9, 2, "third")
+            .unwrap();
+        repository
+            .finish_match_run(
+                failed,
+                false,
+                "failed",
+                TransitionMatchRunOutcome::default(),
+                Some(("provider", "failed")),
+            )
+            .unwrap();
+
+        assert_eq!(
+            repository.latest_completed_match_run(1).unwrap(),
+            Some(TransitionMatchRunReview {
+                run_id: latest_completed,
+                threshold: 8,
+                matched: 2,
+                auto_applied: 1,
+                suggestions: 1,
+                none_suggestions: 0,
+                token_usage: 80,
+            })
+        );
     }
 }

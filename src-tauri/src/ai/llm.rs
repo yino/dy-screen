@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::process::Command;
 
 use async_trait::async_trait;
-use rig_core::providers::openai;
+use rig_core::{client::CompletionClient, extractor::ExtractionError, providers::deepseek};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,12 +17,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::repository::AiRepositoryError;
 
-pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 pub const DEFAULT_MODEL_ID: &str = "deepseek-chat";
 pub const PROMPT_VERSION: &str = "highlight-v1";
 pub const MAX_AGENT_TURNS: u8 = 3;
 pub const DEFAULT_QUALIFIED_SCORE: u8 = 70;
 pub const DEFAULT_EXCELLENT_SCORE: u8 = 80;
+pub const DEFAULT_TRANSITION_AUTO_APPLY_SCORE: u8 = 8;
 
 const fn default_qualified_score() -> u8 {
     DEFAULT_QUALIFIED_SCORE
@@ -30,6 +31,10 @@ const fn default_qualified_score() -> u8 {
 
 const fn default_excellent_score() -> u8 {
     DEFAULT_EXCELLENT_SCORE
+}
+
+const fn default_transition_auto_apply_score() -> u8 {
+    DEFAULT_TRANSITION_AUTO_APPLY_SCORE
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +48,8 @@ pub struct LlmProviderSettings {
     pub qualified_score: u8,
     #[serde(default = "default_excellent_score")]
     pub excellent_score: u8,
+    #[serde(default = "default_transition_auto_apply_score")]
+    pub transition_auto_apply_score: u8,
     pub key_configured: bool,
     pub updated_at: Option<String>,
 }
@@ -56,6 +63,7 @@ impl Default for LlmProviderSettings {
             prompt_version: PROMPT_VERSION.to_owned(),
             qualified_score: DEFAULT_QUALIFIED_SCORE,
             excellent_score: DEFAULT_EXCELLENT_SCORE,
+            transition_auto_apply_score: DEFAULT_TRANSITION_AUTO_APPLY_SCORE,
             key_configured: false,
             updated_at: None,
         }
@@ -87,6 +95,11 @@ impl LlmProviderSettings {
         if self.excellent_score < self.qualified_score {
             return Err(LlmError::InvalidConfiguration(
                 "优秀片段阈值不能低于合格片段阈值".to_owned(),
+            ));
+        }
+        if self.transition_auto_apply_score > 10 {
+            return Err(LlmError::InvalidConfiguration(
+                "转场自动应用阈值必须在 0 到 10 之间".to_owned(),
             ));
         }
         Ok(())
@@ -446,12 +459,16 @@ pub struct HighlightCandidateScore {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct CandidateAgentOutput {
     pub candidates: Vec<HighlightCandidateDraft>,
+    #[serde(default)]
+    #[schemars(skip)]
     pub token_usage: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct RankingAgentOutput {
     pub scores: Vec<HighlightCandidateScore>,
+    #[serde(default)]
+    #[schemars(skip)]
     pub token_usage: u64,
 }
 
@@ -477,14 +494,29 @@ pub struct TransitionAgentRequest {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionScoreRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubtitleCorrectionRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransitionAgentCandidate {
+    pub asset_key: String,
+    pub asset_version: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TransitionAgentMatch {
     pub boundary_id: i64,
-    pub asset_key: Option<String>,
-    pub asset_version: Option<i64>,
+    pub candidates: Vec<TransitionAgentCandidate>,
     pub none: bool,
-    pub confidence: f64,
     pub reason: String,
 }
 
@@ -492,8 +524,73 @@ pub struct TransitionAgentMatch {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TransitionAgentOutput {
     pub matches: Vec<TransitionAgentMatch>,
+    #[serde(default)]
+    #[schemars(skip)]
     pub token_usage: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransitionAgentScore {
+    pub boundary_id: i64,
+    pub asset_key: String,
+    pub asset_version: i64,
+    pub total_score: f64,
+    pub scene_score: f64,
+    pub continuity_score: f64,
+    pub rhythm_score: f64,
+    pub material_score: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransitionScoreOutput {
+    pub scores: Vec<TransitionAgentScore>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub token_usage: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubtitleCorrectionItem {
+    pub index: u32,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubtitleCorrectionOutput {
+    pub corrections: Vec<SubtitleCorrectionItem>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub token_usage: u64,
+}
+
+trait ProviderStructuredOutput {
+    fn set_token_usage(&mut self, _token_usage: u64) {}
+}
+
+impl ProviderStructuredOutput for ProviderDiagnostic {}
+
+macro_rules! impl_provider_token_usage {
+    ($($type:ty),+ $(,)?) => {
+        $(impl ProviderStructuredOutput for $type {
+            fn set_token_usage(&mut self, token_usage: u64) {
+                self.token_usage = token_usage;
+            }
+        })+
+    };
+}
+
+impl_provider_token_usage!(
+    CandidateAgentOutput,
+    RankingAgentOutput,
+    TransitionAgentOutput,
+    TransitionScoreOutput,
+    SubtitleCorrectionOutput,
+);
 
 #[derive(Debug, Error)]
 pub enum LlmError {
@@ -546,6 +643,25 @@ pub trait TransitionAgentProvider: Send + Sync {
         request: TransitionAgentRequest,
         cancellation: CancellationToken,
     ) -> Result<TransitionAgentOutput, LlmError>;
+
+    async fn score_transitions(
+        &self,
+        settings: &LlmProviderSettings,
+        api_key: &str,
+        request: TransitionScoreRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TransitionScoreOutput, LlmError>;
+}
+
+#[async_trait]
+pub trait SubtitleCorrectionProvider: Send + Sync {
+    async fn correct_subtitles(
+        &self,
+        settings: &LlmProviderSettings,
+        api_key: &str,
+        request: SubtitleCorrectionRequest,
+        cancellation: CancellationToken,
+    ) -> Result<SubtitleCorrectionOutput, LlmError>;
 }
 
 #[derive(Default, Clone)]
@@ -671,6 +787,43 @@ impl TransitionAgentProvider for RigDeepSeekProvider {
         )
         .await
     }
+
+    async fn score_transitions(
+        &self,
+        settings: &LlmProviderSettings,
+        api_key: &str,
+        request: TransitionScoreRequest,
+        cancellation: CancellationToken,
+    ) -> Result<TransitionScoreOutput, LlmError> {
+        self.extract_with_preamble(
+            settings,
+            api_key,
+            &request.prompt,
+            "你是受限的只读视频转场评分 Agent。只能评价输入中已经匹配的候选，不调用工具、不访问网络或文件，不生成渲染参数，只输出结构化评分。",
+            cancellation,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl SubtitleCorrectionProvider for RigDeepSeekProvider {
+    async fn correct_subtitles(
+        &self,
+        settings: &LlmProviderSettings,
+        api_key: &str,
+        request: SubtitleCorrectionRequest,
+        cancellation: CancellationToken,
+    ) -> Result<SubtitleCorrectionOutput, LlmError> {
+        self.extract_with_preamble(
+            settings,
+            api_key,
+            &request.prompt,
+            "你是受限的中文 ASR 文本纠错 Agent。只修正错别字、同音错词、明显识别错误和标点，保持原意、语气、专名、数字、数组长度与顺序；不润色、不改写、不合并或拆分条目，只输出结构化结果。",
+            cancellation,
+        )
+        .await
+    }
 }
 
 impl RigDeepSeekProvider {
@@ -682,7 +835,13 @@ impl RigDeepSeekProvider {
         cancellation: CancellationToken,
     ) -> Result<T, LlmError>
     where
-        T: JsonSchema + for<'de> Deserialize<'de> + Serialize + Send + Sync + 'static,
+        T: JsonSchema
+            + for<'de> Deserialize<'de>
+            + Serialize
+            + ProviderStructuredOutput
+            + Send
+            + Sync
+            + 'static,
     {
         self.extract_with_preamble(
             settings,
@@ -703,26 +862,62 @@ impl RigDeepSeekProvider {
         cancellation: CancellationToken,
     ) -> Result<T, LlmError>
     where
-        T: JsonSchema + for<'de> Deserialize<'de> + Serialize + Send + Sync + 'static,
+        T: JsonSchema
+            + for<'de> Deserialize<'de>
+            + Serialize
+            + ProviderStructuredOutput
+            + Send
+            + Sync
+            + 'static,
     {
         settings.validate()?;
         validate_key(api_key).map_err(|_| LlmError::Credential)?;
-        let client = openai::Client::builder()
+        let client = deepseek::Client::builder()
             .api_key(api_key)
             .base_url(DEEPSEEK_BASE_URL)
             .build()
-            .map_err(|_| LlmError::Provider)?
-            .completions_api();
+            .map_err(|_| LlmError::Provider)?;
         let extractor = client
             .extractor::<T>(settings.model_id.clone())
             .preamble(preamble)
+            .additional_params(serde_json::json!({
+                "thinking": { "type": "disabled" },
+                "temperature": 0
+            }))
             .max_tokens(4096)
             .retries(0)
             .build();
         tokio::select! {
             _ = cancellation.cancelled() => Err(LlmError::Cancelled),
-            result = tokio::time::timeout(Duration::from_millis(settings.timeout_ms), extractor.extract(prompt)) => {
-                result.map_err(|_| LlmError::Temporary)?.map_err(|_| LlmError::InvalidResponse)
+            result = tokio::time::timeout(Duration::from_millis(settings.timeout_ms), extractor.extract_with_usage(prompt)) => {
+                let mut response = result
+                    .map_err(|_| LlmError::Temporary)?
+                    .map_err(map_extraction_error)?;
+                let token_usage = if response.usage.total_tokens > 0 {
+                    response.usage.total_tokens
+                } else {
+                    response.usage.input_tokens.saturating_add(response.usage.output_tokens)
+                };
+                response.data.set_token_usage(token_usage);
+                Ok(response.data)
+            }
+        }
+    }
+}
+
+fn map_extraction_error(error: ExtractionError) -> LlmError {
+    match error {
+        ExtractionError::NoData | ExtractionError::DeserializationError(_) => {
+            LlmError::InvalidResponse
+        }
+        ExtractionError::CompletionError(error) => {
+            match error
+                .provider_response_status()
+                .map(|status| status.as_u16())
+            {
+                Some(401 | 403) => LlmError::Credential,
+                Some(408 | 409 | 425 | 429) | Some(500..=599) => LlmError::Temporary,
+                _ => LlmError::Provider,
             }
         }
     }
@@ -743,7 +938,7 @@ impl CancellationCheck for CancellationToken {
 }
 
 pub fn settings_from_row(
-    row: Option<(String, String, i64, String, i64, i64, String)>,
+    row: Option<(String, String, i64, String, i64, i64, i64, String)>,
     key_configured: bool,
 ) -> Result<LlmProviderSettings, LlmError> {
     let Some((
@@ -753,6 +948,7 @@ pub fn settings_from_row(
         prompt_version,
         qualified_score,
         excellent_score,
+        transition_auto_apply_score,
         updated_at,
     )) = row
     else {
@@ -771,6 +967,8 @@ pub fn settings_from_row(
             .map_err(|_| LlmError::InvalidConfiguration("合格片段阈值无效".to_owned()))?,
         excellent_score: u8::try_from(excellent_score)
             .map_err(|_| LlmError::InvalidConfiguration("优秀片段阈值无效".to_owned()))?,
+        transition_auto_apply_score: u8::try_from(transition_auto_apply_score)
+            .map_err(|_| LlmError::InvalidConfiguration("转场自动应用阈值无效".to_owned()))?,
         key_configured,
         updated_at: Some(updated_at),
     };

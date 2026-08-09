@@ -166,4 +166,13 @@ describe("浏览器演示剪辑字幕 API", () => {
       "浏览器演示模式不能恢复本地剪辑字幕",
     );
   });
+
+  it("不提供转场 Agent 且明确拒绝模拟 DeepSeek 文本纠错", async () => {
+    const api = createBrowserApi();
+
+    expect(api.matchAiClipTransitions).toBeUndefined();
+    await expect(api.correctAiClipText?.(1, 1)).rejects.toThrow(
+      "浏览器演示模式不会调用 DeepSeek 纠错",
+    );
+  });
 });

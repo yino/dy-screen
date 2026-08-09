@@ -257,6 +257,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       promptVersion: "highlight-v1",
       qualifiedScore: 70,
       excellentScore: 80,
+      transitionAutoApplyScore: 8,
       keyConfigured: true,
       updatedAt: "2026-07-27T00:00:00Z",
     }),
@@ -689,7 +690,7 @@ describe("App", () => {
     render(<App api={createApi()} />);
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
-    await screen.findByRole("heading", { name: "高光分析 Provider" });
+    await screen.findByRole("heading", { name: "高光与剪辑 Agent" });
 
     const primaryColumn = screen.getByTestId("settings-column-primary");
     const secondaryColumn = screen.getByTestId("settings-column-secondary");
@@ -701,7 +702,7 @@ describe("App", () => {
     expect(within(secondaryColumn).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
       "运行环境",
       "客户端授权",
-      "高光分析 Provider",
+      "高光与剪辑 Agent",
     ]);
   });
 
@@ -730,6 +731,7 @@ describe("App", () => {
     await act(async () => { resolveSave?.(); });
     expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("设置已保存");
     expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+    expect(api.saveAiLlmSettings).not.toHaveBeenCalled();
   });
 
   it("普通设置保存失败后保留输入并允许重试", async () => {
@@ -779,7 +781,7 @@ describe("App", () => {
     expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
   });
 
-  it("Provider 操作与普通设置提交和脏状态隔离", async () => {
+  it("Provider 卡片保存会同步底部保存栏状态", async () => {
     const user = userEvent.setup();
     const api = createApi();
     render(<App api={api} />);
@@ -791,10 +793,13 @@ describe("App", () => {
 
     await user.clear(modelId);
     await user.type(modelId, "deepseek-reasoner");
+    expect(ordinarySave).toBeEnabled();
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
     await user.click(screen.getByRole("button", { name: "保存 Provider" }));
     expect(api.saveAiLlmSettings).toHaveBeenCalledWith(expect.objectContaining({ modelId: "deepseek-reasoner" }), undefined);
     expect(api.saveSettings).not.toHaveBeenCalled();
-    expect(ordinarySave).toBeDisabled();
+    await waitFor(() => expect(ordinarySave).toBeDisabled());
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("所有更改均已保存");
 
     await user.click(screen.getByRole("button", { name: "测试连接" }));
     expect(api.diagnoseAiLlmProvider).toHaveBeenCalledTimes(1);
@@ -802,6 +807,109 @@ describe("App", () => {
     expect(api.clearAiLlmKey).toHaveBeenCalledTimes(1);
     expect(api.saveSettings).not.toHaveBeenCalled();
     expect(ordinarySave).toBeDisabled();
+  });
+
+  it("底部保存设置可以单独保存 Provider 转场阈值", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const threshold = await screen.findByLabelText("转场自动应用阈值");
+    const save = screen.getByRole("button", { name: "保存设置" });
+    await user.clear(threshold);
+    await user.type(threshold, "5");
+
+    expect(save).toBeEnabled();
+    expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
+    await user.click(save);
+
+    expect(api.saveAiLlmSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ transitionAutoApplyScore: 5 }),
+      undefined,
+    );
+    expect(api.saveSettings).not.toHaveBeenCalled();
+    expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("设置已保存");
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+  });
+
+  it("底部保存设置会提交同时发生的普通设置与 Provider 更改", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const outputRoot = await screen.findByLabelText("录像保存目录");
+    const threshold = screen.getByLabelText("转场自动应用阈值");
+    await user.clear(outputRoot);
+    await user.type(outputRoot, "/tmp/provider-and-app");
+    await user.clear(threshold);
+    await user.type(threshold, "6");
+    await user.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(api.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ outputRoot: "/tmp/provider-and-app" }));
+    expect(api.saveAiLlmSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ transitionAutoApplyScore: 6 }),
+      undefined,
+    );
+    expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("设置已保存");
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+  });
+
+  it("底部保存 Provider 失败时保留阈值并允许重试", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.saveAiLlmSettings = vi.fn()
+      .mockRejectedValueOnce(new Error("Provider 暂时不可用"))
+      .mockImplementation(async (settings) => settings);
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const threshold = await screen.findByLabelText("转场自动应用阈值");
+    await user.clear(threshold);
+    await user.type(threshold, "5");
+    await user.click(screen.getByRole("button", { name: "保存设置" }));
+
+    expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("保存失败，输入已保留，请重试");
+    expect(threshold).toHaveValue(5);
+    expect(screen.getByText("Provider 暂时不可用")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "保存设置" }));
+    expect(api.saveAiLlmSettings).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole("status", { name: "设置保存状态" })).toHaveTextContent("设置已保存");
+    expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
+  });
+
+  it("转场自动应用阈值只接受 0 到 10 的整数", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const threshold = await screen.findByLabelText("转场自动应用阈值");
+    const saveProvider = screen.getByRole("button", { name: "保存 Provider" });
+
+    await user.clear(threshold);
+    await user.type(threshold, "11");
+    await user.click(screen.getByRole("button", { name: "保存设置" }));
+    expect(api.saveAiLlmSettings).not.toHaveBeenCalled();
+    await user.click(saveProvider);
+    expect(await screen.findByText("转场自动应用阈值必须是 0 到 10 之间的整数")).toBeInTheDocument();
+    expect(api.saveAiLlmSettings).not.toHaveBeenCalled();
+
+    await user.clear(threshold);
+    await user.type(threshold, "7.5");
+    await user.click(saveProvider);
+    expect(api.saveAiLlmSettings).not.toHaveBeenCalled();
+
+    await user.clear(threshold);
+    await user.type(threshold, "10");
+    await user.click(saveProvider);
+    expect(api.saveAiLlmSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ transitionAutoApplyScore: 10 }),
+      undefined,
+    );
   });
 
   it("首次启动时显示添加主播空状态", async () => {

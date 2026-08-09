@@ -21,9 +21,10 @@ use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome
 use crate::ai::tauri_commands::*;
 use crate::ai::{
     AiClipExportStatus, AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService,
-    AiRepository, ClipExportBridge, ClipExportFailure, ClipOutputDimensions, HighlightWorkflow,
-    LocalAsrRuntime, RigDeepSeekProvider, SourceFingerprint, SystemCredentialStore,
-    build_export_plan, execute_export, probe_output_dimensions, render_clip_subtitle_assets,
+    AiRepository, ClipExportBridge, ClipExportFailure, ClipOutputDimensions,
+    ClipTextCorrectionSummary, ClipTextCorrectionWorkflow, HighlightWorkflow, LocalAsrRuntime,
+    RigDeepSeekProvider, SourceFingerprint, SystemCredentialStore, build_export_plan,
+    execute_export, probe_output_dimensions, render_clip_subtitle_assets,
     select_clip_video_encoder, validate_export_sources, validate_export_subtitles,
 };
 use crate::api::ApiClient;
@@ -31,6 +32,7 @@ use crate::app_lifecycle::{
     InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, log_lifecycle,
 };
 use crate::app_support::{delete_recording_session, delete_recording_video, validate_settings};
+use crate::clip_workflow::{ClipWorkflowProgress, ClipWorkflowPublisher};
 use crate::database::Database;
 use crate::domain::{
     AppSettings, BrowserAccessState, BrowserAccessStatus, CommandError, CreateStreamerRequest,
@@ -80,6 +82,8 @@ struct AppState {
     transition_catalog: TransitionCatalogCoordinator,
     transition_assets: TransitionMaterialAssetService,
     transition_matching: TransitionMatchingWorkflow,
+    clip_text_correction: ClipTextCorrectionWorkflow,
+    clip_workflow_tasks: Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
     clip_export_tasks: Arc<Mutex<HashMap<i64, tokio_util::sync::CancellationToken>>>,
     _telemetry: TelemetryQueue,
 }
@@ -440,6 +444,17 @@ struct DesktopAiPublisher {
     app: AppHandle,
 }
 
+#[derive(Clone)]
+struct DesktopClipWorkflowPublisher {
+    app: AppHandle,
+}
+
+impl ClipWorkflowPublisher for DesktopClipWorkflowPublisher {
+    fn publish(&self, progress: &ClipWorkflowProgress) {
+        let _ = self.app.emit("ai-clip-workflow-event", progress);
+    }
+}
+
 impl AiJobPublisher for DesktopAiPublisher {
     fn publish(&self, event: AiJobEvent) {
         let _ = self.app.emit("ai-job-event", event);
@@ -617,15 +632,116 @@ async fn ai_match_clip_transitions(
     boundary_id: Option<i64>,
     state: State<'_, AppState>,
 ) -> Result<TransitionMatchSummary, String> {
-    state
+    if !state.activation.is_active() {
+        return Err("客户端尚未激活，请先输入有效激活码".to_owned());
+    }
+    let task_key = format!("transition:{clip_project_id}");
+    let cancellation = state.activation.cancellation().child_token();
+    {
+        let mut tasks = state
+            .clip_workflow_tasks
+            .lock()
+            .map_err(|_| "剪辑 Agent 任务状态锁已损坏".to_owned())?;
+        if tasks.contains_key(&task_key) {
+            return Err("当前工程的一键 Agent 已在运行".to_owned());
+        }
+        tasks.insert(task_key.clone(), cancellation.clone());
+    }
+    let result = state
         .transition_matching
-        .match_boundaries(
-            clip_project_id,
-            boundary_id,
-            state.activation.cancellation().child_token(),
-        )
+        .match_boundaries(clip_project_id, boundary_id, cancellation)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    if let Ok(mut tasks) = state.clip_workflow_tasks.lock() {
+        tasks.remove(&task_key);
+    }
+    result
+}
+
+#[tauri::command]
+fn ai_get_latest_clip_transition_review(
+    clip_project_id: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<TransitionMatchSummary>, String> {
+    let repository = TransitionMaterialRepository::new(state.database.clone());
+    let Some(run) = repository
+        .latest_completed_match_run(clip_project_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(TransitionMatchSummary {
+        run_id: run.run_id,
+        threshold: run.threshold,
+        matched: run.matched,
+        auto_applied: run.auto_applied,
+        suggestions: run.suggestions,
+        none_suggestions: run.none_suggestions,
+        token_usage: run.token_usage,
+        boundaries: repository
+            .list_boundaries(clip_project_id)
+            .map_err(|error| error.to_string())?,
+    }))
+}
+
+#[tauri::command]
+fn ai_cancel_clip_transition_agent(
+    clip_project_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    cancel_clip_workflow(&state, &format!("transition:{clip_project_id}"))
+}
+
+#[tauri::command]
+async fn ai_correct_clip_text(
+    clip_project_id: i64,
+    expected_project_version: u32,
+    state: State<'_, AppState>,
+) -> Result<ClipTextCorrectionSummary, String> {
+    if !state.activation.is_active() {
+        return Err("客户端尚未激活，请先输入有效激活码".to_owned());
+    }
+    let task_key = format!("text:{clip_project_id}");
+    let cancellation = state.activation.cancellation().child_token();
+    {
+        let mut tasks = state
+            .clip_workflow_tasks
+            .lock()
+            .map_err(|_| "文本纠错任务状态锁已损坏".to_owned())?;
+        if tasks.contains_key(&task_key) {
+            return Err("当前工程的一键文本纠错已在运行".to_owned());
+        }
+        tasks.insert(task_key.clone(), cancellation.clone());
+    }
+    let result = state
+        .clip_text_correction
+        .correct_project(clip_project_id, expected_project_version, cancellation)
+        .await
+        .map_err(|error| error.to_string());
+    if let Ok(mut tasks) = state.clip_workflow_tasks.lock() {
+        tasks.remove(&task_key);
+    }
+    result
+}
+
+#[tauri::command]
+fn ai_cancel_clip_text_correction(
+    clip_project_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    cancel_clip_workflow(&state, &format!("text:{clip_project_id}"))
+}
+
+fn cancel_clip_workflow(state: &AppState, task_key: &str) -> Result<(), String> {
+    let tasks = state
+        .clip_workflow_tasks
+        .lock()
+        .map_err(|_| "剪辑工作流任务状态锁已损坏".to_owned())?;
+    let cancellation = tasks
+        .get(task_key)
+        .ok_or_else(|| "当前工程没有正在运行的任务".to_owned())?;
+    cancellation.cancel();
+    Ok(())
 }
 
 #[tauri::command]
@@ -1649,6 +1765,10 @@ pub fn run() {
             request_transition_material_preview,
             request_transition_material_thumbnail,
             ai_match_clip_transitions,
+            ai_get_latest_clip_transition_review,
+            ai_cancel_clip_transition_agent,
+            ai_correct_clip_text,
+            ai_cancel_clip_text_correction,
             ai_apply_clip_transition,
             ai_unlock_clip_transition,
             activate_client,
@@ -1834,13 +1954,24 @@ pub fn run() {
             .with_highlight_workflow(highlight_workflow)
             .with_credential_store(credential_store.clone());
             app.manage(AiDesktopState::new(ai_commands));
+            let clip_workflow_publisher: Arc<dyn ClipWorkflowPublisher> =
+                Arc::new(DesktopClipWorkflowPublisher {
+                    app: app.handle().clone(),
+                });
             let transition_matching = TransitionMatchingWorkflow::new(
                 TransitionMaterialRepository::new(database.clone()),
                 AiRepository::new(database.clone()),
                 Arc::new(RigDeepSeekProvider),
-                credential_store,
+                credential_store.clone(),
                 transition_assets.clone(),
-            );
+            )
+            .with_publisher(clip_workflow_publisher.clone());
+            let clip_text_correction = ClipTextCorrectionWorkflow::new(
+                AiRepository::new(database.clone()),
+                Arc::new(RigDeepSeekProvider),
+                credential_store,
+            )
+            .with_publisher(clip_workflow_publisher);
 
             let tray_status_item = MenuItemBuilder::with_id("recording_status", "正在录制：0 路")
                 .enabled(false)
@@ -1937,6 +2068,8 @@ pub fn run() {
                 transition_catalog,
                 transition_assets,
                 transition_matching,
+                clip_text_correction,
+                clip_workflow_tasks: Arc::new(Mutex::new(HashMap::new())),
                 clip_export_tasks: Arc::new(Mutex::new(HashMap::new())),
                 _telemetry: telemetry,
             });

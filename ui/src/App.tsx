@@ -1670,6 +1670,17 @@ function sameAppSettings(left: AppSettings, right: AppSettings): boolean {
     && left.autostartEnabled === right.autostartEnabled;
 }
 
+function sameLlmProviderSettings(left: LlmProviderSettings, right: LlmProviderSettings): boolean {
+  return left.provider === right.provider
+    && left.modelId === right.modelId
+    && left.timeoutMs === right.timeoutMs
+    && left.promptVersion === right.promptVersion
+    && left.qualifiedScore === right.qualifiedScore
+    && left.excellentScore === right.excellentScore
+    && left.transitionAutoApplyScore === right.transitionAutoApplyScore
+    && left.keyConfigured === right.keyConfigured;
+}
+
 export function SettingsPage({ api, settings, maxScreenLimit, environment, browserAccess, accessBusy, activation, onOpenLogs, onDiagnose, onVerifyAccess, onRecheckAccess, onClearAccess, onClearActivation, onSave }: {
   api: ClientApi;
   settings: AppSettings;
@@ -1690,32 +1701,95 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
   const [baseline, setBaseline] = useState(settings);
   const [saveState, setSaveState] = useState<SettingsSaveState>("idle");
   const [llm, setLlm] = useState<LlmProviderSettings | null>(null);
+  const [llmBaseline, setLlmBaseline] = useState<LlmProviderSettings | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [llmMessage, setLlmMessage] = useState<string | null>(null);
   const [llmBusy, setLlmBusy] = useState<"save" | "diagnose" | "clear" | null>(null);
-  const dirty = !sameAppSettings(form, baseline);
-  const dirtyRef = useRef(dirty);
-  dirtyRef.current = dirty;
+  const ordinaryDirty = !sameAppSettings(form, baseline);
+  const providerDirty = Boolean(
+    llm
+      && llmBaseline
+      && (!sameLlmProviderSettings(llm, llmBaseline) || apiKey.trim()),
+  );
+  const dirty = ordinaryDirty || providerDirty;
+  const ordinaryDirtyRef = useRef(ordinaryDirty);
+  ordinaryDirtyRef.current = ordinaryDirty;
 
   useEffect(() => {
     setBaseline(settings);
-    if (!dirtyRef.current) setForm(settings);
+    if (!ordinaryDirtyRef.current) setForm(settings);
   }, [settings]);
-  useEffect(() => { void api.getAiLlmSettings?.().then(setLlm).catch(() => setLlm(null)); }, [api]);
+  useEffect(() => {
+    void api.getAiLlmSettings?.()
+      .then((loaded) => {
+        setLlm(loaded);
+        setLlmBaseline(loaded);
+      })
+      .catch(() => {
+        setLlm(null);
+        setLlmBaseline(null);
+      });
+  }, [api]);
 
   const updateForm = (values: Partial<AppSettings>) => {
     setForm((current) => ({ ...current, ...values }));
     if (saveState !== "saving") setSaveState("idle");
   };
 
+  const updateLlm = (values: Partial<LlmProviderSettings>) => {
+    setLlm((current) => current ? { ...current, ...values } : current);
+    setLlmMessage(null);
+    if (saveState !== "saving") setSaveState("idle");
+  };
+
+  const updateApiKey = (value: string) => {
+    setApiKey(value);
+    setLlmMessage(null);
+    if (saveState !== "saving") setSaveState("idle");
+  };
+
+  const persistLlm = async (): Promise<boolean> => {
+    if (!llm || !api.saveAiLlmSettings || llmBusy !== null) return false;
+    if (!Number.isInteger(llm.qualifiedScore) || !Number.isInteger(llm.excellentScore) || llm.qualifiedScore < 0 || llm.excellentScore > 100 || llm.excellentScore < llm.qualifiedScore) {
+      setLlmMessage("合格/优秀片段阈值必须在 0 到 100 之间，且优秀阈值不能低于合格阈值");
+      return false;
+    }
+    if (!Number.isInteger(llm.transitionAutoApplyScore) || llm.transitionAutoApplyScore < 0 || llm.transitionAutoApplyScore > 10) {
+      setLlmMessage("转场自动应用阈值必须是 0 到 10 之间的整数");
+      return false;
+    }
+    setLlmBusy("save");
+    try {
+      const saved = await api.saveAiLlmSettings(llm, apiKey.trim() || undefined);
+      setLlm(saved);
+      setLlmBaseline(saved);
+      setApiKey("");
+      setLlmMessage("DeepSeek 设置已保存，Key 只存入系统凭据库");
+      return true;
+    } catch (error) {
+      setLlmMessage(errorMessage(error, "无法保存 DeepSeek 设置"));
+      return false;
+    } finally {
+      setLlmBusy(null);
+    }
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!dirty || saveState === "saving") return;
+    if (!dirty || saveState === "saving" || llmBusy !== null) return;
     const submitted = form;
+    const saveOrdinarySettings = ordinaryDirty;
+    const saveProviderSettings = providerDirty;
     setSaveState("saving");
     try {
-      await onSave(submitted);
-      setBaseline(submitted);
+      if (saveOrdinarySettings) {
+        await onSave(submitted);
+        setBaseline(submitted);
+      }
+      if (saveProviderSettings && !(await persistLlm())) {
+        setSaveState("error");
+        return;
+      }
       setSaveState("saved");
     } catch {
       setSaveState("error");
@@ -1723,21 +1797,8 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
   };
 
   const saveLlm = async () => {
-    if (!llm || !api.saveAiLlmSettings || llmBusy !== null) return;
-    if (!Number.isInteger(llm.qualifiedScore) || !Number.isInteger(llm.excellentScore) || llm.qualifiedScore < 0 || llm.excellentScore > 100 || llm.excellentScore < llm.qualifiedScore) {
-      setLlmMessage("合格/优秀片段阈值必须在 0 到 100 之间，且优秀阈值不能低于合格阈值");
-      return;
-    }
-    setLlmBusy("save");
-    try {
-      setLlm(await api.saveAiLlmSettings(llm, apiKey.trim() || undefined));
-      setApiKey("");
-      setLlmMessage("DeepSeek 设置已保存，Key 只存入系统凭据库");
-    } catch (error) {
-      setLlmMessage(errorMessage(error, "无法保存 DeepSeek 设置"));
-    } finally {
-      setLlmBusy(null);
-    }
+    if (!providerDirty || saveState === "saving") return;
+    await persistLlm();
   };
 
   const diagnoseLlm = async () => {
@@ -1759,6 +1820,8 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
     try {
       await api.clearAiLlmKey();
       setLlm((current) => current ? { ...current, keyConfigured: false } : current);
+      setLlmBaseline((current) => current ? { ...current, keyConfigured: false } : current);
+      setApiKey("");
       setLlmMessage("Key 已从系统凭据库清除");
     } catch (error) {
       setLlmMessage(errorMessage(error, "无法清除 DeepSeek Key"));
@@ -1867,21 +1930,23 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
           {llm && (
             <section className="panel settings-card provider-settings-card">
               <div className="panel-header">
-                <div><p className="section-kicker">DEEPSEEK</p><h2>高光分析 Provider</h2></div>
+                <div><p className="section-kicker">DEEPSEEK</p><h2>高光与剪辑 Agent</h2></div>
                 <Sparkles size={21} />
               </div>
-              <label htmlFor="settings-llm-model">模型 ID<input id="settings-llm-model" value={llm.modelId} onChange={(event) => setLlm({ ...llm, modelId: event.target.value })} /></label>
-              <label htmlFor="settings-llm-key">API Key（留空表示不替换）<input id="settings-llm-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label>
-              <label htmlFor="settings-llm-timeout">请求超时（毫秒）<input id="settings-llm-timeout" type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => setLlm({ ...llm, timeoutMs: Number(event.target.value) })} /></label>
+              <label htmlFor="settings-llm-model">模型 ID<input id="settings-llm-model" value={llm.modelId} onChange={(event) => updateLlm({ modelId: event.target.value })} /></label>
+              <label htmlFor="settings-llm-key">API Key（留空表示不替换）<input id="settings-llm-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => updateApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label>
+              <label htmlFor="settings-llm-timeout">请求超时（毫秒）<input id="settings-llm-timeout" type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => updateLlm({ timeoutMs: Number(event.target.value) })} /></label>
               <div className="form-grid">
-                <label htmlFor="settings-qualified-score">合格片段阈值<input id="settings-qualified-score" aria-label="合格片段阈值" type="number" min="0" max="100" value={llm.qualifiedScore} onChange={(event) => setLlm({ ...llm, qualifiedScore: Number(event.target.value) })} /></label>
-                <label htmlFor="settings-excellent-score">优秀片段阈值<input id="settings-excellent-score" aria-label="优秀片段阈值" type="number" min="0" max="100" value={llm.excellentScore} onChange={(event) => setLlm({ ...llm, excellentScore: Number(event.target.value) })} /></label>
+                <label htmlFor="settings-qualified-score">合格片段阈值<input id="settings-qualified-score" aria-label="合格片段阈值" type="number" min="0" max="100" value={llm.qualifiedScore} onChange={(event) => updateLlm({ qualifiedScore: Number(event.target.value) })} /></label>
+                <label htmlFor="settings-excellent-score">优秀片段阈值<input id="settings-excellent-score" aria-label="优秀片段阈值" type="number" min="0" max="100" value={llm.excellentScore} onChange={(event) => updateLlm({ excellentScore: Number(event.target.value) })} /></label>
               </div>
               <p className="settings-help">达到合格阈值的片段会显示在高光候选；达到优秀阈值的片段会在首次分析完成时自动选中。每次高光分析会冻结当时的阈值。</p>
+              <label htmlFor="settings-transition-auto-score">转场自动应用阈值（0–10 分）<input id="settings-transition-auto-score" aria-label="转场自动应用阈值" type="number" min="0" max="10" step="1" value={llm.transitionAutoApplyScore} onChange={(event) => updateLlm({ transitionAutoApplyScore: Number(event.target.value) })} /></label>
+              <p className="settings-help">一键 Agent 会先匹配场景、再独立评分；总分达到该阈值才自动应用。每次运行会冻结当时的阈值，默认 8 分。</p>
               <div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>
               {llmMessage && <p className="form-error provider-message" role="status" aria-live="polite">{llmMessage}</p>}
               <div className="settings-inline-actions">
-                <button type="button" className="secondary-button compact" disabled={llmBusy !== null} onClick={() => void saveLlm()}>{llmBusy === "save" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{llmBusy === "save" ? "正在保存" : "保存 Provider"}</button>
+                <button type="button" className="secondary-button compact" disabled={!providerDirty || llmBusy !== null || saveState === "saving"} onClick={() => void saveLlm()}>{llmBusy === "save" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{llmBusy === "save" ? "正在保存" : "保存 Provider"}</button>
                 <button type="button" className="secondary-button compact" disabled={!llm.keyConfigured || llmBusy !== null} onClick={() => void diagnoseLlm()}>{llmBusy === "diagnose" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}{llmBusy === "diagnose" ? "正在测试" : "测试连接"}</button>
                 <button type="button" className="ghost-button compact" disabled={!llm.keyConfigured || llmBusy !== null} onClick={() => void clearLlmKey()}>{llmBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{llmBusy === "clear" ? "正在清除" : "清除 Key"}</button>
               </div>
@@ -1890,12 +1955,12 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
           )}
         </div>
       </div>
-      <div className={`save-bar ${dirty ? "is-dirty" : "is-pristine"} ${saveState === "error" ? "has-error" : ""}`} aria-busy={saveState === "saving"}>
+      <div className={`save-bar ${dirty ? "is-dirty" : "is-pristine"} ${saveState === "error" ? "has-error" : ""}`} aria-busy={saveState === "saving" || llmBusy === "save"}>
         <span role="status" aria-label="设置保存状态" aria-live="polite">
           {saveState === "saving" ? <LoaderCircle className="spin" size={16} /> : saveState === "error" ? <CircleOff size={16} /> : dirty ? <Save size={16} /> : <CheckCircle2 size={16} />}
           {saveMessage}
         </span>
-        <button className="primary-button" type="submit" disabled={!dirty || saveState === "saving"}>
+        <button className="primary-button" type="submit" disabled={!dirty || saveState === "saving" || llmBusy !== null}>
           {saveState === "saving" ? <LoaderCircle className="spin" size={17} /> : <Save size={17} />}
           {saveState === "saving" ? "正在保存" : "保存设置"}
         </button>

@@ -460,6 +460,7 @@ export interface LlmProviderSettings {
   promptVersion: string;
   qualifiedScore: number;
   excellentScore: number;
+  transitionAutoApplyScore: number;
   keyConfigured: boolean;
   updatedAt: string | null;
 }
@@ -601,10 +602,20 @@ export interface ClipTransitionBoundary {
   assetVersion: number | null;
   selectionSource: BoundarySelectionSource;
   confidence: number | null;
+  score: number | null;
+  sceneScore: number | null;
+  continuityScore: number | null;
+  rhythmScore: number | null;
+  materialScore: number | null;
   reason: string | null;
   suggestedAssetKey: string | null;
   suggestedAssetVersion: number | null;
   suggestionConfidence: number | null;
+  suggestionScore: number | null;
+  suggestionSceneScore: number | null;
+  suggestionContinuityScore: number | null;
+  suggestionRhythmScore: number | null;
+  suggestionMaterialScore: number | null;
   suggestionReason: string | null;
   suggestionNone: boolean;
   manuallyLocked: boolean;
@@ -628,11 +639,36 @@ export interface AiClipTimelineUnit {
 }
 
 export interface TransitionMatchSummary {
+  runId: number;
+  threshold: number;
   matched: number;
   autoApplied: number;
   suggestions: number;
   noneSuggestions: number;
+  tokenUsage: number;
   boundaries: ClipTransitionBoundary[];
+}
+
+export interface ClipTextCorrectionSummary {
+  runId: number;
+  processed: number;
+  changed: number;
+  unchanged: number;
+  skippedManual: number;
+  skippedHidden: number;
+  totalBatches: number;
+  tokenUsage: number;
+  detail: AiClipProjectDetail;
+}
+
+export interface ClipWorkflowProgress {
+  workflow: "textCorrection" | "transitionAgent";
+  clipProjectId: number;
+  runId: number | null;
+  stage: "preparing" | "correcting" | "saving" | "matching" | "scoring" | "applying" | "completed" | "cancelled" | "failed";
+  completed: number;
+  total: number;
+  message: string;
 }
 
 export interface AiClipProject {
@@ -874,6 +910,11 @@ export interface ClientApi {
   requestTransitionMaterialPreview?(assetKey: string, assetVersion: number): Promise<MaterialAssetSnapshot>;
   requestTransitionMaterialThumbnail?(assetKey: string, assetVersion: number): Promise<MaterialAssetSnapshot>;
   matchAiClipTransitions?(clipProjectId: number, boundaryId?: number | null): Promise<TransitionMatchSummary>;
+  getLatestAiClipTransitionReview?(clipProjectId: number): Promise<TransitionMatchSummary | null>;
+  cancelAiClipTransitionAgent?(clipProjectId: number): Promise<void>;
+  correctAiClipText?(clipProjectId: number, expectedProjectVersion: number): Promise<ClipTextCorrectionSummary>;
+  cancelAiClipTextCorrection?(clipProjectId: number): Promise<void>;
+  subscribeClipWorkflow?(listener: (progress: ClipWorkflowProgress) => void): Promise<() => void>;
   applyAiClipTransition?(boundaryId: number, assetKey: string | null, assetVersion: number | null, lockEmpty?: boolean): Promise<ClipTransitionBoundary>;
   unlockAiClipTransition?(boundaryId: number): Promise<ClipTransitionBoundary>;
   startAiClipExport?(clipProjectId: number): Promise<AiClipProject>;

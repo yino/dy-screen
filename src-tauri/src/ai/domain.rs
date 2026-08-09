@@ -682,6 +682,20 @@ pub struct AiClipSubtitleUpdate {
     pub expected_project_version: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipTextCorrectionSummary {
+    pub run_id: i64,
+    pub processed: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+    pub skipped_manual: usize,
+    pub skipped_hidden: usize,
+    pub total_batches: usize,
+    pub token_usage: u64,
+    pub detail: AiClipProjectDetail,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NewAiHighlightRun {

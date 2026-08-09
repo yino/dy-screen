@@ -14,10 +14,14 @@ import {
   FileJson,
   FileText,
   FolderPlus,
+  GitCompareArrows,
   GripVertical,
   LoaderCircle,
+  LocateFixed,
   Maximize2,
   Moon,
+  PanelRightClose,
+  PanelRightOpen,
   Pause,
   Play,
   Plus,
@@ -67,8 +71,12 @@ import type {
   TransitionCatalogState,
   MaterialAssetSnapshot,
   ClipTransitionBoundary,
+  ClipTextCorrectionSummary,
+  ClipWorkflowProgress,
+  TransitionMatchSummary,
 } from "./types";
 import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
+import { buildTextDiff } from "./textDiff";
 
 const segmentPageSize = 200;
 const clipShortcutInteractiveSelector = [
@@ -150,6 +158,12 @@ function safeError(error: unknown, fallback: string): string {
     if (typeof message === "string" && message.trim()) return message;
   }
   return fallback;
+}
+
+function missingDesktopCommandMessage(message: string, command: string, feature: string): string | null {
+  return message.includes(`Command ${command} not found`)
+    ? `当前桌面后端版本过旧，未包含${feature}。请安全退出并重新启动最新客户端`
+    : null;
 }
 
 function safeErrorCode(error: unknown): string | null {
@@ -1333,7 +1347,7 @@ export function AiWorkspace({
   }
 
   if (clipEditor) {
-    return <ClipEditor api={api} initial={clipEditor} projectId={detail?.project.id ?? 0} onBack={() => setClipEditor(null)} />;
+    return <ClipEditor api={api} initial={clipEditor} projectId={detail?.project.id ?? 0} llmSettings={llmSettings} onBack={() => setClipEditor(null)} />;
   }
 
   return (
@@ -1582,6 +1596,42 @@ type ClipMaterialFilter = "all" | "video" | "animation" | "transition";
 type ClipPropertyMode = "segment" | "transition" | "subtitle";
 type ClipSubtitleScope = "current" | "all";
 type ClipSubtitleSaveState = "saved" | "unsaved" | "saving" | "failed" | "conflict";
+type WorkflowReviewMode = "agent" | "textCorrection";
+type AgentReviewFilter = "all" | "applied" | "suggestion" | "none";
+type AgentReviewStatus = Exclude<AgentReviewFilter, "all">;
+
+interface TextCorrectionReviewItem {
+  subtitleId: number;
+  beforeText: string;
+  afterText: string;
+}
+
+interface TextCorrectionReviewState {
+  summary: ClipTextCorrectionSummary;
+  changes: TextCorrectionReviewItem[];
+}
+
+function agentReviewStatus(boundary: ClipTransitionBoundary): AgentReviewStatus {
+  if (boundary.suggestionNone) return "none";
+  if (
+    boundary.assetKey !== null
+    && boundary.assetKey === boundary.suggestedAssetKey
+    && boundary.assetVersion === boundary.suggestedAssetVersion
+  ) return "applied";
+  return "suggestion";
+}
+
+function agentBoundaryScore(boundary: ClipTransitionBoundary): number | null {
+  return boundary.suggestionScore ?? boundary.score;
+}
+
+function isAgentReviewBoundary(boundary: ClipTransitionBoundary): boolean {
+  return boundary.active && (
+    boundary.suggestionNone
+    || boundary.suggestionScore !== null
+    || (boundary.selectionSource === "agent" && boundary.score !== null)
+  );
+}
 
 const clipSubtitleSaveLabels: Record<ClipSubtitleSaveState, string> = {
   saved: "已保存",
@@ -1591,7 +1641,7 @@ const clipSubtitleSaveLabels: Record<ClipSubtitleSaveState, string> = {
   conflict: "版本冲突",
 };
 
-function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initial: AiClipProjectDetail; projectId: number; onBack: () => void }) {
+function ClipEditor({ api, initial, projectId, llmSettings, onBack }: { api: ClientApi; initial: AiClipProjectDetail; projectId: number; llmSettings: LlmProviderSettings | null; onBack: () => void }) {
   const [detail, setDetail] = useState(initial);
   const [selectedId, setSelectedId] = useState(initial.segments[0]?.id ?? null);
   const [preview, setPreview] = useState<PreviewSnapshot | null>(null);
@@ -1613,6 +1663,14 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const [previewingTransition, setPreviewingTransition] = useState<TransitionMaterial | null>(null);
   const [selectedBoundaryId, setSelectedBoundaryId] = useState<number | null>(null);
   const [transitionBusy, setTransitionBusy] = useState(false);
+  const [transitionMatching, setTransitionMatching] = useState(false);
+  const [textCorrecting, setTextCorrecting] = useState(false);
+  const [workflowProgress, setWorkflowProgress] = useState<ClipWorkflowProgress | null>(null);
+  const [agentReview, setAgentReview] = useState<TransitionMatchSummary | null>(null);
+  const [textCorrectionReview, setTextCorrectionReview] = useState<TextCorrectionReviewState | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewMode, setReviewMode] = useState<WorkflowReviewMode>("agent");
+  const [agentReviewFilter, setAgentReviewFilter] = useState<AgentReviewFilter>("all");
   const [videoMaterials, setVideoMaterials] = useState<AiHighlightCandidate[]>([]);
   const [loadingVideoMaterials, setLoadingVideoMaterials] = useState(false);
   const [timelineZoom, setTimelineZoom] = useState(50);
@@ -1633,6 +1691,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const editorRef = useRef<HTMLElement>(null);
   const timelineBodyRef = useRef<HTMLDivElement>(null);
   const materialsRef = useRef<HTMLElement>(null);
+  const propertiesRef = useRef<HTMLElement>(null);
   const pendingSeekSourceMsRef = useRef<number | null>(null);
   const previewAudioContextRef = useRef<AudioContext | null>(null);
   const previewAudioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
@@ -1728,7 +1787,23 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     (state) => state !== "saved",
   );
   const editorLocked = detail.project.exportStatus === "exporting";
-  const versionMutationLocked = editorLocked || subtitleMutationPending || hasUnsavedSubtitles;
+  const workflowRunning = transitionMatching || textCorrecting;
+  const versionMutationLocked = editorLocked || subtitleMutationPending || hasUnsavedSubtitles || workflowRunning;
+  const correctableSubtitleCount = detail.subtitles.filter(
+    (subtitle) => !subtitle.hidden && subtitle.text === subtitle.originalText,
+  ).length;
+  const agentReviewBoundaries = agentReview?.boundaries.filter(isAgentReviewBoundary) ?? [];
+  const agentReviewCounts: Record<AgentReviewFilter, number> = {
+    all: agentReviewBoundaries.length,
+    applied: agentReviewBoundaries.filter((boundary) => agentReviewStatus(boundary) === "applied").length,
+    suggestion: agentReviewBoundaries.filter((boundary) => agentReviewStatus(boundary) === "suggestion").length,
+    none: agentReviewBoundaries.filter((boundary) => agentReviewStatus(boundary) === "none").length,
+  };
+  const filteredAgentReviewBoundaries = agentReviewBoundaries.filter(
+    (boundary) => agentReviewFilter === "all" || agentReviewStatus(boundary) === agentReviewFilter,
+  );
+  const correctedSubtitleIds = new Set(textCorrectionReview?.changes.map((item) => item.subtitleId) ?? []);
+  const reviewResultCount = agentReviewBoundaries.length + (textCorrectionReview?.changes.length ?? 0);
 
   const applyPreviewVolume = useCallback((video: HTMLVideoElement, volumePercent: number) => {
     const normalized = Math.min(200, Math.max(0, volumePercent));
@@ -1770,6 +1845,24 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   }, []);
 
   useEffect(() => {
+    if (!api.subscribeClipWorkflow) return;
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void api.subscribeClipWorkflow((progress) => {
+      if (!disposed && progress.clipProjectId === detail.project.id) {
+        setWorkflowProgress(progress);
+      }
+    }).then((cleanup) => {
+      if (disposed) cleanup();
+      else unsubscribe = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, [api, detail.project.id]);
+
+  useEffect(() => {
     if (!api.listSelectedAiHighlightCandidates) return;
     let disposed = false;
     setLoadingVideoMaterials(true);
@@ -1808,6 +1901,25 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   }, [api]);
 
   useEffect(() => {
+    if (!api.getLatestAiClipTransitionReview) return;
+    let disposed = false;
+    void api.getLatestAiClipTransitionReview(detail.project.id)
+      .then((summary) => {
+        if (disposed || !summary) return;
+        const boundaries = summary.boundaries.filter(isAgentReviewBoundary);
+        if (boundaries.length === 0) return;
+        setAgentReview((current) => current ?? summary);
+        setAgentReviewFilter(boundaries.some(
+          (boundary) => agentReviewStatus(boundary) === "suggestion",
+        ) ? "suggestion" : "all");
+      })
+      .catch((error) => {
+        if (!disposed) setMessage(safeError(error, "无法恢复最近一次 Agent 结果"));
+      });
+    return () => { disposed = true; };
+  }, [api, detail.project.id]);
+
+  useEffect(() => {
     if (!api.requestTransitionMaterialThumbnail) return;
     let disposed = false;
     const pending = filteredTransitionMaterials
@@ -1828,6 +1940,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     if (nextIndex < 0) return;
     const nextStart = timelineUnits.find((unit) => unit.clipSegmentId === segmentId)?.projectStartMs ?? 0;
     pendingSeekSourceMsRef.current = detail.segments[nextIndex].sourceStartMs;
+    setPreviewingTransition(null);
     setSelectedBoundaryId(null);
     setTransitionPreview(null);
     setPropertyMode("segment");
@@ -1991,6 +2104,7 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     pendingSeekSourceMsRef.current = sourceMs;
     setTimelinePositionMs(clampedMs);
     setResumeAfterSegment(resume);
+    setPreviewingTransition(null);
     setSelectedBoundaryId(null);
     setTransitionPreview(null);
     if (target.id !== selected?.id) {
@@ -2011,6 +2125,102 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     setSelectedSubtitleId(subtitle.id);
     setSelectedId(subtitle.clipSegmentId);
     seekProjectTime(subtitle.projectStartMs);
+  };
+
+  const openAgentReview = (boundary?: ClipTransitionBoundary) => {
+    if (!agentReview) return;
+    setReviewMode("agent");
+    setReviewOpen(true);
+    const target = boundary
+      ?? filteredAgentReviewBoundaries.find((item) => item.id === selectedBoundaryId)
+      ?? filteredAgentReviewBoundaries[0]
+      ?? agentReviewBoundaries[0];
+    if (target) selectBoundary(target);
+    window.requestAnimationFrame(() => propertiesRef.current?.focus());
+  };
+
+  const openTextCorrectionReview = (subtitleId?: number) => {
+    if (!textCorrectionReview) return;
+    setReviewMode("textCorrection");
+    setReviewOpen(true);
+    const targetId = subtitleId
+      ?? textCorrectionReview.changes.find((item) => item.subtitleId === selectedSubtitleId)?.subtitleId
+      ?? textCorrectionReview.changes[0]?.subtitleId;
+    if (targetId !== undefined) selectSubtitle(targetId);
+    window.requestAnimationFrame(() => propertiesRef.current?.focus());
+  };
+
+  const openLatestReview = () => {
+    if (reviewMode === "textCorrection" && textCorrectionReview) openTextCorrectionReview();
+    else if (agentReview) openAgentReview();
+    else openTextCorrectionReview();
+  };
+
+  const correctClipText = async () => {
+    if (!api.correctAiClipText || versionMutationLocked || correctableSubtitleCount === 0) return;
+    if (!llmSettings?.keyConfigured) {
+      setMessage("请先在设置中配置 DeepSeek API Key");
+      return;
+    }
+    setTextCorrecting(true);
+    setWorkflowProgress({
+      workflow: "textCorrection",
+      clipProjectId: detail.project.id,
+      runId: null,
+      stage: "preparing",
+      completed: 0,
+      total: 0,
+      message: "正在准备可纠错字幕",
+    });
+    setMessage(null);
+    const beforeTexts = new Map(detail.subtitles.map((subtitle) => [subtitle.id, subtitle.text]));
+    try {
+      const summary = await api.correctAiClipText(detail.project.id, detail.project.version);
+      const changes = summary.detail.subtitles.flatMap((subtitle) => {
+        const beforeText = beforeTexts.get(subtitle.id);
+        return beforeText !== undefined && beforeText !== subtitle.text
+          ? [{ subtitleId: subtitle.id, beforeText, afterText: subtitle.text }]
+          : [];
+      });
+      setDetail(summary.detail);
+      setTextCorrectionReview({ summary, changes });
+      setReviewMode("textCorrection");
+      setReviewOpen(true);
+      setSubtitleDrafts({});
+      setSubtitleSaveStates({});
+      setSubtitleSaveErrors({});
+      setSubtitleScope("all");
+      setPropertyMode("subtitle");
+      const subtitle = summary.detail.subtitles.find((item) => item.id === changes[0]?.subtitleId)
+        ?? summary.detail.subtitles.find((item) => item.id === selectedSubtitleId)
+        ?? summary.detail.subtitles[0]
+        ?? null;
+      if (subtitle) {
+        setSelectedSubtitleId(subtitle.id);
+        setSelectedId(subtitle.clipSegmentId);
+        seekProjectTime(subtitle.projectStartMs);
+      }
+      setMessage(`文本纠错完成：修改 ${summary.changed} 条，未变化 ${summary.unchanged} 条，跳过人工 ${summary.skippedManual} 条、隐藏 ${summary.skippedHidden} 条`);
+      window.requestAnimationFrame(() => propertiesRef.current?.focus());
+    } catch (error) {
+      const text = safeError(error, "一键文本纠错失败");
+      setMessage(
+        missingDesktopCommandMessage(text, "ai_correct_clip_text", "一键文本纠错")
+          ?? (text.includes("取消") ? "一键文本纠错已取消，工程字幕未修改" : text),
+      );
+    } finally {
+      setTextCorrecting(false);
+    }
+  };
+
+  const cancelTextCorrection = async () => {
+    if (!api.cancelAiClipTextCorrection) return;
+    try {
+      await api.cancelAiClipTextCorrection(detail.project.id);
+      setMessage("正在取消一键文本纠错");
+    } catch (error) {
+      setMessage(safeError(error, "取消文本纠错失败"));
+    }
   };
 
   const discardSubtitleDraft = (subtitleId: number) => {
@@ -2081,6 +2291,10 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
         detail.project.version,
       );
       setDetail(next);
+      setTextCorrectionReview((current) => current ? {
+        ...current,
+        summary: { ...current.summary, detail: next },
+      } : current);
       const saved = next.subtitles.find((item) => item.id === subtitle.id);
       setSubtitleDrafts((current) => ({
         ...current,
@@ -2092,7 +2306,9 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
         delete values[subtitle.id];
         return values;
       });
-      if (wasCompleted) setMessage("字幕已恢复为 ASR 原文，旧成品仍保留；请重新导出 MP4");
+      setMessage(wasCompleted
+        ? "字幕已恢复为 ASR 原文，旧成品仍保留；请重新导出 MP4"
+        : "字幕已恢复为 ASR 原文");
     } catch (error) {
       const conflict = safeErrorCode(error) === "clip_version_conflict";
       setSubtitleSaveStates((current) => ({
@@ -2288,6 +2504,12 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     if (!api.getAiClipProject) return;
     const next = await api.getAiClipProject(detail.project.id);
     setDetail(next);
+    setAgentReview((current) => current ? {
+      ...current,
+      boundaries: current.boundaries.map((boundary) =>
+        next.boundaries?.find((item) => item.id === boundary.id) ?? boundary,
+      ),
+    } : current);
     if (boundaryId && next.boundaries?.some((boundary) => boundary.id === boundaryId && boundary.active)) {
       setSelectedBoundaryId(boundaryId);
       setPropertyMode("transition");
@@ -2308,16 +2530,17 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     }
   };
 
-  const applyTransitionMaterial = async (material: TransitionMaterial) => {
-    if (!targetBoundary || !api.applyAiClipTransition || versionMutationLocked) {
+  const applyTransitionMaterial = async (material: TransitionMaterial, boundaryOverride?: ClipTransitionBoundary) => {
+    const boundary = boundaryOverride ?? targetBoundary;
+    if (!boundary || !api.applyAiClipTransition || versionMutationLocked) {
       setMessage("请先在时间轴选择一个片段边界");
       return;
     }
     setTransitionBusy(true);
     setMessage(null);
     try {
-      await api.applyAiClipTransition(targetBoundary.id, material.assetKey, material.assetVersion, true);
-      await reloadTransitions(targetBoundary.id);
+      await api.applyAiClipTransition(boundary.id, material.assetKey, material.assetVersion, true);
+      await reloadTransitions(boundary.id);
       setMessage(`已应用转场素材“${material.title}”`);
     } catch (error) {
       setMessage(safeError(error, "应用转场素材失败"));
@@ -2326,14 +2549,15 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     }
   };
 
-  const previewTransitionMaterial = async (material: TransitionMaterial) => {
+  const previewTransitionMaterial = async (material: TransitionMaterial, boundaryOverride?: ClipTransitionBoundary) => {
     if (!api.requestTransitionMaterialPreview) return;
     setTransitionBusy(true);
     setMessage(null);
     try {
       setPreviewingTransition(material);
-      setSelectedBoundaryId(null);
+      if (!boundaryOverride) setSelectedBoundaryId(null);
       setTransitionPreview(await api.requestTransitionMaterialPreview(material.assetKey, material.assetVersion));
+      if (boundaryOverride) selectBoundary(boundaryOverride);
     } catch (error) {
       setMessage(safeError(error, "预览转场素材失败"));
     } finally {
@@ -2344,15 +2568,43 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const matchTransitions = async (boundaryId?: number) => {
     if (!api.matchAiClipTransitions || versionMutationLocked) return;
     setTransitionBusy(true);
+    setTransitionMatching(true);
     setMessage(null);
     try {
       const summary = await api.matchAiClipTransitions(detail.project.id, boundaryId ?? null);
       await reloadTransitions(boundaryId);
-      setMessage(`智能匹配完成：自动应用 ${summary.autoApplied} 个，建议 ${summary.suggestions} 个`);
+      const reviewBoundaries = summary.boundaries.filter(isAgentReviewBoundary);
+      const defaultFilter: AgentReviewFilter = reviewBoundaries.some(
+        (boundary) => agentReviewStatus(boundary) === "suggestion",
+      ) ? "suggestion" : "all";
+      const firstBoundary = reviewBoundaries.find(
+        (boundary) => defaultFilter === "all" || agentReviewStatus(boundary) === defaultFilter,
+      ) ?? reviewBoundaries[0];
+      setAgentReview(summary);
+      setAgentReviewFilter(defaultFilter);
+      setReviewMode("agent");
+      setReviewOpen(true);
+      if (firstBoundary) selectBoundary(firstBoundary);
+      setMessage(`Agent 完成（阈值 ${summary.threshold} 分）：自动应用 ${summary.autoApplied} 个，低分建议 ${summary.suggestions} 个，无需转场 ${summary.noneSuggestions} 个`);
+      window.requestAnimationFrame(() => propertiesRef.current?.focus());
     } catch (error) {
-      setMessage(safeError(error, "智能匹配转场失败"));
+      const text = safeError(error, "智能匹配转场失败");
+      setMessage(
+        missingDesktopCommandMessage(text, "ai_match_clip_transitions", "一键 Agent") ?? text,
+      );
     } finally {
       setTransitionBusy(false);
+      setTransitionMatching(false);
+    }
+  };
+
+  const cancelTransitionAgent = async () => {
+    if (!api.cancelAiClipTransitionAgent) return;
+    try {
+      await api.cancelAiClipTransitionAgent(detail.project.id);
+      setMessage("正在取消一键 Agent");
+    } catch (error) {
+      setMessage(safeError(error, "取消一键 Agent 失败"));
     }
   };
 
@@ -2367,12 +2619,13 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
     finally { setTransitionBusy(false); }
   };
 
-  const unlockTransition = async () => {
-    if (!selectedBoundary || !api.unlockAiClipTransition) return;
+  const unlockTransition = async (boundaryOverride?: ClipTransitionBoundary) => {
+    const boundary = boundaryOverride ?? selectedBoundary;
+    if (!boundary || !api.unlockAiClipTransition) return;
     setTransitionBusy(true);
     try {
-      await api.unlockAiClipTransition(selectedBoundary.id);
-      await reloadTransitions(selectedBoundary.id);
+      await api.unlockAiClipTransition(boundary.id);
+      await reloadTransitions(boundary.id);
       setMessage("已解除人工锁，可重新智能匹配");
     } catch (error) { setMessage(safeError(error, "解除人工锁失败")); }
     finally { setTransitionBusy(false); }
@@ -2459,6 +2712,41 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
   const activePreviewUrl = transitionPreviewReady
     ? transitionPreview!.mediaUrl!
     : preview?.media ? mediaUrl(preview.media.path) : "";
+  const transitionProgress = workflowProgress?.workflow === "transitionAgent" ? workflowProgress : null;
+  const textCorrectionProgress = workflowProgress?.workflow === "textCorrection" ? workflowProgress : null;
+  const transitionAgentLabel = transitionMatching
+    ? ({ matching: "场景匹配中", scoring: "候选评分中", applying: "应用结果中" } as Record<string, string>)[transitionProgress?.stage ?? ""] ?? "Agent 执行中"
+    : "一键 Agent";
+  const textCorrectionLabel = textCorrecting
+    ? textCorrectionProgress?.stage === "saving" ? "保存纠错中" : "文本纠错中"
+    : "一键文本纠错";
+  const availableTransitionBoundaryCount = detail.boundaries?.filter(
+    (boundary) => boundary.active && !boundary.manuallyLocked,
+  ).length ?? Math.max(0, detail.segments.length - 1);
+  const transitionAgentUnavailableReason = !api.matchAiClipTransitions
+    ? "当前环境不支持一键 Agent"
+    : !llmSettings?.keyConfigured
+      ? "请先在设置中配置 DeepSeek API Key"
+      : detail.segments.length < 2
+        ? "至少需要两个视频片段"
+        : transitionMaterials.length === 0
+          ? "本地转场目录为空，请先同步素材"
+          : availableTransitionBoundaryCount === 0
+            ? agentReview
+              ? "所有转场边界已人工锁定；请在右侧 AI 结果中解除锁定"
+              : "没有未锁定的有效转场边界"
+            : versionMutationLocked
+              ? "请先完成导出、字幕保存或其他工作流"
+              : null;
+  const textCorrectionUnavailableReason = !api.correctAiClipText
+    ? "当前环境不支持一键文本纠错"
+    : !llmSettings?.keyConfigured
+      ? "请先在设置中配置 DeepSeek API Key"
+      : correctableSubtitleCount === 0
+        ? "没有未隐藏且未经人工修改的字幕"
+        : versionMutationLocked
+          ? "请先完成导出、字幕保存或其他工作流"
+          : null;
 
   useEffect(() => {
     if (!isPlaying) return;
@@ -2480,6 +2768,13 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
       </div>
       <div className={`clip-project-status ${detail.project.exportStatus}`}><span />{exportStatusLabel}</div>
       <div className="clip-export-actions">
+        <button
+          className="secondary-button clip-agent-button"
+          aria-label="一键 Agent"
+          disabled={transitionMatching ? !api.cancelAiClipTransitionAgent : Boolean(transitionAgentUnavailableReason) || transitionBusy}
+          title={transitionMatching ? "取消当前一键 Agent" : transitionAgentUnavailableReason ?? `场景匹配后独立评分，达到 ${llmSettings?.transitionAutoApplyScore ?? 8} 分自动应用`}
+          onClick={() => void (transitionMatching ? cancelTransitionAgent() : matchTransitions())}
+        >{transitionMatching ? <X size={15} /> : <Sparkles size={15} />}<span>{transitionAgentLabel}</span></button>
         <button
           className="secondary-button"
           disabled={versionMutationLocked || loadingVideoMaterials || availableVideoMaterials.length === 0}
@@ -2503,9 +2798,9 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
       </div>
     </header>
 
-    <div className="clip-editor-grid">
+    <div className={`clip-editor-grid ${reviewOpen ? "review-open" : ""}`}>
       <aside ref={materialsRef} tabIndex={-1} className="clip-materials" aria-label="视频与动画素材库">
-        <header><div><p className="section-kicker">MATERIALS</p><h3><Sparkles size={15} />素材库</h3></div><button className="icon-button" aria-label="智能匹配全部转场" title="智能匹配全部转场" disabled={transitionBusy || versionMutationLocked || detail.segments.length < 2} onClick={() => void matchTransitions()}><Sparkles size={15} /></button></header>
+        <header><div><p className="section-kicker">MATERIALS</p><h3><Sparkles size={15} />素材库</h3></div></header>
         <nav className="clip-material-tabs" aria-label="素材分类">
           {([ ["all", "全部"], ["video", "视频"], ["animation", "动画"], ["transition", "转场"] ] as Array<[ClipMaterialFilter, string]>).map(([value, label]) => <button key={value} className={materialFilter === value ? "active" : ""} onClick={() => setMaterialFilter(value)}>{label}</button>)}
         </nav>
@@ -2605,6 +2900,12 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               <button className="clip-tool-button danger" disabled={!selected || versionMutationLocked} onClick={() => void remove()}><Trash2 size={13} />删除选中</button>
               <button className="clip-tool-button" aria-label="片段左移" disabled={!selected || selected.position === 0 || versionMutationLocked} onClick={() => selected && void reorder(selected.position, -1)}><ArrowUp size={13} />左移</button>
               <button className="clip-tool-button" aria-label="片段右移" disabled={!selected || selected.position === detail.segments.length - 1 || versionMutationLocked} onClick={() => selected && void reorder(selected.position, 1)}><ArrowDown size={13} />右移</button>
+              <button
+                className="clip-tool-button text-correction"
+                disabled={textCorrecting ? !api.cancelAiClipTextCorrection : Boolean(textCorrectionUnavailableReason)}
+                title={textCorrecting ? "取消当前文本纠错" : textCorrectionUnavailableReason ?? `将 ${correctableSubtitleCount} 条字幕发送给 LLM 保守纠错`}
+                onClick={() => void (textCorrecting ? cancelTextCorrection() : correctClipText())}
+              >{textCorrecting ? <X size={13} /> : <Captions size={13} />}{textCorrectionLabel}</button>
             </div>
             <label className="clip-zoom-control" title="时间轴缩放（+ / -）"><ZoomOut size={13} /><input aria-label="时间轴缩放" type="range" min="1" max="100" value={timelineZoom} onChange={(event) => setTimelineZoom(Number(event.target.value))} /><ZoomIn size={13} /><b>{timelineZoom}%</b></label>
           </header>
@@ -2624,6 +2925,9 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                     const right = detail.segments[index + 1];
                     const boundary = right ? detail.boundaries?.find((item) => item.active && item.leftStableId === segment.id && item.rightStableId === right.id) : null;
                     const bridgeUnit = boundary ? timelineUnits.find((unit) => unit.boundaryId === boundary.id) : null;
+                    const reviewedBoundary = boundary ? agentReviewBoundaries.find((item) => item.id === boundary.id) : null;
+                    const reviewedStatus = reviewedBoundary ? agentReviewStatus(reviewedBoundary) : null;
+                    const reviewedScore = reviewedBoundary ? agentBoundaryScore(reviewedBoundary) : null;
                     return <Fragment key={segment.id}>
                       <button
                         className={`clip-insert-gap ${activeDropIndex === index ? "active" : ""}`}
@@ -2649,9 +2953,9 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
                         className={`clip-bridge-unit ${selectedBoundaryId === boundary.id ? "active" : ""} ${bridgeUnit.sourceStatus ?? "missing"}`}
                         style={{ width: `${Math.max(2, (bridgeUnit.projectEndMs - bridgeUnit.projectStartMs) / Math.max(totalDuration, 1) * 100)}%` }}
                         aria-label={`转场素材：${bridgeUnit.title}`}
-                        onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); selectBoundary(boundary, isPlaying); }}
-                      ><Blend size={12} /><strong>{bridgeUnit.title}</strong><small>{formatDuration(bridgeUnit.projectEndMs - bridgeUnit.projectStartMs)}</small></button>
-                        : <button type="button" className={`clip-boundary-slot ${selectedBoundaryId === boundary.id ? "active" : ""} ${boundary.stale ? "stale" : ""}`} aria-label={`选择 ${segment.title} 与 ${right.title} 之间的转场`} title={boundary.stale ? "需要重新匹配" : "添加转场"} onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); selectBoundary(boundary); }}><Plus size={10} /></button>)}
+                        onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); reviewedBoundary ? openAgentReview(reviewedBoundary) : selectBoundary(boundary, isPlaying); }}
+                      ><Blend size={12} /><strong>{bridgeUnit.title}</strong><small>{formatDuration(bridgeUnit.projectEndMs - bridgeUnit.projectStartMs)}</small>{reviewedBoundary && <em className={`clip-agent-timeline-marker ${reviewedStatus}`}>{reviewedStatus === "none" ? "无" : reviewedScore?.toFixed(1) ?? "--"}</em>}</button>
+                        : <button type="button" className={`clip-boundary-slot ${selectedBoundaryId === boundary.id ? "active" : ""} ${boundary.stale ? "stale" : ""} ${reviewedBoundary ? "reviewed" : ""}`} aria-label={`选择 ${segment.title} 与 ${right.title} 之间的转场${reviewedBoundary ? `，Agent ${reviewedStatus === "none" ? "无需转场" : `${reviewedScore?.toFixed(1) ?? "--"} 分`}` : ""}`} title={reviewedBoundary ? "查看 Agent 评分" : boundary.stale ? "需要重新匹配" : "添加转场"} onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); reviewedBoundary ? openAgentReview(reviewedBoundary) : selectBoundary(boundary); }}>{reviewedBoundary ? <span className={`clip-agent-slot-marker ${reviewedStatus}`}>{reviewedStatus === "none" ? "无" : reviewedScore?.toFixed(1) ?? "--"}</span> : <Plus size={10} />}</button>)}
                     </Fragment>;
                   })}
                   <button
@@ -2667,19 +2971,22 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               <div className="clip-subtitle-track" aria-label="字幕轨" onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); seekProjectTime(((event.clientX - rect.left) / rect.width) * totalDuration); }}>
                 <i className="clip-playhead" style={{ left: `${playheadPercent}%` }} aria-hidden="true" />
                 <div className="clip-track-grid" aria-hidden="true">{timelineTicks.slice(1).map((tick) => <i key={tick} style={{ left: `${totalDuration > 0 ? tick / totalDuration * 100 : 0}%` }} />)}</div>
-                {detail.subtitles.map((subtitle) => <button
-                  key={subtitle.id}
-                  type="button"
-                  aria-label={`字幕：${subtitle.text}`}
-                  aria-current={currentSubtitle?.id === subtitle.id ? "true" : undefined}
-                  className={`${subtitle.hidden ? "hidden" : ""} ${selectedSubtitleId === subtitle.id ? "active" : ""} ${currentSubtitle?.id === subtitle.id ? "playing" : ""}`}
-                  style={{
-                    left: `${totalDuration > 0 ? subtitle.projectStartMs / totalDuration * 100 : 0}%`,
-                    width: `${totalDuration > 0 ? Math.max(0.8, (subtitle.projectEndMs - subtitle.projectStartMs) / totalDuration * 100) : 0}%`,
-                  }}
-                  title={subtitle.hidden ? `已隐藏：${subtitle.text}` : subtitle.text}
-                  onClick={(event) => { event.stopPropagation(); selectSubtitle(subtitle.id); }}
-                >{subtitle.hidden && <CircleOff size={10} />}<span>{subtitle.text}</span></button>)}
+                {detail.subtitles.map((subtitle) => {
+                  const corrected = correctedSubtitleIds.has(subtitle.id);
+                  return <button
+                    key={subtitle.id}
+                    type="button"
+                    aria-label={`字幕：${subtitle.text}${corrected ? "，本次文本纠错已修改" : ""}`}
+                    aria-current={currentSubtitle?.id === subtitle.id ? "true" : undefined}
+                    className={`${subtitle.hidden ? "hidden" : ""} ${selectedSubtitleId === subtitle.id ? "active" : ""} ${currentSubtitle?.id === subtitle.id ? "playing" : ""} ${corrected ? "corrected" : ""}`}
+                    style={{
+                      left: `${totalDuration > 0 ? subtitle.projectStartMs / totalDuration * 100 : 0}%`,
+                      width: `${totalDuration > 0 ? Math.max(0.8, (subtitle.projectEndMs - subtitle.projectStartMs) / totalDuration * 100) : 0}%`,
+                    }}
+                    title={corrected ? `本次纠错已修改：${subtitle.text}` : subtitle.hidden ? `已隐藏：${subtitle.text}` : subtitle.text}
+                    onClick={(event) => { event.stopPropagation(); corrected ? openTextCorrectionReview(subtitle.id) : selectSubtitle(subtitle.id); }}
+                  >{subtitle.hidden && <CircleOff size={10} />}<span>{subtitle.text}</span>{corrected && <i className="clip-text-correction-marker" aria-hidden="true">改</i>}</button>;
+                })}
               </div>
             </div>
           </div>
@@ -2687,9 +2994,24 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
         </section>
       </section>
 
-      <aside className="clip-properties" aria-label="剪辑属性">
-        <header><p className="section-kicker">PROPERTIES</p><h3>属性</h3></header>
-        <nav className="clip-property-tabs" aria-label="属性类型">
+      <aside ref={propertiesRef} tabIndex={-1} className={`clip-properties ${reviewOpen ? "review-open" : ""}`} aria-label="剪辑属性">
+        {reviewOpen ? <>
+          <header className="clip-review-header"><div><p className="section-kicker">AI REVIEW</p><h3><GitCompareArrows size={15} />结果审阅</h3></div><button className="icon-button" aria-label="关闭 AI 结果审阅" title="关闭结果审阅" onClick={() => setReviewOpen(false)}><PanelRightClose size={17} /></button></header>
+          <nav className="clip-review-mode-tabs" aria-label="AI 结果类型">
+            <button aria-label="Agent 结果" disabled={!agentReview} aria-pressed={reviewMode === "agent"} className={reviewMode === "agent" ? "active" : ""} onClick={() => openAgentReview()}>Agent{agentReview && <span>{agentReviewBoundaries.length}</span>}</button>
+            <button aria-label="文本纠错结果" disabled={!textCorrectionReview} aria-pressed={reviewMode === "textCorrection"} className={reviewMode === "textCorrection" ? "active" : ""} onClick={() => openTextCorrectionReview()}>文本纠错{textCorrectionReview && <span>{textCorrectionReview.changes.length}</span>}</button>
+          </nav>
+        </> : <>
+          <header className="clip-property-header">
+            <div><p className="section-kicker">PROPERTIES</p><h3>属性</h3></div>
+            {reviewResultCount > 0 && <button
+              className="icon-button clip-review-toggle"
+              aria-label={`查看 AI 结果，共 ${reviewResultCount} 项`}
+              title="查看本次 Agent 与文本纠错结果"
+              onClick={openLatestReview}
+            ><PanelRightOpen size={16} /><b>{reviewResultCount > 99 ? "99+" : reviewResultCount}</b></button>}
+          </header>
+          <nav className="clip-property-tabs" aria-label="属性类型">
           <button aria-label="片段属性" aria-pressed={propertyMode === "segment"} className={propertyMode === "segment" ? "active" : ""} onClick={() => setPropertyMode("segment")}>片段</button>
           <button aria-label="转场属性" aria-pressed={propertyMode === "transition"} className={propertyMode === "transition" ? "active" : ""} onClick={() => setPropertyMode("transition")}>转场</button>
           <button
@@ -2703,9 +3025,90 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
               }
             }}
           >字幕</button>
-        </nav>
+          </nav>
+        </>}
 
-        {propertyMode === "segment" ? <div className="clip-property-panel">
+        {reviewOpen ? <div className="clip-review-panel">
+          {reviewMode === "agent" && agentReview ? <>
+            <div className="clip-review-summary">
+              <div><span>应用阈值</span><strong>{agentReview.threshold.toFixed(1)}</strong><small>/ 10</small></div>
+              <dl><div><dt>已应用</dt><dd>{agentReviewCounts.applied}</dd></div><div><dt>待确认</dt><dd>{agentReviewCounts.suggestion}</dd></div><div><dt>无需转场</dt><dd>{agentReviewCounts.none}</dd></div></dl>
+            </div>
+            <div className="clip-review-filters" role="group" aria-label="Agent 结果筛选">
+              {([ ["all", "全部"], ["applied", "已应用"], ["suggestion", "待确认"], ["none", "无需转场"] ] as Array<[AgentReviewFilter, string]>).map(([value, label]) => <button key={value} aria-label={`${label} ${agentReviewCounts[value]}`} aria-pressed={agentReviewFilter === value} className={agentReviewFilter === value ? "active" : ""} onClick={() => setAgentReviewFilter(value)}>{label}<span>{agentReviewCounts[value]}</span></button>)}
+            </div>
+            <div className="clip-review-list" aria-label="Agent 边界评分列表">
+              {filteredAgentReviewBoundaries.map((boundary) => {
+                const status = agentReviewStatus(boundary);
+                const statusLabel = status === "applied" ? "已应用" : status === "none" ? "无需转场" : "待确认";
+                const left = detail.segments.find((segment) => segment.id === boundary.leftStableId);
+                const right = detail.segments.find((segment) => segment.id === boundary.rightStableId);
+                const assetKey = status === "applied" ? boundary.assetKey : boundary.suggestedAssetKey;
+                const assetVersion = status === "applied" ? boundary.assetVersion : boundary.suggestedAssetVersion;
+                const material = assetKey && assetVersion
+                  ? transitionMaterials.find((item) => item.assetKey === assetKey && item.assetVersion === assetVersion) ?? null
+                  : null;
+                const score = agentBoundaryScore(boundary);
+                const selectedReview = selectedBoundaryId === boundary.id;
+                const sceneScore = boundary.suggestionSceneScore ?? boundary.sceneScore;
+                const continuityScore = boundary.suggestionContinuityScore ?? boundary.continuityScore;
+                const rhythmScore = boundary.suggestionRhythmScore ?? boundary.rhythmScore;
+                const materialScore = boundary.suggestionMaterialScore ?? boundary.materialScore;
+                const reason = boundary.suggestionReason ?? boundary.reason;
+                return <article key={boundary.id} className={`clip-agent-review-row ${status} ${selectedReview ? "active" : ""}`}>
+                  <button className="clip-review-row-main" aria-expanded={selectedReview} aria-label={`审阅边界：${left?.title ?? boundary.leftStableId} 到 ${right?.title ?? boundary.rightStableId}，${statusLabel}${score === null ? "" : `，${score.toFixed(1)} 分`}`} onClick={() => openAgentReview(boundary)}>
+                    <span className={`clip-review-status ${status}`}>{status === "applied" ? <CheckCircle2 size={13} /> : status === "none" ? <CircleOff size={13} /> : <AlertTriangle size={13} />}{statusLabel}</span>
+                    <strong>{left?.title ?? `片段 ${boundary.leftStableId}`}<ChevronRight size={12} />{right?.title ?? `片段 ${boundary.rightStableId}`}</strong>
+                    <small>{status === "none" ? "Agent 建议直接衔接" : material?.title ?? assetKey ?? "素材信息不可用"}</small>
+                    {score !== null && <b>{score.toFixed(1)}<em>/10</em></b>}
+                  </button>
+                  {selectedReview && <div className="clip-review-row-detail">
+                    {score !== null && <dl className="clip-review-score-grid"><div><dt>场景适配</dt><dd>{sceneScore?.toFixed(1) ?? "--"}</dd></div><div><dt>前后衔接</dt><dd>{continuityScore?.toFixed(1) ?? "--"}</dd></div><div><dt>节奏匹配</dt><dd>{rhythmScore?.toFixed(1) ?? "--"}</dd></div><div><dt>素材契合</dt><dd>{materialScore?.toFixed(1) ?? "--"}</dd></div></dl>}
+                    {status === "suggestion" && score !== null && <p className="clip-review-threshold-note">低于 {agentReview.threshold.toFixed(1)} 分阈值，未自动应用</p>}
+                    {reason && <p className="clip-review-reason">{reason}</p>}
+                    <div className="clip-review-actions">
+                      <button className="secondary-button" onClick={() => selectBoundary(boundary)}><LocateFixed size={13} />定位</button>
+                      {material && <button className="secondary-button" disabled={transitionBusy} onClick={() => void previewTransitionMaterial(material, boundary)}><Play size={13} />预览</button>}
+                      {status === "suggestion" && material && <button className="secondary-button apply" disabled={transitionBusy || versionMutationLocked} onClick={() => void applyTransitionMaterial(material, boundary)}><CheckCircle2 size={13} />应用建议</button>}
+                      {boundary.manuallyLocked && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void unlockTransition(boundary)}><RotateCcw size={13} />解除锁定</button>}
+                    </div>
+                  </div>}
+                </article>;
+              })}
+              {filteredAgentReviewBoundaries.length === 0 && <p className="clip-review-empty">当前筛选下没有结果</p>}
+            </div>
+          </> : reviewMode === "textCorrection" && textCorrectionReview ? <>
+            <div className="clip-review-summary text-correction">
+              <div><span>本次修改</span><strong>{textCorrectionReview.changes.length}</strong><small>条</small></div>
+              <dl><div><dt>已处理</dt><dd>{textCorrectionReview.summary.processed}</dd></div><div><dt>未变化</dt><dd>{textCorrectionReview.summary.unchanged}</dd></div><div><dt>已跳过</dt><dd>{textCorrectionReview.summary.skippedManual + textCorrectionReview.summary.skippedHidden}</dd></div></dl>
+            </div>
+            <div className="clip-review-list text-correction" aria-label="文本纠错差异列表">
+              {textCorrectionReview.changes.map((change) => {
+                const subtitle = detail.subtitles.find((item) => item.id === change.subtitleId);
+                if (!subtitle) return null;
+                const segment = detail.segments.find((item) => item.id === subtitle.clipSegmentId);
+                const parts = buildTextDiff(change.beforeText, change.afterText);
+                const restored = subtitle.text === change.beforeText;
+                return <article key={change.subtitleId} className={`clip-text-review-row ${selectedSubtitleId === change.subtitleId ? "active" : ""} ${restored ? "restored" : ""}`}>
+                  <button className="clip-review-row-main" aria-label={`定位纠错字幕：${change.afterText}`} onClick={() => openTextCorrectionReview(change.subtitleId)}>
+                    <span className={`clip-review-status ${restored ? "restored" : "applied"}`}>{restored ? <RotateCcw size={13} /> : <CheckCircle2 size={13} />}{restored ? "已恢复" : "已纠错"}</span>
+                    <strong>{segment?.title ?? `片段 ${subtitle.clipSegmentId}`}</strong>
+                    <small>{formatTimestamp(subtitle.projectStartMs)} – {formatTimestamp(subtitle.projectEndMs)}</small>
+                  </button>
+                  <div className="clip-review-diff" aria-label={`纠错前：${change.beforeText}；纠错后：${change.afterText}`}>
+                    <p className="before"><b>ASR 原文</b><span>{parts.filter((part) => part.kind !== "added").map((part, index) => part.kind === "removed" ? <del key={`${part.kind}-${index}`}>{part.text}</del> : <span key={`${part.kind}-${index}`}>{part.text}</span>)}</span></p>
+                    <p className="after"><b>纠错结果</b><span>{parts.filter((part) => part.kind !== "removed").map((part, index) => part.kind === "added" ? <ins key={`${part.kind}-${index}`}>{part.text}</ins> : <span key={`${part.kind}-${index}`}>{part.text}</span>)}</span></p>
+                  </div>
+                  <div className="clip-review-actions">
+                    <button className="secondary-button" onClick={() => selectSubtitle(change.subtitleId)}><LocateFixed size={13} />定位</button>
+                    <button className="secondary-button" disabled={restored || subtitleMutationPending || editorLocked} onClick={() => void resetSubtitle(change.subtitleId)}><RotateCcw size={13} />{restored ? "已恢复原文" : "恢复 ASR 原文"}</button>
+                  </div>
+                </article>;
+              })}
+              {textCorrectionReview.changes.length === 0 && <p className="clip-review-empty">本次文本纠错没有修改字幕</p>}
+            </div>
+          </> : <p className="clip-review-empty">本次会话还没有可审阅的 AI 结果</p>}
+        </div> : propertyMode === "segment" ? <div className="clip-property-panel">
           {selected ? <>
             <section className="clip-property-group">
               <h4>基本信息</h4>
@@ -2740,10 +3143,11 @@ function ClipEditor({ api, initial, projectId, onBack }: { api: ClientApi; initi
             {selectedTransitionMaterial ? <section className="clip-property-group">
               <h4>已应用素材</h4><strong>{selectedTransitionMaterial.title}</strong>
               <p>{selectedTransitionMaterial.description}</p>
-              <dl><div><dt>版本</dt><dd>v{selectedTransitionMaterial.assetVersion}</dd></div><div><dt>时长</dt><dd>{formatDuration(selectedTransitionMaterial.durationMs)}</dd></div><div><dt>准备状态</dt><dd>{selectedTransitionMaterial.download.sourceStatus}</dd></div><div><dt>匹配分数</dt><dd>{selectedBoundary.confidence === null ? "人工" : `${Math.round(selectedBoundary.confidence * 100)}%`}</dd></div></dl>
+              <dl><div><dt>版本</dt><dd>v{selectedTransitionMaterial.assetVersion}</dd></div><div><dt>时长</dt><dd>{formatDuration(selectedTransitionMaterial.durationMs)}</dd></div><div><dt>准备状态</dt><dd>{selectedTransitionMaterial.download.sourceStatus}</dd></div><div><dt>匹配分数</dt><dd>{selectedBoundary.score !== null ? `${selectedBoundary.score.toFixed(1)} / 10` : selectedBoundary.confidence === null ? "人工" : `${Math.round(selectedBoundary.confidence * 100)}%`}</dd></div></dl>
+              {selectedBoundary.score !== null && <dl className="clip-transition-score-grid"><div><dt>场景</dt><dd>{selectedBoundary.sceneScore?.toFixed(1)}</dd></div><div><dt>衔接</dt><dd>{selectedBoundary.continuityScore?.toFixed(1)}</dd></div><div><dt>节奏</dt><dd>{selectedBoundary.rhythmScore?.toFixed(1)}</dd></div><div><dt>素材</dt><dd>{selectedBoundary.materialScore?.toFixed(1)}</dd></div></dl>}
               {selectedBoundary.reason && <p>{selectedBoundary.reason}</p>}
             </section> : <section className="clip-property-group"><h4>已应用素材</h4><p>当前边界没有转场素材</p></section>}
-            {(suggestedTransitionMaterial || selectedBoundary.suggestionNone) && <section className="clip-property-group clip-transition-suggestion"><h4>智能建议</h4><strong>{selectedBoundary.suggestionNone ? "建议不使用转场" : suggestedTransitionMaterial?.title}</strong><p>{selectedBoundary.suggestionReason}</p><span>{selectedBoundary.suggestionConfidence === null ? "" : `${Math.round(selectedBoundary.suggestionConfidence * 100)}%`}</span>{suggestedTransitionMaterial && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void applyTransitionMaterial(suggestedTransitionMaterial)}>应用建议</button>}</section>}
+            {(suggestedTransitionMaterial || selectedBoundary.suggestionNone) && <section className="clip-property-group clip-transition-suggestion"><h4>智能建议</h4><strong>{selectedBoundary.suggestionNone ? "建议不使用转场" : suggestedTransitionMaterial?.title}</strong><p>{selectedBoundary.suggestionReason}</p><span>{selectedBoundary.suggestionScore !== null ? `${selectedBoundary.suggestionScore.toFixed(1)} / 10` : selectedBoundary.suggestionConfidence === null ? "" : `${Math.round(selectedBoundary.suggestionConfidence * 100)}%`}</span>{selectedBoundary.suggestionScore !== null && <dl className="clip-transition-score-grid"><div><dt>场景</dt><dd>{selectedBoundary.suggestionSceneScore?.toFixed(1)}</dd></div><div><dt>衔接</dt><dd>{selectedBoundary.suggestionContinuityScore?.toFixed(1)}</dd></div><div><dt>节奏</dt><dd>{selectedBoundary.suggestionRhythmScore?.toFixed(1)}</dd></div><div><dt>素材</dt><dd>{selectedBoundary.suggestionMaterialScore?.toFixed(1)}</dd></div></dl>}{suggestedTransitionMaterial && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void applyTransitionMaterial(suggestedTransitionMaterial)}>应用建议</button>}</section>}
             <div className="clip-transition-actions">
               <button className="secondary-button" disabled={transitionBusy || versionMutationLocked || selectedBoundary.manuallyLocked} onClick={() => void matchTransitions(selectedBoundary.id)}><Sparkles size={13} />重新匹配</button>
               {selectedBoundary.manuallyLocked && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void unlockTransition()}><RotateCcw size={13} />解除锁定</button>}

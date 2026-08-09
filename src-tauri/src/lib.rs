@@ -4,6 +4,7 @@ pub mod ai;
 pub mod api;
 pub mod app_lifecycle;
 pub mod app_support;
+pub mod clip_workflow;
 pub mod database;
 pub mod domain;
 pub mod preview;
