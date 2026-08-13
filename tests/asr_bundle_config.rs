@@ -14,15 +14,25 @@ fn release_configs_bundle_the_staged_asr_directory_at_the_runtime_path() {
         "src-tauri/tauri.windows.conf.json",
     ] {
         let config = read_config(path);
-        assert_eq!(
-            config["bundle"]["resources"]["../resources/asr-stage/"],
-            "resources/asr/"
-        );
+        if path.ends_with("windows.conf.json") {
+            assert_eq!(
+                config["bundle"]["resources"]["../resources/asr-stage/"],
+                "resources/asr/"
+            );
+        }
         assert_eq!(
             config["bundle"]["resources"]["../THIRD_PARTY_NOTICES.md"],
             "licenses/THIRD_PARTY_NOTICES.md"
         );
     }
+
+    let generator = fs::read_to_string(format!(
+        "{}/scripts/generate-tauri-macos-resource-config.sh",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    assert!(generator.contains("jq -n --arg source"));
+    assert!(generator.contains("\"resources/asr/\""));
 }
 
 #[test]

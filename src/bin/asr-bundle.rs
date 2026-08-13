@@ -94,6 +94,7 @@ enum BundleCommand {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BundlePlatform {
     MacosAarch64,
+    MacosX86_64,
     WindowsX86_64,
 }
 
@@ -101,6 +102,7 @@ impl BundlePlatform {
     fn target(self) -> (&'static str, &'static str) {
         match self {
             Self::MacosAarch64 => ("macos", "aarch64"),
+            Self::MacosX86_64 => ("macos", "x86_64"),
             Self::WindowsX86_64 => ("windows", "x86_64"),
         }
     }
@@ -108,6 +110,7 @@ impl BundlePlatform {
     fn label(self) -> &'static str {
         match self {
             Self::MacosAarch64 => "macos-aarch64",
+            Self::MacosX86_64 => "macos-x86-64",
             Self::WindowsX86_64 => "windows-x86_64",
         }
     }
@@ -591,6 +594,7 @@ fn verify_bundle(root: &Path, platform: BundlePlatform) -> Result<(), String> {
     let runtime_manifest = RuntimeManifest::from_json(&runtime_manifest)
         .map_err(|error| format!("Runtime Resource Pack 清单无效：{error}"))?;
     verify_runtime_manifest_contract(root, &manifest, selected, &runtime_manifest)?;
+    verify_macos_architecture_when_applicable(root, selected)?;
     verify_macos_relocatability_when_applicable(root, selected)?;
     verify_windows_resources_when_applicable(root, selected)?;
     verify_engine_version_when_runnable(root, &manifest, selected)?;
@@ -831,6 +835,50 @@ fn seal_platform_resources(
             })
         })
         .collect()
+}
+
+fn verify_macos_architecture_when_applicable(
+    root: &Path,
+    platform: &AsrPlatformManifest,
+) -> Result<(), String> {
+    if std::env::consts::OS != "macos" || platform.os != "macos" {
+        return Ok(());
+    }
+    let expected = match platform.arch.as_str() {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => return Err("macOS 资源清单声明了不支持的架构".to_owned()),
+    };
+    for (relative, _) in platform_paths(platform) {
+        let path = root.join(relative);
+        if !is_macho(&path)? {
+            return Err(format!(
+                "macOS 原生资源 {} 不是 Mach-O 文件",
+                path.display()
+            ));
+        }
+        let output = Command::new("lipo")
+            .arg("-archs")
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("无法检查 {} 的 Mach-O 架构：{error}", path.display()))?;
+        if !output.status.success() {
+            return Err(format!("无法读取 {} 的 Mach-O 架构", path.display()));
+        }
+        let architectures = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if architectures.as_slice() != [expected] {
+            return Err(format!(
+                "macOS 原生资源 {} 的架构 {:?} 与目标 {} 不一致",
+                path.display(),
+                architectures,
+                platform.arch
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_macos_relocatability_when_applicable(
@@ -1181,14 +1229,26 @@ mod tests {
         fs::write(root.join("models/vad.bin"), vad).unwrap();
         fs::write(root.join("normalization/map.txt"), normalization).unwrap();
         fs::write(root.join("licenses/license.txt"), b"license").unwrap();
-        fs::write(root.join("lib/macos-aarch64/libfake.dylib"), b"library").unwrap();
+        let source = root.join("fixture.c");
+        let binary = root.join("fixture");
+        fs::write(
+            &source,
+            b"#include <stdio.h>\nint main(void) { puts(\"whisper.cpp version: 1.9.1\"); return 0; }\n",
+        )
+        .unwrap();
+        let status = Command::new("clang")
+            .args(["-arch", "arm64"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::copy(&binary, root.join("lib/macos-aarch64/libfake.dylib")).unwrap();
         for name in ["whisper-cli", "vad", "ffmpeg", "ffprobe"] {
-            let body = if name == "whisper-cli" {
-                "#!/bin/sh\nprintf '%s\\n' 'whisper.cpp version: 1.9.1'\n"
-            } else {
-                "#!/bin/sh\nexit 0\n"
-            };
-            write_executable(&root.join("bin/macos-aarch64").join(name), body);
+            let target = root.join("bin/macos-aarch64").join(name);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(&binary, target).unwrap();
         }
         let manifest = serde_json::json!({
             "schemaVersion":1,"bundleVersion":"test",

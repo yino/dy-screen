@@ -1,5 +1,5 @@
 #!/bin/sh
-# 验证已安装 macOS arm64 正式发行包，并生成不含本地路径和工具原始输出的 JSON 证据。
+# 验证已安装的当前架构 macOS 正式发行包，并生成不含本地路径和工具原始输出的 JSON 证据。
 # 只有 Developer ID、stapling、Gatekeeper、离线 ASR 和应用启动全部通过时才返回成功。
 
 set -eu
@@ -37,10 +37,23 @@ if [ -z "$APP" ] || [ -z "$DMG" ] || [ -z "$ASR_CLI" ] || [ -z "$ASR_BUNDLE" ] |
   usage
   exit 2
 fi
-if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
-  printf '%s\n' '错误：该脚本只接受 macOS arm64 正式发行目标机。' >&2
+if [ "$(uname -s)" != Darwin ]; then
+  printf '%s\n' '错误：该脚本只接受 macOS 正式发行目标机。' >&2
   exit 2
 fi
+HARDWARE_ARCH=$(uname -m)
+if [ "$HARDWARE_ARCH" = x86_64 ] && [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || printf '%s' 0)" = 1 ]; then
+  printf '%s\n' '错误：Intel 正式发行验收必须在真实 Intel Mac 运行，不能使用 Rosetta 转译进程。' >&2
+  exit 2
+fi
+case "$HARDWARE_ARCH" in
+  arm64) RELEASE_ARCH=aarch64; RESOURCE_PLATFORM=macos-aarch64; RESOURCE_DIR=macos-aarch64 ;;
+  x86_64) RELEASE_ARCH=x86_64; RESOURCE_PLATFORM=macos-x86-64; RESOURCE_DIR=macos-x86_64 ;;
+  *)
+    printf '错误：不支持的 macOS 硬件架构 %s。\n' "$HARDWARE_ARCH" >&2
+    exit 2
+    ;;
+esac
 
 require_regular_file() {
   if [ ! -f "$1" ] || [ -L "$1" ]; then
@@ -130,7 +143,7 @@ fi
 
 SIGNED_MACHO_COUNT=0
 MACHO_COUNT=0
-for CANDIDATE in "$RESOURCE_ROOT/bin/macos-aarch64/"* "$RESOURCE_ROOT/lib/macos-aarch64/"*; do
+for CANDIDATE in "$RESOURCE_ROOT/bin/$RESOURCE_DIR/"* "$RESOURCE_ROOT/lib/$RESOURCE_DIR/"*; do
   [ -f "$CANDIDATE" ] || continue
   if file "$CANDIDATE" | grep -q 'Mach-O'; then
     MACHO_COUNT=$((MACHO_COUNT + 1))
@@ -150,7 +163,8 @@ DMG_STAPLED=$(bool_command xcrun stapler validate "$DMG")
 GATEKEEPER_APP=$(bool_command spctl --assess --type execute --verbose=4 "$APP")
 GATEKEEPER_DMG=$(bool_command spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG")
 DMG_VALID=$(bool_command hdiutil verify "$DMG")
-RESOURCE_BUNDLE_VALID=$(bool_command "$ASR_BUNDLE" verify --root "$RESOURCE_ROOT" --platform macos-aarch64)
+RESOURCE_BUNDLE_VALID=$(bool_command "$ASR_BUNDLE" verify --root "$RESOURCE_ROOT" --platform "$RESOURCE_PLATFORM")
+BUNDLE_ARCHITECTURE_VALID=$(bool_command "$SCRIPT_ROOT/verify-macos-bundle-architecture.sh" "$APP" "$RELEASE_ARCH")
 FFMPEG_CLIP_CAPABILITIES_VALID=$(bool_command "$SCRIPT_ROOT/verify-clip-ffmpeg-capabilities.sh" "$RESOURCE_FFMPEG")
 
 INSTALLED_UNDER_APPLICATIONS=false
@@ -220,6 +234,7 @@ if [ "$APP_CODE_SIGNATURE_VALID" = true ] \
   && [ "$GATEKEEPER_DMG" = true ] \
   && [ "$DMG_VALID" = true ] \
   && [ "$RESOURCE_BUNDLE_VALID" = true ] \
+  && [ "$BUNDLE_ARCHITECTURE_VALID" = true ] \
   && [ "$FFMPEG_CLIP_CAPABILITIES_VALID" = true ] \
   && [ "$INSTALLED_UNDER_APPLICATIONS" = true ] \
   && [ "$OFFLINE_OBSERVED" = true ] \
@@ -238,7 +253,7 @@ printf '%s\n' \
   '  "schemaVersion": 1,' \
   "  \"collectedAtUtc\": \"$COLLECTED_AT_UTC\"," \
   '  "platform": "macos",' \
-  '  "architecture": "arm64",' \
+  "  \"architecture\": \"$HARDWARE_ARCH\"," \
   "  \"dmgSha256\": \"$DMG_SHA256\"," \
   "  \"mainBinarySha256\": \"$MAIN_BINARY_SHA256\"," \
   "  \"resourceManifestSha256\": \"$RESOURCE_MANIFEST_SHA256\"," \
@@ -256,6 +271,7 @@ printf '%s\n' \
   "  \"gatekeeperDmgPassed\": $GATEKEEPER_DMG," \
   "  \"dmgVerified\": $DMG_VALID," \
   "  \"resourceBundleValid\": $RESOURCE_BUNDLE_VALID," \
+  "  \"bundleArchitectureValid\": $BUNDLE_ARCHITECTURE_VALID," \
   "  \"ffmpegClipCapabilitiesValid\": $FFMPEG_CLIP_CAPABILITIES_VALID," \
   "  \"installedUnderApplications\": $INSTALLED_UNDER_APPLICATIONS," \
   "  \"offlineObserved\": $OFFLINE_OBSERVED," \

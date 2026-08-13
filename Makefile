@@ -31,7 +31,7 @@ ACCEPT_ROOM_URLS ?= https://live.douyin.com/703940802949 https://live.douyin.com
 ACCEPT_MINUTES ?= 30
 APP_LOG_DIR ?= $(HOME)/Library/Logs/com.yino.dyscreen
 ASR_SOURCE ?= $(if $(wildcard resources/asr-source/manifest.json),resources/asr-source,)
-ASR_STAGE ?= resources/asr-stage
+ASR_STAGE ?= resources/asr-stage$(if $(filter x86_64,$(MACOS_ARCH)),-x86_64,)
 ASR_RESOURCE_ROOT ?= $(if $(wildcard resources/asr-stage/manifest.json),resources/asr-stage,)
 ASR_VIDEO ?=
 ASR_TEST_VIDEO ?= $(CURDIR)/tests/fixtures/asr/short_zh.mp4
@@ -44,8 +44,21 @@ ASR_DMG ?=
 ASR_RELEASE_EVIDENCE ?=
 ASR_BUNDLES ?= app
 TAURI_BUILD_ARGS ?=
-MACOS_RELEASE_APP ?= src-tauri/target/release/bundle/macos/切片智能体.app
-MACOS_RELEASE_DMG ?= src-tauri/target/release/bundle/dmg/切片智能体_$(RESOURCE_APP_VERSION)_aarch64.dmg
+MACOS_HOST_ARCH_RAW := $(shell uname -m)
+MACOS_HOST_ARCH_arm64 := aarch64
+MACOS_HOST_ARCH_aarch64 := aarch64
+MACOS_HOST_ARCH_x86_64 := x86_64
+MACOS_HOST_ARCH := $(MACOS_HOST_ARCH_$(MACOS_HOST_ARCH_RAW))
+MACOS_ARCH ?= $(MACOS_HOST_ARCH)
+MACOS_RUST_TARGET_aarch64 := aarch64-apple-darwin
+MACOS_RUST_TARGET_x86_64 := x86_64-apple-darwin
+MACOS_RUST_TARGET := $(MACOS_RUST_TARGET_$(MACOS_ARCH))
+MACOS_RESOURCE_PLATFORM := macos-$(subst _,-,$(MACOS_ARCH))
+MACOS_RESOURCE_DIR := macos-$(MACOS_ARCH)
+MACOS_TARGET_ROOT := src-tauri/target/$(MACOS_RUST_TARGET)/release
+MACOS_TAURI_RESOURCE_CONFIG ?= src-tauri/gen/tauri.macos.resources.$(MACOS_ARCH).json
+MACOS_RELEASE_APP ?= $(MACOS_TARGET_ROOT)/bundle/macos/切片智能体.app
+MACOS_RELEASE_DMG ?= $(MACOS_TARGET_ROOT)/bundle/dmg/切片智能体_$(RESOURCE_APP_VERSION)_$(MACOS_ARCH).dmg
 MACOS_RELEASE_VOLUME_NAME ?= 切片智能体
 EXECUTABLE_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
 ASR_BUNDLE_BINARY ?= target/release/asr-bundle$(EXECUTABLE_SUFFIX)
@@ -64,9 +77,11 @@ ASR_COMPLETION_WINDOWS_RELEASE ?=
 ASR_COMPLETION_MACOS_PERFORMANCE ?=
 ASR_COMPLETION_WINDOWS_PERFORMANCE ?=
 FFMPEG_SOURCE ?= $(if $(wildcard resources/asr-source/sources/ffmpeg-8.1.2.tar.xz),resources/asr-source/sources/ffmpeg-8.1.2.tar.xz,)
-FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg
+FFMPEG_ASR_OUTPUT ?= resources/asr-build/ffmpeg-$(MACOS_ARCH)
 WHISPER_SOURCE ?= $(if $(wildcard resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz),resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz,)
-WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper
+WHISPER_ASR_OUTPUT ?= resources/asr-build/whisper-$(MACOS_ARCH)
+MACOS_RESOURCE_SOURCE ?= resources/asr-source-macos-$(MACOS_ARCH)
+MACOS_ASR_SOURCE ?= $(if $(wildcard $(MACOS_RESOURCE_SOURCE)/manifest.json),$(MACOS_RESOURCE_SOURCE),$(ASR_SOURCE))
 WINDOWS_FFMPEG_OUTPUT ?= resources/asr-build/ffmpeg-windows
 WINDOWS_WHISPER_OUTPUT ?= resources/asr-build/whisper-windows
 WINDOWS_RESOURCE_SOURCE ?= resources/asr-source-windows
@@ -74,7 +89,7 @@ WINDOWS_ASR_SOURCE ?= $(if $(wildcard $(WINDOWS_RESOURCE_SOURCE)/manifest.json),
 VC_REDIST_SOURCE ?=
 VC_REDIST_LICENSE ?=
 POWERSHELL ?= powershell.exe
-RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/aarch64/2026.07.4/
+RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/$(MACOS_ARCH)/2026.07.4/
 WINDOWS_RESOURCE_BASE_URL ?= https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/windows/x86_64/2026.07.4/
 RESOURCE_RELEASE_DIR ?= dist/runtime-resources
 RESOURCE_CHANNEL ?= stable
@@ -97,7 +112,7 @@ JSON_ARG = $(if $(filter 1 true yes on,$(JSON)),--json,)
 ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
 ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(ASR_RESOURCE_ROOT)",)
 
-.PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build-mac-release build core-build \
+.PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build-mac-release build-mac-intel-release macos-build-doctor build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor clip-subtitle-doctor test-clip-subtitle test-clip-subtitle-integration test-clip-transition-integration test-transition-catalog-fixture test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
@@ -105,7 +120,7 @@ ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(AS
 	test-browser-access test-access-core test-room-resolution test-tauri-browser test-access-supervisor test-access-ui test-access-fixtures test-app-lifecycle accept-access-fixtures \
 	accept-deepseek \
 	diagnose-real-room tail-access-log accept-real-room accept-real-multi \
-	asr-ffmpeg-macos asr-ffmpeg-windows asr-whisper-macos asr-whisper-windows asr-prepare-windows asr-sign-windows-resources windows-build-doctor asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows app-build-windows-dev app-build-windows-release runtime-resource-verify runtime-resource-verify-windows runtime-resource-verify-windows-release runtime-resource-publish runtime-resource-publish-windows runtime-resource-publish-windows-dev runtime-manifest-payload runtime-manifest-apply-signature \
+	asr-ffmpeg-macos asr-ffmpeg-windows asr-whisper-macos asr-whisper-windows asr-prepare-macos asr-prepare-windows asr-sign-windows-resources windows-build-doctor asr-stage-macos asr-stage-windows asr-build-macos asr-build-windows app-build-resources app-build-resources-windows app-build-windows-dev app-build-windows-release runtime-resource-verify runtime-resource-verify-windows runtime-resource-verify-windows-release runtime-resource-publish runtime-resource-publish-windows runtime-resource-publish-windows-dev runtime-manifest-payload runtime-manifest-apply-signature \
 	asr-test-contract asr-test-media asr-test-vad asr-test-whisper asr-test-cli asr-test-stages asr-transcribe \
 	asr-check-windows asr-test-windows-scripts asr-test-windows-target asr-verify-release-macos asr-verify-release-windows asr-quality-collect asr-quality-evaluate asr-performance-macos asr-performance-windows asr-evidence-audit \
 	inspect-profile inspect-room resolve record record-multi clean
@@ -124,17 +139,19 @@ help:
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端（禁用强制结束录制的 Rust watcher）' \
 		'  make app-build       构建 macOS .app 安装产物' \
-		'  make build-mac-release DY_SCREEN_API_BASE_URL=... 构建无 Finder 依赖的 macOS arm64 .app/.dmg 发布候选包' \
-		'  make app-build-resources ASR_SOURCE=... 构建强制携带运行资源的发行包（缺资源直接失败）' \
+		'  make build-mac-release MACOS_ARCH=aarch64|x86_64 DY_SCREEN_API_BASE_URL=... 构建架构专属 macOS .app/.dmg' \
+		'  make build-mac-intel-release DY_SCREEN_API_BASE_URL=... 在当前 macOS 构建 Intel x86_64 发布候选包（独立 staging）' \
+		'  make app-build-resources MACOS_ASR_SOURCE=... 构建强制携带目标架构运行资源的 macOS 发行包' \
 		'  make app-build-resources-windows ASR_SOURCE=... 构建 Windows x64 强制资源发行包' \
-		'  make asr-ffmpeg-macos FFMPEG_SOURCE=/ffmpeg-8.1.2.tar.xz 构建 LGPL 应用运行时 FFmpeg' \
+		'  make asr-ffmpeg-macos MACOS_ARCH=aarch64|x86_64 FFMPEG_SOURCE=... 构建目标架构 LGPL FFmpeg' \
 		'  make asr-ffmpeg-windows FFMPEG_SOURCE=C:/ffmpeg-8.1.2.tar.xz 构建 Windows x64 LGPL FFmpeg' \
-		'  make asr-whisper-macos WHISPER_SOURCE=/whisper.cpp-v1.9.1.tar.gz 构建静态 Metal sidecar' \
+		'  make asr-whisper-macos MACOS_ARCH=aarch64|x86_64 WHISPER_SOURCE=... 构建目标架构 sidecar' \
+		'  make asr-prepare-macos MACOS_ARCH=... 组装目标架构 macOS 可信资源源目录' \
 		'  make asr-whisper-windows WHISPER_SOURCE=C:/whisper.cpp-v1.9.1.tar.gz 构建 SSE4.2 CPU sidecar' \
 		'  make asr-prepare-windows VC_REDIST_SOURCE=... VC_REDIST_LICENSE=... 组装 Windows 可信资源源目录' \
-		'  make asr-stage-macos ASR_SOURCE=/可信资源目录  准备 macOS ASR 随包资源' \
-		'  make asr-build-macos ASR_SOURCE=/可信资源目录  构建含本地 ASR 的 macOS .app' \
-		'  本机已准备资源时可直接运行 make asr-build-macos；默认复用 resources/asr-source/' \
+		'  make asr-stage-macos MACOS_ARCH=... MACOS_ASR_SOURCE=/可信资源目录 准备目标架构 macOS ASR 随包资源' \
+		'  make asr-build-macos MACOS_ARCH=... MACOS_ASR_SOURCE=/可信资源目录 构建含本地 ASR 的架构专属 macOS .app' \
+		'  本机已准备资源时可直接运行 make asr-build-macos；默认复用目标架构 resources/asr-source-macos-*' \
 		'  make asr-build-macos ASR_BUNDLES=app,dmg  同时生成 DMG（需要可用 Finder 会话）' \
 		'  make asr-stage-windows ASR_SOURCE=/可信资源目录 准备 Windows ASR 随包资源' \
 		'  make app-build-windows-dev ASR_SOURCE=/可信资源目录 构建无签名 Windows NSIS 开发包' \
@@ -275,18 +292,34 @@ app-build:
 
 build-mac-release:
 	@test "$$(uname -s)" = "Darwin" || { printf '%s\n' '错误：build-mac-release 只能在 macOS 上运行。' >&2; exit 2; }
-	@test "$$(uname -m)" = "arm64" || { printf '%s\n' '错误：当前发行资源仅支持 macOS arm64。' >&2; exit 2; }
+	@"$(MAKE)" macos-build-doctor MACOS_ARCH="$(MACOS_ARCH)"
 	@test -n "$(DY_SCREEN_API_BASE_URL)" || { printf '%s\n' '错误：必须设置 DY_SCREEN_API_BASE_URL。' >&2; exit 2; }
 	@test "$(DY_SCREEN_API_BASE_URL)" != "http://localhost/api/" || { printf '%s\n' '错误：macOS 发布构建不能使用默认 localhost API。' >&2; exit 2; }
-	@printf '%s\n' '构建 macOS arm64 .app/.dmg 发布候选包；DMG 使用无 Finder、无挂载的直接压缩流程。'
-	CI=1 "$(MAKE)" app-build-resources ASR_BUNDLES=app TAURI_BUILD_ARGS=--ci
+	@printf '构建 macOS %s .app/.dmg 发布候选包；DMG 使用无 Finder、无挂载的直接压缩流程。\n' "$(MACOS_ARCH)"
+	CI=1 "$(MAKE)" app-build-resources MACOS_ARCH="$(MACOS_ARCH)" ASR_BUNDLES=app TAURI_BUILD_ARGS=--ci
 	./scripts/build-macos-dmg.sh "$(MACOS_RELEASE_APP)" "$(MACOS_RELEASE_DMG)" "$(MACOS_RELEASE_VOLUME_NAME)"
+
+build-mac-intel-release:
+	"$(MAKE)" build-mac-release MACOS_ARCH=x86_64
+
+macos-build-doctor:
+	@test "$$(uname -s)" = "Darwin" || { printf '%s\n' '错误：macOS 构建只能在 macOS 上运行。' >&2; exit 2; }
+	@test -n "$(MACOS_RUST_TARGET)" || { printf '错误：不支持的 MACOS_ARCH=%s，只接受 aarch64 或 x86_64。\n' "$(MACOS_ARCH)" >&2; exit 2; }
+	@command -v xcrun >/dev/null 2>&1 || { printf '%s\n' '错误：缺少 Xcode Command Line Tools（xcrun）。' >&2; exit 1; }
+	@command -v lipo >/dev/null 2>&1 || { printf '%s\n' '错误：缺少 Mach-O 架构检查工具 lipo。' >&2; exit 1; }
+	@command -v rustup >/dev/null 2>&1 || { printf '%s\n' '错误：缺少 rustup，无法检查 macOS Rust target。' >&2; exit 1; }
+	@if [ "$(MACOS_ARCH)" = x86_64 ]; then command -v nasm >/dev/null 2>&1 || { printf '%s\n' '错误：构建 macOS Intel FFmpeg 需要 nasm。' >&2; exit 1; }; fi
+	@"$(CARGO)" --version >/dev/null
+	@rustup target list --installed | grep -Fxq "$(MACOS_RUST_TARGET)" || { printf '错误：缺少 Rust target %s，请执行 rustup target add %s。\n' "$(MACOS_RUST_TARGET)" "$(MACOS_RUST_TARGET)" >&2; exit 1; }
+	@printf 'macOS 构建环境通过：架构=%s，Rust target=%s，资源平台=%s。\n' "$(MACOS_ARCH)" "$(MACOS_RUST_TARGET)" "$(MACOS_RESOURCE_PLATFORM)"
 
 app-build-resources: asr-stage-macos
 	@test -f "$(ASR_STAGE)/runtime-manifest.json" || { printf '%s\n' '错误：Runtime Resource Pack 清单缺失。' >&2; exit 2; }
-	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：正式资源发行构建必须设置 RESOURCE_BASE_URL。' >&2; exit 2; }
-	"$(MAKE)" runtime-resource-verify ASR_STAGE="$(ASR_STAGE)"
-	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- $(TAURI_BUILD_ARGS) --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
+	@case "$(RESOURCE_BASE_URL)" in https://*/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/$(MACOS_ARCH)/$(RESOURCE_BUNDLE_VERSION)/) ;; *) printf '错误：RESOURCE_BASE_URL 必须是目标架构的 HTTPS 版本目录，后缀为 /%s/%s/macos/%s/%s/。\n' "$(RESOURCE_CHANNEL)" "$(RESOURCE_APP_VERSION)" "$(MACOS_ARCH)" "$(RESOURCE_BUNDLE_VERSION)" >&2; exit 2;; esac
+	"$(MAKE)" runtime-resource-verify MACOS_ARCH="$(MACOS_ARCH)" ASR_STAGE="$(ASR_STAGE)"
+	./scripts/generate-tauri-macos-resource-config.sh "$(ASR_STAGE)" "$(MACOS_TAURI_RESOURCE_CONFIG)"
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" DY_SCREEN_RESOURCE_BASE_URL="$(RESOURCE_BASE_URL)" "$(NPM)" run tauri:build -- $(TAURI_BUILD_ARGS) --config src-tauri/tauri.macos.conf.json --config "$(MACOS_TAURI_RESOURCE_CONFIG)" --target "$(MACOS_RUST_TARGET)" --bundles "$(ASR_BUNDLES)"
+	./scripts/verify-macos-bundle-architecture.sh "$(MACOS_RELEASE_APP)" "$(MACOS_ARCH)"
 
 app-build-resources-windows: app-build-windows-release
 
@@ -306,9 +339,12 @@ app-build-windows-release: runtime-resource-verify-windows-release
 		-Cargo "$(CARGO)" -Npm "$(NPM)"
 
 runtime-resource-verify:
+	@test -n "$(MACOS_RUST_TARGET)" || { printf '错误：不支持的 MACOS_ARCH=%s，只接受 aarch64 或 x86_64。\n' "$(MACOS_ARCH)" >&2; exit 2; }
 	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }
-	"$(CARGO)" run --offline --bin asr-bundle -- verify --root "$(ASR_STAGE)" --platform macos-aarch64
-	"$(MAKE)" clip-subtitle-doctor FFMPEG="$(ASR_STAGE)/bin/macos-aarch64/ffmpeg" FFPROBE="$(ASR_STAGE)/bin/macos-aarch64/ffprobe"
+	"$(CARGO)" run --offline --bin asr-bundle -- verify --root "$(ASR_STAGE)" --platform $(MACOS_RESOURCE_PLATFORM)
+	@if [ "$(MACOS_HOST_ARCH)" = "$(MACOS_ARCH)" ] || { [ "$(MACOS_ARCH)" = x86_64 ] && arch -x86_64 /usr/bin/true >/dev/null 2>&1; }; then \
+		"$(MAKE)" clip-subtitle-doctor FFMPEG="$(ASR_STAGE)/bin/$(MACOS_RESOURCE_DIR)/ffmpeg" FFPROBE="$(ASR_STAGE)/bin/$(MACOS_RESOURCE_DIR)/ffprobe"; \
+	else printf '%s\n' '提示：当前主机不能运行目标 FFmpeg，能力检查延后到目标 Mac；静态架构与依赖校验已执行。'; fi
 
 runtime-resource-verify-windows:
 	@test -n "$(ASR_STAGE)" || { printf '%s\n' '错误：必须指定 ASR_STAGE。' >&2; exit 2; }
@@ -324,10 +360,10 @@ runtime-resource-verify-windows-release: runtime-resource-verify-windows
 		-TimestampUrl "$(WINDOWS_TIMESTAMP_URL)" -VerifyOnly
 
 runtime-resource-publish: runtime-resource-verify
-	@test -n "$(RESOURCE_BASE_URL)" || { printf '%s\n' '错误：必须设置 RESOURCE_BASE_URL（仅用于发布说明，应用地址由构建期注入）。' >&2; exit 2; }
-	@mkdir -p "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/aarch64/$(RESOURCE_BUNDLE_VERSION)"
-	cp -R "$(ASR_STAGE)/." "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/aarch64/$(RESOURCE_BUNDLE_VERSION)/"
-	@printf '{"channel":"%s","appVersion":"%s","platform":"macos","arch":"aarch64","bundleVersion":"%s","manifest":"runtime-manifest.json"}\n' "$(RESOURCE_CHANNEL)" "$(RESOURCE_APP_VERSION)" "$(RESOURCE_BUNDLE_VERSION)" > "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/index.json"
+	@case "$(RESOURCE_BASE_URL)" in https://*/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/$(MACOS_ARCH)/$(RESOURCE_BUNDLE_VERSION)/) ;; *) printf '错误：RESOURCE_BASE_URL 必须是目标架构的 HTTPS 版本目录，后缀为 /%s/%s/macos/%s/%s/。\n' "$(RESOURCE_CHANNEL)" "$(RESOURCE_APP_VERSION)" "$(MACOS_ARCH)" "$(RESOURCE_BUNDLE_VERSION)" >&2; exit 2;; esac
+	@mkdir -p "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/$(MACOS_ARCH)/$(RESOURCE_BUNDLE_VERSION)"
+	cp -R "$(ASR_STAGE)/." "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/$(MACOS_ARCH)/$(RESOURCE_BUNDLE_VERSION)/"
+	@printf '{"channel":"%s","appVersion":"%s","platform":"macos","arch":"%s","bundleVersion":"%s","manifest":"runtime-manifest.json","resourceBaseUrl":"%s"}\n' "$(RESOURCE_CHANNEL)" "$(RESOURCE_APP_VERSION)" "$(MACOS_ARCH)" "$(RESOURCE_BUNDLE_VERSION)" "$(RESOURCE_BASE_URL)" > "$(RESOURCE_RELEASE_DIR)/$(RESOURCE_CHANNEL)/$(RESOURCE_APP_VERSION)/macos/$(MACOS_ARCH)/index.json"
 	@printf '%s\n' '资源发布目录已生成。请在上传前使用正式 Ed25519 私钥签署 runtime-manifest.json，并将 RESOURCE_BASE_URL 配置到构建环境。'
 
 runtime-manifest-payload:
@@ -351,8 +387,9 @@ runtime-resource-publish-windows-dev: runtime-resource-verify-windows
 		--allow-unsigned-development
 
 asr-ffmpeg-macos:
+	@test -n "$(MACOS_RUST_TARGET)" || { printf '错误：不支持的 MACOS_ARCH=%s，只接受 aarch64 或 x86_64。\n' "$(MACOS_ARCH)" >&2; exit 2; }
 	@test -n "$(FFMPEG_SOURCE)" || { printf '%s\n' '错误：必须通过 FFMPEG_SOURCE 指定 ffmpeg-8.1.2.tar.xz。' >&2; exit 2; }
-	./scripts/build-asr-ffmpeg-macos.sh "$(FFMPEG_SOURCE)" "$(FFMPEG_ASR_OUTPUT)"
+	./scripts/build-asr-ffmpeg-macos.sh "$(FFMPEG_SOURCE)" "$(FFMPEG_ASR_OUTPUT)" "$(MACOS_ARCH)"
 
 windows-build-doctor:
 	"$(POWERSHELL)" -NoProfile -File scripts/windows-build-doctor.ps1
@@ -363,8 +400,15 @@ asr-ffmpeg-windows: windows-build-doctor
 		-SourceArchive "$(FFMPEG_SOURCE)" -OutputRoot "$(WINDOWS_FFMPEG_OUTPUT)"
 
 asr-whisper-macos:
+	@test -n "$(MACOS_RUST_TARGET)" || { printf '错误：不支持的 MACOS_ARCH=%s，只接受 aarch64 或 x86_64。\n' "$(MACOS_ARCH)" >&2; exit 2; }
 	@test -n "$(WHISPER_SOURCE)" || { printf '%s\n' '错误：必须通过 WHISPER_SOURCE 指定 whisper.cpp-v1.9.1.tar.gz。' >&2; exit 2; }
-	./scripts/build-asr-whisper-macos.sh "$(WHISPER_SOURCE)" "$(WHISPER_ASR_OUTPUT)"
+	./scripts/build-asr-whisper-macos.sh "$(WHISPER_SOURCE)" "$(WHISPER_ASR_OUTPUT)" "$(MACOS_ARCH)"
+
+asr-prepare-macos:
+	@test -n "$(MACOS_RUST_TARGET)" || { printf '错误：不支持的 MACOS_ARCH=%s，只接受 aarch64 或 x86_64。\n' "$(MACOS_ARCH)" >&2; exit 2; }
+	@test -n "$(ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 ASR_SOURCE 指定包含共用模型、字典和许可证的资源目录。' >&2; exit 2; }
+	./scripts/prepare-asr-resources-macos.sh "$(ASR_SOURCE)" "$(FFMPEG_ASR_OUTPUT)" "$(WHISPER_ASR_OUTPUT)" \
+		"$(MACOS_RESOURCE_SOURCE)" "$(MACOS_ARCH)" "$(RESOURCE_BUNDLE_VERSION)"
 
 asr-whisper-windows:
 	@test -n "$(WHISPER_SOURCE)" || { printf '%s\n' '错误：必须通过 WHISPER_SOURCE 指定 whisper.cpp-v1.9.1.tar.gz。' >&2; exit 2; }
@@ -387,15 +431,18 @@ asr-sign-windows-resources:
 		-TimestampUrl "$(WINDOWS_TIMESTAMP_URL)"
 
 asr-stage-macos:
-	@test -n "$(ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 ASR_SOURCE 指定已经准备好的可信资源目录。' >&2; exit 2; }
-	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(ASR_SOURCE)" --target "$(ASR_STAGE)" --platform macos-aarch64
+	@test -n "$(MACOS_RUST_TARGET)" || { printf '错误：不支持的 MACOS_ARCH=%s，只接受 aarch64 或 x86_64。\n' "$(MACOS_ARCH)" >&2; exit 2; }
+	@test -n "$(MACOS_ASR_SOURCE)" || { printf '错误：必须通过 MACOS_ASR_SOURCE 或 ASR_SOURCE 指定 macOS %s 可信资源目录。\n' "$(MACOS_ARCH)" >&2; exit 2; }
+	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(MACOS_ASR_SOURCE)" --target "$(ASR_STAGE)" --platform $(MACOS_RESOURCE_PLATFORM) --channel "$(RESOURCE_CHANNEL)"
 
 asr-stage-windows:
 	@test -n "$(WINDOWS_ASR_SOURCE)" || { printf '%s\n' '错误：必须通过 WINDOWS_ASR_SOURCE 或 ASR_SOURCE 指定 Windows 可信资源目录。' >&2; exit 2; }
 	"$(CARGO)" run --offline --bin asr-bundle -- stage --source "$(WINDOWS_ASR_SOURCE)" --target "$(ASR_STAGE)" --platform windows-x86-64 --channel "$(RESOURCE_CHANNEL)"
 
 asr-build-macos: asr-stage-macos
-	"$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --bundles "$(ASR_BUNDLES)"
+	./scripts/generate-tauri-macos-resource-config.sh "$(ASR_STAGE)" "$(MACOS_TAURI_RESOURCE_CONFIG)"
+	"$(NPM)" run tauri:build -- --config src-tauri/tauri.macos.conf.json --config "$(MACOS_TAURI_RESOURCE_CONFIG)" --target "$(MACOS_RUST_TARGET)" --bundles "$(ASR_BUNDLES)"
+	./scripts/verify-macos-bundle-architecture.sh "$(MACOS_RELEASE_APP)" "$(MACOS_ARCH)"
 
 asr-build-windows: app-build-windows-dev
 

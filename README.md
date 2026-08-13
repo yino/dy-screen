@@ -39,7 +39,7 @@
 - 磁盘低于 10 GB 时警告，低于 2 GB 时不启动新录制，低于 1 GB 时安全停止活动录制；
 - AI 剪辑工作区支持创建项目、通过系统文件选择器导入多个本地视频，或选择一场已结束直播并按稳定顺序展开全部登记分片；
 - 只有用户点击“开始分析”后才运行 ASR，打开页面、应用启动和新录像完成都不会自动识别；
-- 本地流水线使用 FFprobe、FFmpeg、Silero VAD 和 `whisper.cpp small-q5_1`，macOS arm64 使用 Metal，Windows x64 使用 CPU；
+- 本地流水线使用 FFprobe、FFmpeg、Silero VAD 和 `whisper.cpp small-q5_1`，macOS arm64 使用 Metal，macOS Intel 与 Windows x64 使用 CPU；
 - ASR 全局单并发，默认允许已完成视频在录制期间识别，不占用录制并发许可；设置中关闭并行后可恢复录制优先；相同源版本与识别配置可以跨项目复用稳定转写产物；
 - 项目结果提供播放器、点击句段跳转、当前句段高亮、可关闭的跟随播放、仅存在于 WebView 的临时字幕、复制及 TXT/JSON 导出；
 - AI 工作区支持标签/分析目标快照、队列中的“下一个处理”和“立即切换”，并在 ASR 完成后按用户授权运行候选发现 Agent 与评分 Agent；合格/优秀阈值默认分别为 70/80，合格候选按页展示且不设数量上限，优秀候选首次分析完成时自动选中；
@@ -100,22 +100,23 @@ dy-screen/
 
 ## 环境要求
 
-录制与桌面能力当前优先在 macOS 开发；本地 ASR 的首版发行目标明确为 macOS arm64 和 Windows x64。Intel Mac、Windows ARM64 和 Linux ASR 不在本版支持范围。
+录制与桌面能力当前优先在 macOS 开发；本地 ASR 发行目标为 macOS arm64、macOS Intel x86_64 和 Windows x64。macOS 两种架构分别生成安装包，不提供 universal DMG；Windows ARM64 和 Linux ASR 不在本版支持范围。
 
 - Node.js 20 或更高版本；
 - npm；
 - Rust stable 和 Cargo；
 - FFmpeg，同时需要 FFprobe；
 - GNU Make 或兼容的 `make`；
-- macOS 构建 Tauri 时需要 Xcode Command Line Tools。
+- macOS 构建 Tauri 时需要 Xcode Command Line Tools；构建 Intel FFmpeg 还需要 CMake 与 NASM。
 
 macOS 使用 Homebrew 安装示例：
 
 ```bash
 xcode-select --install
-brew install node rustup ffmpeg
+brew install node rustup ffmpeg cmake nasm
 rustup toolchain install stable --profile minimal
 rustup default stable
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
 如果终端找不到 Cargo：
@@ -310,103 +311,164 @@ http://localhost:1420/
 
 浏览器预览使用 `localStorage` 模拟主播、标签和设置，不能解析真实直播状态、建立抖音 WebView 会话或启动 FFmpeg。访问会话固定显示“真实访问验证仅桌面端可用”，不会伪造恢复成功。浏览器演示中的标签不会写入 SQLite；真实监听和录制必须使用 `make app-dev`。
 
-## 构建桌面应用
+## 各平台打包流程
 
-普通开发构建不强制包含大模型，适合 UI、数据库和非真实 ASR 测试：
+当前提供三个独立发行目标，不生成 universal DMG，也不支持在 macOS 上直接生成 Windows 安装包：
+
+| 目标平台 | 构建系统 | 架构参数 | 主要产物 |
+| --- | --- | --- | --- |
+| macOS Apple Silicon | macOS arm64 | `MACOS_ARCH=aarch64` | `.app`、arm64 DMG |
+| macOS Intel | macOS arm64 或 Intel | `MACOS_ARCH=x86_64` | `.app`、x86_64 DMG |
+| Windows x64 | Windows 10/11 x64 | 固定 `x86_64` | NSIS `.exe` |
+
+### 通用准备
+
+先完成[环境要求](#环境要求)中的工具安装，并安装前端依赖：
+
+```bash
+make install
+```
+
+普通开发构建不携带正式运行资源，只适合 UI、数据库和非真实 ASR 测试：
 
 ```bash
 make app-build
 ```
 
-默认产物位于：
+正式 ASR 安装包需要以下本地输入，打包过程不会联网下载：
+
+- `resources/asr-source/`：公共模型、VAD、OpenCC 字典、许可证和锁定源码归档；
+- `resources/asr-source/sources/ffmpeg-8.1.2.tar.xz`；
+- `resources/asr-source/sources/whisper.cpp-v1.9.1.tar.gz`；
+- Windows 额外需要 Microsoft 官方 `vc_redist.x64.exe` 及其许可/来源说明。
+
+下列命令中的 `api.example.invalid` 和 `resources.example.invalid` 是故意设置的无效占位域名，正式打包前必须替换。资源地址必须使用 HTTPS，且路径中的 channel、应用版本、平台、架构和资源版本必须与构建参数一致。
+
+### macOS Apple Silicon arm64
+
+首次为 arm64 准备原生资源并打包：
+
+```bash
+make macos-build-doctor MACOS_ARCH=aarch64
+make asr-ffmpeg-macos MACOS_ARCH=aarch64
+make asr-whisper-macos MACOS_ARCH=aarch64
+make asr-prepare-macos MACOS_ARCH=aarch64 ASR_SOURCE=resources/asr-source
+
+make build-mac-release \
+  MACOS_ARCH=aarch64 \
+  MACOS_ASR_SOURCE=resources/asr-source-macos-aarch64 \
+  DY_SCREEN_API_BASE_URL=https://api.example.invalid/api/ \
+  RESOURCE_BASE_URL=https://resources.example.invalid/stable/0.3.0/macos/aarch64/2026.07.4/
+```
+
+原生资源已经准备好时，只需重复执行最后一个 `make build-mac-release` 命令。构建会使用独立的 `resources/asr-stage/`，校验包内 Mach-O 架构，并输出：
 
 ```text
-src-tauri/target/release/bundle/macos/切片智能体.app
+src-tauri/target/aarch64-apple-darwin/release/bundle/macos/切片智能体.app
+src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/切片智能体_0.3.0_aarch64.dmg
 ```
 
-正式 ASR 安装包必须先准备一个符合 `resources/asr/manifest.json` 结构的可信资源目录。该目录包含公共模型、VAD、规范化字典和至少一个目标平台的 `whisper.cpp`、VAD、FFmpeg、FFprobe；Windows 还包含官方 `vc_redist.x64.exe`。构建工具不会联网，也拒绝把指向 Homebrew 或开发机路径的符号链接放进安装包。
+### macOS Intel x86_64
 
-本机已经准备好的资源会持久保存在 `resources/asr-source/`：其中包含模型、sidecar、FFmpeg 动态库、源码归档和 `SHA256SUMS`。该目录中的大型二进制按 `.gitignore` 保存在本机，不会提交到 Git；后续直接执行 `make asr-stage-macos` 或 `make asr-build-macos` 即可复用，不依赖 `/private/tmp`，也不会重复下载。没有本地资源时，再通过 `ASR_SOURCE` 指定可信资源目录。
-
-仓库中的 manifest 是跨平台模板；`asr-bundle stage` 会为所选平台生成只包含一个平台且完整封存全部原生文件哈希的发行 manifest。模板目录不能直接作为正式运行资源。
-
-### Runtime Resource Pack 发行与首次启动
-
-资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证。`asr-bundle stage` 会同时生成 `runtime-manifest.json`，清单采用 v2 结构，记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。带声桥接素材和字幕导出要求 FFmpeg 同时具备 H.264、HEVC、AAC、PNG 解码，`concat`/`image2` demuxer，`scale`、`pad`、`format`、`aformat`、`volume`、`concat`、`overlay` 等受控滤镜，以及平台 H.264/AAC 编码器和 MP4 muxer。`make runtime-resource-verify` 和正式发行验收会逐项检查，旧资源包不满足时必须升级后才能预览或导出。
+可以在当前 Apple Silicon Mac 上交叉生成 Intel 包。首次构建前确保已经安装 Intel Rust target、CMake 和 NASM：
 
 ```bash
-# 生成并校验 macOS arm64 随包资源
-make asr-stage-macos ASR_SOURCE=/absolute/path/to/resources
-make runtime-resource-verify ASR_STAGE=resources/asr-stage
+rustup target add x86_64-apple-darwin
+brew install cmake nasm
 
-# 构建正式的资源发行包；缺少资源时直接失败
-make app-build-resources ASR_SOURCE=/absolute/path/to/resources
+make macos-build-doctor MACOS_ARCH=x86_64
+make asr-ffmpeg-macos MACOS_ARCH=x86_64
+make asr-whisper-macos MACOS_ARCH=x86_64
+make asr-prepare-macos MACOS_ARCH=x86_64 ASR_SOURCE=resources/asr-source
 
-# 生成自有 HTTPS 静态托管目录（上传前必须用正式 Ed25519 私钥签署清单）
-make runtime-resource-publish \
-  ASR_STAGE=resources/asr-stage \
-  RESOURCE_BASE_URL=https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/aarch64/2026.07.4/ \
-  RESOURCE_RELEASE_DIR=dist/runtime-resources
+make build-mac-intel-release \
+  MACOS_ASR_SOURCE=resources/asr-source-macos-x86_64 \
+  DY_SCREEN_API_BASE_URL=https://api.example.invalid/api/ \
+  RESOURCE_BASE_URL=https://resources.example.invalid/stable/0.3.0/macos/x86_64/2026.07.4/
 ```
 
-托管目录约定为 `channel/appVersion/platform/arch/bundleVersion/`，并在同一固定地址提供 `runtime-manifest.json` 及清单声明的资源文件。服务器应支持 HTTPS、Range 和大文件缓存；应用不会上传视频、音频、转写、主播信息、Cookie 或本地数据库。用户安装后如果资源未就绪，只能在资源页查看版本/大小/组件、下载、取消、重试或重新检测，监控、录制、视频库和 AI 剪辑保持锁定。
+原生资源已经准备好时，只需重复执行最后一个 `make build-mac-intel-release` 命令。该入口固定使用 `MACOS_ARCH=x86_64` 和 `resources/asr-stage-x86_64/`，不会覆盖 arm64 staging。产物位于：
 
-当前 macOS arm64 发行构建使用的固定资源基地址为：
-`https://yino-cut.oss-cn-beijing.aliyuncs.com/cut/stable/0.3.0/macos/aarch64/2026.07.4/`。
-`index.json` 仅用于发布目录索引，不能直接作为下载基地址。
-
-macOS 的 ASR 专用 FFmpeg 应从锁定的官方 `ffmpeg-8.1.2.tar.xz` 构建：
-
-```bash
-make asr-ffmpeg-macos \
-  FFMPEG_SOURCE=/absolute/path/to/ffmpeg-8.1.2.tar.xz \
-  FFMPEG_ASR_OUTPUT=/absolute/path/to/output
+```text
+src-tauri/target/x86_64-apple-darwin/release/bundle/macos/切片智能体.app
+src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/切片智能体_0.3.0_x86_64.dmg
 ```
 
-脚本校验源码 SHA-256，只启用录制、预览、封面、ASR、H.264/HEVC/AAC 解码和桥接剪辑导出需要的协议、容器、滤镜及系统 VideoToolbox 编码器，仍禁用 GPL/nonfree 与第三方编码器；输出使用 LGPL-2.1-or-later，携带完整许可证，并把 dylib 改写为包内相对路径。Homebrew 常规 FFmpeg 启用了 GPL 外部组件且依赖开发机动态库，不能直接复制进正式安装包。
+交叉构建会审计主程序、Whisper/VAD sidecar、FFmpeg/FFprobe 和包内 dylib，要求全部为单一 x86_64 Mach-O，最低系统版本不高于 macOS 12.0。Apple Silicon 上生成的是发布候选；正式 Intel 发布仍需在真实 Intel Mac 完成 Developer ID 签名、公证、Gatekeeper、离线启动、录制、预览、封面、ASR 和剪辑导出验收。
 
-macOS Whisper sidecar 应使用静态、可移植构建：
+### Windows x64
 
-```bash
-make asr-whisper-macos \
-  WHISPER_SOURCE=/absolute/path/to/whisper.cpp-v1.9.1.tar.gz \
-  WHISPER_ASR_OUTPUT=/absolute/path/to/output
-```
-
-脚本锁定源码 SHA-256 和提交，静态链接 Whisper/GGML、内嵌 Metal shader，并拒绝包外动态库和绝对 RPATH。不能直接复制仍引用 CMake 构建目录的动态 `whisper-cli`。
-
-macOS arm64：
-
-```bash
-make asr-build-macos
-```
-
-该命令默认从 `resources/asr-source/` 重新封存 `resources/asr-stage/`，再将同一份资源复制进 `.app` 的 `Contents/Resources/resources/asr/`。如需使用其他资源目录，可显式传入 `ASR_SOURCE=/absolute/path/to/asr-resources`。
-
-Windows x64 必须在原生 Windows 10/11 x64 的 Visual Studio 2022 Developer PowerShell 中构建。
-先诊断工具链，再从仓库锁定源码构建 FFmpeg/Whisper、组装 Microsoft VC++ 运行库并生成开发包：
+Windows 包必须在原生 Windows 10/11 x64 的 Visual Studio 2022 Developer PowerShell 中构建。首次准备资源并生成无签名开发包：
 
 ```powershell
 make windows-build-doctor
 make asr-ffmpeg-windows
 make asr-whisper-windows
-make asr-prepare-windows VC_REDIST_SOURCE=C:/inputs/vc_redist.x64.exe VC_REDIST_LICENSE=C:/inputs/Microsoft-VCRedist.txt
-make app-build-windows-dev WINDOWS_ASR_SOURCE=resources/asr-source-windows RESOURCE_CHANNEL=development WINDOWS_RESOURCE_BASE_URL=https://resources.example/development/0.3.0/windows/x86_64/2026.07.4/
+make asr-prepare-windows `
+  VC_REDIST_SOURCE=C:/release-inputs/vc_redist.x64.exe `
+  VC_REDIST_LICENSE=C:/release-inputs/Microsoft-VCRedist.txt
+
+make app-build-windows-dev `
+  WINDOWS_ASR_SOURCE=resources/asr-source-windows `
+  RESOURCE_CHANNEL=development `
+  WINDOWS_RESOURCE_BASE_URL=https://resources.example.invalid/development/0.3.0/windows/x86_64/2026.07.4/
 ```
 
-开发 NSIS 可以无签名，但无签名资源不能发布到 `stable`。正式发行要求项目 PE/DLL 先完成
-Authenticode，再 staging 并对 Runtime manifest 进行外部 Ed25519 签名，最后签署 NSIS 并执行
-干净 Windows 设备验收。DeepSeek Key 在 Windows 上只保存到 Credential Manager，不写入 SQLite。
-完整的工具版本、签名顺序、资源发布、升级/卸载和故障排查见
-[`docs/wiki/Windows-构建与发行.md`](docs/wiki/Windows-构建与发行.md)；每次候选发行使用
-[`docs/templates/windows-release-checklist.md`](docs/templates/windows-release-checklist.md) 记录真实证据。
+无签名 NSIS 只能用于开发测试，不能发布到 `stable`。正式包必须先签署自产 PE/DLL，再生成并外部签署 Runtime manifest，最后构建带 Authenticode 和 RFC 3161 时间戳的 NSIS：
 
-Apple Silicon 开发机可用 `make asr-check-windows` 执行 Windows x64 条件编译与严格 Clippy；
-该检查不能替代 PowerShell AST、NSIS、签名、安装、业务运行或 SmartScreen 实机验收。
+```powershell
+make asr-sign-windows-resources `
+  WINDOWS_CERTIFICATE_THUMBPRINT=证书指纹 `
+  WINDOWS_TIMESTAMP_URL=https://时间戳服务
 
-macOS 和 Windows 构建都会先由 `asr-bundle` 生成单平台 `resources/asr-stage/`。macOS 可通过
-`ASR_BUNDLES=app,dmg` 同时生成 `.app`/`.dmg`；Windows 生成 currentUser NSIS，并携带离线
-WebView2、VC++ 运行库和完整运行资源。
+make asr-stage-windows `
+  WINDOWS_ASR_SOURCE=resources/asr-source-windows `
+  RESOURCE_CHANNEL=stable
+
+make runtime-manifest-payload
+# 在隔离签名环境签署 dist/runtime-manifest.payload，再继续：
+make runtime-manifest-apply-signature `
+  RUNTIME_MANIFEST_SIGNATURE=C:/release-inputs/runtime-manifest.sig
+
+make app-build-windows-release `
+  WINDOWS_CERTIFICATE_THUMBPRINT=证书指纹 `
+  WINDOWS_TIMESTAMP_URL=https://时间戳服务 `
+  WINDOWS_RESOURCE_BASE_URL=https://resources.example.invalid/stable/0.3.0/windows/x86_64/2026.07.4/
+```
+
+NSIS 默认输出到 `src-tauri/target/release/bundle/nsis/`，脱敏构建记录输出到 `dist/windows/`。完整的工具版本、证书要求、资源发布、升级/卸载和故障排查见 [`docs/wiki/Windows-构建与发行.md`](docs/wiki/Windows-构建与发行.md)；每次候选发行使用 [`docs/templates/windows-release-checklist.md`](docs/templates/windows-release-checklist.md) 记录真实证据。
+
+Apple Silicon 开发机只能用 `make asr-check-windows` 做 Windows x64 条件编译和严格 Clippy 检查，不能生成或验收 Windows 安装包。
+
+### Runtime Resource Pack 发行
+
+macOS 和 Windows 构建都会先由 `asr-bundle` 生成单平台 staging。资源包包含 FFmpeg/FFprobe、Whisper、VAD sidecar、small 量化模型、Silero 模型、OpenCC 字典、平台动态库、Windows VC++ 运行库和许可证；`runtime-manifest.json` 记录平台、版本、逐文件 SHA-256、最小内存/磁盘和许可证来源。
+
+macOS 两种架构使用不同的 staging、下载地址和索引，发布其中一个架构不会覆盖另一个架构：
+
+```bash
+# Apple Silicon arm64
+make runtime-resource-publish \
+  MACOS_ARCH=aarch64 \
+  ASR_STAGE=resources/asr-stage \
+  RESOURCE_BASE_URL=https://resources.example.invalid/stable/0.3.0/macos/aarch64/2026.07.4/ \
+  RESOURCE_RELEASE_DIR=dist/runtime-resources
+
+# Intel x86_64
+make runtime-resource-publish \
+  MACOS_ARCH=x86_64 \
+  ASR_STAGE=resources/asr-stage-x86_64 \
+  RESOURCE_BASE_URL=https://resources.example.invalid/stable/0.3.0/macos/x86_64/2026.07.4/ \
+  RESOURCE_RELEASE_DIR=dist/runtime-resources
+```
+
+托管目录约定为 `channel/appVersion/platform/arch/bundleVersion/`，每个架构的索引分别位于 `channel/appVersion/macos/{aarch64|x86_64}/index.json`。`index.json` 只用于发布目录索引，不能作为下载基地址。上传前必须使用正式 Ed25519 私钥签署 manifest；服务器应支持 HTTPS、Range 和大文件缓存。
+
+macOS 的 ASR 专用 FFmpeg 从锁定的官方源码构建，只启用录制、预览、封面、ASR 和剪辑导出需要的能力，禁用 GPL/nonfree 与第三方编码器。Whisper/GGML 使用静态、可移植构建：arm64 内嵌 Metal shader，x86_64 关闭 Metal、BLAS 和构建机原生 CPU 优化，使用 SSE4.2 CPU 基线。Homebrew FFmpeg 和引用本机构建目录的动态 `whisper-cli` 不能放入正式安装包。
+
+带声桥接素材和字幕导出要求 FFmpeg 同时具备 H.264、HEVC、AAC、PNG 解码，`concat`/`image2` demuxer，`scale`、`pad`、`format`、`aformat`、`volume`、`concat`、`overlay` 等受控滤镜，以及平台 H.264/AAC 编码器和 MP4 muxer。`make runtime-resource-verify` 和正式发行验收会逐项检查。
+
+用户安装后如果资源未就绪，只能在资源页查看版本/大小/组件、下载、取消、重试或重新检测；监控、录制、视频库和 AI 剪辑保持锁定。应用不会上传视频、音频、转写、主播信息、Cookie 或本地数据库。Windows 上的 DeepSeek Key 只保存到 Credential Manager，不写入 SQLite。
 
 ## 自动监听与录制逻辑
 
@@ -638,6 +700,8 @@ ffmpeg -i input.mkv -c copy output.mp4
 make help
 ```
 
+完整打包顺序、平台限制和产物路径以[各平台打包流程](#各平台打包流程)为准；下表用于查询单个目标的用途。
+
 | 命令 | 用途 |
 | --- | --- |
 | `make doctor` | 检查 Node、npm、Cargo、FFmpeg 和 FFprobe |
@@ -646,13 +710,19 @@ make help
 | `make typecheck` | 执行 React/TypeScript 类型检查 |
 | `make frontend-build` | 类型检查并构建 React 前端 |
 | `make app-dev` | 启动 Tauri 桌面开发客户端；保留 Vite 前端热更新并禁用会强制结束录制进程的 Rust watcher |
-| `make app-build` | 构建桌面应用 |
-| `make asr-ffmpeg-macos FFMPEG_SOURCE=...` | 从锁定官方源码构建 LGPL、支持直播录制与本地媒体处理、可相对定位的 macOS 运行时 FFmpeg |
-| `make asr-stage-macos ASR_SOURCE=...` | 校验并准备单平台 macOS arm64 ASR 随包目录 |
-| `make asr-build-macos ASR_SOURCE=...` | 构建包含本地 ASR 资源的 macOS `.app`/`.dmg` |
-| `make asr-stage-windows ASR_SOURCE=...` | 校验并准备单平台 Windows x64 ASR 随包目录 |
+| `make app-build` | 构建不携带正式运行资源的桌面开发包 |
+| `make macos-build-doctor MACOS_ARCH=...` | 检查目标架构、Rust target、Xcode 工具链，以及 Intel FFmpeg 所需 NASM |
+| `make asr-ffmpeg-macos MACOS_ARCH=... FFMPEG_SOURCE=...` | 从锁定官方源码构建目标架构 LGPL、可相对定位的 macOS 运行时 FFmpeg |
+| `make asr-whisper-macos MACOS_ARCH=... WHISPER_SOURCE=...` | 构建 arm64 Metal 或 Intel SSE4.2 CPU Whisper/VAD sidecar |
+| `make asr-prepare-macos MACOS_ARCH=... ASR_SOURCE=...` | 将目标架构原生文件与公共模型、字典、许可证组装为可信资源源 |
+| `make asr-stage-macos MACOS_ARCH=... MACOS_ASR_SOURCE=...` | 校验并准备单架构 macOS ASR 随包目录 |
+| `make asr-build-macos MACOS_ARCH=... MACOS_ASR_SOURCE=...` | 构建并审计包含本地 ASR 资源的架构专属 macOS `.app` |
+| `make build-mac-release MACOS_ARCH=... ...` | 生成指定架构的 macOS `.app`/DMG 发布候选包 |
+| `make build-mac-intel-release ...` | 在 macOS 上生成 Intel x86_64 `.app`/DMG 发布候选包 |
+| `make asr-stage-windows WINDOWS_ASR_SOURCE=...` | 校验并准备单平台 Windows x64 ASR 随包目录 |
 | `make windows-build-doctor` | 在原生 Windows x64 检查 VS/SDK/Rust/Node/CMake/NSIS/MSYS2/签名工具 |
 | `make asr-ffmpeg-windows` | 从锁定 FFmpeg 8.1.2 源码构建 Windows x64 LGPL sidecar |
+| `make asr-whisper-windows` | 从锁定 whisper.cpp v1.9.1 源码构建 Windows x64 CPU sidecar |
 | `make asr-prepare-windows ...` | 组装 FFmpeg、Whisper、模型、字典、许可证和 Microsoft VC++ 可信源目录 |
 | `make app-build-windows-dev ...` | 构建明确标记为非正式的无签名 Windows NSIS 开发包 |
 | `make app-build-windows-release ...` | 使用证书存储和 RFC 3161 时间戳构建正式 Windows NSIS |
@@ -882,7 +952,7 @@ make accept-real-multi \
 - 内置播放器一次只预览单个已完成分片，不提供整场分片合并、统一时间轴或无缝连播；
 - 预览仅在需要时生成可清理 MP4 缓存，不会在每次录制结束后自动转换全部录像；
 - AI 工作区支持只读原始时间戳文本、DeepSeek 高光评分、合格/优秀阈值、已选择候选的单轨剪辑工程、工程级字幕校对和逐字烧录的 H.264/AAC MP4 导出；仍不支持修改原始转写、SRT/ASS、说话人分离、真实字级时间戳、字幕拆分合并或调时、波形、多轨、外部素材、字幕样式配置或对原始录像的就地修改；
-- 本地 ASR 只支持 macOS arm64 Metal 和 Windows x64 CPU；不支持 Intel Mac、Windows ARM64、Linux、CUDA/Vulkan、多模型切换、在线下载或任意模型路径；
+- 本地 ASR 支持 macOS arm64 Metal、macOS Intel x86_64 CPU 和 Windows x64 CPU；不支持 Windows ARM64、Linux、CUDA/Vulkan、多模型切换、在线下载或任意模型路径。Intel 安装包可在 Apple Silicon 上交叉构建，但正式发布仍需真实 Intel Mac 验收；
 - small 量化模型已通过固定中文短句测试，但至少 10 场真实中文直播的商品名、金额、主播名召回率和 8 GB 双平台长时性能仍需目标设备样本验收；效果不达标时应另立用户明确授权的云端 `AsrEngine` Adapter 变更，本版不自动上传或回退；
 - 主播标签目前只作为未来切片上下文预留，不会自动生成 Prompt 或触发模型调用；
 - 主播标签表单、排序按钮、徽章折叠和详情布局已在 macOS 自动化测试与构建中验证，Windows/Linux 仍需实机确认字体、窄窗口和 WebView 表单行为；

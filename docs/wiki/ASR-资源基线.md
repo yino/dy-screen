@@ -8,11 +8,13 @@
 - `whisper.cpp v1.9.1`，源码提交 `f049fff95a089aa9969deb009cdd4892b3e74916`；
 - 多语言 `ggml-small-q5_1.bin`，190,085,487 字节；
 - Silero VAD `ggml-silero-v6.2.0.bin`，885,098 字节；
-- macOS arm64 使用 Metal 构建；Windows x64 使用 CPU 构建。
+- macOS arm64 使用 Metal 构建；macOS Intel x86_64 与 Windows x64 使用 CPU 构建。
 
 `whisper-cli` 在 macOS arm64 使用 Metal。`whisper.cpp v1.9.1` 的独立
 `whisper-vad-speech-segments` 在当前 Apple Silicon 实测启用 `--use-gpu` 会异常退出，
 因此 VAD sidecar 固定使用 CPU；Silero VAD 本身很轻量，不影响主模型使用 Metal。
+macOS Intel 构建关闭 Metal、BLAS 和 `GGML_NATIVE`，并关闭 AVX、AVX2、FMA、F16C、BMI2，
+只声明 SSE4.2 CPU 基线，避免把 Apple Silicon 构建机特征带入 Intel 包。
 
 模型和 VAD 的 SHA-256、来源、逻辑 ID、最低资源要求以
 [`resources/asr/manifest.json`](../../resources/asr/manifest.json) 为准。任务开始前必须校验
@@ -49,13 +51,19 @@ manifest、许可证说明、真实样本基准和两个平台安装验证记录
 ## 发行暂存
 
 正式构建不从网络下载资源。构建机先准备一个与 manifest 路径一致的可信目录，再使用根
-crate 的 Rust 工具复制和校验单一目标平台：
+crate 的 Rust 工具复制和校验单一目标平台。macOS 平台值分别为 `macos-aarch64` 和
+`macos-x86-64`，建议使用独立 staging 目录：
 
 ```bash
-cargo run --offline --bin asr-bundle -- stage \
-  --source /absolute/path/to/asr-resources \
-  --target resources/asr-stage \
-  --platform macos-aarch64
+make asr-stage-macos \
+  MACOS_ARCH=aarch64 \
+  MACOS_ASR_SOURCE=resources/asr-source-macos-aarch64 \
+  ASR_STAGE=resources/asr-stage
+
+make asr-stage-macos \
+  MACOS_ARCH=x86_64 \
+  MACOS_ASR_SOURCE=resources/asr-source-macos-x86_64 \
+  ASR_STAGE=resources/asr-stage-x86_64
 ```
 
 Windows 平台值为 `windows-x86-64`。工具会验证模型、VAD 和规范化字典的大小与 SHA-256，
@@ -84,17 +92,37 @@ make asr-check-windows
 
 macOS FFmpeg 使用 `scripts/build-asr-ffmpeg-macos.sh` 从官方 `ffmpeg-8.1.2.tar.xz` 构建。
 源码锁定 SHA-256 为
-`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`。构建禁用网络、
-GPL/nonfree 与外部编解码库，只保留常见本地容器、AAC/MP3/Opus/Vorbis/FLAC/AC3/PCM
-解码和 PCM WAV 输出，许可证为 LGPL-2.1-or-later。7 个 FFmpeg dylib 通过 manifest 的
+`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`。构建禁用
+GPL/nonfree 与外部编解码库，只保留直播录制所需的受控 HTTPS 网络协议，以及预览、封面、
+ASR 和剪辑导出所需的容器、编解码器与滤镜，许可证为 LGPL-2.1-or-later。7 个 FFmpeg dylib 通过 manifest 的
 `libraries` 字段进入资源检查，并改写为 `@loader_path`/`@executable_path` 相对依赖；脚本
-在结束前扫描并拒绝任何构建临时绝对路径。
+在结束前扫描并拒绝任何构建临时绝对路径。`MACOS_ARCH=aarch64|x86_64` 会同时选择 Clang
+架构、资源目录和最低 macOS 12.0；Intel 构建需要 NASM。
 
 macOS Whisper 使用 `scripts/build-asr-whisper-macos.sh` 从锁定 SHA-256 的
-`whisper.cpp-v1.9.1.tar.gz` 构建。脚本关闭共享库和网络下载，静态链接 Whisper/GGML、
-启用并内嵌 Metal shader，只允许最终 sidecar 依赖 `/System` 与 `/usr/lib`。构建结束后执行
-ad-hoc 签名、版本检查和 Mach-O 依赖扫描；`asr-bundle verify` 会在发行暂存阶段再次拒绝
-包外动态依赖或绝对 RPATH。
+`whisper.cpp-v1.9.1.tar.gz` 构建。脚本关闭共享库和网络下载并静态链接 Whisper/GGML；arm64
+启用并内嵌 Metal shader，Intel x86_64 使用可移植 CPU 配置。最终 sidecar 只允许依赖
+`/System` 与 `/usr/lib`。构建结束后执行 ad-hoc 签名、版本检查和 Mach-O 依赖扫描；
+`asr-bundle verify` 会在发行暂存阶段再次拒绝包外动态依赖或绝对 RPATH。
+
+Apple Silicon 构建 Intel Runtime Resource Pack 的完整入口为：
+
+```bash
+rustup target add x86_64-apple-darwin
+brew install cmake nasm
+make macos-build-doctor MACOS_ARCH=x86_64
+make asr-ffmpeg-macos MACOS_ARCH=x86_64
+make asr-whisper-macos MACOS_ARCH=x86_64
+make asr-prepare-macos MACOS_ARCH=x86_64 ASR_SOURCE=resources/asr-source
+make asr-stage-macos MACOS_ARCH=x86_64 \
+  MACOS_ASR_SOURCE=resources/asr-source-macos-x86_64 \
+  ASR_STAGE=resources/asr-stage-x86_64
+make runtime-resource-verify MACOS_ARCH=x86_64 ASR_STAGE=resources/asr-stage-x86_64
+```
+
+组装和安装包审计要求 FFmpeg、FFprobe、Whisper、VAD 与 7 个 dylib 都是目标单切片 Mach-O，
+最低系统版本不高于 macOS 12.0。Rosetta 运行只能作为辅助能力检查；正式 Intel 发行仍要求
+真实 Intel Mac 的 Developer ID、notarization、Gatekeeper、离线启动和完整业务验收证据。
 
 Windows Whisper 使用 `scripts/build-asr-whisper-windows.ps1` 在 Visual Studio 2022 x64
 Developer PowerShell 中构建。脚本显式关闭 `GGML_NATIVE`、AVX、AVX2、FMA、F16C 和 BMI2，

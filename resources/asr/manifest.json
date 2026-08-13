@@ -64,6 +64,29 @@
       "maximumThreads": 4
     },
     {
+      "os": "macos",
+      "arch": "x86_64",
+      "accelerator": "cpu",
+      "sidecar": "bin/macos-x86_64/whisper-cli",
+      "vadSidecar": "bin/macos-x86_64/vad-speech-segments",
+      "ffmpeg": "bin/macos-x86_64/ffmpeg",
+      "ffprobe": "bin/macos-x86_64/ffprobe",
+      "libraries": [
+        "lib/macos-x86_64/libavcodec.62.dylib",
+        "lib/macos-x86_64/libavdevice.62.dylib",
+        "lib/macos-x86_64/libavfilter.11.dylib",
+        "lib/macos-x86_64/libavformat.62.dylib",
+        "lib/macos-x86_64/libavutil.60.dylib",
+        "lib/macos-x86_64/libswresample.6.dylib",
+        "lib/macos-x86_64/libswscale.9.dylib"
+      ],
+      "resourceIntegrity": [],
+      "minimumMemoryBytes": 8589934592,
+      "minimumFreeDiskBytes": 2147483648,
+      "maximumThreads": 4,
+      "minimumCpuFeatures": ["sse4.2"]
+    },
+    {
       "os": "windows",
       "arch": "x86_64",
       "accelerator": "cpu",

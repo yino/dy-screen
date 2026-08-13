@@ -25,7 +25,7 @@ fn macos_ffmpeg_build_is_locked_lgpl_media_capable_and_relocatable() {
         "DECODERS_OUTPUT",
         "MUXERS_OUTPUT",
         "@loader_path",
-        "@executable_path/../../lib/macos-aarch64",
+        "@executable_path/../../lib/$MACOS_RESOURCE_DIR",
         "--enable-(gpl|nonfree)",
         "COPYING.LGPLv2.1",
     ] {
@@ -81,8 +81,9 @@ fn macos_whisper_build_is_locked_static_metal_offline_and_relocatable() {
         "f049fff95a089aa9969deb009cdd4892b3e74916",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DGGML_STATIC=ON",
-        "-DGGML_METAL=ON",
-        "-DGGML_METAL_EMBED_LIBRARY=ON",
+        "-DGGML_METAL=$GGML_METAL",
+        "-DGGML_METAL_EMBED_LIBRARY=$GGML_METAL_EMBED_LIBRARY",
+        "-DGGML_NATIVE=OFF",
         "-DWHISPER_CURL=OFF",
         "BAD_DEPENDENCIES",
         "codesign --verify --strict",
@@ -130,6 +131,9 @@ fn manifest_declares_runtime_libraries_and_complete_license_texts() {
     .unwrap();
     let macos = manifest.platform("macos", "aarch64").unwrap();
     assert_eq!(macos.libraries.len(), 7);
+    let macos_intel = manifest.platform("macos", "x86_64").unwrap();
+    assert_eq!(macos_intel.libraries.len(), 7);
+    assert_eq!(macos_intel.accelerator, "cpu");
     assert_eq!(manifest.license_files.len(), 5);
     for relative in manifest.license_files {
         let path = root.join("resources/asr").join(relative);
@@ -264,6 +268,13 @@ fn macos_release_verifier_requires_developer_id_notarization_offline_asr_and_lau
         "asrExpectedTextPassed",
         "sourceUnchanged",
         "allPassed",
+        "RESOURCE_PLATFORM=macos-x86-64",
+        "RESOURCE_DIR=macos-x86_64",
+        "sysctl.proc_translated",
+        "不能使用 Rosetta",
+        "verify-macos-bundle-architecture.sh",
+        "bundleArchitectureValid",
+        "\\\"architecture\\\": \\\"$HARDWARE_ARCH\\\"",
     ] {
         assert!(
             script.contains(required),
