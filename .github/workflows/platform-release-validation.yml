@@ -1,0 +1,252 @@
+name: 原生平台发行能力验收
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 要执行的原生目标平台
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - macos-intel
+          - windows-x64
+  push:
+    branches:
+      - codex/platform-release-validation
+    paths:
+      - ".github/workflows/platform-release-validation.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
+      - "resources/asr/**"
+      - "scripts/build-asr-*"
+      - "scripts/prepare-asr-*"
+      - "scripts/verify-*-release-*"
+      - "scripts/verify-clip-ffmpeg-capabilities.*"
+      - "scripts/verify-macos-bundle-architecture.sh"
+      - "src/**"
+      - "src-tauri/**"
+      - "tests/**"
+      - "ui/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-release-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FFMPEG_URL: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+  FFMPEG_SHA256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+  WHISPER_URL: https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/f049fff95a089aa9969deb009cdd4892b3e74916
+  WHISPER_SHA256: 279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3
+  ASR_MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
+  ASR_MODEL_SHA256: ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb
+  VAD_MODEL_URL: https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin
+  VAD_MODEL_SHA256: 2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987
+  VC_REDIST_URL: https://download.visualstudio.microsoft.com/download/pr/9d270333-8b7b-4f96-9458-6fcdb2ec0b25/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe
+  VC_REDIST_SHA256: cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b
+
+jobs:
+  macos-intel:
+    if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'macos-intel' }}
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装原生构建工具
+        run: brew install jq nasm ripgrep cmake
+      - name: 获取并校验锁定发行输入
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_root="$RUNNER_TEMP/dy-screen-input"
+          common_root="$input_root/common"
+          mkdir -p "$common_root/models" "$input_root/sources"
+          cp -R resources/asr/. "$common_root/"
+          download() {
+            local url=$1 output=$2 expected=$3
+            curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$output" "$url"
+            printf '%s  %s\n' "$expected" "$output" | shasum -a 256 -c -
+          }
+          download "$FFMPEG_URL" "$input_root/sources/ffmpeg-8.1.2.tar.xz" "$FFMPEG_SHA256"
+          download "$WHISPER_URL" "$input_root/sources/whisper.cpp-v1.9.1.tar.gz" "$WHISPER_SHA256"
+          download "$ASR_MODEL_URL" "$common_root/models/ggml-small-q5_1.bin" "$ASR_MODEL_SHA256"
+          download "$VAD_MODEL_URL" "$common_root/models/ggml-silero-v6.2.0.bin" "$VAD_MODEL_SHA256"
+      - name: 构建 macOS Intel 随包资源
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+          input_root="$RUNNER_TEMP/dy-screen-input"
+          build_root="$RUNNER_TEMP/dy-screen-build"
+          source_root="$RUNNER_TEMP/dy-screen-source-macos-x86_64"
+          stage_root="$RUNNER_TEMP/dy-screen-stage-macos-x86_64"
+          ./scripts/build-asr-ffmpeg-macos.sh \
+            "$input_root/sources/ffmpeg-8.1.2.tar.xz" "$build_root/ffmpeg" x86_64
+          ./scripts/build-asr-whisper-macos.sh \
+            "$input_root/sources/whisper.cpp-v1.9.1.tar.gz" "$build_root/whisper" x86_64
+          ./scripts/prepare-asr-resources-macos.sh \
+            "$input_root/common" "$build_root/ffmpeg" "$build_root/whisper" \
+            "$source_root" x86_64 2026.07.4
+          cargo run --locked --bin asr-bundle -- stage \
+            --source "$source_root" --target "$stage_root" \
+            --platform macos-x86-64 --channel development
+      - name: 构建含资源的 Intel 应用候选
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          stage_root="$RUNNER_TEMP/dy-screen-stage-macos-x86_64"
+          config="$RUNNER_TEMP/tauri.macos.resources.x86_64.json"
+          ./scripts/generate-tauri-macos-resource-config.sh "$stage_root" "$config"
+          DY_SCREEN_API_BASE_URL='https://api.invalid/' \
+          DY_SCREEN_RESOURCE_BASE_URL='https://resources.invalid/development/0.3.0/macos/x86_64/2026.07.4/' \
+            npm run tauri:build -- --ci \
+              --config src-tauri/tauri.macos.conf.json \
+              --config "$config" \
+              --target x86_64-apple-darwin \
+              --bundles app
+      - name: 执行 macOS Intel 原生资源与媒体验收
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/platform-validation
+          ./scripts/verify-platform-release-macos.sh \
+            'src-tauri/target/x86_64-apple-darwin/release/bundle/macos/切片智能体.app' \
+            'dist/platform-validation/macos-intel.json'
+          jq -e '.nativeHost == true and .allPassed == true and (.steps | length) == 7' \
+            dist/platform-validation/macos-intel.json
+      - name: 上传 macOS Intel 候选和证据
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-release-macos-intel-${{ github.run_id }}
+          path: |
+            dist/platform-validation/
+            src-tauri/target/x86_64-apple-darwin/release/bundle/macos/切片智能体.app/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  windows-x64:
+    if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'windows-x64' }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装 MSYS2 UCRT64 构建工具
+        shell: powershell
+        run: |
+          & C:\msys64\usr\bin\bash.exe -lc `
+            "pacman -Sy --noconfirm --needed make diffutils pkgconf nasm mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-zlib"
+          if ($LASTEXITCODE -ne 0) { throw "MSYS2 UCRT64 工具安装失败。" }
+      - name: 获取并校验锁定发行输入
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $inputRoot = Join-Path $env:RUNNER_TEMP "dy-screen-input"
+          $commonRoot = Join-Path $inputRoot "common"
+          New-Item -ItemType Directory -Force -Path (Join-Path $commonRoot "models"), (Join-Path $inputRoot "sources") | Out-Null
+          Copy-Item -Path "resources\asr\*" -Destination $commonRoot -Recurse -Force
+          function Download-Verified([string]$Url, [string]$Output, [string]$Expected) {
+            & curl.exe --fail --location --retry 3 --proto "=https" --tlsv1.2 --output $Output $Url
+            if ($LASTEXITCODE -ne 0) { throw "发行输入下载失败。" }
+            $actual = (Get-FileHash -LiteralPath $Output -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $Expected) { throw "发行输入 SHA-256 不匹配：$Output" }
+          }
+          Download-Verified $env:FFMPEG_URL (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") $env:FFMPEG_SHA256
+          Download-Verified $env:WHISPER_URL (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") $env:WHISPER_SHA256
+          Download-Verified $env:ASR_MODEL_URL (Join-Path $commonRoot "models\ggml-small-q5_1.bin") $env:ASR_MODEL_SHA256
+          Download-Verified $env:VAD_MODEL_URL (Join-Path $commonRoot "models\ggml-silero-v6.2.0.bin") $env:VAD_MODEL_SHA256
+          Download-Verified $env:VC_REDIST_URL (Join-Path $inputRoot "vc_redist.x64.exe") $env:VC_REDIST_SHA256
+      - name: 构建 Windows x64 随包资源
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { throw "根 crate 依赖获取失败。" }
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "Tauri crate 依赖获取失败。" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsRoot)) { throw "找不到 Visual Studio x64 C++ 工具。" }
+          Import-Module (Join-Path $vsRoot "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          $inputRoot = Join-Path $env:RUNNER_TEMP "dy-screen-input"
+          $buildRoot = Join-Path $env:RUNNER_TEMP "dy-screen-build"
+          $sourceRoot = Join-Path $env:RUNNER_TEMP "dy-screen-source-windows-x64"
+          & .\scripts\build-asr-ffmpeg-windows.ps1 `
+            -SourceArchive (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") `
+            -OutputRoot (Join-Path $buildRoot "ffmpeg")
+          & .\scripts\build-asr-whisper-windows.ps1 `
+            -SourceArchive (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") `
+            -OutputRoot (Join-Path $buildRoot "whisper")
+          & .\scripts\prepare-asr-resources-windows.ps1 `
+            -CommonSource (Join-Path $inputRoot "common") `
+            -FfmpegRoot (Join-Path $buildRoot "ffmpeg") `
+            -WhisperRoot (Join-Path $buildRoot "whisper") `
+            -VcRedist (Join-Path $inputRoot "vc_redist.x64.exe") `
+            -VcLicense "resources\asr\licenses\Microsoft-VCRedist.txt" `
+            -OutputRoot $sourceRoot `
+            -BundleVersion "2026.07.4"
+          cargo run --locked --bin asr-bundle -- stage `
+            --source $sourceRoot --target "resources\asr-stage" `
+            --platform windows-x86-64 --channel development
+          if ($LASTEXITCODE -ne 0) { throw "Windows x64 随包资源 staging 失败。" }
+      - name: 构建含资源的 Windows NSIS 候选
+        shell: powershell
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw "npm ci 失败。" }
+          & .\scripts\build-windows-installer.ps1 `
+            -RepoRoot $env:GITHUB_WORKSPACE `
+            -Mode Development `
+            -ResourceBaseUrl "https://resources.invalid/development/0.3.0/windows/x86_64/2026.07.4/"
+      - name: 执行 Windows x64 原生安装、资源与媒体验收
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem -LiteralPath "src-tauri\target\release\bundle\nsis" `
+            -Filter "*.exe" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if ($null -eq $installer) { throw "没有找到 NSIS 候选。" }
+          New-Item -ItemType Directory -Force -Path "dist\platform-validation" | Out-Null
+          & .\scripts\verify-platform-release-windows.ps1 `
+            -Installer $installer.FullName `
+            -InstallDirectory "C:\dy-screen-platform-validation" `
+            -Output "dist\platform-validation\windows-x64.json" `
+            -RepoRoot $env:GITHUB_WORKSPACE
+          $report = Get-Content -LiteralPath "dist\platform-validation\windows-x64.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+          if (-not $report.nativeHost -or -not $report.allPassed -or @($report.steps).Count -ne 8) {
+            throw "Windows x64 平台发行证据不完整。"
+          }
+      - name: 上传 Windows x64 候选和证据
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-release-windows-x64-${{ github.run_id }}
+          path: |
+            dist/platform-validation/
+            dist/windows/
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

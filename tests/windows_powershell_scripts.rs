@@ -31,6 +31,7 @@ if ($errors.Count -gt 0) {
         "scripts/build-windows-installer.ps1",
         "scripts/collect-asr-performance-windows.ps1",
         "scripts/test-asr-windows-target.ps1",
+        "scripts/verify-platform-release-windows.ps1",
         "scripts/verify-asr-release-windows.ps1",
     ] {
         let output = Command::new("powershell.exe")

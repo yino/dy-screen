@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "generator": "FFmpeg 8.1.2 with libx264/libx265 and synthetic lavfi inputs",
+  "fixtures": [
+    {
+      "path": "bridge-h264-aac.mp4",
+      "sha256": "da9d8886e50d6bf1f425f8cf186da3e9177a31996c62805fb2363ff62ec798e5",
+      "videoCodec": "h264",
+      "audioCodec": "aac",
+      "width": 160,
+      "height": 120,
+      "durationMs": 800
+    },
+    {
+      "path": "bridge-hevc-aac.mp4",
+      "sha256": "f4523104ae72ad9c38cfe00bf5ba74c6caf19d055489ad991d4ff3b2a5ca2dd4",
+      "videoCodec": "hevc",
+      "audioCodec": "aac",
+      "width": 160,
+      "height": 120,
+      "durationMs": 800
+    },
+    {
+      "path": "horizontal-h264-aac.mp4",
+      "sha256": "b8d5f23c19e608b439cf88af83a8bfc25a4efb11a088ef80126e9dba8c8d95a1",
+      "videoCodec": "h264",
+      "audioCodec": "aac",
+      "width": 320,
+      "height": 240,
+      "durationMs": 1000
+    },
+    {
+      "path": "vertical-h264-aac.mp4",
+      "sha256": "62ef10fa0aed7e108d9f1a1ee3f388ef7210ea420d77fc94a480bfc55eea8862",
+      "videoCodec": "h264",
+      "audioCodec": "aac",
+      "width": 240,
+      "height": 320,
+      "durationMs": 1000
+    }
+  ]
+}

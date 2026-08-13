@@ -1,0 +1,10 @@
+Microsoft Visual C++ 2015-2022 Redistributable x64
+
+Official download and supported-version information:
+https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
+
+Redistribution is governed by the Microsoft Visual Studio 2022 licensing terms:
+https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/
+
+The release pipeline accepts only an x64 PE installer with a valid Microsoft Corporation
+Authenticode signature and a separately pinned SHA-256 digest.

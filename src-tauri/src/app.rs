@@ -21,11 +21,13 @@ use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome
 use crate::ai::tauri_commands::*;
 use crate::ai::{
     AiClipExportStatus, AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService,
-    AiRepository, ClipExportBridge, ClipExportFailure, ClipOutputDimensions,
-    ClipTextCorrectionSummary, ClipTextCorrectionWorkflow, HighlightWorkflow, LocalAsrRuntime,
-    RigDeepSeekProvider, SourceFingerprint, SystemCredentialStore, build_export_plan,
-    execute_export, probe_output_dimensions, render_clip_subtitle_assets,
-    select_clip_video_encoder, validate_export_sources, validate_export_subtitles,
+    AiRepository, AiSmartWorkflowEvent, AiSmartWorkflowMetric, ClipExportBridge, ClipExportFailure,
+    ClipOutputDimensions, ClipTextCorrectionSummary, ClipTextCorrectionWorkflow, CredentialStore,
+    HighlightWorkflow, LocalAsrRuntime, RigDeepSeekProvider, SmartClippingWorkflow,
+    SmartWorkflowGate, SmartWorkflowPublisher, SmartWorkflowTelemetry, SourceFingerprint,
+    SystemCredentialStore, build_export_plan, execute_export, probe_output_dimensions,
+    render_clip_subtitle_assets, select_clip_video_encoder, validate_export_sources,
+    validate_export_subtitles,
 };
 use crate::api::ApiClient;
 use crate::app_lifecycle::{
@@ -139,6 +141,74 @@ impl RoomResolutionPublisher for DesktopRoomResolutionPublisher {
 
     fn publish_diagnostic(&self, entry: &dy_screen::access::AccessDiagnosticEntry) {
         self.logger.log_access(entry);
+    }
+}
+
+#[derive(Clone)]
+struct DesktopSmartWorkflowGate {
+    activation: ActivationService,
+    repository: AiRepository,
+    credentials: Arc<dyn CredentialStore>,
+}
+
+impl SmartWorkflowGate for DesktopSmartWorkflowGate {
+    fn activation_ready(&self) -> bool {
+        self.activation.is_active()
+    }
+
+    fn provider_ready(&self) -> bool {
+        let key_configured = self
+            .credentials
+            .get()
+            .ok()
+            .flatten()
+            .is_some_and(|value| !value.trim().is_empty());
+        key_configured
+            && self
+                .repository
+                .get_llm_provider_settings(true)
+                .is_ok_and(|settings| settings.validate().is_ok())
+    }
+}
+
+#[derive(Clone)]
+struct DesktopSmartWorkflowPublisher {
+    app: AppHandle,
+}
+
+impl SmartWorkflowPublisher for DesktopSmartWorkflowPublisher {
+    fn publish(&self, event: &AiSmartWorkflowEvent) {
+        let _ = self.app.emit("ai-smart-workflow-event", event);
+    }
+}
+
+#[derive(Clone)]
+struct DesktopSmartWorkflowTelemetry {
+    telemetry: TelemetryQueue,
+}
+
+impl SmartWorkflowTelemetry for DesktopSmartWorkflowTelemetry {
+    fn record(&self, metric: &AiSmartWorkflowMetric) {
+        let duration = metric
+            .duration_bucket
+            .as_deref()
+            .or(metric.first_draft_latency_bucket.as_deref())
+            .unwrap_or("none");
+        self.telemetry.track(
+            "feature_use",
+            serde_json::json!({
+                "feature": "smart_clipping",
+                "action": metric.stage,
+                "result": metric.terminal_state,
+                "duration": duration,
+                "platform": metric.platform,
+                "count": metric.batch_count.saturating_add(metric.candidate_count),
+                "source": metric.mode,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
     }
 }
 
@@ -1821,6 +1891,15 @@ pub fn run() {
             ai_set_project_context,
             ai_delete_project,
             ai_pick_local_videos,
+            ai_create_local_smart_workflow,
+            ai_list_active_live_sessions,
+            ai_create_live_smart_workflow,
+            ai_authorize_smart_workflow,
+            ai_list_smart_workflows,
+            ai_get_smart_workflow,
+            ai_cancel_smart_workflow,
+            ai_retry_smart_workflow_stage,
+            ai_open_smart_draft,
             ai_import_local_grants,
             ai_list_completed_sessions,
             ai_list_replay_streamers,
@@ -1947,11 +2026,11 @@ pub fn run() {
                 credential_store.clone(),
             ));
             let ai_commands = AiCommandService::new(
-                ai_project_service,
+                ai_project_service.clone(),
                 crate::ai::AiRepository::new(database.clone()),
                 ai_components.runtime.clone(),
             )
-            .with_highlight_workflow(highlight_workflow)
+            .with_highlight_workflow(highlight_workflow.clone())
             .with_credential_store(credential_store.clone());
             app.manage(AiDesktopState::new(ai_commands));
             let clip_workflow_publisher: Arc<dyn ClipWorkflowPublisher> =
@@ -1969,9 +2048,35 @@ pub fn run() {
             let clip_text_correction = ClipTextCorrectionWorkflow::new(
                 AiRepository::new(database.clone()),
                 Arc::new(RigDeepSeekProvider),
-                credential_store,
+                credential_store.clone(),
             )
             .with_publisher(clip_workflow_publisher);
+            let smart_clipping = SmartClippingWorkflow::new(
+                database.clone(),
+                ai_project_service,
+                ai_components.runtime.clone(),
+                highlight_workflow,
+                clip_text_correction.clone(),
+                transition_matching.clone(),
+                Arc::new(DesktopSmartWorkflowGate {
+                    activation: activation.clone(),
+                    repository: AiRepository::new(database.clone()),
+                    credentials: credential_store,
+                }),
+            )
+            .with_publisher(Arc::new(DesktopSmartWorkflowPublisher {
+                app: app.handle().clone(),
+            }))
+            .with_telemetry(Arc::new(DesktopSmartWorkflowTelemetry {
+                telemetry: telemetry.clone(),
+            }));
+            let smart_recovery = smart_clipping.clone();
+            let smart_finalized_video = smart_clipping.clone();
+            let smart_finalized_session = smart_clipping.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = smart_recovery.recover_and_resume().await;
+            });
+            app.manage(SmartClippingDesktopState::new(smart_clipping));
 
             let tray_status_item = MenuItemBuilder::with_id("recording_status", "正在录制：0 路")
                 .enabled(false)
@@ -2014,6 +2119,22 @@ pub fn run() {
                 monitor_logger,
             )
             .map_err(std::io::Error::other)?;
+            supervisor.set_finalized_video_handler(Arc::new(move |video_id| {
+                let workflow = smart_finalized_video.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = workflow.ingest_finalized_video(video_id).await {
+                        eprintln!("智能成片接收完成分片失败：{}", error.message);
+                    }
+                });
+            }));
+            supervisor.set_finalized_session_handler(Arc::new(move |session_id| {
+                let workflow = smart_finalized_session.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = workflow.finalize_live_session(session_id).await {
+                        eprintln!("智能成片收敛直播场次失败：{}", error.message);
+                    }
+                });
+            }));
             supervisor.set_runtime_resources(app.state::<RuntimeResourceState>().inner().clone());
             let preview_cache_dir = app_cache_dir.join("video-preview");
             std::fs::create_dir_all(&preview_cache_dir)?;

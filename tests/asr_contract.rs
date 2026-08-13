@@ -109,8 +109,13 @@ fn bundled_manifest_is_strict_and_selects_declared_platforms_only() {
         manifest.platform("windows", "x86_64").unwrap().runtime,
         Some("Microsoft Visual C++ 2015-2022 Redistributable x64".to_owned())
     );
+    let macos_intel = manifest
+        .platform("macos", "x86_64")
+        .expect("macOS Intel platform");
+    assert_eq!(macos_intel.accelerator, "cpu");
+    assert_eq!(macos_intel.minimum_cpu_features, vec!["sse4.2"]);
     assert_eq!(
-        manifest.platform("macos", "x86_64").unwrap_err().code,
+        manifest.platform("linux", "x86_64").unwrap_err().code,
         "unsupported_asr_platform"
     );
 

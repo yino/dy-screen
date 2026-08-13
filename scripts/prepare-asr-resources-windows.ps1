@@ -21,6 +21,7 @@ Set-StrictMode -Version Latest
 
 $ExpectedFfmpegSha256 = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
 $ExpectedWhisperSha256 = "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3"
+$ExpectedVcRedistSha256 = "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
 
 function Assert-RegularFile {
     param([string]$Path, [string]$Label)
@@ -88,13 +89,18 @@ Assert-RegularFile -Path $VcRedist -Label "VC++ x64 运行库"
 Assert-RegularFile -Path $VcLicense -Label "VC++ 运行库许可说明"
 if (Test-Path -LiteralPath $OutputRoot) { throw "输出目录已经存在，请使用一个新的目录。" }
 
+$vcSha256 = (Get-FileHash -LiteralPath $VcRedist -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($vcSha256 -ne $ExpectedVcRedistSha256) {
+    throw "VC++ x64 运行库 SHA-256 与锁定版本不一致。"
+}
 $vcSignature = Get-AuthenticodeSignature -LiteralPath $VcRedist
 if ($vcSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
     $null -eq $vcSignature.SignerCertificate -or
     $vcSignature.SignerCertificate.Subject -notmatch "Microsoft Corporation") {
     throw "VC++ x64 运行库没有有效的 Microsoft Authenticode 签名。"
 }
-Assert-X64Pe -Path $VcRedist -Label "VC++ x64 运行库"
+# Microsoft 的 x64 redistributable 使用 x86 bootstrapper 外壳安装 x64 payload，
+# 因此不能用 PE machine 字段判断 payload 架构；文件哈希、签名和版本共同固定该输入。
 $vcVersion = (Get-Item -LiteralPath $VcRedist).VersionInfo.FileVersion
 if ([string]::IsNullOrWhiteSpace($vcVersion)) { throw "无法读取 VC++ x64 运行库版本。" }
 
@@ -220,7 +226,7 @@ try {
         platform = "windows-x86-64"
         bundleVersion = [string]$manifest.bundleVersion
         vcRuntimeVersion = $vcVersion
-        vcRuntimeSha256 = (Get-FileHash -LiteralPath $VcRedist -Algorithm SHA256).Hash.ToLowerInvariant()
+        vcRuntimeSha256 = $vcSha256
         vcRuntimeMicrosoftSignatureValid = $true
         ffmpegSourceSha256 = $ExpectedFfmpegSha256
         whisperSourceSha256 = $ExpectedWhisperSha256

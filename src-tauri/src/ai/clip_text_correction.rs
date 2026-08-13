@@ -69,6 +69,37 @@ impl ClipTextCorrectionWorkflow {
         expected_project_version: u32,
         cancellation: CancellationToken,
     ) -> Result<ClipTextCorrectionSummary> {
+        self.correct_project_with_ownership(
+            clip_project_id,
+            expected_project_version,
+            cancellation,
+            false,
+        )
+        .await
+    }
+
+    pub async fn correct_smart_project(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+        cancellation: CancellationToken,
+    ) -> Result<ClipTextCorrectionSummary> {
+        self.correct_project_with_ownership(
+            clip_project_id,
+            expected_project_version,
+            cancellation,
+            true,
+        )
+        .await
+    }
+
+    async fn correct_project_with_ownership(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+        cancellation: CancellationToken,
+        automated: bool,
+    ) -> Result<ClipTextCorrectionSummary> {
         self.publish(
             clip_project_id,
             None,
@@ -245,11 +276,20 @@ impl ClipTextCorrectionWorkflow {
             batches.len(),
             "正在校验并保存工程字幕",
         );
-        let (detail, changed) = match self.repository.apply_clip_text_corrections(
-            clip_project_id,
-            plan.project_version,
-            &updates,
-        ) {
+        let applied = if automated {
+            self.repository.apply_automated_clip_text_corrections(
+                clip_project_id,
+                plan.project_version,
+                &updates,
+            )
+        } else {
+            self.repository.apply_clip_text_corrections(
+                clip_project_id,
+                plan.project_version,
+                &updates,
+            )
+        };
+        let (detail, changed) = match applied {
             Ok(result) => result,
             Err(error) => {
                 let wrapped = ClipTextCorrectionError::Repository(error);

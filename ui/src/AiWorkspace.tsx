@@ -14,6 +14,7 @@ import {
   FileJson,
   FileText,
   FolderPlus,
+  FolderOpen,
   GitCompareArrows,
   GripVertical,
   LoaderCircle,
@@ -26,12 +27,14 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Radio,
   Search,
   RotateCcw,
   Scissors,
   SkipBack,
   SkipForward,
   Sparkles,
+  ShieldCheck,
   SunMedium,
   Trash2,
   Video,
@@ -53,6 +56,9 @@ import type {
   AiClipSegment,
   AiInputStatus,
   AiJobEvent,
+  AiActiveLiveSession,
+  AiSmartStage,
+  AiSmartWorkflowDetail,
   AiProject,
   AiProjectDetail,
   AiProjectInput,
@@ -76,6 +82,7 @@ import type {
   TransitionMatchSummary,
 } from "./types";
 import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
+import { recoverSmartWorkflows, type SmartWorkflowSnapshot } from "./smartWorkflowRecovery";
 import { buildTextDiff } from "./textDiff";
 
 const segmentPageSize = 200;
@@ -142,6 +149,28 @@ const highlightRunStatusLabels: Record<AiHighlightRun["status"], string> = {
   ranking: "统一评分",
   completed: "已完成",
   partial: "部分完成",
+  cancelled: "已取消",
+  failed: "失败",
+};
+
+const smartStageLabels: Record<AiSmartStage, string> = {
+  preflight: "输入预检",
+  asr: "ASR 识别",
+  highlight: "高光提取",
+  draft: "合辑草稿",
+  correction: "文本纠错",
+  transition: "转场匹配",
+  review: "等待审阅",
+};
+
+const smartStatusLabels: Record<AiSmartWorkflowDetail["workflow"]["status"], string> = {
+  draft: "待授权",
+  queued: "排队中",
+  running: "处理中",
+  awaiting_selection: "等待选择候选",
+  review_ready: "可审阅",
+  paused: "已暂停",
+  completed: "已完成",
   cancelled: "已取消",
   failed: "失败",
 };
@@ -386,6 +415,283 @@ function HighlightAudit({
       <small className="ai-highlight-audit-footnote">当前版本保存最终结构化候选、评分和理由，不保存 Provider 原始响应正文；API Key、请求头和模型隐藏推理从不记录。</small>
     </div>}
   </details>;
+}
+
+function SmartClippingHome({
+  api,
+  environment,
+  llmSettings,
+  onOpenDraft,
+}: {
+  api: ClientApi;
+  environment: AiEnvironmentDiagnostic | null;
+  llmSettings: LlmProviderSettings | null;
+  onOpenDraft: (detail: AiClipProjectDetail) => void;
+}) {
+  const [mode, setMode] = useState<"local" | "live">("local");
+  const [grants, setGrants] = useState<Array<{ grantId: string; displayName: string }>>([]);
+  const [sessions, setSessions] = useState<AiActiveLiveSession[]>([]);
+  const [sessionId, setSessionId] = useState<number | null>(null);
+  const [authorized, setAuthorized] = useState(false);
+  const [snapshot, setSnapshot] = useState<SmartWorkflowSnapshot>({
+    workflows: [],
+    details: new Map(),
+  });
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let recovery: { dispose(): void } | undefined;
+    void recoverSmartWorkflows(api, (next) => {
+      if (disposed) return;
+      setSnapshot(next);
+      setSelectedWorkflowId((current) => current ?? next.workflows[0]?.id ?? null);
+    })
+      .then((value) => {
+        if (disposed) value.dispose();
+        else recovery = value;
+      })
+      .catch((failure) => !disposed && setError(safeError(failure, "无法恢复智能成片任务")));
+    return () => {
+      disposed = true;
+      recovery?.dispose();
+    };
+  }, [api]);
+
+  useEffect(() => {
+    let disposed = false;
+    if (mode !== "live") return;
+    void api.listActiveLiveSessions()
+      .then((items) => {
+        if (disposed) return;
+        setSessions(items);
+        setSessionId((current) => current ?? items[0]?.sessionId ?? null);
+      })
+      .catch((failure) => !disposed && setError(safeError(failure, "无法读取正在录制的直播间")));
+    return () => {
+      disposed = true;
+    };
+  }, [api, mode]);
+
+  const selectedDetail = selectedWorkflowId === null
+    ? null
+    : snapshot.details.get(selectedWorkflowId) ?? null;
+  const sourceReady = mode === "local" ? grants.length > 0 : sessionId !== null;
+  const gatesReady = Boolean(environment?.ready && llmSettings?.keyConfigured);
+  const canCreate = sourceReady && gatesReady && authorized && !busy;
+  const configuration = {
+    name: mode === "local" ? "本地智能成片" : "直播智能成片",
+    provider: llmSettings?.provider ?? "deepseek",
+    modelId: llmSettings?.modelId ?? "deepseek-chat",
+    textScope: "selected_clip_subtitles" as const,
+    outputPreference: "reviewable_compilation",
+  };
+
+  const refreshWorkflow = async (workflowId: number) => {
+    const detail = await api.getSmartWorkflow(workflowId);
+    setSnapshot((current) => {
+      const details = new Map(current.details);
+      details.set(workflowId, detail);
+      return {
+        details,
+        workflows: Array.from(details.values())
+          .map((item) => item.workflow)
+          .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id - left.id),
+      };
+    });
+  };
+
+  const pickLocal = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setGrants(await api.pickAiLocalVideos());
+      setAuthorized(false);
+    } catch (failure) {
+      setError(safeError(failure, "系统文件选择器不可用"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const create = async () => {
+    if (!canCreate) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const detail = mode === "local"
+        ? await api.createLocalSmartWorkflow({
+            configuration,
+            grantIds: grants.map((grant) => grant.grantId),
+            authorizationConfirmed: true,
+          })
+        : await api.createLiveSmartWorkflow({
+            configuration,
+            sessionId: sessionId!,
+            authorizationConfirmed: true,
+          });
+      setSelectedWorkflowId(detail.workflow.id);
+      setSnapshot((current) => {
+        const details = new Map(current.details);
+        details.set(detail.workflow.id, detail);
+        return {
+          details,
+          workflows: [
+            detail.workflow,
+            ...current.workflows.filter((item) => item.id !== detail.workflow.id),
+          ],
+        };
+      });
+      setGrants([]);
+      setAuthorized(false);
+    } catch (failure) {
+      setError(safeError(failure, "智能成片任务创建失败"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retry = async (detail: AiSmartWorkflowDetail) => {
+    const attempt = [...detail.attempts]
+      .reverse()
+      .find((item) => item.status === "failed" || item.status === "interrupted");
+    if (!attempt) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await api.retrySmartWorkflowStage({
+        workflowId: detail.workflow.id,
+        expectedGeneration: detail.workflow.generation,
+        stage: attempt.stage,
+        batchId: attempt.batchId,
+      });
+      setSnapshot((current) => {
+        const details = new Map(current.details);
+        details.set(updated.workflow.id, updated);
+        return { ...current, details };
+      });
+    } catch (failure) {
+      setError(safeError(failure, "阶段重试失败"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="smart-clipping" aria-labelledby="smart-clipping-title">
+      <header className="smart-clipping-header">
+        <div>
+          <p className="section-kicker">SMART CLIPPING</p>
+          <h2 id="smart-clipping-title">智能成片</h2>
+        </div>
+        <span className="smart-clipping-status"><ShieldCheck size={15} />一次授权仅用于当前任务</span>
+      </header>
+
+      {error && <div className="smart-error" role="alert"><AlertTriangle size={16} /><span>{error}</span><button aria-label="关闭智能成片错误" onClick={() => setError(null)}><X size={14} /></button></div>}
+
+      <div className="smart-create-layout">
+        <div className="smart-create-form">
+          <div className="smart-mode-control" role="group" aria-label="智能成片输入模式">
+            <button className={mode === "local" ? "active" : ""} onClick={() => { setMode("local"); setAuthorized(false); }}><FolderOpen size={16} />本地视频</button>
+            <button className={mode === "live" ? "active" : ""} onClick={() => { setMode("live"); setAuthorized(false); }}><Radio size={16} />直播间</button>
+          </div>
+
+          {mode === "local" ? (
+            <div className="smart-source-picker">
+              <button className="secondary-button" disabled={busy} onClick={() => void pickLocal()}><FolderPlus size={16} />选择视频</button>
+              <div className="smart-source-summary" aria-live="polite">
+                {grants.length === 0 ? <span className="smart-source-empty">尚未选择视频</span> : grants.map((grant, index) => <span key={grant.grantId}><b>{index + 1}</b>{grant.displayName}</span>)}
+              </div>
+            </div>
+          ) : (
+            <div className="smart-live-picker">
+              {sessions.length === 0 ? <div className="smart-empty-inline">当前没有正在录制的受信直播间</div> : sessions.map((session) => (
+                <label key={session.sessionId} className={sessionId === session.sessionId ? "selected" : ""}>
+                  <input type="radio" name="smart-live-session" checked={sessionId === session.sessionId} onChange={() => { setSessionId(session.sessionId); setAuthorized(false); }} />
+                  <Radio size={15} /><span><strong>{session.streamerName}</strong><small>{formatSessionTime(session.startedAt)} 开始录制</small></span>
+                </label>
+              ))}
+            </div>
+          )}
+
+          <div className="smart-authorization">
+            <div className="smart-auth-summary">
+              <span><b>目标</b>多段高光合辑草稿</span>
+              <span><b>Provider</b>{llmSettings?.provider ?? "未配置"} · {llmSettings?.modelId ?? "未配置"}</span>
+              <span><b>发送范围</b>入选片段的规范化字幕与工程字幕副本</span>
+              <span><b>导出</b>必须审阅后由你明确选择目标</span>
+            </div>
+            <label className="smart-auth-confirm"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} />我确认仅为当前{mode === "local" ? "任务" : "直播场次"}授权自动高光、纠错与转场匹配</label>
+            <div className="smart-gates">
+              <span className={environment?.ready ? "ready" : "blocked"}>{environment?.ready ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}ASR 资源</span>
+              <span className={llmSettings?.keyConfigured ? "ready" : "blocked"}>{llmSettings?.keyConfigured ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}Provider</span>
+              <span className={sourceReady ? "ready" : "blocked"}>{sourceReady ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}受信来源</span>
+            </div>
+            <button className="primary-button smart-create-button" disabled={!canCreate} onClick={() => void create()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}创建并启动</button>
+          </div>
+        </div>
+
+        <div className="smart-task-list">
+          <header><h3>智能任务</h3><span>{snapshot.workflows.length}</span></header>
+          {snapshot.workflows.length === 0 ? <div className="smart-empty-inline">创建后的任务会在这里持续更新</div> : snapshot.workflows.map((workflow) => (
+            <button key={workflow.id} className={selectedWorkflowId === workflow.id ? "active" : ""} onClick={() => { setSelectedWorkflowId(workflow.id); void refreshWorkflow(workflow.id); }}>
+              <span className={`smart-task-dot ${workflow.status}`} />
+              <span><strong>{workflow.name}</strong><small>{workflow.mode === "local" ? "本地视频" : "直播间"} · {smartStatusLabels[workflow.status]}</small></span>
+              <span className="smart-task-stage">{smartStageLabels[workflow.stage]}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {selectedDetail && (
+        <div className="smart-detail">
+          <header>
+            <div><h3>{selectedDetail.workflow.name}</h3><p>{selectedDetail.workflow.sourceSummary}</p></div>
+            <span className={`smart-state ${selectedDetail.workflow.status}`}>{smartStatusLabels[selectedDetail.workflow.status]}</span>
+          </header>
+          <div className="smart-stage-strip" aria-label={`当前阶段 ${smartStageLabels[selectedDetail.workflow.stage]}`}>
+            {Object.entries(smartStageLabels).map(([stage, label]) => {
+              const attempt = [...selectedDetail.attempts].reverse().find((item) => item.stage === stage);
+              return <span key={stage} className={`${stage === selectedDetail.workflow.stage ? "current" : ""} ${attempt?.status ?? "pending"}`}><i />{label}<small>{attempt?.status === "running" ? `${attempt.progress}%` : attempt?.status === "completed" ? "完成" : attempt?.status === "failed" ? "失败" : ""}</small></span>;
+            })}
+          </div>
+          <div className="smart-metrics">
+            <span><b>{selectedDetail.batches.length}</b>批次</span>
+            <span><b>{selectedDetail.workflow.pendingBatchCount}</b>积压</span>
+            <span><b>{selectedDetail.workflow.candidateCount}</b>候选</span>
+            <span><b>{selectedDetail.workflow.selectedCount}</b>自动入选</span>
+            <span><b>{selectedDetail.drafts.length}</b>草稿版本</span>
+          </div>
+          {selectedDetail.workflow.lastErrorMessage && <div className="smart-detail-error"><AlertTriangle size={15} /><span><b>{selectedDetail.workflow.lastErrorCode}</b>{selectedDetail.workflow.lastErrorMessage}</span></div>}
+          <div className="smart-drafts">
+            {selectedDetail.drafts.map((draft) => (
+              <div key={draft.id} className="smart-draft-row">
+                <span><strong>草稿 v{draft.generation}</strong><small>{draft.ownership === "automation" ? "自动更新中" : "已转为人工编辑"} · {draft.status === "exporting" || draft.status === "frozen" ? "导出已冻结" : draft.status === "exported" ? "已导出" : draft.status === "review_ready" ? "可审阅" : "准备中"}{selectedDetail.drafts.some((candidate) => candidate.generation > draft.generation) ? " · 存在下一版草稿" : ""}</small></span>
+                <button disabled={busy} onClick={() => {
+                  void api.openSmartDraft(draft.id)
+                    .then(onOpenDraft)
+                    .catch((failure) => setError(safeError(failure, "无法打开智能草稿")));
+                }}><Scissors size={14} />审阅成片</button>
+              </div>
+            ))}
+          </div>
+          <footer>
+            {(selectedDetail.workflow.status === "failed" || selectedDetail.workflow.status === "paused") && <button disabled={busy} onClick={() => void retry(selectedDetail)}><RotateCcw size={14} />重试失败阶段</button>}
+            {!(["completed", "cancelled"] as readonly string[]).includes(selectedDetail.workflow.status) && <button className="danger-quiet" disabled={busy} onClick={() => {
+              void api.cancelSmartWorkflow(
+                selectedDetail.workflow.id,
+                selectedDetail.workflow.generation,
+              )
+                .then((detail) => refreshWorkflow(detail.workflow.id))
+                .catch((failure) => setError(safeError(failure, "无法取消智能任务")));
+            }}><X size={14} />取消任务</button>}
+          </footer>
+        </div>
+      )}
+    </section>
+  );
 }
 
 export function AiWorkspace({
@@ -1353,6 +1659,13 @@ export function AiWorkspace({
   return (
     <div className="page-content ai-page ai-workspace">
       {message && <div className="ai-message" role="status"><span>{message}</span><button aria-label="关闭 AI 提示" onClick={() => setMessage(null)}><X size={15} /></button></div>}
+
+      <SmartClippingHome api={api} environment={environment} llmSettings={llmSettings} onOpenDraft={setClipEditor} />
+
+      <div className="advanced-mode-heading">
+        <div><p className="section-kicker">ADVANCED MODE</p><h2>高级模式</h2></div>
+        <span>手动管理 ASR、高光候选与剪辑工程</span>
+      </div>
 
       <section className={`ai-environment ${environment?.ready ? "ready" : "unavailable"}`}>
         <div className="ai-environment-icon">{environment?.ready ? <CheckCircle2 size={22} /> : <AlertTriangle size={22} />}</div>

@@ -14,12 +14,13 @@ use crate::database::{Database, DatabaseError};
 
 use super::domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
-    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate, AiClipTimelineUnit,
-    AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk,
-    AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
-    AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact, NewAiHighlightChunk,
-    NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile, RecoverySummary,
-    SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
+    AiClipProjectSource, AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate,
+    AiClipTimelineUnit, AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage,
+    AiHighlightChunk, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind,
+    AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
+    AiSmartClipSourceInput, AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AsrArtifact,
+    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
+    RecoverySummary, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
 };
 
 use super::llm::{HighlightCandidateDraft, HighlightCandidateScore, LlmProviderSettings};
@@ -238,11 +239,51 @@ fn mark_clip_project_edited(
     transaction.execute(
         r#"UPDATE ai_clip_projects
            SET version = version + 1,
+               ownership = CASE WHEN smart_workflow_id IS NULL THEN ownership ELSE 'user' END,
                export_status = 'idle', export_progress = 0, output_path = NULL,
                last_error_code = NULL, last_error_message = NULL, updated_at = ?1
            WHERE id = ?2"#,
         params![now, clip_project_id],
     )?;
+    transaction.execute(
+        r#"UPDATE ai_smart_drafts
+           SET ownership = 'user', status = CASE
+                   WHEN status IN ('active', 'review_ready') THEN 'review_ready'
+                   ELSE status END,
+               updated_at = ?1
+           WHERE clip_project_id = ?2 AND ownership = 'automation'"#,
+        params![now, clip_project_id],
+    )?;
+    Ok(())
+}
+
+fn mark_clip_project_automated(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_project_id: i64,
+    now: &str,
+) -> Result<()> {
+    let changed = transaction.execute(
+        r#"UPDATE ai_clip_projects
+           SET version = version + 1, export_status = 'idle', export_progress = 0,
+               output_path = NULL, last_error_code = NULL, last_error_message = NULL,
+               updated_at = ?1
+           WHERE id = ?2 AND smart_workflow_id IS NOT NULL
+             AND ownership = 'automation' AND export_status = 'idle'"#,
+        params![now, clip_project_id],
+    )?;
+    if changed == 0 {
+        return Err(AiRepositoryError::ClipVersionConflict);
+    }
+    let changed = transaction.execute(
+        r#"UPDATE ai_smart_drafts
+           SET automation_project_version = automation_project_version + 1, updated_at = ?1
+           WHERE clip_project_id = ?2 AND ownership = 'automation'
+             AND status IN ('active', 'review_ready')"#,
+        params![now, clip_project_id],
+    )?;
+    if changed == 0 {
+        return Err(AiRepositoryError::ClipVersionConflict);
+    }
     Ok(())
 }
 
@@ -1296,7 +1337,7 @@ impl AiRepository {
         let transaction = connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT id FROM ai_clip_projects WHERE highlight_run_id = ?1",
+                "SELECT id FROM ai_clip_projects WHERE highlight_run_id = ?1 AND smart_workflow_id IS NULL",
                 [run_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -1334,6 +1375,13 @@ impl AiRepository {
             )?;
             let id = transaction.last_insert_rowid();
             transaction.execute(
+                r#"INSERT INTO ai_clip_project_sources(
+                       clip_project_id, highlight_run_id, workflow_batch_id,
+                       source_order, primary_source, created_at
+                   ) VALUES(?1, ?2, NULL, 0, 1, ?3)"#,
+                params![id, run_id, now],
+            )?;
+            transaction.execute(
                 r#"INSERT INTO ai_clip_segments(clip_project_id, candidate_id, input_id, position, title, source_start_ms, source_end_ms, volume_percent, effect, created_at, updated_at)
                    SELECT ?1, c.id, c.input_id,
                           ROW_NUMBER() OVER (ORDER BY i.position, c.start_ms, c.id) - 1,
@@ -1353,6 +1401,704 @@ impl AiRepository {
             .reconcile_boundaries(project_id)
             .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         self.get_clip_project(project_id)
+    }
+
+    pub fn list_clip_project_sources(
+        &self,
+        clip_project_id: i64,
+    ) -> Result<Vec<AiClipProjectSource>> {
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(
+            r#"SELECT clip_project_id, highlight_run_id, workflow_batch_id,
+                      source_order, primary_source
+               FROM ai_clip_project_sources WHERE clip_project_id = ?1
+               ORDER BY source_order, highlight_run_id"#,
+        )?;
+        statement
+            .query_map([clip_project_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let row = row?;
+                Ok(AiClipProjectSource {
+                    clip_project_id: row.0,
+                    highlight_run_id: row.1,
+                    workflow_batch_id: row.2,
+                    source_order: u32::try_from(row.3)
+                        .map_err(|_| AiRepositoryError::Integrity("剪辑来源顺序损坏".to_owned()))?,
+                    primary_source: row.4,
+                })
+            })
+            .collect()
+    }
+
+    pub fn create_smart_clip_project(
+        &self,
+        workflow_id: i64,
+        generation: u32,
+        name: &str,
+        sources: &[AiSmartClipSourceInput],
+        candidate_ids: &[i64],
+    ) -> Result<(AiClipProjectDetail, AiSmartDraft)> {
+        if generation == 0 || sources.is_empty() || candidate_ids.is_empty() {
+            return Err(AiRepositoryError::InvalidState(
+                "智能合辑必须包含来源和入选候选".to_owned(),
+            ));
+        }
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return Err(AiRepositoryError::InvalidState(
+                "智能合辑名称不能为空".to_owned(),
+            ));
+        }
+        let unique_sources = sources
+            .iter()
+            .map(|source| source.highlight_run_id)
+            .collect::<std::collections::HashSet<_>>();
+        let unique_candidates = candidate_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_sources.len() != sources.len() || unique_candidates.len() != candidate_ids.len() {
+            return Err(AiRepositoryError::Integrity(
+                "智能合辑来源或候选不能重复".to_owned(),
+            ));
+        }
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let workflow = transaction
+            .query_row(
+                "SELECT status FROM ai_smart_workflows WHERE id = ?1",
+                [workflow_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("智能成片任务"))?;
+        if matches!(workflow.as_str(), "completed" | "cancelled") {
+            return Err(AiRepositoryError::InvalidState(
+                "已结束智能任务不能创建草稿".to_owned(),
+            ));
+        }
+        if transaction
+            .query_row(
+                "SELECT 1 FROM ai_smart_drafts WHERE workflow_id = ?1 AND generation = ?2",
+                params![workflow_id, generation],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Err(AiRepositoryError::InvalidState(
+                "该智能草稿代次已经存在".to_owned(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            r#"INSERT INTO ai_clip_projects(
+                   highlight_run_id, smart_workflow_id, draft_generation, ownership,
+                   name, export_status, export_progress, version, created_at, updated_at
+               ) VALUES(?1, ?2, ?3, 'automation', ?4, 'idle', 0, 1, ?5, ?5)"#,
+            params![
+                sources[0].highlight_run_id,
+                workflow_id,
+                generation,
+                trimmed_name,
+                now,
+            ],
+        )?;
+        let clip_project_id = transaction.last_insert_rowid();
+        for (source_order, source) in sources.iter().enumerate() {
+            let valid = transaction
+                .query_row(
+                    r#"SELECT 1 FROM ai_smart_workflow_batches
+                       WHERE id = ?1 AND workflow_id = ?2 AND highlight_run_id = ?3
+                         AND status IN ('highlight', 'completed')"#,
+                    params![
+                        source.workflow_batch_id,
+                        workflow_id,
+                        source.highlight_run_id
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !valid {
+                return Err(AiRepositoryError::Integrity(
+                    "剪辑来源不属于当前智能任务的已处理批次".to_owned(),
+                ));
+            }
+            transaction.execute(
+                r#"INSERT INTO ai_clip_project_sources(
+                       clip_project_id, highlight_run_id, workflow_batch_id,
+                       source_order, primary_source, created_at
+                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"#,
+                params![
+                    clip_project_id,
+                    source.highlight_run_id,
+                    source.workflow_batch_id,
+                    i64::try_from(source_order).unwrap_or(i64::MAX),
+                    source_order == 0,
+                    now,
+                ],
+            )?;
+        }
+        let placeholders = std::iter::repeat_n("?", candidate_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut candidate_sql = format!(
+            r#"SELECT c.id, c.input_id, c.title, c.start_ms, c.end_ms, source.source_order
+               FROM ai_highlight_candidates c
+               JOIN ai_clip_project_sources source
+                 ON source.clip_project_id = ? AND source.highlight_run_id = c.run_id
+               WHERE c.id IN ({placeholders}) AND c.selected = 1
+               ORDER BY source.source_order,
+                        (SELECT position FROM ai_project_inputs WHERE id = c.input_id),
+                        c.start_ms, c.id"#
+        );
+        let mut bind_values = Vec::<rusqlite::types::Value>::with_capacity(candidate_ids.len() + 1);
+        bind_values.push(clip_project_id.into());
+        bind_values.extend(candidate_ids.iter().copied().map(Into::into));
+        let candidates = transaction
+            .prepare(&candidate_sql)?
+            .query_map(rusqlite::params_from_iter(bind_values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        candidate_sql.clear();
+        if candidates.len() != candidate_ids.len() {
+            return Err(AiRepositoryError::Integrity(
+                "智能合辑包含未入选或来源集合外候选".to_owned(),
+            ));
+        }
+        for (position, candidate) in candidates.iter().enumerate() {
+            transaction.execute(
+                r#"INSERT INTO ai_clip_segments(
+                       clip_project_id, candidate_id, input_id, position, title,
+                       source_start_ms, source_end_ms, volume_percent, effect,
+                       created_at, updated_at
+                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'none', ?8, ?8)"#,
+                params![
+                    clip_project_id,
+                    candidate.0,
+                    candidate.1,
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                    candidate.2,
+                    candidate.3,
+                    candidate.4,
+                    now,
+                ],
+            )?;
+        }
+        seed_clip_subtitle_snapshots(&transaction, clip_project_id, None)?;
+        transaction.execute(
+            r#"INSERT INTO ai_smart_drafts(
+                   workflow_id, generation, clip_project_id, ownership, status,
+                   automation_project_version, created_at, updated_at
+               ) VALUES(?1, ?2, ?3, 'automation', 'active', 1, ?4, ?4)"#,
+            params![workflow_id, generation, clip_project_id, now],
+        )?;
+        let draft_id = transaction.last_insert_rowid();
+        transaction.execute(
+            r#"UPDATE ai_smart_workflows
+               SET active_draft_generation = ?1, stage = 'draft', status = 'running',
+                   event_sequence = event_sequence + 1, updated_at = ?2
+               WHERE id = ?3"#,
+            params![generation, now, workflow_id],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+        let detail = self.get_clip_project(clip_project_id)?;
+        let draft = self.get_smart_draft(draft_id)?;
+        Ok((detail, draft))
+    }
+
+    pub fn append_smart_clip_candidates(
+        &self,
+        clip_project_id: i64,
+        expected_version: u32,
+        candidate_ids: &[i64],
+    ) -> Result<AiClipProjectDetail> {
+        if candidate_ids.is_empty() {
+            return self.get_clip_project(clip_project_id);
+        }
+        let unique = candidate_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique.len() != candidate_ids.len() {
+            return Err(AiRepositoryError::Integrity(
+                "自动追加候选不能重复".to_owned(),
+            ));
+        }
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let (version, ownership, workflow_id, draft_generation, export_status) = transaction
+            .query_row(
+                r#"SELECT version, ownership, smart_workflow_id, draft_generation, export_status
+                   FROM ai_clip_projects WHERE id = ?1"#,
+                [clip_project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+        if version != i64::from(expected_version)
+            || ownership != "automation"
+            || workflow_id.is_none()
+            || draft_generation.is_none()
+        {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        if export_status != "idle" {
+            return Err(AiRepositoryError::ClipExportInProgress);
+        }
+        let placeholders = std::iter::repeat_n("?", candidate_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"SELECT c.id, c.input_id, c.title, c.start_ms, c.end_ms, source.source_order
+               FROM ai_highlight_candidates c
+               JOIN ai_clip_project_sources source
+                 ON source.clip_project_id = ? AND source.highlight_run_id = c.run_id
+               WHERE c.id IN ({placeholders}) AND c.selected = 1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ai_clip_segments segment
+                     WHERE segment.clip_project_id = ? AND segment.candidate_id = c.id
+                 )
+               ORDER BY source.source_order,
+                        (SELECT position FROM ai_project_inputs WHERE id = c.input_id),
+                        c.start_ms, c.id"#
+        );
+        let mut bind_values = Vec::<rusqlite::types::Value>::with_capacity(candidate_ids.len() + 2);
+        bind_values.push(clip_project_id.into());
+        bind_values.extend(candidate_ids.iter().copied().map(Into::into));
+        bind_values.push(clip_project_id.into());
+        let candidates = transaction
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(bind_values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if candidates.len() != candidate_ids.len() {
+            return Err(AiRepositoryError::Integrity(
+                "自动追加包含重复、未入选或来源集合外候选".to_owned(),
+            ));
+        }
+        let mut position = transaction.query_row(
+            "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
+            [clip_project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for candidate in candidates {
+            transaction.execute(
+                r#"INSERT INTO ai_clip_segments(
+                       clip_project_id, candidate_id, input_id, position, title,
+                       source_start_ms, source_end_ms, volume_percent, effect,
+                       created_at, updated_at
+                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'none', ?8, ?8)"#,
+                params![
+                    clip_project_id,
+                    candidate.0,
+                    candidate.1,
+                    position,
+                    candidate.2,
+                    candidate.3,
+                    candidate.4,
+                    now,
+                ],
+            )?;
+            let segment_id = transaction.last_insert_rowid();
+            seed_clip_subtitle_snapshots(&transaction, clip_project_id, Some(segment_id))?;
+            position += 1;
+        }
+        transaction.execute(
+            r#"UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1
+               WHERE id = ?2 AND version = ?3 AND ownership = 'automation'"#,
+            params![now, clip_project_id, expected_version],
+        )?;
+        transaction.execute(
+            r#"UPDATE ai_smart_drafts
+               SET automation_project_version = automation_project_version + 1, updated_at = ?1
+               WHERE clip_project_id = ?2 AND ownership = 'automation'
+                 AND automation_project_version = ?3"#,
+            params![now, clip_project_id, expected_version],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn append_smart_clip_sources_and_candidates(
+        &self,
+        clip_project_id: i64,
+        expected_version: u32,
+        sources: &[AiSmartClipSourceInput],
+        candidate_ids: &[i64],
+    ) -> Result<AiClipProjectDetail> {
+        if sources.is_empty() || candidate_ids.is_empty() {
+            return Err(AiRepositoryError::InvalidState(
+                "智能草稿增量必须包含来源和候选".to_owned(),
+            ));
+        }
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let (version, ownership, workflow_id, export_status) = transaction
+            .query_row(
+                r#"SELECT version, ownership, smart_workflow_id, export_status
+                   FROM ai_clip_projects WHERE id = ?1"#,
+                [clip_project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("剪辑工程"))?;
+        let workflow_id = workflow_id.ok_or_else(|| {
+            AiRepositoryError::InvalidState("普通工程不能接受智能任务增量".to_owned())
+        })?;
+        if version != i64::from(expected_version) || ownership != "automation" {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        if export_status != "idle" {
+            return Err(AiRepositoryError::ClipExportInProgress);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut source_order = transaction.query_row(
+            r#"SELECT COALESCE(MAX(source_order) + 1, 0)
+               FROM ai_clip_project_sources WHERE clip_project_id = ?1"#,
+            [clip_project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        for source in sources {
+            let valid = transaction
+                .query_row(
+                    r#"SELECT 1 FROM ai_smart_workflow_batches batch
+                       WHERE batch.id = ?1 AND batch.workflow_id = ?2
+                         AND batch.highlight_run_id = ?3
+                         AND (
+                           batch.status IN ('highlight', 'completed')
+                           OR EXISTS (
+                             SELECT 1 FROM ai_clip_project_sources project_source
+                             WHERE project_source.clip_project_id = ?4
+                               AND project_source.workflow_batch_id = batch.id
+                               AND project_source.highlight_run_id = batch.highlight_run_id
+                           )
+                         )"#,
+                    params![
+                        source.workflow_batch_id,
+                        workflow_id,
+                        source.highlight_run_id,
+                        clip_project_id,
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !valid {
+                return Err(AiRepositoryError::Integrity(
+                    "增量来源不属于当前智能任务的稳定批次".to_owned(),
+                ));
+            }
+            let inserted = transaction.execute(
+                r#"INSERT OR IGNORE INTO ai_clip_project_sources(
+                       clip_project_id, highlight_run_id, workflow_batch_id,
+                       source_order, primary_source, created_at
+                   ) VALUES(?1, ?2, ?3, ?4, 0, ?5)"#,
+                params![
+                    clip_project_id,
+                    source.highlight_run_id,
+                    source.workflow_batch_id,
+                    source_order,
+                    now,
+                ],
+            )?;
+            if inserted > 0 {
+                source_order += 1;
+            }
+        }
+        let ordered_source_runs = transaction
+            .prepare(
+                r#"SELECT source.highlight_run_id
+                   FROM ai_clip_project_sources source
+                   JOIN ai_smart_workflow_batches batch ON batch.id = source.workflow_batch_id
+                   WHERE source.clip_project_id = ?1
+                   ORDER BY batch.position, batch.id, source.highlight_run_id"#,
+            )?
+            .query_map([clip_project_id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        transaction.execute(
+            r#"UPDATE ai_clip_project_sources SET source_order = source_order + 1000000000
+               WHERE clip_project_id = ?1"#,
+            [clip_project_id],
+        )?;
+        for (position, highlight_run_id) in ordered_source_runs.into_iter().enumerate() {
+            transaction.execute(
+                r#"UPDATE ai_clip_project_sources SET source_order = ?1
+                   WHERE clip_project_id = ?2 AND highlight_run_id = ?3"#,
+                params![
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                    clip_project_id,
+                    highlight_run_id,
+                ],
+            )?;
+        }
+        let unique_candidates = candidate_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_candidates.len() != candidate_ids.len() {
+            return Err(AiRepositoryError::Integrity(
+                "智能草稿增量候选不能重复".to_owned(),
+            ));
+        }
+        let placeholders = std::iter::repeat_n("?", candidate_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"SELECT c.id, c.input_id, c.title, c.start_ms, c.end_ms
+               FROM ai_highlight_candidates c
+               JOIN ai_clip_project_sources source
+                 ON source.clip_project_id = ? AND source.highlight_run_id = c.run_id
+               WHERE c.id IN ({placeholders}) AND c.selected = 1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ai_clip_segments segment
+                     WHERE segment.clip_project_id = ? AND segment.candidate_id = c.id
+                 )
+               ORDER BY source.source_order,
+                        (SELECT position FROM ai_project_inputs WHERE id = c.input_id),
+                        c.start_ms, c.id"#
+        );
+        let mut bind_values = Vec::<rusqlite::types::Value>::with_capacity(candidate_ids.len() + 2);
+        bind_values.push(clip_project_id.into());
+        bind_values.extend(candidate_ids.iter().copied().map(Into::into));
+        bind_values.push(clip_project_id.into());
+        let candidates = transaction
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(bind_values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let already_present = transaction.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ? AND candidate_id IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(
+                std::iter::once(rusqlite::types::Value::from(clip_project_id))
+                    .chain(candidate_ids.iter().copied().map(Into::into)),
+            ),
+            |row| row.get::<_, i64>(0),
+        )?;
+        if candidates.len() + usize::try_from(already_present).unwrap_or_default()
+            != candidate_ids.len()
+        {
+            return Err(AiRepositoryError::Integrity(
+                "智能草稿增量包含未入选或来源集合外候选".to_owned(),
+            ));
+        }
+        if candidates.is_empty() {
+            transaction.commit()?;
+            drop(connection);
+            return self.get_clip_project(clip_project_id);
+        }
+        let mut position = transaction.query_row(
+            "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
+            [clip_project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        for candidate in candidates {
+            transaction.execute(
+                r#"INSERT INTO ai_clip_segments(
+                       clip_project_id, candidate_id, input_id, position, title,
+                       source_start_ms, source_end_ms, volume_percent, effect,
+                       created_at, updated_at
+                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 100, 'none', ?8, ?8)"#,
+                params![
+                    clip_project_id,
+                    candidate.0,
+                    candidate.1,
+                    position,
+                    candidate.2,
+                    candidate.3,
+                    candidate.4,
+                    now,
+                ],
+            )?;
+            let segment_id = transaction.last_insert_rowid();
+            seed_clip_subtitle_snapshots(&transaction, clip_project_id, Some(segment_id))?;
+            position += 1;
+        }
+        let ordered_segment_ids = transaction
+            .prepare(
+                r#"SELECT segment.id
+                   FROM ai_clip_segments segment
+                   JOIN ai_highlight_candidates candidate ON candidate.id = segment.candidate_id
+                   JOIN ai_clip_project_sources source
+                     ON source.clip_project_id = segment.clip_project_id
+                    AND source.highlight_run_id = candidate.run_id
+                   JOIN ai_project_inputs input ON input.id = segment.input_id
+                   WHERE segment.clip_project_id = ?1
+                   ORDER BY source.source_order, input.position,
+                            segment.source_start_ms, segment.source_end_ms, segment.id"#,
+            )?
+            .query_map([clip_project_id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        transaction.execute(
+            "UPDATE ai_clip_segments SET position = position + 1000000000 WHERE clip_project_id = ?1",
+            [clip_project_id],
+        )?;
+        for (position, segment_id) in ordered_segment_ids.into_iter().enumerate() {
+            transaction.execute(
+                "UPDATE ai_clip_segments SET position = ?1 WHERE id = ?2",
+                params![i64::try_from(position).unwrap_or(i64::MAX), segment_id],
+            )?;
+        }
+        let changed = transaction.execute(
+            r#"UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1
+               WHERE id = ?2 AND version = ?3 AND ownership = 'automation'
+                 AND export_status = 'idle'"#,
+            params![now, clip_project_id, expected_version],
+        )?;
+        let draft_changed = transaction.execute(
+            r#"UPDATE ai_smart_drafts
+               SET automation_project_version = automation_project_version + 1,
+                   status = 'active', updated_at = ?1
+               WHERE clip_project_id = ?2 AND ownership = 'automation'
+                 AND automation_project_version = ?3
+                 AND status IN ('active', 'review_ready')"#,
+            params![now, clip_project_id, expected_version],
+        )?;
+        if changed != 1 || draft_changed != 1 {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        transaction.commit()?;
+        drop(connection);
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+        self.get_clip_project(clip_project_id)
+    }
+
+    pub fn mark_smart_draft_review_ready(
+        &self,
+        clip_project_id: i64,
+        expected_version: u32,
+    ) -> Result<AiSmartDraft> {
+        let now = Utc::now().to_rfc3339();
+        let changed = self.database.connection()?.execute(
+            r#"UPDATE ai_smart_drafts
+               SET status = 'review_ready', first_reviewable_at = COALESCE(first_reviewable_at, ?1),
+                   updated_at = ?1
+               WHERE clip_project_id = ?2 AND automation_project_version = ?3
+                 AND status IN ('active', 'review_ready')"#,
+            params![now, clip_project_id, expected_version],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::ClipVersionConflict);
+        }
+        let draft_id = self.database.connection()?.query_row(
+            "SELECT id FROM ai_smart_drafts WHERE clip_project_id = ?1",
+            [clip_project_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.get_smart_draft(draft_id)
+    }
+
+    pub fn get_smart_draft(&self, draft_id: i64) -> Result<AiSmartDraft> {
+        let row = self
+            .database
+            .connection()?
+            .query_row(
+                r#"SELECT id, workflow_id, generation, clip_project_id, ownership,
+                          status, automation_project_version, frozen_project_version,
+                          first_reviewable_at, created_at, updated_at
+                   FROM ai_smart_drafts WHERE id = ?1"#,
+                [draft_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("智能草稿"))?;
+        Ok(AiSmartDraft {
+            id: row.0,
+            workflow_id: row.1,
+            generation: u32::try_from(row.2)
+                .map_err(|_| AiRepositoryError::Integrity("草稿代次损坏".to_owned()))?,
+            clip_project_id: row.3,
+            ownership: AiSmartDraftOwnership::parse(&row.4)
+                .ok_or_else(|| AiRepositoryError::Integrity("草稿所有权损坏".to_owned()))?,
+            status: AiSmartDraftStatus::parse(&row.5)
+                .ok_or_else(|| AiRepositoryError::Integrity("草稿状态损坏".to_owned()))?,
+            automation_project_version: u32::try_from(row.6)
+                .map_err(|_| AiRepositoryError::Integrity("自动草稿工程版本损坏".to_owned()))?,
+            frozen_project_version: row
+                .7
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        AiRepositoryError::Integrity("冻结草稿工程版本损坏".to_owned())
+                    })
+                })
+                .transpose()?,
+            first_reviewable_at: row.8,
+            created_at: row.9,
+            updated_at: row.10,
+        })
     }
 
     pub fn get_clip_project(&self, clip_project_id: i64) -> Result<AiClipProjectDetail> {
@@ -1384,7 +2130,7 @@ impl AiRepository {
         }
         let project = connection
             .query_row(
-                "SELECT id, highlight_run_id, name, export_status, export_progress, output_path, last_error_code, last_error_message, output_width, output_height, version, created_at, updated_at FROM ai_clip_projects WHERE id = ?1",
+                "SELECT id, highlight_run_id, name, export_status, export_progress, output_path, last_error_code, last_error_message, output_width, output_height, version, created_at, updated_at, smart_workflow_id, draft_generation, ownership, export_frozen_version FROM ai_clip_projects WHERE id = ?1",
                 [clip_project_id],
                 map_clip_project,
             )
@@ -1660,6 +2406,38 @@ impl AiRepository {
         expected_project_version: u32,
         updates: &[ClipTextCorrectionUpdate],
     ) -> Result<(AiClipProjectDetail, usize)> {
+        self.apply_clip_text_corrections_with_ownership(
+            clip_project_id,
+            expected_project_version,
+            updates,
+            false,
+        )
+    }
+
+    /// 智能编排器使用的纠错提交路径。它与人工纠错共享同一套逐字幕比较和
+    /// 原子提交规则，但成功时保持自动化所有权，避免后续直播高光被错误地
+    /// 路由到新草稿代次。
+    pub fn apply_automated_clip_text_corrections(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+        updates: &[ClipTextCorrectionUpdate],
+    ) -> Result<(AiClipProjectDetail, usize)> {
+        self.apply_clip_text_corrections_with_ownership(
+            clip_project_id,
+            expected_project_version,
+            updates,
+            true,
+        )
+    }
+
+    fn apply_clip_text_corrections_with_ownership(
+        &self,
+        clip_project_id: i64,
+        expected_project_version: u32,
+        updates: &[ClipTextCorrectionUpdate],
+        automated: bool,
+    ) -> Result<(AiClipProjectDetail, usize)> {
         let normalized = updates
             .iter()
             .map(|update| {
@@ -1707,7 +2485,11 @@ impl AiRepository {
             }
         }
         if changed_items > 0 {
-            mark_clip_project_edited(&transaction, clip_project_id, &now)?;
+            if automated {
+                mark_clip_project_automated(&transaction, clip_project_id, &now)?;
+            } else {
+                mark_clip_project_edited(&transaction, clip_project_id, &now)?;
+            }
         }
         transaction.commit()?;
         drop(connection);
@@ -1853,9 +2635,9 @@ impl AiRepository {
         let candidate = transaction
             .query_row(
                 r#"SELECT c.input_id, c.title, c.start_ms, c.end_ms
-                   FROM ai_clip_projects p
-                   JOIN ai_highlight_candidates c ON c.run_id = p.highlight_run_id
-                   WHERE p.id = ?1 AND c.id = ?2 AND c.selected = 1"#,
+                   FROM ai_clip_project_sources source
+                   JOIN ai_highlight_candidates c ON c.run_id = source.highlight_run_id
+                   WHERE source.clip_project_id = ?1 AND c.id = ?2 AND c.selected = 1"#,
                 params![clip_project_id, candidate_id],
                 |row| {
                     Ok((
@@ -1868,7 +2650,9 @@ impl AiRepository {
             )
             .optional()?
             .ok_or_else(|| {
-                AiRepositoryError::Integrity("只能追加当前高光运行中已进入待切片的视频".to_owned())
+                AiRepositoryError::Integrity(
+                    "只能追加当前工程来源集合中已进入待切片的视频".to_owned(),
+                )
             })?;
         if transaction
             .query_row(
@@ -2011,13 +2795,31 @@ impl AiRepository {
         let (code, message) = error
             .map(|(code, message)| (Some(code), Some(message)))
             .unwrap_or((None, None));
-        let changed = self.database.connection()?.execute(
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
             "UPDATE ai_clip_projects SET export_status = ?1, export_progress = ?2, output_path = ?3, last_error_code = ?4, last_error_message = ?5, updated_at = ?6 WHERE id = ?7",
-            params![status.as_str(), i64::from(progress), output_path, code, message, Utc::now().to_rfc3339(), clip_project_id],
+            params![status.as_str(), i64::from(progress), output_path, code, message, now, clip_project_id],
         )?;
         if changed == 0 {
             return Err(AiRepositoryError::NotFound("剪辑工程"));
         }
+        let draft_status = match status {
+            AiClipExportStatus::Exporting => Some("exporting"),
+            AiClipExportStatus::Completed => Some("exported"),
+            AiClipExportStatus::Cancelled => Some("frozen"),
+            AiClipExportStatus::Failed => Some("failed"),
+            AiClipExportStatus::Idle => None,
+        };
+        if let Some(draft_status) = draft_status {
+            transaction.execute(
+                "UPDATE ai_smart_drafts SET status = ?1, updated_at = ?2 WHERE clip_project_id = ?3",
+                params![draft_status, now, clip_project_id],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
         self.get_clip_project(clip_project_id)
             .map(|detail| detail.project)
     }
@@ -2036,9 +2838,24 @@ impl AiRepository {
         transaction.execute(
             r#"UPDATE ai_clip_projects
                SET export_status = 'exporting', export_progress = 0, output_path = NULL,
-                   last_error_code = NULL, last_error_message = NULL, updated_at = ?1
-               WHERE id = ?2"#,
-            params![Utc::now().to_rfc3339(), clip_project_id],
+                   export_frozen_version = ?1,
+                   last_error_code = NULL, last_error_message = NULL, updated_at = ?2
+               WHERE id = ?3"#,
+            params![
+                expected_project_version,
+                Utc::now().to_rfc3339(),
+                clip_project_id
+            ],
+        )?;
+        transaction.execute(
+            r#"UPDATE ai_smart_drafts
+               SET status = 'exporting', frozen_project_version = ?1, updated_at = ?2
+               WHERE clip_project_id = ?3 AND frozen_project_version IS NULL"#,
+            params![
+                expected_project_version,
+                Utc::now().to_rfc3339(),
+                clip_project_id
+            ],
         )?;
         transaction.commit()?;
         drop(connection);
@@ -2088,7 +2905,9 @@ impl AiRepository {
 
     /// 导出子进程不会跨应用重启恢复；启动时将遗留的运行状态安全降级为可重试状态。
     pub fn recover_interrupted_clip_exports(&self) -> Result<u64> {
-        let changed = self.database.connection()?.execute(
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
             r#"UPDATE ai_clip_projects
                SET export_status = 'cancelled', export_progress = 0, output_path = NULL,
                    last_error_code = 'app_restarted',
@@ -2097,6 +2916,12 @@ impl AiRepository {
                WHERE export_status = 'exporting'"#,
             [Utc::now().to_rfc3339()],
         )?;
+        transaction.execute(
+            r#"UPDATE ai_smart_drafts SET status = 'failed', updated_at = ?1
+               WHERE status = 'exporting'"#,
+            [Utc::now().to_rfc3339()],
+        )?;
+        transaction.commit()?;
         Ok(changed as u64)
     }
 
@@ -3372,6 +4197,283 @@ pub(crate) fn migrate_ai_v21(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v22 为统一智能成片建立父任务/批次/阶段/候选/草稿结构，并将剪辑工程
+/// 从单一高光运行唯一绑定迁移为显式来源集合。
+pub(crate) fn migrate_ai_v22(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 22",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let migration = (|| -> crate::database::Result<()> {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            r#"
+            CREATE TABLE ai_smart_workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+                mode TEXT NOT NULL CHECK(mode IN ('local', 'live')),
+                status TEXT NOT NULL CHECK(status IN (
+                    'draft', 'queued', 'running', 'awaiting_selection', 'review_ready',
+                    'paused', 'completed', 'cancelled', 'failed'
+                )),
+                stage TEXT NOT NULL CHECK(stage IN (
+                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition', 'review'
+                )),
+                generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
+                source_session_id INTEGER REFERENCES recording_sessions(id) ON DELETE RESTRICT,
+                source_summary TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                text_scope TEXT NOT NULL,
+                authorization_digest TEXT,
+                authorized_at TEXT,
+                configuration_fingerprint TEXT NOT NULL,
+                active_draft_generation INTEGER CHECK(active_draft_generation IS NULL OR active_draft_generation > 0),
+                live_cursor_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+                event_sequence INTEGER NOT NULL DEFAULT 0 CHECK(event_sequence >= 0),
+                candidate_count INTEGER NOT NULL DEFAULT 0 CHECK(candidate_count >= 0),
+                selected_count INTEGER NOT NULL DEFAULT 0 CHECK(selected_count >= 0),
+                pending_batch_count INTEGER NOT NULL DEFAULT 0 CHECK(pending_batch_count >= 0),
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK((mode = 'live' AND source_session_id IS NOT NULL) OR (mode = 'local' AND source_session_id IS NULL)),
+                CHECK((authorization_digest IS NULL) = (authorized_at IS NULL))
+            );
+            CREATE INDEX idx_ai_smart_workflows_status_updated
+                ON ai_smart_workflows(status, updated_at DESC, id DESC);
+            CREATE UNIQUE INDEX idx_ai_smart_workflows_active_live_session
+                ON ai_smart_workflows(source_session_id)
+                WHERE mode = 'live' AND status NOT IN ('completed', 'cancelled');
+
+            CREATE TABLE ai_smart_workflow_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER NOT NULL REFERENCES ai_smart_workflows(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL CHECK(position >= 0),
+                video_id INTEGER REFERENCES videos(id) ON DELETE RESTRICT,
+                source_fingerprint TEXT NOT NULL,
+                project_id INTEGER REFERENCES ai_projects(id) ON DELETE RESTRICT,
+                highlight_run_id INTEGER REFERENCES ai_highlight_runs(id) ON DELETE RESTRICT,
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'queued', 'asr', 'highlight', 'completed', 'failed', 'cancelled'
+                )),
+                finalized_at TEXT NOT NULL,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(workflow_id, position),
+                UNIQUE(workflow_id, source_fingerprint),
+                UNIQUE(workflow_id, video_id)
+            );
+            CREATE INDEX idx_ai_smart_batches_workflow_status_position
+                ON ai_smart_workflow_batches(workflow_id, status, position, id);
+
+            CREATE TABLE ai_smart_stage_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER NOT NULL REFERENCES ai_smart_workflows(id) ON DELETE CASCADE,
+                batch_id INTEGER REFERENCES ai_smart_workflow_batches(id) ON DELETE CASCADE,
+                draft_generation INTEGER CHECK(draft_generation IS NULL OR draft_generation > 0),
+                stage TEXT NOT NULL CHECK(stage IN (
+                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition', 'review'
+                )),
+                input_fingerprint TEXT NOT NULL,
+                attempt_generation INTEGER NOT NULL CHECK(attempt_generation > 0),
+                status TEXT NOT NULL CHECK(status IN (
+                    'pending', 'running', 'completed', 'interrupted', 'cancelled', 'failed'
+                )),
+                progress INTEGER NOT NULL DEFAULT 0 CHECK(progress BETWEEN 0 AND 100),
+                result_kind TEXT,
+                result_id INTEGER,
+                duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(workflow_id, batch_id, draft_generation, stage, attempt_generation)
+            );
+            CREATE INDEX idx_ai_smart_attempts_scope_stage_generation
+                ON ai_smart_stage_attempts(workflow_id, batch_id, draft_generation, stage, attempt_generation DESC);
+            CREATE UNIQUE INDEX idx_ai_smart_attempts_completed_fingerprint
+                ON ai_smart_stage_attempts(workflow_id, IFNULL(batch_id, -1), IFNULL(draft_generation, -1), stage, input_fingerprint)
+                WHERE status = 'completed';
+
+            CREATE TABLE ai_smart_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER NOT NULL REFERENCES ai_smart_workflows(id) ON DELETE CASCADE,
+                dedupe_key TEXT NOT NULL,
+                semantic_fingerprint TEXT NOT NULL,
+                canonical_candidate_id INTEGER NOT NULL REFERENCES ai_highlight_candidates(id) ON DELETE RESTRICT,
+                total_score INTEGER NOT NULL CHECK(total_score BETWEEN 0 AND 100),
+                qualified INTEGER NOT NULL DEFAULT 0 CHECK(qualified IN (0, 1)),
+                selected INTEGER NOT NULL DEFAULT 0 CHECK(selected IN (0, 1)),
+                session_start_ms INTEGER NOT NULL CHECK(session_start_ms >= 0),
+                session_end_ms INTEGER NOT NULL CHECK(session_end_ms > session_start_ms),
+                first_finalized_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(workflow_id, dedupe_key)
+            );
+            CREATE INDEX idx_ai_smart_candidates_workflow_score_time
+                ON ai_smart_candidates(workflow_id, qualified, selected, total_score DESC, session_start_ms, id);
+
+            CREATE TABLE ai_smart_candidate_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                smart_candidate_id INTEGER NOT NULL REFERENCES ai_smart_candidates(id) ON DELETE CASCADE,
+                batch_id INTEGER NOT NULL REFERENCES ai_smart_workflow_batches(id) ON DELETE CASCADE,
+                candidate_id INTEGER NOT NULL REFERENCES ai_highlight_candidates(id) ON DELETE RESTRICT,
+                video_id INTEGER REFERENCES videos(id) ON DELETE RESTRICT,
+                input_id INTEGER NOT NULL REFERENCES ai_project_inputs(id) ON DELETE RESTRICT,
+                stable_segment_ids_json TEXT NOT NULL,
+                source_start_ms INTEGER NOT NULL CHECK(source_start_ms >= 0),
+                source_end_ms INTEGER NOT NULL CHECK(source_end_ms > source_start_ms),
+                session_start_ms INTEGER NOT NULL CHECK(session_start_ms >= 0),
+                session_end_ms INTEGER NOT NULL CHECK(session_end_ms > session_start_ms),
+                source_order INTEGER NOT NULL CHECK(source_order >= 0),
+                created_at TEXT NOT NULL,
+                UNIQUE(smart_candidate_id, batch_id, candidate_id, source_order)
+            );
+            CREATE INDEX idx_ai_smart_candidate_sources_candidate_order
+                ON ai_smart_candidate_sources(smart_candidate_id, source_order, id);
+
+            CREATE TABLE ai_smart_drafts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id INTEGER NOT NULL REFERENCES ai_smart_workflows(id) ON DELETE CASCADE,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                clip_project_id INTEGER NOT NULL UNIQUE,
+                ownership TEXT NOT NULL CHECK(ownership IN ('automation', 'user')),
+                status TEXT NOT NULL CHECK(status IN (
+                    'active', 'review_ready', 'exporting', 'frozen', 'exported', 'failed', 'superseded'
+                )),
+                automation_project_version INTEGER NOT NULL CHECK(automation_project_version > 0),
+                frozen_project_version INTEGER CHECK(frozen_project_version IS NULL OR frozen_project_version > 0),
+                first_reviewable_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(workflow_id, generation),
+                FOREIGN KEY(clip_project_id) REFERENCES ai_clip_projects_v22(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE ai_clip_projects_v22 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                highlight_run_id INTEGER NOT NULL REFERENCES ai_highlight_runs(id) ON DELETE CASCADE,
+                smart_workflow_id INTEGER REFERENCES ai_smart_workflows(id) ON DELETE CASCADE,
+                draft_generation INTEGER CHECK(draft_generation IS NULL OR draft_generation > 0),
+                ownership TEXT NOT NULL DEFAULT 'user' CHECK(ownership IN ('automation', 'user')),
+                name TEXT NOT NULL,
+                export_status TEXT NOT NULL DEFAULT 'idle' CHECK(export_status IN ('idle', 'exporting', 'completed', 'cancelled', 'failed')),
+                export_progress INTEGER NOT NULL DEFAULT 0 CHECK(export_progress BETWEEN 0 AND 100),
+                output_path TEXT,
+                last_error_code TEXT,
+                last_error_message TEXT,
+                output_width INTEGER CHECK(output_width IS NULL OR output_width > 0),
+                output_height INTEGER CHECK(output_height IS NULL OR output_height > 0),
+                version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+                export_frozen_version INTEGER CHECK(export_frozen_version IS NULL OR export_frozen_version > 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK((smart_workflow_id IS NULL AND draft_generation IS NULL AND ownership = 'user') OR (smart_workflow_id IS NOT NULL AND draft_generation IS NOT NULL)),
+                CHECK((output_width IS NULL) = (output_height IS NULL))
+            );
+            INSERT INTO ai_clip_projects_v22(
+                id, highlight_run_id, smart_workflow_id, draft_generation, ownership,
+                name, export_status, export_progress, output_path, last_error_code,
+                last_error_message, output_width, output_height, version,
+                export_frozen_version, created_at, updated_at
+            )
+            SELECT id, highlight_run_id, NULL, NULL, 'user', name, export_status,
+                   export_progress, output_path, last_error_code, last_error_message,
+                   output_width, output_height, version, NULL, created_at, updated_at
+            FROM ai_clip_projects;
+
+            CREATE TABLE ai_clip_project_sources (
+                clip_project_id INTEGER NOT NULL REFERENCES ai_clip_projects_v22(id) ON DELETE CASCADE,
+                highlight_run_id INTEGER NOT NULL REFERENCES ai_highlight_runs(id) ON DELETE RESTRICT,
+                workflow_batch_id INTEGER REFERENCES ai_smart_workflow_batches(id) ON DELETE RESTRICT,
+                source_order INTEGER NOT NULL CHECK(source_order >= 0),
+                primary_source INTEGER NOT NULL DEFAULT 0 CHECK(primary_source IN (0, 1)),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(clip_project_id, highlight_run_id),
+                UNIQUE(clip_project_id, source_order)
+            );
+            INSERT INTO ai_clip_project_sources(
+                clip_project_id, highlight_run_id, workflow_batch_id, source_order,
+                primary_source, created_at
+            )
+            SELECT id, highlight_run_id, NULL, 0, 1, created_at
+            FROM ai_clip_projects_v22;
+
+            DROP TABLE ai_clip_projects;
+            ALTER TABLE ai_clip_projects_v22 RENAME TO ai_clip_projects;
+            CREATE UNIQUE INDEX idx_ai_clip_projects_manual_default_run
+                ON ai_clip_projects(highlight_run_id)
+                WHERE smart_workflow_id IS NULL;
+            CREATE UNIQUE INDEX idx_ai_clip_projects_workflow_generation
+                ON ai_clip_projects(smart_workflow_id, draft_generation)
+                WHERE smart_workflow_id IS NOT NULL;
+            CREATE INDEX idx_ai_clip_project_sources_run
+                ON ai_clip_project_sources(highlight_run_id, clip_project_id);
+            CREATE UNIQUE INDEX idx_ai_clip_project_sources_primary
+                ON ai_clip_project_sources(clip_project_id)
+                WHERE primary_source = 1;
+
+            INSERT INTO schema_migrations(version, applied_at) VALUES(22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+            "#,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    let restore_foreign_keys = connection.pragma_update(None, "foreign_keys", "ON");
+    migration?;
+    restore_foreign_keys?;
+    let violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        return Err(DatabaseError::MigrationIntegrity(format!(
+            "AI v22 迁移发现 {violations} 条外键异常"
+        )));
+    }
+    Ok(())
+}
+
+/// v23 固定直播智能任务创建时的视频水位，排除历史分片并允许后续乱序登记。
+pub(crate) fn migrate_ai_v23(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 23",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "ALTER TABLE ai_smart_workflows ADD COLUMN live_start_video_id INTEGER",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(23, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 type ProjectRow = (
     i64,
     String,
@@ -3767,13 +4869,31 @@ fn map_clip_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<AiClipProject> 
                 )),
             )
         })?;
+    let smart_workflow_id = row.get::<_, Option<i64>>(13)?;
+    let draft_generation = optional_positive_u32(row, 14, "无效智能草稿代次")?;
+    let ownership_value = row.get::<_, String>(15)?;
+    let ownership = AiSmartDraftOwnership::parse(&ownership_value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            15,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "无效智能草稿所有权",
+            )),
+        )
+    })?;
+    let export_frozen_version = optional_positive_u32(row, 16, "无效导出冻结版本")?;
     Ok(AiClipProject {
         id: row.get(0)?,
         highlight_run_id: row.get(1)?,
+        smart_workflow_id,
+        draft_generation,
+        ownership,
         name: row.get(2)?,
         output_width,
         output_height,
         version,
+        export_frozen_version,
         export_status: parsed_status,
         export_progress: progress,
         output_path: row.get(5)?,
@@ -4028,4 +5148,148 @@ fn validate_score(score: &HighlightCandidateScore) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod smart_migration_tests {
+    use super::*;
+
+    #[test]
+    fn v22_backfills_existing_clip_project_source_and_is_idempotent() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                CREATE TABLE streamers(id INTEGER PRIMARY KEY);
+                CREATE TABLE recording_sessions(
+                    id INTEGER PRIMARY KEY,
+                    streamer_id INTEGER,
+                    started_at TEXT,
+                    ended_at TEXT,
+                    status TEXT,
+                    output_root TEXT
+                );
+                CREATE TABLE videos(id INTEGER PRIMARY KEY, session_id INTEGER);
+                CREATE TABLE ai_projects(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE ai_project_inputs(
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES ai_projects(id) ON DELETE CASCADE
+                );
+                CREATE TABLE ai_highlight_runs(
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES ai_projects(id) ON DELETE CASCADE
+                );
+                CREATE TABLE ai_highlight_chunks(
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL REFERENCES ai_highlight_runs(id) ON DELETE CASCADE
+                );
+                CREATE TABLE ai_highlight_candidates(
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL REFERENCES ai_highlight_runs(id) ON DELETE CASCADE,
+                    chunk_id INTEGER NOT NULL REFERENCES ai_highlight_chunks(id) ON DELETE CASCADE,
+                    input_id INTEGER NOT NULL REFERENCES ai_project_inputs(id) ON DELETE CASCADE
+                );
+                CREATE TABLE ai_clip_projects (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    highlight_run_id INTEGER NOT NULL UNIQUE REFERENCES ai_highlight_runs(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    export_status TEXT NOT NULL DEFAULT 'idle',
+                    export_progress INTEGER NOT NULL DEFAULT 0,
+                    output_path TEXT,
+                    last_error_code TEXT,
+                    last_error_message TEXT,
+                    output_width INTEGER,
+                    output_height INTEGER,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO ai_projects(id, name) VALUES(1, '历史项目');
+                INSERT INTO ai_project_inputs(id, project_id) VALUES(1, 1);
+                INSERT INTO ai_highlight_runs(id, project_id) VALUES(7, 1);
+                INSERT INTO ai_highlight_chunks(id, run_id) VALUES(8, 7);
+                INSERT INTO ai_highlight_candidates(id, run_id, chunk_id, input_id) VALUES(9, 7, 8, 1);
+                INSERT INTO ai_clip_projects(
+                    id, highlight_run_id, name, export_status, export_progress,
+                    output_width, output_height, version, created_at, updated_at
+                ) VALUES(11, 7, '历史剪辑', 'idle', 0, 1920, 1080, 3, 'before', 'before');
+                "#,
+            )
+            .unwrap();
+
+        migrate_ai_v22(&mut connection).unwrap();
+        migrate_ai_v22(&mut connection).unwrap();
+
+        let clip = connection
+            .query_row(
+                r#"SELECT id, highlight_run_id, smart_workflow_id, draft_generation,
+                          ownership, name, version
+                   FROM ai_clip_projects WHERE id = 11"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            clip,
+            (
+                11,
+                7,
+                None,
+                None,
+                "user".to_owned(),
+                "历史剪辑".to_owned(),
+                3
+            )
+        );
+        let source = connection
+            .query_row(
+                r#"SELECT highlight_run_id, source_order, primary_source
+                   FROM ai_clip_project_sources WHERE clip_project_id = 11"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(source, (7, 0, 1));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 22",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
 }

@@ -990,7 +990,11 @@ impl TransitionMaterialRepository {
                 current.id,
             ],
         )?;
-        mark_project_edited(&transaction, input.clip_project_id, &now)?;
+        if input.selection_source == BoundarySelectionSource::Manual {
+            mark_project_edited(&transaction, input.clip_project_id, &now)?;
+        } else {
+            mark_project_automated(&transaction, input.clip_project_id, &now)?;
+        }
         transaction.commit()?;
         drop(connection);
         self.boundary(current.id)
@@ -1083,7 +1087,7 @@ impl TransitionMaterialRepository {
                     boundary_id,
                 ],
             )?;
-            mark_project_edited(&transaction, current.clip_project_id, &now)?;
+            mark_project_automated(&transaction, current.clip_project_id, &now)?;
         } else {
             transaction.execute(
                 r#"UPDATE ai_clip_transition_boundaries
@@ -1893,9 +1897,41 @@ fn mark_project_edited(
 ) -> Result<()> {
     transaction.execute(
         r#"UPDATE ai_clip_projects
+           SET version = version + 1,
+               ownership = CASE WHEN smart_workflow_id IS NULL THEN ownership ELSE 'user' END,
+               export_status = 'idle', export_progress = 0,
+               output_path = NULL, last_error_code = NULL, last_error_message = NULL,
+               updated_at = ?1 WHERE id = ?2"#,
+        params![now, clip_project_id],
+    )?;
+    transaction.execute(
+        r#"UPDATE ai_smart_drafts
+           SET ownership = 'user', status = CASE
+                   WHEN status IN ('active', 'review_ready') THEN 'review_ready'
+                   ELSE status END,
+               updated_at = ?1
+           WHERE clip_project_id = ?2 AND ownership = 'automation'"#,
+        params![now, clip_project_id],
+    )?;
+    Ok(())
+}
+
+fn mark_project_automated(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_project_id: i64,
+    now: &str,
+) -> Result<()> {
+    transaction.execute(
+        r#"UPDATE ai_clip_projects
            SET version = version + 1, export_status = 'idle', export_progress = 0,
                output_path = NULL, last_error_code = NULL, last_error_message = NULL,
                updated_at = ?1 WHERE id = ?2"#,
+        params![now, clip_project_id],
+    )?;
+    transaction.execute(
+        r#"UPDATE ai_smart_drafts
+           SET automation_project_version = automation_project_version + 1, updated_at = ?1
+           WHERE clip_project_id = ?2 AND ownership = 'automation'"#,
         params![now, clip_project_id],
     )?;
     Ok(())
@@ -2393,7 +2429,9 @@ mod tests {
         let repository = TransitionMaterialRepository::new(database);
 
         let first = repository
-            .begin_match_run(1, 1, "deepseek", "model", "match-v1", "score-v1", 7, 2, "first")
+            .begin_match_run(
+                1, 1, "deepseek", "model", "match-v1", "score-v1", 7, 2, "first",
+            )
             .unwrap();
         repository
             .finish_match_run(
@@ -2412,7 +2450,9 @@ mod tests {
             )
             .unwrap();
         let latest_completed = repository
-            .begin_match_run(1, 2, "deepseek", "model", "match-v1", "score-v1", 8, 2, "second")
+            .begin_match_run(
+                1, 2, "deepseek", "model", "match-v1", "score-v1", 8, 2, "second",
+            )
             .unwrap();
         repository
             .finish_match_run(
@@ -2431,7 +2471,9 @@ mod tests {
             )
             .unwrap();
         let failed = repository
-            .begin_match_run(1, 3, "deepseek", "model", "match-v1", "score-v1", 9, 2, "third")
+            .begin_match_run(
+                1, 3, "deepseek", "model", "match-v1", "score-v1", 9, 2, "third",
+            )
             .unwrap();
         repository
             .finish_match_run(

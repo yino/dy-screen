@@ -7,12 +7,15 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use super::{
-    AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate, AiCommandError,
-    AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic, AiHighlightCandidate,
-    AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun, AiImportBatchView, AiProject,
-    AiProjectDetailView, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage,
-    AiReplayStreamerCursor, AiReplayStreamerPage, AiSessionImportView, AiSessionOption,
-    AiTranscriptProjection, AiTrustedFileGrant, LlmProviderSettings, ProviderDiagnostic,
+    AiActiveLiveSession, AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate,
+    AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
+    AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun,
+    AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiReplaySessionCursor,
+    AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerPage, AiSessionImportView,
+    AiSessionOption, AiSmartWorkflow, AiSmartWorkflowDetail, AiTranscriptProjection,
+    AiTrustedFileGrant, AuthorizeSmartWorkflowInput, CreateLiveSmartWorkflowInput,
+    CreateLocalSmartWorkflowInput, LlmProviderSettings, ProviderDiagnostic,
+    RetrySmartWorkflowStageInput, SmartClippingWorkflow, SmartWorkflowError,
 };
 
 pub struct AiDesktopState {
@@ -22,6 +25,16 @@ pub struct AiDesktopState {
 impl AiDesktopState {
     pub fn new(commands: AiCommandService) -> Self {
         Self { commands }
+    }
+}
+
+pub struct SmartClippingDesktopState {
+    workflow: SmartClippingWorkflow,
+}
+
+impl SmartClippingDesktopState {
+    pub fn new(workflow: SmartClippingWorkflow) -> Self {
+        Self { workflow }
     }
 }
 
@@ -110,6 +123,115 @@ pub(crate) async fn ai_pick_local_videos(
         .filter_map(|path| path.into_path().ok())
         .collect::<Vec<_>>();
     state.commands.register_backend_file_selection(paths)
+}
+
+#[tauri::command]
+pub(crate) async fn ai_create_local_smart_workflow(
+    input: CreateLocalSmartWorkflowInput,
+    ai_state: State<'_, AiDesktopState>,
+    smart_state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    let trusted_files = ai_state
+        .commands
+        .consume_trusted_file_grants(&input.grant_ids)
+        .map_err(|error| SmartWorkflowError::new(&error.code, error.message, error.retryable))?;
+    smart_state
+        .workflow
+        .create_local(
+            input.configuration,
+            trusted_files,
+            input.authorization_confirmed,
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_active_live_sessions(
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<Vec<AiActiveLiveSession>, SmartWorkflowError> {
+    state.workflow.list_active_live_sessions()
+}
+
+#[tauri::command]
+pub(crate) async fn ai_create_live_smart_workflow(
+    input: CreateLiveSmartWorkflowInput,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state
+        .workflow
+        .create_live(
+            input.configuration,
+            input.session_id,
+            input.authorization_confirmed,
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_authorize_smart_workflow(
+    input: AuthorizeSmartWorkflowInput,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state
+        .workflow
+        .authorize_and_resume(
+            input.workflow_id,
+            input.expected_generation,
+            &input.configuration_fingerprint,
+            input.authorization_confirmed,
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_smart_workflows(
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<Vec<AiSmartWorkflow>, SmartWorkflowError> {
+    state.workflow.list()
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_smart_workflow(
+    workflow_id: i64,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state.workflow.get(workflow_id)
+}
+
+#[tauri::command]
+pub(crate) async fn ai_cancel_smart_workflow(
+    workflow_id: i64,
+    expected_generation: u32,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state
+        .workflow
+        .cancel(workflow_id, expected_generation)
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_retry_smart_workflow_stage(
+    input: RetrySmartWorkflowStageInput,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state
+        .workflow
+        .retry_stage(
+            input.workflow_id,
+            input.expected_generation,
+            input.stage,
+            input.batch_id,
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_open_smart_draft(
+    draft_id: i64,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiClipProjectDetail, SmartWorkflowError> {
+    state.workflow.open_draft(draft_id)
 }
 
 #[tauri::command]

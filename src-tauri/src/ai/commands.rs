@@ -308,6 +308,13 @@ impl AiCommandService {
             .map_err(service_error)
     }
 
+    pub fn consume_trusted_file_grants(
+        &self,
+        grant_ids: &[String],
+    ) -> Result<Vec<TrustedLocalFile>, AiCommandError> {
+        self.grants.consume(grant_ids)
+    }
+
     pub fn list_completed_sessions(
         &self,
         limit: usize,

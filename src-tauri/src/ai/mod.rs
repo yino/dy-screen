@@ -16,6 +16,7 @@ mod processor;
 mod projection;
 mod repository;
 mod service;
+mod smart_workflow;
 pub(crate) mod tauri_commands;
 
 pub use clip_export::{
@@ -37,14 +38,21 @@ pub use commands::{
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
-    AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
-    AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleFrame, AiClipSubtitleUpdate,
-    AiClipTimelineUnit, AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage,
-    AiHighlightChunk, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind,
-    AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AsrArtifact,
-    ClipTextCorrectionSummary, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput,
-    NewAsrArtifact, RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
-    TranscriptSegmentDraft,
+    AiActiveLiveSession, AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject,
+    AiClipProjectDetail, AiClipProjectSource, AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle,
+    AiClipSubtitleFrame, AiClipSubtitleUpdate, AiClipTimelineUnit, AiClipTimelineUnitKind,
+    AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk, AiHighlightProgress,
+    AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject,
+    AiProjectDetail, AiProjectInput, AiProjectStatus, AiSmartBatchStatus, AiSmartCandidate,
+    AiSmartCandidateSource, AiSmartClipSourceInput, AiSmartDraft, AiSmartDraftOwnership,
+    AiSmartDraftStatus, AiSmartStage, AiSmartStageAttempt, AiSmartStageAttemptStatus,
+    AiSmartWorkflow, AiSmartWorkflowBatch, AiSmartWorkflowDetail, AiSmartWorkflowEvent,
+    AiSmartWorkflowMetric, AiSmartWorkflowMode, AiSmartWorkflowStatus, AsrArtifact,
+    AuthorizeSmartWorkflowInput, ClipTextCorrectionSummary, CreateLiveSmartWorkflowInput,
+    CreateLocalSmartWorkflowInput, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput,
+    NewAiSmartCandidate, NewAiSmartCandidateSource, NewAiSmartWorkflow, NewAiSmartWorkflowBatch,
+    NewAsrArtifact, RecognitionProfile, RecoverySummary, RetrySmartWorkflowStageInput,
+    SmartWorkflowConfiguration, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
@@ -80,8 +88,13 @@ pub use service::{
     AiSessionOption, ImportBatchResult, ImportRejection, PreflightReport, ServiceError,
     SessionImportResult, TrustedLocalFile,
 };
+pub use smart_workflow::{
+    SilentSmartWorkflowPublisher, SilentSmartWorkflowTelemetry, SmartClippingWorkflow,
+    SmartStageAttemptStart, SmartWorkflowError, SmartWorkflowGate, SmartWorkflowPublisher,
+    SmartWorkflowRepository, SmartWorkflowResult, SmartWorkflowTelemetry,
+};
 
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
-    migrate_ai_v16, migrate_ai_v21,
+    migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23,
 };

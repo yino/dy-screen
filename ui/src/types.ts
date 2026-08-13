@@ -453,6 +453,159 @@ export interface AiJobEvent {
   message: string;
 }
 
+export type AiSmartWorkflowMode = "local" | "live";
+export type AiSmartWorkflowStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "awaiting_selection"
+  | "review_ready"
+  | "paused"
+  | "completed"
+  | "cancelled"
+  | "failed";
+export type AiSmartStage =
+  | "preflight"
+  | "asr"
+  | "highlight"
+  | "draft"
+  | "correction"
+  | "transition"
+  | "review";
+export type AiSmartBatchStatus =
+  | "pending"
+  | "queued"
+  | "asr"
+  | "highlight"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type AiSmartStageAttemptStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "interrupted"
+  | "cancelled"
+  | "failed";
+export type AiSmartDraftOwnership = "automation" | "user";
+export type AiSmartDraftStatus =
+  | "active"
+  | "review_ready"
+  | "exporting"
+  | "frozen"
+  | "exported"
+  | "failed"
+  | "superseded";
+
+export interface SmartWorkflowConfiguration {
+  name: string;
+  provider: string;
+  modelId: string;
+  textScope: "selected_clip_subtitles";
+  outputPreference: string;
+}
+
+export interface AiSmartWorkflow {
+  id: number;
+  name: string;
+  mode: AiSmartWorkflowMode;
+  status: AiSmartWorkflowStatus;
+  stage: AiSmartStage;
+  generation: number;
+  sourceSessionId: number | null;
+  sourceSummary: string;
+  provider: string;
+  modelId: string;
+  textScope: string;
+  authorizationDigest: string | null;
+  authorizedAt: string | null;
+  configurationFingerprint: string;
+  activeDraftGeneration: number | null;
+  liveCursorVideoId: number | null;
+  liveStartVideoId: number | null;
+  eventSequence: number;
+  candidateCount: number;
+  selectedCount: number;
+  pendingBatchCount: number;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiSmartWorkflowBatch {
+  id: number;
+  workflowId: number;
+  position: number;
+  videoId: number | null;
+  sourceFingerprint: string;
+  projectId: number | null;
+  highlightRunId: number | null;
+  status: AiSmartBatchStatus;
+  finalizedAt: string;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiSmartStageAttempt {
+  id: number;
+  workflowId: number;
+  batchId: number | null;
+  draftGeneration: number | null;
+  stage: AiSmartStage;
+  inputFingerprint: string;
+  attemptGeneration: number;
+  status: AiSmartStageAttemptStatus;
+  progress: number;
+  resultKind: string | null;
+  resultId: number | null;
+  durationMs: number | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiSmartDraft {
+  id: number;
+  workflowId: number;
+  generation: number;
+  clipProjectId: number;
+  ownership: AiSmartDraftOwnership;
+  status: AiSmartDraftStatus;
+  automationProjectVersion: number;
+  frozenProjectVersion: number | null;
+  firstReviewableAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiSmartWorkflowDetail {
+  workflow: AiSmartWorkflow;
+  batches: AiSmartWorkflowBatch[];
+  attempts: AiSmartStageAttempt[];
+  drafts: AiSmartDraft[];
+}
+
+export interface AiSmartWorkflowEvent {
+  workflowId: number;
+  workflowGeneration: number;
+  batchId: number | null;
+  stage: AiSmartStage;
+  sequence: number;
+  status: AiSmartWorkflowStatus;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export interface AiActiveLiveSession {
+  sessionId: number;
+  streamerName: string;
+  startedAt: string;
+}
+
 export interface LlmProviderSettings {
   provider: "deepseek";
   modelId: string;
@@ -862,6 +1015,33 @@ export interface ClientApi {
   setAiProjectContext?(projectId: number, tags: string[], analysisGoal: string | null): Promise<AiProject>;
   deleteAiProject(projectId: number): Promise<void>;
   pickAiLocalVideos(): Promise<AiTrustedFileGrant[]>;
+  createLocalSmartWorkflow(input: {
+    configuration: SmartWorkflowConfiguration;
+    grantIds: string[];
+    authorizationConfirmed: boolean;
+  }): Promise<AiSmartWorkflowDetail>;
+  listActiveLiveSessions(): Promise<AiActiveLiveSession[]>;
+  createLiveSmartWorkflow(input: {
+    configuration: SmartWorkflowConfiguration;
+    sessionId: number;
+    authorizationConfirmed: boolean;
+  }): Promise<AiSmartWorkflowDetail>;
+  authorizeSmartWorkflow(input: {
+    workflowId: number;
+    expectedGeneration: number;
+    configurationFingerprint: string;
+    authorizationConfirmed: boolean;
+  }): Promise<AiSmartWorkflowDetail>;
+  listSmartWorkflows(): Promise<AiSmartWorkflow[]>;
+  getSmartWorkflow(workflowId: number): Promise<AiSmartWorkflowDetail>;
+  cancelSmartWorkflow(workflowId: number, expectedGeneration: number): Promise<AiSmartWorkflowDetail>;
+  retrySmartWorkflowStage(input: {
+    workflowId: number;
+    expectedGeneration: number;
+    stage: AiSmartStage;
+    batchId: number | null;
+  }): Promise<AiSmartWorkflowDetail>;
+  openSmartDraft(draftId: number): Promise<AiClipProjectDetail>;
   importAiLocalGrants(projectId: number, grantIds: string[]): Promise<AiImportBatch>;
   listAiCompletedSessions(limit?: number): Promise<AiSessionOption[]>;
   listAiReplayStreamers(search?: string, cursor?: AiReplayStreamerCursor | null, limit?: number): Promise<AiReplayStreamerPage>;
@@ -927,6 +1107,7 @@ export interface ClientApi {
   subscribePreview(listener: (snapshot: PreviewSnapshot) => void): Promise<() => void>;
   subscribeThumbnail(listener: (event: ThumbnailEvent) => void): Promise<() => void>;
   subscribeAi(listener: (event: AiJobEvent) => void): Promise<() => void>;
+  subscribeSmartWorkflows(listener: (event: AiSmartWorkflowEvent) => void): Promise<() => void>;
   subscribeActivation(listener: (state: ActivationState) => void): Promise<() => void>;
 }
 

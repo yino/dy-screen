@@ -416,9 +416,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{AiClipEffect, AiClipSegment, ClipExportBridge};
-    #[cfg(unix)]
-    use crate::ai::{AiClipSubtitle, build_clip_subtitle_frames, render_clip_subtitle_assets};
+    use crate::ai::{
+        AiClipEffect, AiClipSegment, AiClipSubtitle, ClipExportBridge, build_clip_subtitle_frames,
+        render_clip_subtitle_assets,
+    };
 
     fn source(effect: AiClipEffect) -> ClipExportSource {
         ClipExportSource {
@@ -578,109 +579,45 @@ mod tests {
         assert!(!temporary_output.exists());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn exports_mixed_source_dimensions_to_a_playable_mp4() {
         use std::fs::File;
         use std::io::BufReader as StdBufReader;
         use std::process::Command as ProcessCommand;
 
-        let fixture_ffmpeg = std::env::var_os("DY_SCREEN_FIXTURE_FFMPEG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        let fixture_ffmpeg = std::env::var_os("DY_SCREEN_FIXTURE_FFMPEG").map(PathBuf::from);
         let runtime_ffmpeg = std::env::var_os("DY_SCREEN_CLIP_FFMPEG")
             .map(PathBuf::from)
-            .unwrap_or_else(|| fixture_ffmpeg.clone());
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
         let runtime_ffprobe = std::env::var_os("DY_SCREEN_CLIP_FFPROBE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("ffprobe"));
-        if ProcessCommand::new(&fixture_ffmpeg)
+        let runtime_available = ProcessCommand::new(&runtime_ffmpeg)
             .arg("-version")
             .output()
-            .is_err()
-            || ProcessCommand::new(&runtime_ffmpeg)
+            .is_ok()
+            && ProcessCommand::new(&runtime_ffprobe)
                 .arg("-version")
                 .output()
-                .is_err()
-            || ProcessCommand::new(&runtime_ffprobe)
-                .arg("-version")
-                .output()
-                .is_err()
-        {
+                .is_ok();
+        if !runtime_available {
+            assert_ne!(
+                std::env::var("DY_SCREEN_REQUIRE_CLIP_PLATFORM_VALIDATION").as_deref(),
+                Ok("1"),
+                "发行验收要求包内 FFmpeg/FFprobe 可执行，不能跳过真实导出测试"
+            );
             return;
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let horizontal = directory.path().join("horizontal.mp4");
-        let vertical = directory.path().join("vertical.mp4");
-        let hevc_bridge = directory.path().join("bridge-hevc.mp4");
-        for (path, color, size) in [
-            (&horizontal, "red", "320x240"),
-            (&vertical, "blue", "240x320"),
-        ] {
-            let status = ProcessCommand::new(&fixture_ffmpeg)
-                .args([
-                    "-y",
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &format!("color=c={color}:s={size}:d=1"),
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:duration=1",
-                    "-shortest",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "aac",
-                ])
-                .arg(path)
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-        let available_fixture_encoders = ProcessCommand::new(&fixture_ffmpeg)
-            .args(["-hide_banner", "-encoders"])
-            .output()
-            .unwrap();
-        if !String::from_utf8_lossy(&available_fixture_encoders.stdout)
-            .lines()
-            .any(|line| line.split_whitespace().nth(1) == Some("libx265"))
-        {
-            return;
-        }
-        let status = ProcessCommand::new(&fixture_ffmpeg)
-            .args([
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=blue:s=320x240:r=24:d=0.8",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=880:sample_rate=48000:duration=0.8",
-                "-shortest",
-                "-c:v",
-                "libx265",
-                "-tag:v",
-                "hvc1",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-            ])
-            .arg(&hevc_bridge)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/clip-platform");
+        let horizontal = fixture_root.join("horizontal-h264-aac.mp4");
+        let vertical = fixture_root.join("vertical-h264-aac.mp4");
+        let hevc_bridge = fixture_root.join("bridge-hevc-aac.mp4");
+        assert!(horizontal.is_file());
+        assert!(vertical.is_file());
+        assert!(hevc_bridge.is_file());
 
         let mut first = source(AiClipEffect::None);
         first.source_path = horizontal.to_string_lossy().into_owned();
@@ -875,43 +812,46 @@ mod tests {
             .unwrap();
         assert!((2.30..=2.55).contains(&duration));
 
-        let frame = directory.path().join("subtitle-frame.png");
-        let status = ProcessCommand::new(&fixture_ffmpeg)
-            .args(["-y", "-v", "error", "-ss", "0.4", "-i"])
-            .arg(&exported)
-            .args(["-frames:v", "1"])
-            .arg(&frame)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let decoder = png::Decoder::new(StdBufReader::new(File::open(frame).unwrap()));
-        let mut reader = decoder.read_info().unwrap();
-        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
-        let info = reader.next_frame(&mut pixels).unwrap();
-        let channels = match info.color_type {
-            png::ColorType::Rgb => 3,
-            png::ColorType::Rgba => 4,
-            color_type => panic!("字幕帧颜色类型不受支持：{color_type:?}"),
-        };
-        let mut dark_subtitle_pixels = 0;
-        let mut bright_subtitle_pixels = 0;
-        for y in 160..info.height as usize {
-            for x in 0..info.width as usize {
-                let offset = (y * info.width as usize + x) * channels;
-                let (red, green, blue) = (pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-                if red < 180 && green < 90 && blue < 90 {
-                    dark_subtitle_pixels += 1;
-                }
-                if red > 180 && green > 180 && blue > 180 {
-                    bright_subtitle_pixels += 1;
+        if let Some(fixture_ffmpeg) = fixture_ffmpeg.as_ref() {
+            let frame = directory.path().join("subtitle-frame.png");
+            let status = ProcessCommand::new(fixture_ffmpeg)
+                .args(["-y", "-v", "error", "-ss", "0.4", "-i"])
+                .arg(&exported)
+                .args(["-frames:v", "1"])
+                .arg(&frame)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let decoder = png::Decoder::new(StdBufReader::new(File::open(frame).unwrap()));
+            let mut reader = decoder.read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut pixels).unwrap();
+            let channels = match info.color_type {
+                png::ColorType::Rgb => 3,
+                png::ColorType::Rgba => 4,
+                color_type => panic!("字幕帧颜色类型不受支持：{color_type:?}"),
+            };
+            let mut dark_subtitle_pixels = 0;
+            let mut bright_subtitle_pixels = 0;
+            for y in 160..info.height as usize {
+                for x in 0..info.width as usize {
+                    let offset = (y * info.width as usize + x) * channels;
+                    let (red, green, blue) =
+                        (pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+                    if red < 180 && green < 90 && blue < 90 {
+                        dark_subtitle_pixels += 1;
+                    }
+                    if red > 180 && green > 180 && blue > 180 {
+                        bright_subtitle_pixels += 1;
+                    }
                 }
             }
+            assert!(dark_subtitle_pixels > 100, "字幕区域没有检测到黑色文字描边");
+            assert!(
+                bright_subtitle_pixels > 20,
+                "字幕区域没有检测到白色文字像素"
+            );
         }
-        assert!(dark_subtitle_pixels > 100, "字幕区域没有检测到黑色文字描边");
-        assert!(
-            bright_subtitle_pixels > 20,
-            "字幕区域没有检测到白色文字像素"
-        );
 
         let mut all_hidden_sources = sources.to_vec();
         for source in &mut all_hidden_sources {
@@ -943,39 +883,43 @@ mod tests {
         )
         .await
         .unwrap();
-        let hidden_frame = directory.path().join("all-hidden-frame.png");
-        let status = ProcessCommand::new(&fixture_ffmpeg)
-            .args(["-y", "-v", "error", "-ss", "0.4", "-i"])
-            .arg(&hidden_output)
-            .args(["-frames:v", "1"])
-            .arg(&hidden_frame)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let decoder = png::Decoder::new(StdBufReader::new(File::open(hidden_frame).unwrap()));
-        let mut reader = decoder.read_info().unwrap();
-        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
-        let info = reader.next_frame(&mut pixels).unwrap();
-        let channels = match info.color_type {
-            png::ColorType::Rgb => 3,
-            png::ColorType::Rgba => 4,
-            color_type => panic!("隐藏字幕帧颜色类型不受支持：{color_type:?}"),
-        };
-        let mut hidden_dark_pixels = 0;
-        let mut hidden_bright_pixels = 0;
-        for y in 160..info.height as usize {
-            for x in 0..info.width as usize {
-                let offset = (y * info.width as usize + x) * channels;
-                let (red, green, blue) = (pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-                if red < 180 && green < 90 && blue < 90 {
-                    hidden_dark_pixels += 1;
-                }
-                if red > 180 && green > 180 && blue > 180 {
-                    hidden_bright_pixels += 1;
+        assert!(hidden_output.is_file());
+        if let Some(fixture_ffmpeg) = fixture_ffmpeg.as_ref() {
+            let hidden_frame = directory.path().join("all-hidden-frame.png");
+            let status = ProcessCommand::new(fixture_ffmpeg)
+                .args(["-y", "-v", "error", "-ss", "0.4", "-i"])
+                .arg(&hidden_output)
+                .args(["-frames:v", "1"])
+                .arg(&hidden_frame)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let decoder = png::Decoder::new(StdBufReader::new(File::open(hidden_frame).unwrap()));
+            let mut reader = decoder.read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut pixels).unwrap();
+            let channels = match info.color_type {
+                png::ColorType::Rgb => 3,
+                png::ColorType::Rgba => 4,
+                color_type => panic!("隐藏字幕帧颜色类型不受支持：{color_type:?}"),
+            };
+            let mut hidden_dark_pixels = 0;
+            let mut hidden_bright_pixels = 0;
+            for y in 160..info.height as usize {
+                for x in 0..info.width as usize {
+                    let offset = (y * info.width as usize + x) * channels;
+                    let (red, green, blue) =
+                        (pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+                    if red < 180 && green < 90 && blue < 90 {
+                        hidden_dark_pixels += 1;
+                    }
+                    if red > 180 && green > 180 && blue > 180 {
+                        hidden_bright_pixels += 1;
+                    }
                 }
             }
+            assert!(hidden_dark_pixels < 20, "全部隐藏后仍检测到黑色字幕描边");
+            assert!(hidden_bright_pixels < 20, "全部隐藏后仍检测到白色字幕字形");
         }
-        assert!(hidden_dark_pixels < 20, "全部隐藏后仍检测到黑色字幕描边");
-        assert!(hidden_bright_pixels < 20, "全部隐藏后仍检测到白色字幕字形");
     }
 }

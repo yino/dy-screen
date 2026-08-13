@@ -520,6 +520,8 @@ pub struct Supervisor {
     shutdown: CancellationToken,
     changes: broadcast::Sender<MonitorEvent>,
     runtime_resources: Arc<Mutex<Option<RuntimeResourceState>>>,
+    finalized_video_handler: Arc<Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>>,
+    finalized_session_handler: Arc<Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>>,
     worker_runtime: Arc<dyn WorkerRuntime>,
 }
 
@@ -638,6 +640,8 @@ impl Supervisor {
             shutdown: CancellationToken::new(),
             changes,
             runtime_resources: Arc::new(Mutex::new(None)),
+            finalized_video_handler: Arc::new(Mutex::new(None)),
+            finalized_session_handler: Arc::new(Mutex::new(None)),
             worker_runtime,
         }
     }
@@ -645,6 +649,18 @@ impl Supervisor {
     pub fn set_runtime_resources(&mut self, resources: RuntimeResourceState) {
         if let Ok(mut current) = self.runtime_resources.lock() {
             *current = Some(resources);
+        }
+    }
+
+    pub fn set_finalized_video_handler(&mut self, handler: Arc<dyn Fn(i64) + Send + Sync>) {
+        if let Ok(mut current) = self.finalized_video_handler.lock() {
+            *current = Some(handler);
+        }
+    }
+
+    pub fn set_finalized_session_handler(&mut self, handler: Arc<dyn Fn(i64) + Send + Sync>) {
+        if let Ok(mut current) = self.finalized_session_handler.lock() {
+            *current = Some(handler);
         }
     }
 
@@ -1725,6 +1741,7 @@ impl Supervisor {
             changes: self.changes.clone(),
             publisher: self.publisher.clone(),
             streamer_id: streamer.id,
+            finalized_video_handler: self.finalized_video_handler.clone(),
         });
         let recorder = FfmpegRecorder::new(RecordingConfig {
             ffmpeg: FfmpegConfig {
@@ -1941,6 +1958,14 @@ impl Supervisor {
         self.database
             .reconcile_session_manifests(session.id)
             .map_err(|error| error.to_string())?;
+        if let Some(handler) = self
+            .finalized_session_handler
+            .lock()
+            .ok()
+            .and_then(|handler| handler.clone())
+        {
+            handler(session.id);
+        }
         self.emit("session_changed", Some(streamer.id)).await;
         Ok(final_end)
     }
@@ -2020,6 +2045,7 @@ struct DatabaseEventSink {
     changes: broadcast::Sender<MonitorEvent>,
     publisher: Arc<dyn MonitorPublisher>,
     streamer_id: i64,
+    finalized_video_handler: Arc<Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>>,
 }
 
 impl EventSink for DatabaseEventSink {
@@ -2055,7 +2081,7 @@ impl EventSink for DatabaseEventSink {
                 let size_bytes = std::fs::metadata(&path)
                     .map(|metadata| metadata.len() as i64)
                     .unwrap_or_default();
-                if let Err(error) = self.database.add_video(&NewVideo {
+                let video_id = match self.database.add_video(&NewVideo {
                     session_id: self.session_id,
                     path: path.to_string_lossy().into_owned(),
                     started_at,
@@ -2065,8 +2091,19 @@ impl EventSink for DatabaseEventSink {
                     audio_present,
                     status: "complete".to_owned(),
                 }) {
-                    eprintln!("登记完成分片失败：{error}");
-                    return false;
+                    Ok(video_id) => video_id,
+                    Err(error) => {
+                        eprintln!("登记完成分片失败：{error}");
+                        return false;
+                    }
+                };
+                if let Some(handler) = self
+                    .finalized_video_handler
+                    .lock()
+                    .ok()
+                    .and_then(|handler| handler.clone())
+                {
+                    handler(video_id);
                 }
                 Some(MonitorEvent {
                     kind: "video_changed".to_owned(),
@@ -2116,6 +2153,7 @@ mod tests {
             changes,
             publisher: Arc::new(NoopPublisher),
             streamer_id: streamer.id,
+            finalized_video_handler: Arc::new(Mutex::new(None)),
         };
 
         assert!(sink.emit(JobEvent::RecordingStarted {
@@ -2144,6 +2182,7 @@ mod tests {
             changes,
             publisher: Arc::new(NoopPublisher),
             streamer_id: 42,
+            finalized_video_handler: Arc::new(Mutex::new(None)),
         };
 
         let accepted = sink.emit(JobEvent::SegmentFinalized {

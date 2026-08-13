@@ -190,6 +190,13 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         "transition_material_downloads",
         "ai_clip_transition_boundaries",
         "ai_transition_match_runs",
+        "ai_smart_workflows",
+        "ai_smart_workflow_batches",
+        "ai_smart_stage_attempts",
+        "ai_smart_candidates",
+        "ai_smart_candidate_sources",
+        "ai_smart_drafts",
+        "ai_clip_project_sources",
         "client_activation",
         "client_activation_secrets",
     ] {
@@ -322,6 +329,25 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
         );
     }
     for column in [
+        "smart_workflow_id",
+        "draft_generation",
+        "ownership",
+        "export_frozen_version",
+    ] {
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('ai_clip_projects') WHERE name = ?1",
+                    [column],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some(),
+            "missing smart clip project column {column}"
+        );
+    }
+    for column in [
         "clip_project_id",
         "clip_segment_id",
         "input_id",
@@ -373,6 +399,37 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
             .any(|(table, column, on_delete)| {
                 table == "ai_clip_projects" && column == "clip_project_id" && on_delete == "CASCADE"
             })
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 22",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 23",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(
+        connection
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('ai_smart_workflows') WHERE name = 'live_start_video_id'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
     );
 }
 

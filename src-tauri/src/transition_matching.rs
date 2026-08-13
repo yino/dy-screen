@@ -462,16 +462,28 @@ impl TransitionMatchingWorkflow {
         let connection = database
             .connection()
             .map_err(|_| TransitionMatchingError::Repository)?;
-        let json = connection
-            .query_row(
-                r#"SELECT run.tags_snapshot_json FROM ai_clip_projects project
-               JOIN ai_highlight_runs run ON run.id = project.highlight_run_id
-               WHERE project.id = ?1"#,
-                [clip_project_id],
-                |row| row.get::<_, String>(0),
+        let values = connection
+            .prepare(
+                r#"SELECT run.tags_snapshot_json
+                   FROM ai_clip_project_sources source
+                   JOIN ai_highlight_runs run ON run.id = source.highlight_run_id
+                   WHERE source.clip_project_id = ?1
+                   ORDER BY source.source_order, run.id"#,
             )
+            .map_err(|_| TransitionMatchingError::Repository)?
+            .query_map([clip_project_id], |row| row.get::<_, String>(0))
+            .map_err(|_| TransitionMatchingError::Repository)?
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| TransitionMatchingError::Repository)?;
-        serde_json::from_str(&json).map_err(|_| TransitionMatchingError::Repository)
+        let mut tags = std::collections::BTreeSet::new();
+        for json in values {
+            for tag in serde_json::from_str::<Vec<String>>(&json)
+                .map_err(|_| TransitionMatchingError::Repository)?
+            {
+                tags.insert(tag);
+            }
+        }
+        Ok(tags.into_iter().collect())
     }
 
     fn boundary_asr(&self, boundary: &ClipTransitionBoundary) -> Result<(String, String)> {

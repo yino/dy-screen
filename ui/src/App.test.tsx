@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { App, SettingsPage } from "./App";
 import type {
   AiEnvironmentDiagnostic,
+  AiSmartWorkflowDetail,
   AiProject,
   AiProjectDetail,
   AppSettings,
@@ -142,6 +143,100 @@ const readyRuntimeStatus: RuntimeResourceView = {
   updatedAt: "2026-07-26T00:00:00Z",
 };
 
+function smartWorkflowDetail(
+  overrides: Partial<AiSmartWorkflowDetail["workflow"]> = {},
+): AiSmartWorkflowDetail {
+  const workflow = {
+    id: 501,
+    name: "直播智能成片",
+    mode: "live" as const,
+    status: "review_ready" as const,
+    stage: "review" as const,
+    generation: 1,
+    sourceSessionId: 88,
+    sourceSummary: "1 个正在录制的受信直播会话",
+    provider: "deepseek",
+    modelId: "deepseek-chat",
+    textScope: "selected_clip_subtitles",
+    authorizationDigest: "authorization-digest",
+    authorizedAt: "2026-08-14T00:00:00Z",
+    configurationFingerprint: "configuration-fingerprint",
+    activeDraftGeneration: 2,
+    liveCursorVideoId: 32,
+    liveStartVideoId: 30,
+    eventSequence: 8,
+    candidateCount: 3,
+    selectedCount: 2,
+    pendingBatchCount: 1,
+    lastErrorCode: null,
+    lastErrorMessage: null,
+    createdAt: "2026-08-14T00:00:00Z",
+    updatedAt: "2026-08-14T00:04:00Z",
+    ...overrides,
+  };
+  return {
+    workflow,
+    batches: [{
+      id: 601,
+      workflowId: workflow.id,
+      position: 0,
+      videoId: 31,
+      sourceFingerprint: "private-source-fingerprint",
+      projectId: 101,
+      highlightRunId: 701,
+      status: workflow.status === "failed" ? "failed" : "completed",
+      finalizedAt: "2026-08-14T00:01:00Z",
+      lastErrorCode: workflow.lastErrorCode,
+      lastErrorMessage: workflow.lastErrorMessage,
+      createdAt: "2026-08-14T00:01:00Z",
+      updatedAt: workflow.updatedAt,
+    }],
+    attempts: workflow.status === "failed" ? [{
+      id: 801,
+      workflowId: workflow.id,
+      batchId: 601,
+      draftGeneration: 2,
+      stage: "correction",
+      inputFingerprint: "private-attempt-fingerprint",
+      attemptGeneration: 1,
+      status: "failed",
+      progress: 50,
+      resultKind: null,
+      resultId: null,
+      durationMs: 1_000,
+      lastErrorCode: workflow.lastErrorCode,
+      lastErrorMessage: workflow.lastErrorMessage,
+      createdAt: "2026-08-14T00:02:00Z",
+      updatedAt: workflow.updatedAt,
+    }] : [],
+    drafts: [{
+      id: 901,
+      workflowId: workflow.id,
+      generation: 1,
+      clipProjectId: 1001,
+      ownership: "user",
+      status: "exporting",
+      automationProjectVersion: 3,
+      frozenProjectVersion: 3,
+      firstReviewableAt: "2026-08-14T00:03:00Z",
+      createdAt: "2026-08-14T00:02:30Z",
+      updatedAt: workflow.updatedAt,
+    }, {
+      id: 902,
+      workflowId: workflow.id,
+      generation: 2,
+      clipProjectId: 1002,
+      ownership: "automation",
+      status: "review_ready",
+      automationProjectVersion: 1,
+      frozenProjectVersion: null,
+      firstReviewableAt: "2026-08-14T00:04:00Z",
+      createdAt: "2026-08-14T00:04:00Z",
+      updatedAt: workflow.updatedAt,
+    }],
+  };
+}
+
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
   return {
     getActivationState: vi.fn().mockResolvedValue(activeActivation),
@@ -218,6 +313,15 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     renameAiProject: vi.fn().mockResolvedValue(aiProject),
     deleteAiProject: vi.fn().mockResolvedValue(undefined),
     pickAiLocalVideos: vi.fn().mockResolvedValue([]),
+    createLocalSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能成片"),
+    listActiveLiveSessions: vi.fn().mockResolvedValue([]),
+    createLiveSmartWorkflow: vi.fn().mockRejectedValue("测试未配置直播智能成片"),
+    authorizeSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务授权"),
+    listSmartWorkflows: vi.fn().mockResolvedValue([]),
+    getSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务详情"),
+    cancelSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务取消"),
+    retrySmartWorkflowStage: vi.fn().mockRejectedValue("测试未配置智能任务重试"),
+    openSmartDraft: vi.fn().mockRejectedValue("测试未配置智能草稿"),
     importAiLocalGrants: vi.fn().mockResolvedValue({ added: [], rejected: [] }),
     listAiCompletedSessions: vi.fn().mockResolvedValue([]),
     listAiReplayStreamers: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
@@ -272,6 +376,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     subscribePreview: vi.fn().mockResolvedValue(() => undefined),
     subscribeThumbnail: vi.fn().mockResolvedValue(() => undefined),
     subscribeAi: vi.fn().mockResolvedValue(() => undefined),
+    subscribeSmartWorkflows: vi.fn().mockResolvedValue(() => undefined),
     subscribeActivation: vi.fn().mockResolvedValue(() => undefined),
   };
 }
@@ -1100,6 +1205,118 @@ describe("App", () => {
     expect(screen.getByText("视频和转写全程保留在本机")).toBeInTheDocument();
     expect(api.pickAiLocalVideos).not.toHaveBeenCalled();
     expect(api.requestAiInputPreview).not.toHaveBeenCalled();
+  });
+
+  it("智能成片本地创建必须经过来源、资源和一次授权门禁", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.pickAiLocalVideos = vi.fn().mockResolvedValue([
+      { grantId: "grant-smart-a", displayName: "本地高光 A.mp4" },
+      { grantId: "grant-smart-b", displayName: "本地高光 B.mov" },
+    ]);
+    const created = smartWorkflowDetail({ mode: "local", name: "本地智能成片", sourceSessionId: null });
+    api.createLocalSmartWorkflow = vi.fn().mockResolvedValue(created);
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    const createButton = await screen.findByRole("button", { name: "创建并启动" });
+    expect(createButton).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "选择视频" }));
+    expect(await screen.findByText("本地高光 A.mp4")).toBeInTheDocument();
+    expect(createButton).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: /仅为当前任务授权/ }));
+    expect(createButton).toBeEnabled();
+    await user.click(createButton);
+
+    expect(api.createLocalSmartWorkflow).toHaveBeenCalledWith({
+      configuration: {
+        name: "本地智能成片",
+        provider: "deepseek",
+        modelId: "deepseek-chat",
+        textScope: "selected_clip_subtitles",
+        outputPreference: "reviewable_compilation",
+      },
+      grantIds: ["grant-smart-a", "grant-smart-b"],
+      authorizationConfirmed: true,
+    });
+    expect(screen.queryByRole("button", { name: "导出 MP4" })).not.toBeInTheDocument();
+  });
+
+  it("直播智能成片只展示受信录制会话且不接受 URL", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.listActiveLiveSessions = vi.fn().mockResolvedValue([{
+      sessionId: 88,
+      streamerName: "正在录制的直播间",
+      startedAt: "2026-08-14T00:00:00Z",
+    }]);
+    api.createLiveSmartWorkflow = vi.fn().mockResolvedValue(smartWorkflowDetail());
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    await user.click(screen.getByRole("button", { name: "直播间" }));
+    expect(await screen.findByText("正在录制的直播间")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /直播/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/URL/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("checkbox", { name: /仅为当前直播场次授权/ }));
+    await user.click(screen.getByRole("button", { name: "创建并启动" }));
+    expect(api.createLiveSmartWorkflow).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 88,
+      authorizationConfirmed: true,
+    }));
+  });
+
+  it("智能任务显示长脱敏错误并支持局部重试和任务取消", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const longError = `Provider 暂时不可用：${"请稍后重试".repeat(40)}`;
+    const failed = smartWorkflowDetail({
+      status: "failed",
+      stage: "correction",
+      lastErrorCode: "smart_correction_failed",
+      lastErrorMessage: longError,
+    });
+    api.listSmartWorkflows = vi.fn().mockResolvedValue([failed.workflow]);
+    api.getSmartWorkflow = vi.fn().mockResolvedValue(failed);
+    api.retrySmartWorkflowStage = vi.fn().mockResolvedValue({
+      ...failed,
+      workflow: { ...failed.workflow, status: "queued" },
+    });
+    api.cancelSmartWorkflow = vi.fn().mockResolvedValue({
+      ...failed,
+      workflow: { ...failed.workflow, status: "cancelled", generation: 2 },
+    });
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    expect(await screen.findByText(longError)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试失败阶段" }));
+    expect(api.retrySmartWorkflowStage).toHaveBeenCalledWith({
+      workflowId: failed.workflow.id,
+      expectedGeneration: 1,
+      stage: "correction",
+      batchId: 601,
+    });
+    await user.click(screen.getByRole("button", { name: "取消任务" }));
+    expect(api.cancelSmartWorkflow).toHaveBeenCalledWith(failed.workflow.id, 1);
+  });
+
+  it("智能草稿区分人工所有权、冻结和下一版并可打开审阅", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const detail = smartWorkflowDetail();
+    api.listSmartWorkflows = vi.fn().mockResolvedValue([detail.workflow]);
+    api.getSmartWorkflow = vi.fn().mockResolvedValue(detail);
+    api.openSmartDraft = vi.fn().mockRejectedValue("测试打开动作");
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    expect(await screen.findByText(/已转为人工编辑 · 导出已冻结 · 存在下一版草稿/)).toBeInTheDocument();
+    expect(screen.getByText(/自动更新中 · 可审阅/)).toBeInTheDocument();
+    const reviewButtons = screen.getAllByRole("button", { name: "审阅成片" });
+    await user.click(reviewButtons[1]);
+    expect(api.openSmartDraft).toHaveBeenCalledWith(902);
+    expect(await screen.findByText("测试打开动作")).toBeInTheDocument();
   });
 
   it("AI 环境不可用时保留项目浏览并展示重新检测和安装修复说明", async () => {

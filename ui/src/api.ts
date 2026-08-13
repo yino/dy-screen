@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AiEnvironmentDiagnostic,
+  AiClipProjectDetail,
   AiExportResult,
   AiImportBatch,
   AiHighlightCandidatePage,
@@ -9,6 +10,10 @@ import type {
   AiHighlightProgress,
   AiHighlightRun,
   AiJobEvent,
+  AiActiveLiveSession,
+  AiSmartWorkflow,
+  AiSmartWorkflowDetail,
+  AiSmartWorkflowEvent,
   AiProject,
   AiProjectDetail,
   AiProjectSummary,
@@ -132,6 +137,27 @@ const tauriApi: ClientApi = {
     invoke<AiProject>("ai_set_project_context", { projectId, tags, analysisGoal }),
   deleteAiProject: (projectId) => invoke<void>("ai_delete_project", { projectId }),
   pickAiLocalVideos: () => invoke<AiTrustedFileGrant[]>("ai_pick_local_videos"),
+  createLocalSmartWorkflow: (input) =>
+    invoke<AiSmartWorkflowDetail>("ai_create_local_smart_workflow", { input }),
+  listActiveLiveSessions: () =>
+    invoke<AiActiveLiveSession[]>("ai_list_active_live_sessions"),
+  createLiveSmartWorkflow: (input) =>
+    invoke<AiSmartWorkflowDetail>("ai_create_live_smart_workflow", { input }),
+  authorizeSmartWorkflow: (input) =>
+    invoke<AiSmartWorkflowDetail>("ai_authorize_smart_workflow", { input }),
+  listSmartWorkflows: () =>
+    invoke<AiSmartWorkflow[]>("ai_list_smart_workflows"),
+  getSmartWorkflow: (workflowId) =>
+    invoke<AiSmartWorkflowDetail>("ai_get_smart_workflow", { workflowId }),
+  cancelSmartWorkflow: (workflowId, expectedGeneration) =>
+    invoke<AiSmartWorkflowDetail>("ai_cancel_smart_workflow", {
+      workflowId,
+      expectedGeneration,
+    }),
+  retrySmartWorkflowStage: (input) =>
+    invoke<AiSmartWorkflowDetail>("ai_retry_smart_workflow_stage", { input }),
+  openSmartDraft: (draftId) =>
+    invoke<AiClipProjectDetail>("ai_open_smart_draft", { draftId }),
   importAiLocalGrants: (projectId, grantIds) =>
     invoke<AiImportBatch>("ai_import_local_grants", { projectId, grantIds }),
   listAiCompletedSessions: (limit = 100) =>
@@ -279,6 +305,12 @@ const tauriApi: ClientApi = {
     });
     return unlisten;
   },
+  subscribeSmartWorkflows: async (listener) => {
+    const unlisten = await listen<AiSmartWorkflowEvent>("ai-smart-workflow-event", (event) => {
+      listener(event.payload);
+    });
+    return unlisten;
+  },
   subscribeActivation: async (listener) => {
     const unlisten = await listen<ActivationState>("activation-event", (event) => {
       listener(event.payload);
@@ -295,6 +327,7 @@ export function createBrowserApi(): ClientApi {
     : null;
   const visualQaSettings = visualQaState === "settings";
   const visualQaResources = visualQaState === "resources";
+  const visualQaSmart = visualQaState === "smart";
   const thumbnailBatches = new Map<string, ThumbnailBatch>();
   const desktopAccessUnavailable = (): BrowserAccessState => ({
     status: visualQaSettings ? "verification_required" : "session_expired",
@@ -309,10 +342,12 @@ export function createBrowserApi(): ClientApi {
   const rejectDesktopAccess = (): Promise<never> =>
     Promise.reject(new Error("真实访问验证仅桌面端可用"));
   const demoActivation = (): ActivationState => ({
-    configured: false,
-    active: false,
-    status: "missing",
-    message: "浏览器演示模式不能连接激活服务，请使用 Tauri 客户端完成激活",
+    configured: visualQaSmart,
+    active: visualQaSmart,
+    status: visualQaSmart ? "active" : "missing",
+    message: visualQaSmart
+      ? "开发态智能成片视觉验收"
+      : "浏览器演示模式不能连接激活服务，请使用 Tauri 客户端完成激活",
     deviceIdHint: "…browser",
     lastHeartbeatAt: null,
     nextHeartbeatAt: null,
@@ -397,6 +432,149 @@ export function createBrowserApi(): ClientApi {
     errorCode: null,
     errorMessage: null,
     updatedAt: new Date().toISOString(),
+  });
+
+  const demoSmartWorkflow = (): AiSmartWorkflowDetail => ({
+    workflow: {
+      id: 501,
+      name: "夏季新品直播智能成片",
+      mode: "live",
+      status: "failed",
+      stage: "correction",
+      generation: 3,
+      sourceSessionId: 88,
+      sourceSummary: "受信直播会话 · 已持续录制 01:42:18 · 仅处理完成登记的分片",
+      provider: "deepseek",
+      modelId: "deepseek-chat",
+      textScope: "selected_clip_subtitles",
+      authorizationDigest: "browser-qa-authorization",
+      authorizedAt: "2026-08-14T09:00:00+08:00",
+      configurationFingerprint: "browser-qa-configuration",
+      activeDraftGeneration: 2,
+      liveCursorVideoId: 103,
+      liveStartVideoId: 100,
+      eventSequence: 17,
+      candidateCount: 12,
+      selectedCount: 5,
+      pendingBatchCount: 2,
+      lastErrorCode: "provider_timeout",
+      lastErrorMessage: "字幕纠错 Provider 在等待响应时超过了当前超时限制。本次失败只影响这个智能批次，直播录制与后续完成分片登记仍在继续；已完成的 ASR、高光候选和第一版草稿均已保留。请检查网络、模型额度或超时配置后重试失败阶段。此段开发态长文本用于检查窄窗口、字体放大和辅助技术模式下是否能完整换行，且不会遮挡重试、取消或审阅操作。",
+      createdAt: "2026-08-14T09:00:00+08:00",
+      updatedAt: "2026-08-14T10:42:18+08:00",
+    },
+    batches: [
+      {
+        id: 601,
+        workflowId: 501,
+        position: 0,
+        videoId: 101,
+        sourceFingerprint: "browser-qa-source-1",
+        projectId: 701,
+        highlightRunId: 801,
+        status: "completed",
+        finalizedAt: "2026-08-14T09:15:00+08:00",
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        createdAt: "2026-08-14T09:15:01+08:00",
+        updatedAt: "2026-08-14T09:23:00+08:00",
+      },
+      {
+        id: 602,
+        workflowId: 501,
+        position: 1,
+        videoId: 102,
+        sourceFingerprint: "browser-qa-source-2",
+        projectId: 702,
+        highlightRunId: 802,
+        status: "failed",
+        finalizedAt: "2026-08-14T09:30:00+08:00",
+        lastErrorCode: "provider_timeout",
+        lastErrorMessage: "字幕纠错服务暂时不可用",
+        createdAt: "2026-08-14T09:30:01+08:00",
+        updatedAt: "2026-08-14T10:42:18+08:00",
+      },
+      {
+        id: 603,
+        workflowId: 501,
+        position: 2,
+        videoId: 103,
+        sourceFingerprint: "browser-qa-source-3",
+        projectId: 703,
+        highlightRunId: 803,
+        status: "completed",
+        finalizedAt: "2026-08-14T09:45:00+08:00",
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        createdAt: "2026-08-14T09:45:01+08:00",
+        updatedAt: "2026-08-14T09:52:00+08:00",
+      },
+    ],
+    attempts: [
+      {
+        id: 901,
+        workflowId: 501,
+        batchId: 601,
+        draftGeneration: null,
+        stage: "asr",
+        inputFingerprint: "browser-qa-asr",
+        attemptGeneration: 1,
+        status: "completed",
+        progress: 100,
+        resultKind: "project",
+        resultId: 701,
+        durationMs: 82_000,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        createdAt: "2026-08-14T09:15:01+08:00",
+        updatedAt: "2026-08-14T09:16:23+08:00",
+      },
+      {
+        id: 902,
+        workflowId: 501,
+        batchId: 602,
+        draftGeneration: 2,
+        stage: "correction",
+        inputFingerprint: "browser-qa-correction",
+        attemptGeneration: 2,
+        status: "failed",
+        progress: 58,
+        resultKind: null,
+        resultId: null,
+        durationMs: 30_000,
+        lastErrorCode: "provider_timeout",
+        lastErrorMessage: "字幕纠错服务暂时不可用",
+        createdAt: "2026-08-14T10:41:48+08:00",
+        updatedAt: "2026-08-14T10:42:18+08:00",
+      },
+    ],
+    drafts: [
+      {
+        id: 1001,
+        workflowId: 501,
+        generation: 1,
+        clipProjectId: 1101,
+        ownership: "user",
+        status: "frozen",
+        automationProjectVersion: 4,
+        frozenProjectVersion: 5,
+        firstReviewableAt: "2026-08-14T09:28:00+08:00",
+        createdAt: "2026-08-14T09:25:00+08:00",
+        updatedAt: "2026-08-14T10:10:00+08:00",
+      },
+      {
+        id: 1002,
+        workflowId: 501,
+        generation: 2,
+        clipProjectId: 1102,
+        ownership: "automation",
+        status: "review_ready",
+        automationProjectVersion: 2,
+        frozenProjectVersion: null,
+        firstReviewableAt: "2026-08-14T10:35:00+08:00",
+        createdAt: "2026-08-14T10:30:00+08:00",
+        updatedAt: "2026-08-14T10:42:18+08:00",
+      },
+    ],
   });
 
   const normalizeTags = (tags: StreamerTagInput[]): StreamerTag[] => {
@@ -702,7 +880,38 @@ export function createBrowserApi(): ClientApi {
       throw new Error("浏览器演示模式不能修改本地 AI 项目");
     },
     deleteAiProject: async () => undefined,
-    pickAiLocalVideos: async () => [],
+    pickAiLocalVideos: async () => visualQaSmart ? [
+      { grantId: "browser-qa-local-1", displayName: "新品发布会完整录像.mp4" },
+      { grantId: "browser-qa-local-2", displayName: "嘉宾访谈补充机位.mp4" },
+    ] : [],
+    createLocalSmartWorkflow: async () => {
+      throw new Error("浏览器演示模式不能读取本地媒体或调用 Provider");
+    },
+    listActiveLiveSessions: async () => visualQaSmart ? [{
+      sessionId: 88,
+      streamerName: "夏季新品发布直播间",
+      startedAt: "2026-08-14T09:00:00+08:00",
+    }] : [],
+    createLiveSmartWorkflow: async () => {
+      throw new Error("浏览器演示模式不能订阅录制会话或调用 Provider");
+    },
+    authorizeSmartWorkflow: async () => {
+      throw new Error("浏览器演示模式不能授权真实智能任务");
+    },
+    listSmartWorkflows: async () => visualQaSmart ? [demoSmartWorkflow().workflow] : [],
+    getSmartWorkflow: async (workflowId) => {
+      if (visualQaSmart && workflowId === 501) return demoSmartWorkflow();
+      throw new Error("浏览器演示模式没有智能任务数据库");
+    },
+    cancelSmartWorkflow: async () => {
+      throw new Error("浏览器演示模式没有运行中的智能任务");
+    },
+    retrySmartWorkflowStage: async () => {
+      throw new Error("浏览器演示模式不能调用 Provider");
+    },
+    openSmartDraft: async () => {
+      throw new Error("浏览器演示模式不能读取本地剪辑工程");
+    },
     importAiLocalGrants: async () => ({ added: [], rejected: [] }),
     listAiCompletedSessions: async () => [],
     listAiReplayStreamers: async () => ({ items: [], nextCursor: null }),
@@ -743,18 +952,24 @@ export function createBrowserApi(): ClientApi {
     exportAiTxt: async () => ({ saved: false }),
     exportAiJson: async () => ({ saved: false }),
     diagnoseAiEnvironment: async (): Promise<AiEnvironmentDiagnostic> => ({
-      ready: false,
+      ready: visualQaSmart,
       platform: "browser-demo",
       engineId: "whisper.cpp",
       engineVersion: "v1.9.1",
       modelId: "whisper-small-multilingual-q5_1",
       modelVersion: "",
-      checks: [{
+      checks: visualQaSmart ? [{
+        code: "browser_visual_qa",
+        passed: true,
+        message: "开发态视觉验收资源快照",
+      }] : [{
         code: "desktop_required",
         passed: false,
         message: "浏览器演示模式不能访问随包 ASR 资源",
       }],
-      message: "请在 Tauri 桌面客户端中使用本地语音识别",
+      message: visualQaSmart
+        ? "开发态视觉验收资源已就绪"
+        : "请在 Tauri 桌面客户端中使用本地语音识别",
     }),
     getAiLlmSettings: async (): Promise<LlmProviderSettings> => ({
       provider: "deepseek",
@@ -764,7 +979,7 @@ export function createBrowserApi(): ClientApi {
       qualifiedScore: 70,
       excellentScore: 80,
       transitionAutoApplyScore: 8,
-      keyConfigured: visualQaSettings,
+      keyConfigured: visualQaSettings || visualQaSmart,
       updatedAt: null,
     }),
     saveAiLlmSettings: async () => {
@@ -839,6 +1054,7 @@ export function createBrowserApi(): ClientApi {
     subscribePreview: async () => () => undefined,
     subscribeThumbnail: async () => () => undefined,
     subscribeAi: async () => () => undefined,
+    subscribeSmartWorkflows: async () => () => undefined,
     subscribeActivation: async () => () => undefined,
   };
 }

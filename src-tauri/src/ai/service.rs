@@ -684,6 +684,51 @@ impl AiProjectService {
         Ok(result)
     }
 
+    /// 智能直播只可按视频库 ID 导入一个已登记完成分片。路径来自 SQLite，
+    /// 调用方无法用任意 URL 或仍在写入的文件替代该来源。
+    pub async fn import_completed_video(
+        &self,
+        project_id: i64,
+        video_id: i64,
+        cancellation: CancellationToken,
+    ) -> Result<AiProjectInput, ServiceError> {
+        let video = self.database.get_video(video_id)?;
+        if video.status != "complete"
+            || video.ended_at.is_none()
+            || video.audio_present != Some(true)
+        {
+            return Err(ServiceError::Media(
+                "录像分片尚未完成登记或没有可识别音轨".to_owned(),
+            ));
+        }
+        let path = PathBuf::from(&video.path);
+        let source = FrozenMediaSource::from_path(&path)
+            .map_err(|error| ServiceError::Media(error.safe_message))?;
+        let inspection = self
+            .inspector
+            .inspect(&source, cancellation)
+            .await
+            .map_err(|error| ServiceError::Media(error.safe_message))?;
+        if !inspection.audio_present {
+            return Err(ServiceError::Media("录像分片没有可识别音轨".to_owned()));
+        }
+        let detail = self.repository.get_project(project_id)?;
+        let position = next_input_position(&detail.inputs);
+        Ok(self.repository.add_input(
+            project_id,
+            NewAiProjectInput {
+                position,
+                source_kind: AiInputSourceKind::VideoLibrary,
+                video_id: Some(video.id),
+                display_name: display_name(&path),
+                source_path: video.path,
+                source_fingerprint: source_fingerprint(&source, Some(video.id))?,
+                duration_ms: Some(inspection.duration_ms),
+                audio_present: Some(true),
+            },
+        )?)
+    }
+
     pub fn reorder_inputs(&self, project_id: i64, ordered_ids: &[i64]) -> Result<(), ServiceError> {
         Ok(self.repository.reorder_inputs(project_id, ordered_ids)?)
     }

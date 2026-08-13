@@ -255,6 +255,8 @@ impl Database {
         migrate_recording_priority_v17(&mut connection)?;
         crate::transition_materials::migrate_transition_materials_v18(&mut connection)?;
         crate::ai::migrate_ai_v21(&mut connection)?;
+        crate::ai::migrate_ai_v22(&mut connection)?;
+        crate::ai::migrate_ai_v23(&mut connection)?;
 
         let applied = connection
             .query_row(
@@ -1470,8 +1472,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_video(&self, video: &NewVideo) -> Result<()> {
-        self.connection()?.execute(
+    pub fn add_video(&self, video: &NewVideo) -> Result<i64> {
+        let connection = self.connection()?;
+        connection.execute(
             r#"
             INSERT OR IGNORE INTO videos(
                 session_id, path, started_at, ended_at, duration_seconds,
@@ -1490,7 +1493,13 @@ impl Database {
                 Utc::now().to_rfc3339()
             ],
         )?;
-        Ok(())
+        connection
+            .query_row(
+                "SELECT id FROM videos WHERE path = ?1",
+                [&video.path],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn list_videos(

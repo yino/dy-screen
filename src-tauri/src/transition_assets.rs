@@ -1003,76 +1003,40 @@ mod tests {
         assert!(transcoded.authorized_path(generated_token).is_some());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn real_h264_and_hevc_samples_keep_audio_and_generate_compatible_preview() {
         use std::process::Command as ProcessCommand;
 
-        let fixture_ffmpeg = std::env::var_os("DY_SCREEN_FIXTURE_FFMPEG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
         let runtime_ffmpeg = std::env::var_os("DY_SCREEN_CLIP_FFMPEG")
             .map(PathBuf::from)
-            .unwrap_or_else(|| fixture_ffmpeg.clone());
+            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
         let runtime_ffprobe = std::env::var_os("DY_SCREEN_CLIP_FFPROBE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("ffprobe"));
-        let Ok(encoders) = ProcessCommand::new(&fixture_ffmpeg)
-            .args(["-hide_banner", "-encoders"])
-            .output()
-        else {
-            return;
-        };
-        let encoders = String::from_utf8_lossy(&encoders.stdout);
-        if !["libx264", "libx265"].iter().all(|encoder| {
-            encoders
-                .lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(*encoder))
-        }) || ProcessCommand::new(&runtime_ffmpeg)
+        let runtime_available = ProcessCommand::new(&runtime_ffmpeg)
             .arg("-version")
             .output()
-            .is_err()
-            || ProcessCommand::new(&runtime_ffprobe)
+            .is_ok()
+            && ProcessCommand::new(&runtime_ffprobe)
                 .arg("-version")
                 .output()
-                .is_err()
-        {
+                .is_ok();
+        if !runtime_available {
+            assert_ne!(
+                std::env::var("DY_SCREEN_REQUIRE_CLIP_PLATFORM_VALIDATION").as_deref(),
+                Ok("1"),
+                "发行验收要求包内 FFmpeg/FFprobe 可执行，不能跳过真实预览测试"
+            );
             return;
         }
 
         let directory = tempfile::tempdir().unwrap();
-        let h264 = directory.path().join("bridge-h264.mp4");
-        let hevc = directory.path().join("bridge-hevc.mp4");
-        for (path, color, encoder, tag) in [
-            (&h264, "red", "libx264", None),
-            (&hevc, "blue", "libx265", Some("hvc1")),
-        ] {
-            let mut command = ProcessCommand::new(&fixture_ffmpeg);
-            command.args([
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                &format!("color=c={color}:s=160x120:r=24:d=0.8"),
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=660:sample_rate=48000:duration=0.8",
-                "-shortest",
-                "-c:v",
-                encoder,
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-            ]);
-            if let Some(tag) = tag {
-                command.args(["-tag:v", tag]);
-            }
-            assert!(command.arg(path).status().unwrap().success());
-        }
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/clip-platform");
+        let h264 = fixture_root.join("bridge-h264-aac.mp4");
+        let hevc = fixture_root.join("bridge-hevc-aac.mp4");
+        assert!(h264.is_file());
+        assert!(hevc.is_file());
 
         let request = |source: &Path| PreviewRequest {
             video_id: 1,
