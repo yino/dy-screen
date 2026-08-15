@@ -77,6 +77,7 @@ fn windows_ffmpeg_builder_pins_lgpl_source_and_all_runtime_capabilities() {
 #[test]
 fn windows_resource_assembly_requires_x64_pe_microsoft_runtime_and_atomic_output() {
     let script = read("scripts/prepare-asr-resources-windows.ps1");
+    let attributes = read(".gitattributes");
     let gitignore = read(".gitignore");
     for required in [
         "Assert-X64Pe",
@@ -100,6 +101,11 @@ fn windows_resource_assembly_requires_x64_pe_microsoft_runtime_and_atomic_output
     assert!(!script.contains("Invoke-WebRequest"));
     assert!(!script.contains("Start-BitsTransfer"));
     assert!(!script.contains("Assert-X64Pe -Path $VcRedist"));
+    assert!(
+        attributes
+            .lines()
+            .any(|line| line == "/resources/asr/normalization/TSCharacters.txt text eol=lf")
+    );
     assert!(
         gitignore
             .lines()

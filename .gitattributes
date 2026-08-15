@@ -1,0 +1,2 @@
+# Preserve bytes for release resources whose SHA-256 is pinned in the manifest.
+/resources/asr/normalization/TSCharacters.txt text eol=lf
