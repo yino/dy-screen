@@ -30,6 +30,7 @@ if [ ! -d "$APP_ROOT" ] || [ -L "$APP_ROOT" ]; then
   printf '%s\n' '错误：应用包缺失或是符号链接。' >&2
   exit 1
 fi
+APP_ROOT=$(CDPATH= cd -- "$APP_ROOT" && pwd)
 if [ -e "$OUTPUT" ]; then
   printf '%s\n' '错误：平台发行证据已经存在，不会覆盖。' >&2
   exit 1

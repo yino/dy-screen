@@ -214,6 +214,7 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(macos.contains("sysctl.proc_translated"));
     assert!(macos.contains("CFBundleExecutable"));
     assert!(macos.contains("plutil -extract"));
+    assert!(macos.contains("APP_ROOT=$(CDPATH= cd -- \"$APP_ROOT\" && pwd)"));
     assert!(windows.contains("OSArchitecture.ToString().ToLowerInvariant() -ne \"x64\""));
     assert!(windows.contains("/D=$installDirectoryAbsolute"));
     assert!(windows.contains("Wait-PathRemoved"));
