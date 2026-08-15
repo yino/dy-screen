@@ -302,6 +302,7 @@ jobs:
           }
           $packageOutput = @()
           $installerOutput = @()
+          $installerLog = Join-Path $env:RUNNER_TEMP "dy-screen-windows-installer.log"
           try {
             & npm.cmd ci 2>&1 | Tee-Object -Variable packageOutput
             $npmExitCode = $LASTEXITCODE
@@ -310,13 +311,19 @@ jobs:
               -RepoRoot $env:GITHUB_WORKSPACE `
               -Mode Development `
               -ResourceBaseUrl "https://resources.invalid/development/0.3.0/windows/x86_64/2026.07.4/" `
-              2>&1 | Tee-Object -Variable installerOutput
+              *>&1 | Tee-Object -FilePath $installerLog -Variable installerOutput
           } catch {
+            if (Test-Path -LiteralPath $installerLog -PathType Leaf) {
+              $installerOutput = @(Get-Content -LiteralPath $installerLog -Encoding UTF8)
+            }
             $diagnosticLines = @($packageOutput) + @($installerOutput)
             $diagnostic = @($diagnosticLines |
               ForEach-Object { [string]$_ } |
               Where-Object { $_ -match "(?i)(error|failed|failure|invalid|missing|not found|refused|拒绝|失败|不一致|缺少|无效)" } |
-              Select-Object -Last 8) -join " | "
+              Select-Object -Last 12) -join " | "
+            if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+              $diagnostic = @($installerOutput | Select-Object -Last 12) -join " | "
+            }
             if ([string]::IsNullOrWhiteSpace($diagnostic)) {
               $diagnostic = [string]$_.Exception.Message
             }
