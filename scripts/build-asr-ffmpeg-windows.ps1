@@ -105,6 +105,7 @@ cd "$source_root"
   --enable-network \
   --enable-schannel \
   --enable-mediafoundation \
+  --enable-d3d11va \
   --enable-zlib \
   --pkg-config-flags=--static \
   --enable-protocol=file,pipe,http,https,tcp,tls,crypto,httpproxy \

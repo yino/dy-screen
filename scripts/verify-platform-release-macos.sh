@@ -63,6 +63,10 @@ fi
 mkdir "$LOG_ROOT"
 trap 'rm -f "$PART"' EXIT HUP INT TERM
 
+ci_annotation_value() {
+  sed -e 's/%/%25/g' -e 's/\r/%0D/g'
+}
+
 run_step() {
   STEP_NAME=$1
   shift
@@ -83,8 +87,16 @@ run_step() {
     '{name:$name,exitCode:$exitCode,wallMs:$wallMs,outputSha256:$outputSha256}' \
     >"$LOG_ROOT/$STEP_NAME.json"
   if [ "$STEP_EXIT" -ne 0 ]; then
-    printf '::error title=macOS Intel 原生验收失败::step=%s, exitCode=%s, logSha256=%s\n' \
-      "$STEP_NAME" "$STEP_EXIT" "$STEP_SHA"
+    STEP_DIAGNOSTIC=$(grep -E -i '(error(\[|:)|failed|failure|panicked|assertion|no such|invalid argument)' "$STEP_LOG" 2>/dev/null |
+      tail -n 6 |
+      tr '\r\n' '  ' |
+      cut -c 1-1200 || true)
+    if [ -z "$STEP_DIAGNOSTIC" ]; then
+      STEP_DIAGNOSTIC="step log did not contain a recognized failure line"
+    fi
+    STEP_DIAGNOSTIC=$(printf '%s' "$STEP_DIAGNOSTIC" | ci_annotation_value)
+    printf '::error title=macOS Intel 原生验收失败::step=%s, exitCode=%s, logSha256=%s, diagnostic=%s\n' \
+      "$STEP_NAME" "$STEP_EXIT" "$STEP_SHA" "$STEP_DIAGNOSTIC"
     printf '错误：macOS Intel 平台验收步骤失败：%s。日志：%s\n' "$STEP_NAME" "$STEP_LOG" >&2
     return "$STEP_EXIT"
   fi

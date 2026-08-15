@@ -45,6 +45,7 @@ fn windows_ffmpeg_builder_pins_lgpl_source_and_all_runtime_capabilities() {
         "--disable-autodetect",
         "--enable-schannel",
         "--enable-mediafoundation",
+        "--enable-d3d11va",
         "--enable-encoder=pcm_s16le,aac,h264_mf,mjpeg",
         "--enable-demuxer=mov,matroska,flv,hls",
         "concat,image2",
@@ -227,6 +228,7 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(!workflow.contains("shell: powershell"));
     assert_eq!(workflow.matches("shell: pwsh").count(), 5);
     assert!(macos.contains("::error title=macOS Intel 原生验收失败"));
+    assert!(macos.contains("diagnostic=%s"));
     assert!(windows.contains("::error title=Windows x64 原生验收失败"));
     assert!(workflow.contains("::error title=Windows x64 资源构建失败::$Name"));
     for stage in [
