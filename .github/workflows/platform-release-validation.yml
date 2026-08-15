@@ -168,17 +168,34 @@ jobs:
           $commonRoot = Join-Path $inputRoot "common"
           New-Item -ItemType Directory -Force -Path (Join-Path $commonRoot "models"), (Join-Path $inputRoot "sources") | Out-Null
           Copy-Item -Path "resources\asr\*" -Destination $commonRoot -Recurse -Force
-          function Download-Verified([string]$Url, [string]$Output, [string]$Expected) {
-            & curl.exe --fail --location --retry 3 --proto "=https" --tlsv1.2 --output $Output $Url
-            if ($LASTEXITCODE -ne 0) { throw "发行输入下载失败。" }
+          function Download-Verified([string]$Name, [string]$Url, [string]$Output, [string]$Expected) {
+            Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
+            $previousErrorActionPreference = $ErrorActionPreference
+            $curlExitCode = -1
+            try {
+              # Windows PowerShell promotes native stderr (including curl's progress meter) to errors.
+              $ErrorActionPreference = "Continue"
+              & curl.exe --silent --show-error --fail --location --retry 5 --retry-all-errors `
+                --connect-timeout 60 --max-time 3600 --proto "=https" --tlsv1.2 --output $Output $Url
+              $curlExitCode = $LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($curlExitCode -ne 0) {
+              Write-Host "::error title=锁定发行输入下载失败::$Name (curl exit $curlExitCode)"
+              throw "发行输入下载失败：$Name"
+            }
             $actual = (Get-FileHash -LiteralPath $Output -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actual -ne $Expected) { throw "发行输入 SHA-256 不匹配：$Output" }
+            if ($actual -ne $Expected) {
+              Write-Host "::error title=锁定发行输入完整性失败::$Name SHA-256 不匹配"
+              throw "发行输入 SHA-256 不匹配：$Name"
+            }
           }
-          Download-Verified $env:FFMPEG_URL (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") $env:FFMPEG_SHA256
-          Download-Verified $env:WHISPER_URL (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") $env:WHISPER_SHA256
-          Download-Verified $env:ASR_MODEL_URL (Join-Path $commonRoot "models\ggml-small-q5_1.bin") $env:ASR_MODEL_SHA256
-          Download-Verified $env:VAD_MODEL_URL (Join-Path $commonRoot "models\ggml-silero-v6.2.0.bin") $env:VAD_MODEL_SHA256
-          Download-Verified $env:VC_REDIST_URL (Join-Path $inputRoot "vc_redist.x64.exe") $env:VC_REDIST_SHA256
+          Download-Verified "FFmpeg" $env:FFMPEG_URL (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") $env:FFMPEG_SHA256
+          Download-Verified "whisper.cpp" $env:WHISPER_URL (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") $env:WHISPER_SHA256
+          Download-Verified "ASR model" $env:ASR_MODEL_URL (Join-Path $commonRoot "models\ggml-small-q5_1.bin") $env:ASR_MODEL_SHA256
+          Download-Verified "VAD model" $env:VAD_MODEL_URL (Join-Path $commonRoot "models\ggml-silero-v6.2.0.bin") $env:VAD_MODEL_SHA256
+          Download-Verified "VC++ x64 runtime" $env:VC_REDIST_URL (Join-Path $inputRoot "vc_redist.x64.exe") $env:VC_REDIST_SHA256
       - name: 构建 Windows x64 随包资源
         shell: powershell
         run: |

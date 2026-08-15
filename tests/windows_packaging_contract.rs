@@ -206,4 +206,9 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(windows.contains("Start-Sleep -Milliseconds 250"));
     assert!(workflow.contains("(.steps | length) == 7"));
     assert!(workflow.contains("@($report.steps).Count -ne 8"));
+    assert!(workflow.contains(
+        "--silent --show-error --fail --location --retry 5 --retry-all-errors"
+    ));
+    assert!(workflow.contains("$ErrorActionPreference = \"Continue\""));
+    assert!(workflow.contains("锁定发行输入下载失败::$Name (curl exit $curlExitCode)"));
 }
