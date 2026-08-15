@@ -84,6 +84,25 @@ try {
         throw "whisper.cpp 源码归档目录结构不符合锁定版本。"
     }
 
+    $CiStage = "patch-msvc-sse42"
+    $CpuCmake = Join-Path $SourceRoot "ggml\src\ggml-cpu\CMakeLists.txt"
+    Assert-RegularFile -Path $CpuCmake -Label "whisper.cpp GGML CPU CMake 文件"
+    $CpuCmakeText = [IO.File]::ReadAllText($CpuCmake)
+    $Sse42FlagPattern = [Regex]::new(
+        '(?m)^[ \t]*list\(APPEND ARCH_FLAGS /arch:SSE4\.2\)\r?\n'
+    )
+    if ($Sse42FlagPattern.Matches($CpuCmakeText).Count -ne 1 -or
+        $CpuCmakeText -notmatch 'list\(APPEND ARCH_DEFINITIONS GGML_SSE42\)') {
+        throw "whisper.cpp 的 MSVC SSE4.2 配置与锁定源码不一致。"
+    }
+    # cl.exe x64 没有 /arch:SSE4.2 开关；显式 SSE4.2 intrinsic 可直接编译。
+    # 仅移除无效开关，保留 GGML_SSE42 定义和 manifest 声明的最低 CPU 能力。
+    $CpuCmakeText = $Sse42FlagPattern.Replace($CpuCmakeText, "", 1)
+    if ($CpuCmakeText.Contains("/arch:SSE4.2")) {
+        throw "whisper.cpp 的无效 MSVC SSE4.2 开关未完全移除。"
+    }
+    [IO.File]::WriteAllText($CpuCmake, $CpuCmakeText, [Text.UTF8Encoding]::new($false))
+
     # 关闭 native/AVX/AVX2/FMA/BMI2/F16C，使二进制最低要求与 manifest 的 SSE4.2 一致。
     # Whisper/GGML 与 MSVC CRT 均静态链接；Windows 安装包仍携带 VC++ 运行库以覆盖主程序
     # 和其他发行组件的兼容要求。
@@ -178,6 +197,7 @@ try {
         "source_commit=$ExpectedCommit"
         "architecture=x86_64"
         "minimum_cpu=sse4.2"
+        "msvc_sse42_patch=remove-unsupported-arch-flag"
         "avx=disabled"
         "avx2=disabled"
         "linkage=static-whisper-ggml-msvc-runtime"

@@ -118,6 +118,10 @@ fn windows_whisper_build_locks_cpu_baseline_and_static_dependencies() {
         "stage=$Stage, exitCode=$ExitCode, diagnostic=$diagnostic",
         "cmake-configure",
         "cmake-build",
+        "patch-msvc-sse42",
+        "$Sse42FlagPattern.Matches($CpuCmakeText).Count -ne 1",
+        "$Sse42FlagPattern.Replace($CpuCmakeText, \"\", 1)",
+        "msvc_sse42_patch=remove-unsupported-arch-flag",
         "[IO.Path]::GetTempPath()",
     ] {
         assert!(
@@ -126,6 +130,7 @@ fn windows_whisper_build_locks_cpu_baseline_and_static_dependencies() {
         );
     }
     assert!(script.contains("whisper.cpp-f049fff95a089aa9969deb009cdd4892b3e74916"));
+    assert!(!script.contains("-DGGML_SSE42=OFF"));
     assert!(!script.contains("utf8NoBOM"));
 }
 
