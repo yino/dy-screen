@@ -307,11 +307,11 @@ jobs:
             & npm.cmd ci 2>&1 | Tee-Object -Variable packageOutput
             $npmExitCode = $LASTEXITCODE
             if ($npmExitCode -ne 0) { throw "npm ci 退出码为 $npmExitCode。" }
-            & .\scripts\build-windows-installer.ps1 `
+            $installerOutput = @(& .\scripts\build-windows-installer.ps1 `
               -RepoRoot $env:GITHUB_WORKSPACE `
               -Mode Development `
               -ResourceBaseUrl "https://resources.invalid/development/0.3.0/windows/x86_64/2026.07.4/" `
-              *>&1 | Tee-Object -FilePath $installerLog -Variable installerOutput
+              *>&1 | Tee-Object -FilePath $installerLog)
           } catch {
             if (Test-Path -LiteralPath $installerLog -PathType Leaf) {
               $installerOutput = @(Get-Content -LiteralPath $installerLog -Encoding UTF8)

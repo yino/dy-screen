@@ -257,7 +257,9 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(workflow.contains("Tee-Object -Variable nativeOutput"));
     assert!(workflow.contains("Tee-Object -Variable packageOutput"));
     assert!(workflow.contains("dy-screen-windows-installer.log"));
-    assert!(workflow.contains("Tee-Object -FilePath $installerLog -Variable installerOutput"));
+    assert!(workflow.contains("$installerOutput = @(& .\\scripts\\build-windows-installer.ps1"));
+    assert!(workflow.contains("*>&1 | Tee-Object -FilePath $installerLog)"));
+    assert!(!workflow.contains("-FilePath $installerLog -Variable installerOutput"));
     assert!(workflow.contains("Get-Content -LiteralPath $installerLog -Encoding UTF8"));
     assert!(workflow.contains("Select-Object -Last 5"));
     assert!(workflow.contains("Select-Object -Last 12"));
