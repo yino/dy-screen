@@ -76,14 +76,21 @@ jobs:
           mkdir -p "$common_root/models" "$input_root/sources"
           cp -R resources/asr/. "$common_root/"
           download() {
-            local url=$1 output=$2 expected=$3
-            curl --fail --location --retry 3 --proto '=https' --tlsv1.2 --output "$output" "$url"
+            local name=$1 url=$2 output=$3 expected=$4 exit_code=0
+            rm -f "$output"
+            curl --silent --show-error --fail --location --retry 5 --retry-all-errors \
+              --connect-timeout 60 --max-time 3600 --proto '=https' --tlsv1.2 \
+              --output "$output" "$url" || exit_code=$?
+            if [ "$exit_code" -ne 0 ]; then
+              printf '::error title=锁定发行输入下载失败::%s (curl exit %s)\n' "$name" "$exit_code"
+              return "$exit_code"
+            fi
             printf '%s  %s\n' "$expected" "$output" | shasum -a 256 -c -
           }
-          download "$FFMPEG_URL" "$input_root/sources/ffmpeg-8.1.2.tar.xz" "$FFMPEG_SHA256"
-          download "$WHISPER_URL" "$input_root/sources/whisper.cpp-v1.9.1.tar.gz" "$WHISPER_SHA256"
-          download "$ASR_MODEL_URL" "$common_root/models/ggml-small-q5_1.bin" "$ASR_MODEL_SHA256"
-          download "$VAD_MODEL_URL" "$common_root/models/ggml-silero-v6.2.0.bin" "$VAD_MODEL_SHA256"
+          download FFmpeg "$FFMPEG_URL" "$input_root/sources/ffmpeg-8.1.2.tar.xz" "$FFMPEG_SHA256"
+          download whisper.cpp "$WHISPER_URL" "$input_root/sources/whisper.cpp-v1.9.1.tar.gz" "$WHISPER_SHA256"
+          download ASR-model "$ASR_MODEL_URL" "$common_root/models/ggml-small-q5_1.bin" "$ASR_MODEL_SHA256"
+          download VAD-model "$VAD_MODEL_URL" "$common_root/models/ggml-silero-v6.2.0.bin" "$VAD_MODEL_SHA256"
       - name: 构建 macOS Intel 随包资源
         shell: bash
         run: |
@@ -203,13 +210,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
+          function ConvertTo-CiAnnotationValue([string]$Value) {
+            $sanitized = $Value
+            foreach ($root in @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE)) {
+              if (-not [string]::IsNullOrWhiteSpace($root)) {
+                $sanitized = $sanitized.Replace($root, "<runner-path>")
+              }
+            }
+            return $sanitized.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+          }
           function Invoke-NativeStage([string]$Name, [scriptblock]$Action) {
             try {
               & $Action
               $exitCode = $LASTEXITCODE
               if ($exitCode -ne 0) { throw "$Name 退出码为 $exitCode。" }
             } catch {
-              Write-Host "::error title=Windows x64 资源构建失败::$Name"
+              $diagnostic = ConvertTo-CiAnnotationValue ([string]$_.Exception.Message)
+              Write-Host "::error title=Windows x64 资源构建失败::$Name, diagnostic=$diagnostic"
               throw
             }
           }
@@ -217,7 +234,8 @@ jobs:
             try {
               & $Action
             } catch {
-              Write-Host "::error title=Windows x64 资源构建失败::$Name"
+              $diagnostic = ConvertTo-CiAnnotationValue ([string]$_.Exception.Message)
+              Write-Host "::error title=Windows x64 资源构建失败::$Name, diagnostic=$diagnostic"
               throw
             }
           }
