@@ -215,4 +215,16 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert_eq!(workflow.matches("shell: pwsh").count(), 5);
     assert!(macos.contains("::error title=macOS Intel 原生验收失败"));
     assert!(windows.contains("::error title=Windows x64 原生验收失败"));
+    assert!(workflow.contains("::error title=Windows x64 资源构建失败::$Name"));
+    for stage in [
+        "root-cargo-fetch",
+        "tauri-cargo-fetch",
+        "visual-studio-environment",
+        "ffmpeg-build",
+        "whisper-build",
+        "resource-assembly",
+        "asr-bundle-stage",
+    ] {
+        assert!(workflow.contains(stage), "Windows CI 缺少诊断阶段 {stage}");
+    }
 }

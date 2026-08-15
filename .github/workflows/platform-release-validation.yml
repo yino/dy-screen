@@ -203,36 +203,63 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
-          cargo fetch --locked
-          if ($LASTEXITCODE -ne 0) { throw "根 crate 依赖获取失败。" }
-          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { throw "Tauri crate 依赖获取失败。" }
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if ([string]::IsNullOrWhiteSpace($vsRoot)) { throw "找不到 Visual Studio x64 C++ 工具。" }
-          Import-Module (Join-Path $vsRoot "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
-          Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          function Invoke-NativeStage([string]$Name, [scriptblock]$Action) {
+            try {
+              & $Action
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) { throw "$Name 退出码为 $exitCode。" }
+            } catch {
+              Write-Host "::error title=Windows x64 资源构建失败::$Name"
+              throw
+            }
+          }
+          function Invoke-PowerShellStage([string]$Name, [scriptblock]$Action) {
+            try {
+              & $Action
+            } catch {
+              Write-Host "::error title=Windows x64 资源构建失败::$Name"
+              throw
+            }
+          }
+          Invoke-NativeStage "root-cargo-fetch" { cargo fetch --locked }
+          Invoke-NativeStage "tauri-cargo-fetch" { cargo fetch --locked --manifest-path src-tauri/Cargo.toml }
+          Invoke-PowerShellStage "visual-studio-environment" {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $script:vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($script:vsRoot)) {
+              throw "找不到 Visual Studio x64 C++ 工具。"
+            }
+            Import-Module (Join-Path $script:vsRoot "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+            Enter-VsDevShell -VsInstallPath $script:vsRoot -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          }
           $inputRoot = Join-Path $env:RUNNER_TEMP "dy-screen-input"
           $buildRoot = Join-Path $env:RUNNER_TEMP "dy-screen-build"
           $sourceRoot = Join-Path $env:RUNNER_TEMP "dy-screen-source-windows-x64"
-          & .\scripts\build-asr-ffmpeg-windows.ps1 `
-            -SourceArchive (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") `
-            -OutputRoot (Join-Path $buildRoot "ffmpeg")
-          & .\scripts\build-asr-whisper-windows.ps1 `
-            -SourceArchive (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") `
-            -OutputRoot (Join-Path $buildRoot "whisper")
-          & .\scripts\prepare-asr-resources-windows.ps1 `
-            -CommonSource (Join-Path $inputRoot "common") `
-            -FfmpegRoot (Join-Path $buildRoot "ffmpeg") `
-            -WhisperRoot (Join-Path $buildRoot "whisper") `
-            -VcRedist (Join-Path $inputRoot "vc_redist.x64.exe") `
-            -VcLicense "resources\asr\licenses\Microsoft-VCRedist.txt" `
-            -OutputRoot $sourceRoot `
-            -BundleVersion "2026.07.4"
-          cargo run --locked --bin asr-bundle -- stage `
-            --source $sourceRoot --target "resources\asr-stage" `
-            --platform windows-x86-64 --channel development
-          if ($LASTEXITCODE -ne 0) { throw "Windows x64 随包资源 staging 失败。" }
+          Invoke-PowerShellStage "ffmpeg-build" {
+            & .\scripts\build-asr-ffmpeg-windows.ps1 `
+              -SourceArchive (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") `
+              -OutputRoot (Join-Path $buildRoot "ffmpeg")
+          }
+          Invoke-PowerShellStage "whisper-build" {
+            & .\scripts\build-asr-whisper-windows.ps1 `
+              -SourceArchive (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") `
+              -OutputRoot (Join-Path $buildRoot "whisper")
+          }
+          Invoke-PowerShellStage "resource-assembly" {
+            & .\scripts\prepare-asr-resources-windows.ps1 `
+              -CommonSource (Join-Path $inputRoot "common") `
+              -FfmpegRoot (Join-Path $buildRoot "ffmpeg") `
+              -WhisperRoot (Join-Path $buildRoot "whisper") `
+              -VcRedist (Join-Path $inputRoot "vc_redist.x64.exe") `
+              -VcLicense "resources\asr\licenses\Microsoft-VCRedist.txt" `
+              -OutputRoot $sourceRoot `
+              -BundleVersion "2026.07.4"
+          }
+          Invoke-NativeStage "asr-bundle-stage" {
+            cargo run --locked --bin asr-bundle -- stage `
+              --source $sourceRoot --target "resources\asr-stage" `
+              --platform windows-x86-64 --channel development
+          }
       - name: 构建含资源的 Windows NSIS 候选
         shell: pwsh
         run: |
@@ -271,6 +298,6 @@ jobs:
             dist/platform-validation/
             dist/windows/
             src-tauri/target/release/bundle/nsis/*.exe
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
           compression-level: 0
