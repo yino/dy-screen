@@ -4,10 +4,11 @@ set -eu
 # 从锁定的 FFmpeg 官方源码构建指定架构的 macOS LGPL sidecar。
 # 同一受控二进制服务直播录制、预览、封面和本地 ASR；不启用 GPL/nonfree 或第三方编解码库。
 
-EXPECTED_SHA256='464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c'
+RELEASE_SHA256='464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c'
+GITHUB_TAG_SHA256='9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7'
 
 if [ "$#" -ne 3 ]; then
-  printf '%s\n' '用法：build-asr-ffmpeg-macos.sh <ffmpeg-8.1.2.tar.xz> <输出目录> <aarch64|x86_64>' >&2
+  printf '%s\n' '用法：build-asr-ffmpeg-macos.sh <FFmpeg 8.1.2 锁定源码归档> <输出目录> <aarch64|x86_64>' >&2
   exit 2
 fi
 
@@ -45,10 +46,14 @@ if [ "$MACOS_ARCH" = x86_64 ] && ! command -v nasm >/dev/null 2>&1; then
 fi
 
 ACTUAL_SHA256=$(shasum -a 256 "$SOURCE_ARCHIVE" | awk '{print $1}')
-if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-  printf '%s\n' '错误：FFmpeg 源码 SHA-256 与锁定值不一致。' >&2
-  exit 1
-fi
+case "$ACTUAL_SHA256" in
+  "$RELEASE_SHA256") SOURCE_ROOT_NAME=ffmpeg-8.1.2 ;;
+  "$GITHUB_TAG_SHA256") SOURCE_ROOT_NAME=FFmpeg-n8.1.2 ;;
+  *)
+    printf '%s\n' '错误：FFmpeg 源码 SHA-256 与锁定值不一致。' >&2
+    exit 1
+    ;;
+esac
 
 if [ -e "$OUTPUT_ROOT" ]; then
   printf '%s\n' '错误：输出目录已经存在，请使用一个新的目录。' >&2
@@ -60,7 +65,7 @@ TEMP_BASE=${TEMP_BASE%/}
 BUILD_ROOT=$(mktemp -d "$TEMP_BASE/dy-screen-ffmpeg.XXXXXX")
 trap 'rm -rf "$BUILD_ROOT"' EXIT HUP INT TERM
 tar -xf "$SOURCE_ARCHIVE" -C "$BUILD_ROOT"
-SOURCE_ROOT="$BUILD_ROOT/ffmpeg-8.1.2"
+SOURCE_ROOT="$BUILD_ROOT/$SOURCE_ROOT_NAME"
 INSTALL_ROOT="$BUILD_ROOT/install"
 
 cd "$SOURCE_ROOT"
@@ -243,8 +248,8 @@ done
 fi
 
 printf '%s\n' \
-  "source=ffmpeg-8.1.2.tar.xz" \
-  "sha256=$EXPECTED_SHA256" \
+  "source=$SOURCE_NAME" \
+  "sha256=$ACTUAL_SHA256" \
   "architecture=$MACOS_ARCH" \
   "apple_architecture=$APPLE_ARCH" \
   "runtime_validation=$RUNTIME_CHECKED" \

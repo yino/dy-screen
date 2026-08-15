@@ -40,8 +40,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FFMPEG_URL: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
-  FFMPEG_SHA256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+  FFMPEG_URL: https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n8.1.2
+  FFMPEG_SHA256: 9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7
   WHISPER_URL: https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/f049fff95a089aa9969deb009cdd4892b3e74916
   WHISPER_SHA256: 279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3
   ASR_MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
@@ -87,7 +87,7 @@ jobs:
             fi
             printf '%s  %s\n' "$expected" "$output" | shasum -a 256 -c -
           }
-          download FFmpeg "$FFMPEG_URL" "$input_root/sources/ffmpeg-8.1.2.tar.xz" "$FFMPEG_SHA256"
+          download FFmpeg "$FFMPEG_URL" "$input_root/sources/FFmpeg-n8.1.2.tar.gz" "$FFMPEG_SHA256"
           download whisper.cpp "$WHISPER_URL" "$input_root/sources/whisper.cpp-v1.9.1.tar.gz" "$WHISPER_SHA256"
           download ASR-model "$ASR_MODEL_URL" "$common_root/models/ggml-small-q5_1.bin" "$ASR_MODEL_SHA256"
           download VAD-model "$VAD_MODEL_URL" "$common_root/models/ggml-silero-v6.2.0.bin" "$VAD_MODEL_SHA256"
@@ -102,7 +102,7 @@ jobs:
           source_root="$RUNNER_TEMP/dy-screen-source-macos-x86_64"
           stage_root="$RUNNER_TEMP/dy-screen-stage-macos-x86_64"
           ./scripts/build-asr-ffmpeg-macos.sh \
-            "$input_root/sources/ffmpeg-8.1.2.tar.xz" "$build_root/ffmpeg" x86_64
+            "$input_root/sources/FFmpeg-n8.1.2.tar.gz" "$build_root/ffmpeg" x86_64
           ./scripts/build-asr-whisper-macos.sh \
             "$input_root/sources/whisper.cpp-v1.9.1.tar.gz" "$build_root/whisper" x86_64
           ./scripts/prepare-asr-resources-macos.sh \
@@ -200,7 +200,7 @@ jobs:
               throw "发行输入 SHA-256 不匹配：$Name"
             }
           }
-          Download-Verified "FFmpeg" $env:FFMPEG_URL (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") $env:FFMPEG_SHA256
+          Download-Verified "FFmpeg" $env:FFMPEG_URL (Join-Path $inputRoot "sources\FFmpeg-n8.1.2.tar.gz") $env:FFMPEG_SHA256
           Download-Verified "whisper.cpp" $env:WHISPER_URL (Join-Path $inputRoot "sources\whisper.cpp-v1.9.1.tar.gz") $env:WHISPER_SHA256
           Download-Verified "ASR model" $env:ASR_MODEL_URL (Join-Path $commonRoot "models\ggml-small-q5_1.bin") $env:ASR_MODEL_SHA256
           Download-Verified "VAD model" $env:VAD_MODEL_URL (Join-Path $commonRoot "models\ggml-silero-v6.2.0.bin") $env:VAD_MODEL_SHA256
@@ -263,7 +263,7 @@ jobs:
           $sourceRoot = Join-Path $env:RUNNER_TEMP "dy-screen-source-windows-x64"
           Invoke-PowerShellStage "ffmpeg-build" {
             & .\scripts\build-asr-ffmpeg-windows.ps1 `
-              -SourceArchive (Join-Path $inputRoot "sources\ffmpeg-8.1.2.tar.xz") `
+              -SourceArchive (Join-Path $inputRoot "sources\FFmpeg-n8.1.2.tar.gz") `
               -OutputRoot (Join-Path $buildRoot "ffmpeg")
           }
           Invoke-PowerShellStage "whisper-build" {

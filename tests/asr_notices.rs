@@ -27,6 +27,7 @@ fn third_party_notices_cover_every_manifest_resource_and_release_gate() {
     }
     for release_gate in [
         "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+        "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7",
         "--enable-nonfree",
         "--enable-gpl",
         "Developer ID",

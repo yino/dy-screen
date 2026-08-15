@@ -19,7 +19,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$ExpectedFfmpegSha256 = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+$ExpectedFfmpegSha256 = @(
+    "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+    "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7"
+)
 $ExpectedWhisperSha256 = "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3"
 $ExpectedVcRedistSha256 = "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
 
@@ -134,7 +137,10 @@ $ffmpegVersionText = Get-Content -LiteralPath $ffmpegVersionRecord -Raw -Encodin
 $ffprobeVersionText = Get-Content -LiteralPath $ffprobeVersionRecord -Raw -Encoding UTF8
 $whisperRecordText = Get-Content -LiteralPath $whisperBuildRecord -Raw -Encoding UTF8
 $whisperVersionText = Get-Content -LiteralPath $whisperVersionRecord -Raw -Encoding UTF8
-if ($ffmpegRecordText -notmatch "source_sha256=$ExpectedFfmpegSha256" -or
+$ffmpegSourceSha256 = @($ExpectedFfmpegSha256 | Where-Object {
+    $ffmpegRecordText -match "source_sha256=$_"
+}) | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($ffmpegSourceSha256) -or
     $ffmpegRecordText -notmatch "license=LGPL-2.1-or-later" -or
     $ffmpegRecordText -notmatch "runtime_dependencies=windows-system-only" -or
     $ffmpegVersionText -notmatch "ffmpeg version\s+8\.1\.2" -or
@@ -228,7 +234,7 @@ try {
         vcRuntimeVersion = $vcVersion
         vcRuntimeSha256 = $vcSha256
         vcRuntimeMicrosoftSignatureValid = $true
-        ffmpegSourceSha256 = $ExpectedFfmpegSha256
+        ffmpegSourceSha256 = $ffmpegSourceSha256
         whisperSourceSha256 = $ExpectedWhisperSha256
         assembledAtUtc = [DateTime]::UtcNow.ToString("o")
     }

@@ -92,7 +92,10 @@ make asr-check-windows
 
 macOS FFmpeg 使用 `scripts/build-asr-ffmpeg-macos.sh` 从官方 `ffmpeg-8.1.2.tar.xz` 构建。
 源码锁定 SHA-256 为
-`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`。构建禁用
+`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`。原生 CI 使用 FFmpeg
+官方 GitHub 仓库的 `n8.1.2` tag 归档，锁定 SHA-256 为
+`9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7`；两种归档都由构建脚本
+按哈希和解包根目录显式验证。构建禁用
 GPL/nonfree 与外部编解码库，只保留直播录制所需的受控 HTTPS 网络协议，以及预览、封面、
 ASR 和剪辑导出所需的容器、编解码器与滤镜，许可证为 LGPL-2.1-or-later。7 个 FFmpeg dylib 通过 manifest 的
 `libraries` 字段进入资源检查，并改写为 `@loader_path`/`@executable_path` 相对依赖；脚本

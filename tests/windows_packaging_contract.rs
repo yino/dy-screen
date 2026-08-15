@@ -39,7 +39,13 @@ fn windows_doctor_covers_native_build_and_signing_toolchain_without_private_path
 #[test]
 fn windows_ffmpeg_builder_pins_lgpl_source_and_all_runtime_capabilities() {
     let script = read("scripts/build-asr-ffmpeg-windows.ps1");
-    assert!(script.contains("464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"));
+    for source in [
+        "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+        "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7",
+        "FFmpeg-n8.1.2",
+    ] {
+        assert!(script.contains(source), "FFmpeg 构建缺少锁定来源 {source}");
+    }
     for required in [
         "--disable-everything",
         "--disable-autodetect",
@@ -90,7 +96,8 @@ fn windows_resource_assembly_requires_x64_pe_microsoft_runtime_and_atomic_output
         "resourceIntegrity",
         "SHA256SUMS",
         "build-records\\windows",
-        "source_sha256=$ExpectedFfmpegSha256",
+        "$ffmpegRecordText -match \"source_sha256=$_\"",
+        "ffmpegSourceSha256 = $ffmpegSourceSha256",
         "source_sha256=$ExpectedWhisperSha256",
         "公共资源 $relative 的 SHA-256",
         ".dy-screen-windows-resource-source",
@@ -211,7 +218,8 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     for required in [
         "macos-15-intel",
         "windows-2022",
-        "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+        "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7",
+        "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n8.1.2",
         "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3",
         "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
         "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987",
@@ -247,6 +255,7 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(workflow.contains("local name=$1 url=$2 output=$3 expected=$4 exit_code=0"));
     assert_eq!(workflow.matches("--retry 5 --retry-all-errors").count(), 2);
     assert!(workflow.contains("锁定发行输入下载失败::%s (curl exit %s)"));
+    assert!(!workflow.contains("--insecure"));
     assert!(!workflow.contains("shell: powershell"));
     assert_eq!(workflow.matches("shell: pwsh").count(), 5);
     assert!(macos.contains("::error title=macOS Intel 原生验收失败"));

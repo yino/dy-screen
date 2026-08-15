@@ -9,6 +9,8 @@ fn macos_ffmpeg_build_is_locked_lgpl_media_capable_and_relocatable() {
     let script = fs::read_to_string(root.join("scripts/build-asr-ffmpeg-macos.sh")).unwrap();
     for required in [
         "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c",
+        "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7",
+        "FFmpeg-n8.1.2",
         "--disable-everything",
         "--enable-shared",
         "--disable-static",

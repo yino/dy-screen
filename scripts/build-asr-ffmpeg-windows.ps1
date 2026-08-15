@@ -11,7 +11,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$ExpectedSha256 = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+$ReleaseSha256 = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+$GitHubTagSha256 = "9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7"
 $ExpectedVersion = "8.1.2"
 $CiStage = "preflight"
 
@@ -60,7 +61,13 @@ if (-not [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
 Assert-RegularFile -Path $SourceArchive -Label "FFmpeg 源码归档"
 if (Test-Path -LiteralPath $OutputRoot) { throw "输出目录已经存在，请使用一个新的目录。" }
 $actualSha256 = (Get-FileHash -LiteralPath $SourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualSha256 -ne $ExpectedSha256) { throw "FFmpeg 源码 SHA-256 与锁定值不一致。" }
+$sourceRootName = if ($actualSha256 -eq $ReleaseSha256) {
+    "ffmpeg-8.1.2"
+} elseif ($actualSha256 -eq $GitHubTagSha256) {
+    "FFmpeg-n8.1.2"
+} else {
+    throw "FFmpeg 源码 SHA-256 与锁定值不一致。"
+}
 
 $bash = Join-Path $Msys2Root "usr\bin\bash.exe"
 $gcc = Join-Path $Msys2Root "ucrt64\bin\gcc.exe"
@@ -80,7 +87,7 @@ output_root=$(cygpath -u "$2")
 work_root=$(mktemp -d)
 trap 'rm -rf "$work_root"' EXIT
 tar -xf "$source_archive" -C "$work_root"
-source_root="$work_root/ffmpeg-8.1.2"
+source_root="$work_root/$3"
 install_root="$work_root/install"
 cd "$source_root"
 ./configure \
@@ -126,7 +133,7 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
 '@
     [IO.File]::WriteAllText($buildScript, $script, [Text.UTF8Encoding]::new($false))
     $CiStage = "configure-build"
-    & $bash $buildScript ([IO.Path]::GetFullPath($SourceArchive)) ([IO.Path]::GetFullPath($OutputRoot)) 2>&1 |
+    & $bash $buildScript ([IO.Path]::GetFullPath($SourceArchive)) ([IO.Path]::GetFullPath($OutputRoot)) $sourceRootName 2>&1 |
         Tee-Object -Variable buildOutput
     $buildExitCode = $LASTEXITCODE
     if ($buildExitCode -ne 0) {
@@ -189,8 +196,8 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
     }
     [IO.File]::WriteAllText((Join-Path $OutputRoot "ffprobe-version.txt"), $probeVersion, [Text.UTF8Encoding]::new($false))
     @(
-        "source=ffmpeg-8.1.2.tar.xz"
-        "source_sha256=$ExpectedSha256"
+        "source=$([IO.Path]::GetFileName($SourceArchive))"
+        "source_sha256=$actualSha256"
         "architecture=x86_64"
         "license=LGPL-2.1-or-later"
         "toolchain=msys2-ucrt64"

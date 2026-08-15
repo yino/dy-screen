@@ -38,9 +38,11 @@
 ## FFmpeg 与 FFprobe
 
 - 组件：平台匹配的 `ffmpeg` 与 `ffprobe`；
-- macOS 固定源码：`ffmpeg-8.1.2.tar.xz`，SHA-256
-  `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`；
-- 上游：https://ffmpeg.org/；
+- 固定源码归档：FFmpeg release `ffmpeg-8.1.2.tar.xz`，SHA-256
+  `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`；原生 CI 使用
+  FFmpeg 官方 GitHub 仓库 `n8.1.2` tag 归档，SHA-256
+  `9fd092511605bbebafe095ea6d38d9e40f34d12f7386e1258372df8be0576eb7`；
+- 上游：https://ffmpeg.org/ 和 https://github.com/FFmpeg/FFmpeg；
 - 许可证：FFmpeg 默认可按 LGPL-2.1-or-later 分发；启用 GPL 组件后，整个 FFmpeg 二进制
   受 GPL-2.0-or-later 约束；启用 nonfree 组件的构建不得再分发；
 - 发行门禁：构建流水线必须保存 `ffmpeg -version` 和 `ffprobe -version` 输出，并拒绝包含
