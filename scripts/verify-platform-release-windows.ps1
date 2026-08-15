@@ -142,13 +142,17 @@ function Invoke-EvidenceStep {
         $combined,
         [Text.UTF8Encoding]::new($false)
     )
+    $outputSha256 = Get-TextSha256 $combined
     $script:Steps.Add([ordered]@{
         name = $Name
         exitCode = $result.ExitCode
         wallMs = $result.WallMs
-        outputSha256 = Get-TextSha256 $combined
+        outputSha256 = $outputSha256
     })
-    if ($result.ExitCode -ne 0) { throw "Windows 平台发行验收步骤失败：$Name。" }
+    if ($result.ExitCode -ne 0) {
+        Write-Host "::error title=Windows x64 原生验收失败::step=$Name, exitCode=$($result.ExitCode), logSha256=$outputSha256"
+        throw "Windows 平台发行验收步骤失败：$Name。"
+    }
     return $result
 }
 

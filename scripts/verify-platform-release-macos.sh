@@ -83,6 +83,8 @@ run_step() {
     '{name:$name,exitCode:$exitCode,wallMs:$wallMs,outputSha256:$outputSha256}' \
     >"$LOG_ROOT/$STEP_NAME.json"
   if [ "$STEP_EXIT" -ne 0 ]; then
+    printf '::error title=macOS Intel 原生验收失败::step=%s, exitCode=%s, logSha256=%s\n' \
+      "$STEP_NAME" "$STEP_EXIT" "$STEP_SHA"
     printf '错误：macOS Intel 平台验收步骤失败：%s。日志：%s\n' "$STEP_NAME" "$STEP_LOG" >&2
     return "$STEP_EXIT"
   fi

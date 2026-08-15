@@ -155,15 +155,17 @@ jobs:
           node-version: 22
           cache: npm
       - name: 安装 MSYS2 UCRT64 构建工具
-        shell: powershell
+        shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           & C:\msys64\usr\bin\bash.exe -lc `
             "pacman -Sy --noconfirm --needed make diffutils pkgconf nasm mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-zlib"
           if ($LASTEXITCODE -ne 0) { throw "MSYS2 UCRT64 工具安装失败。" }
       - name: 获取并校验锁定发行输入
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           $inputRoot = Join-Path $env:RUNNER_TEMP "dy-screen-input"
           $commonRoot = Join-Path $inputRoot "common"
           New-Item -ItemType Directory -Force -Path (Join-Path $commonRoot "models"), (Join-Path $inputRoot "sources") | Out-Null
@@ -173,7 +175,7 @@ jobs:
             $previousErrorActionPreference = $ErrorActionPreference
             $curlExitCode = -1
             try {
-              # Windows PowerShell promotes native stderr (including curl's progress meter) to errors.
+              # Suppress curl's progress stderr and keep native failure handling exit-code based.
               $ErrorActionPreference = "Continue"
               & curl.exe --silent --show-error --fail --location --retry 5 --retry-all-errors `
                 --connect-timeout 60 --max-time 3600 --proto "=https" --tlsv1.2 --output $Output $Url
@@ -197,9 +199,10 @@ jobs:
           Download-Verified "VAD model" $env:VAD_MODEL_URL (Join-Path $commonRoot "models\ggml-silero-v6.2.0.bin") $env:VAD_MODEL_SHA256
           Download-Verified "VC++ x64 runtime" $env:VC_REDIST_URL (Join-Path $inputRoot "vc_redist.x64.exe") $env:VC_REDIST_SHA256
       - name: 构建 Windows x64 随包资源
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           cargo fetch --locked
           if ($LASTEXITCODE -ne 0) { throw "根 crate 依赖获取失败。" }
           cargo fetch --locked --manifest-path src-tauri/Cargo.toml
@@ -231,8 +234,10 @@ jobs:
             --platform windows-x86-64 --channel development
           if ($LASTEXITCODE -ne 0) { throw "Windows x64 随包资源 staging 失败。" }
       - name: 构建含资源的 Windows NSIS 候选
-        shell: powershell
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           npm ci
           if ($LASTEXITCODE -ne 0) { throw "npm ci 失败。" }
           & .\scripts\build-windows-installer.ps1 `
@@ -240,8 +245,10 @@ jobs:
             -Mode Development `
             -ResourceBaseUrl "https://resources.invalid/development/0.3.0/windows/x86_64/2026.07.4/"
       - name: 执行 Windows x64 原生安装、资源与媒体验收
-        shell: powershell
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           $installer = Get-ChildItem -LiteralPath "src-tauri\target\release\bundle\nsis" `
             -Filter "*.exe" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
           if ($null -eq $installer) { throw "没有找到 NSIS 候选。" }
