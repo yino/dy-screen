@@ -103,6 +103,8 @@ fn windows_whisper_build_locks_cpu_baseline_and_static_dependencies() {
         "f049fff95a089aa9969deb009cdd4892b3e74916",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DGGML_STATIC=ON",
+        "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+        "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
         "-DGGML_NATIVE=OFF",
         "-DGGML_SSE42=ON",
         "-DGGML_AVX=OFF",

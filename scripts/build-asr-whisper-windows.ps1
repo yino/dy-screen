@@ -91,8 +91,10 @@ try {
     $Sse42FlagPattern = [Regex]::new(
         '(?m)^[ \t]*list\(APPEND ARCH_FLAGS /arch:SSE4\.2\)\r?\n'
     )
-    if ($Sse42FlagPattern.Matches($CpuCmakeText).Count -ne 1 -or
-        $CpuCmakeText -notmatch 'list\(APPEND ARCH_DEFINITIONS GGML_SSE42\)') {
+    if ($Sse42FlagPattern.Matches($CpuCmakeText).Count -ne 1) {
+        throw "whisper.cpp 的 MSVC SSE4.2 开关与锁定源码不一致。"
+    }
+    if ($CpuCmakeText -notmatch 'list\(APPEND ARCH_DEFINITIONS GGML_SSE42\)') {
         throw "whisper.cpp 的 MSVC SSE4.2 配置与锁定源码不一致。"
     }
     # cl.exe x64 没有 /arch:SSE4.2 开关；显式 SSE4.2 intrinsic 可直接编译。
@@ -110,6 +112,7 @@ try {
     $configureOutput = @()
     & cmake.exe -S $SourceRoot -B $BuildRoot -A x64 `
         -DCMAKE_BUILD_TYPE=Release `
+        -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
         -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
         -DBUILD_SHARED_LIBS=OFF `
         -DGGML_STATIC=ON `
