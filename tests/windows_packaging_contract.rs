@@ -140,6 +140,8 @@ fn windows_tauri_and_nsis_contract_is_offline_stable_and_current_user_scoped() {
     let hooks = read("src-tauri/windows/asr-runtime-hooks.nsh");
     assert!(hooks.contains("vc_redist.x64.exe"));
     assert!(hooks.contains("IntCmp $0 3010 runtime_ready"));
+    assert!(hooks.contains("IntCmp $0 1638 runtime_ready"));
+    assert_eq!(hooks.matches("/SD IDOK").count(), 2);
     assert!(hooks.contains("Abort"));
 }
 
@@ -245,6 +247,11 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(windows.contains("/D=$installDirectoryAbsolute"));
     assert!(windows.contains("Wait-PathRemoved"));
     assert!(windows.contains("Start-Sleep -Milliseconds 250"));
+    assert!(workflow.contains(
+        "$installDirectory = Join-Path $env:RUNNER_TEMP \"dy-screen-platform-validation-install\""
+    ));
+    assert!(workflow.contains("-InstallDirectory $installDirectory"));
+    assert!(!workflow.contains("-InstallDirectory \"C:\\dy-screen-platform-validation\""));
     assert!(workflow.contains("(.steps | length) == 7"));
     assert!(workflow.contains("@($report.steps).Count -ne 8"));
     assert!(

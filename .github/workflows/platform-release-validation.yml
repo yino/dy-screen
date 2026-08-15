@@ -336,13 +336,14 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
+          $installDirectory = Join-Path $env:RUNNER_TEMP "dy-screen-platform-validation-install"
           $installer = Get-ChildItem -LiteralPath "src-tauri\target\release\bundle\nsis" `
             -Filter "*.exe" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
           if ($null -eq $installer) { throw "没有找到 NSIS 候选。" }
           New-Item -ItemType Directory -Force -Path "dist\platform-validation" | Out-Null
           & .\scripts\verify-platform-release-windows.ps1 `
             -Installer $installer.FullName `
-            -InstallDirectory "C:\dy-screen-platform-validation" `
+            -InstallDirectory $installDirectory `
             -Output "dist\platform-validation\windows-x64.json" `
             -RepoRoot $env:GITHUB_WORKSPACE
           $report = Get-Content -LiteralPath "dist\platform-validation\windows-x64.json" -Raw -Encoding UTF8 | ConvertFrom-Json
