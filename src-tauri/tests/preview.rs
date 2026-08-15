@@ -74,7 +74,19 @@ fn transcode_plan_targets_h264_and_optional_aac() {
     assert!(args.windows(2).any(|pair| pair == ["-map", "0:a:0?"]));
     assert!(args.windows(2).any(|pair| pair == ["-f", "mov"]));
     assert!(args.windows(2).any(|pair| pair == ["-brand", "mp42"]));
+    assert!(!args.windows(2).any(|pair| pair == ["-allow_sw", "1"]));
     assert_eq!(args.last().map(String::as_str), Some("preview.part.mp4"));
+
+    let videotoolbox_args = build_transcode_args(
+        Path::new("input.mkv"),
+        Path::new("preview.part.mp4"),
+        "h264_videotoolbox",
+    );
+    assert!(
+        videotoolbox_args
+            .windows(2)
+            .any(|pair| pair == ["-allow_sw", "1"])
+    );
 }
 
 #[test]

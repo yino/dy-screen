@@ -1135,7 +1135,7 @@ pub fn build_remux_args(input: &Path, output: &Path) -> Vec<String> {
 }
 
 pub fn build_transcode_args(input: &Path, output: &Path, encoder: &str) -> Vec<String> {
-    vec![
+    let mut arguments = vec![
         "-hide_banner".to_owned(),
         "-nostdin".to_owned(),
         "-y".to_owned(),
@@ -1149,6 +1149,11 @@ pub fn build_transcode_args(input: &Path, output: &Path, encoder: &str) -> Vec<S
         "yuv420p".to_owned(),
         "-c:v".to_owned(),
         encoder.to_owned(),
+    ];
+    if encoder == "h264_videotoolbox" {
+        arguments.extend(["-allow_sw".to_owned(), "1".to_owned()]);
+    }
+    arguments.extend([
         "-c:a".to_owned(),
         "aac".to_owned(),
         "-b:a".to_owned(),
@@ -1163,7 +1168,8 @@ pub fn build_transcode_args(input: &Path, output: &Path, encoder: &str) -> Vec<S
         "-brand".to_owned(),
         "mp42".to_owned(),
         output.to_string_lossy().into_owned(),
-    ]
+    ]);
+    arguments
 }
 
 pub fn parse_progress_percent(line: &str, duration_seconds: Option<f64>) -> Option<f64> {
