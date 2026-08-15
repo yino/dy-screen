@@ -35,6 +35,9 @@ use crate::runtime_resource_state::RuntimeResourceState;
 const VERIFICATION_WAIT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const LIVE_RECHECK_BASE_SECONDS: u64 = 30;
 
+type FinalizedHandler = Arc<dyn Fn(i64) + Send + Sync>;
+type SharedFinalizedHandler = Arc<Mutex<Option<FinalizedHandler>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorState {
     pub live_status: String,
@@ -520,8 +523,8 @@ pub struct Supervisor {
     shutdown: CancellationToken,
     changes: broadcast::Sender<MonitorEvent>,
     runtime_resources: Arc<Mutex<Option<RuntimeResourceState>>>,
-    finalized_video_handler: Arc<Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>>,
-    finalized_session_handler: Arc<Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>>,
+    finalized_video_handler: SharedFinalizedHandler,
+    finalized_session_handler: SharedFinalizedHandler,
     worker_runtime: Arc<dyn WorkerRuntime>,
 }
 
@@ -2045,7 +2048,7 @@ struct DatabaseEventSink {
     changes: broadcast::Sender<MonitorEvent>,
     publisher: Arc<dyn MonitorPublisher>,
     streamer_id: i64,
-    finalized_video_handler: Arc<Mutex<Option<Arc<dyn Fn(i64) + Send + Sync>>>>,
+    finalized_video_handler: SharedFinalizedHandler,
 }
 
 impl EventSink for DatabaseEventSink {

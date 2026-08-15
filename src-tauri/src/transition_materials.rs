@@ -1227,6 +1227,7 @@ impl TransitionMaterialRepository {
         .transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_match_run(
         &self,
         clip_project_id: i64,

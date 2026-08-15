@@ -937,8 +937,10 @@ impl CancellationCheck for CancellationToken {
     }
 }
 
-pub fn settings_from_row(
-    row: Option<(String, String, i64, String, i64, i64, i64, String)>,
+type LlmProviderSettingsRow = (String, String, i64, String, i64, i64, i64, String);
+
+pub(crate) fn settings_from_row(
+    row: Option<LlmProviderSettingsRow>,
     key_configured: bool,
 ) -> Result<LlmProviderSettings, LlmError> {
     let Some((

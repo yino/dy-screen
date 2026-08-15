@@ -64,7 +64,10 @@ fn windows_ffmpeg_builder_pins_lgpl_source_and_all_runtime_capabilities() {
         "capability-validation",
         "build-records",
     ] {
-        assert!(script.contains(stage), "Windows FFmpeg 缺少诊断阶段 {stage}");
+        assert!(
+            script.contains(stage),
+            "Windows FFmpeg 缺少诊断阶段 {stage}"
+        );
     }
     assert!(script.contains("Windows FFmpeg configure/build failed"));
     assert!(script.contains("ConvertTo-CiAnnotationValue"));
@@ -216,9 +219,9 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(windows.contains("Start-Sleep -Milliseconds 250"));
     assert!(workflow.contains("(.steps | length) == 7"));
     assert!(workflow.contains("@($report.steps).Count -ne 8"));
-    assert!(workflow.contains(
-        "--silent --show-error --fail --location --retry 5 --retry-all-errors"
-    ));
+    assert!(
+        workflow.contains("--silent --show-error --fail --location --retry 5 --retry-all-errors")
+    );
     assert!(workflow.contains("$ErrorActionPreference = \"Continue\""));
     assert!(workflow.contains("锁定发行输入下载失败::$Name (curl exit $curlExitCode)"));
     assert!(!workflow.contains("shell: powershell"));

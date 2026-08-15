@@ -1713,13 +1713,13 @@ impl AiRepository {
                 "自动追加包含重复、未入选或来源集合外候选".to_owned(),
             ));
         }
-        let mut position = transaction.query_row(
+        let start_position = transaction.query_row(
             "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
             [clip_project_id],
             |row| row.get::<_, i64>(0),
         )?;
         let now = Utc::now().to_rfc3339();
-        for candidate in candidates {
+        for (position, candidate) in (start_position..).zip(candidates) {
             transaction.execute(
                 r#"INSERT INTO ai_clip_segments(
                        clip_project_id, candidate_id, input_id, position, title,
@@ -1739,7 +1739,6 @@ impl AiRepository {
             )?;
             let segment_id = transaction.last_insert_rowid();
             seed_clip_subtitle_snapshots(&transaction, clip_project_id, Some(segment_id))?;
-            position += 1;
         }
         transaction.execute(
             r#"UPDATE ai_clip_projects SET version = version + 1, updated_at = ?1
@@ -1944,12 +1943,12 @@ impl AiRepository {
             drop(connection);
             return self.get_clip_project(clip_project_id);
         }
-        let mut position = transaction.query_row(
+        let start_position = transaction.query_row(
             "SELECT COUNT(*) FROM ai_clip_segments WHERE clip_project_id = ?1",
             [clip_project_id],
             |row| row.get::<_, i64>(0),
         )?;
-        for candidate in candidates {
+        for (position, candidate) in (start_position..).zip(candidates) {
             transaction.execute(
                 r#"INSERT INTO ai_clip_segments(
                        clip_project_id, candidate_id, input_id, position, title,
@@ -1969,7 +1968,6 @@ impl AiRepository {
             )?;
             let segment_id = transaction.last_insert_rowid();
             seed_clip_subtitle_snapshots(&transaction, clip_project_id, Some(segment_id))?;
-            position += 1;
         }
         let ordered_segment_ids = transaction
             .prepare(
@@ -2496,6 +2494,7 @@ impl AiRepository {
         Ok((self.get_clip_project(clip_project_id)?, changed_items))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn begin_clip_text_correction_run(
         &self,
         clip_project_id: i64,

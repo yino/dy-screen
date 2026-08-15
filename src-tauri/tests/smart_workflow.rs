@@ -1051,18 +1051,19 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
             && attempt.status == AiSmartStageAttemptStatus::Completed
             && attempt.last_error_code.as_deref() == Some("smart_transition_skipped")
     }));
-    let published = events.0.lock().unwrap();
-    assert!(
-        published
-            .windows(2)
-            .all(|pair| pair[0].sequence <= pair[1].sequence)
-    );
-    assert!(
-        published
-            .iter()
-            .all(|event| event.workflow_id == workflow_id)
-    );
-    drop(published);
+    {
+        let published = events.0.lock().unwrap();
+        assert!(
+            published
+                .windows(2)
+                .all(|pair| pair[0].sequence <= pair[1].sequence)
+        );
+        assert!(
+            published
+                .iter()
+                .all(|event| event.workflow_id == workflow_id)
+        );
+    }
 
     let manual = project_service
         .create_draft("普通项目", &profile())

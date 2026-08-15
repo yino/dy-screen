@@ -954,7 +954,7 @@ impl SmartWorkflowRepository {
             if grouped
                 .last()
                 .and_then(|group| group.first())
-                .map_or(true, |row| row.0 != smart_id)
+                .is_none_or(|row| row.0 != smart_id)
             {
                 grouped.push(Vec::new());
             }
@@ -2042,23 +2042,23 @@ impl SmartClippingWorkflow {
                 .ok_or_else(|| {
                     SmartWorkflowError::new("smart_batch_unavailable", "重试批次不存在", false)
                 })?;
-            if stage == AiSmartStage::Asr {
-                if let Some(project_id) = batch.project_id {
-                    let project = self
-                        .repository
-                        .get_project(project_id)
-                        .map_err(repository_error)?;
-                    for input in project.inputs.iter().filter(|input| {
-                        matches!(
-                            input.status,
-                            AiInputStatus::Failed | AiInputStatus::Cancelled
-                        )
-                    }) {
-                        self.controller
-                            .retry_input(input.id)
-                            .await
-                            .map_err(command_error)?;
-                    }
+            if stage == AiSmartStage::Asr
+                && let Some(project_id) = batch.project_id
+            {
+                let project = self
+                    .repository
+                    .get_project(project_id)
+                    .map_err(repository_error)?;
+                for input in project.inputs.iter().filter(|input| {
+                    matches!(
+                        input.status,
+                        AiInputStatus::Failed | AiInputStatus::Cancelled
+                    )
+                }) {
+                    self.controller
+                        .retry_input(input.id)
+                        .await
+                        .map_err(command_error)?;
                 }
             }
             self.workflows
@@ -3161,7 +3161,7 @@ pub fn smart_workflow_metric(
         .attempts
         .iter()
         .filter_map(|attempt| attempt.duration_ms)
-        .last();
+        .next_back();
     let first_reviewable = detail
         .drafts
         .iter()
