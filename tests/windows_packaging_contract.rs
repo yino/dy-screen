@@ -137,6 +137,14 @@ fn windows_tauri_and_nsis_contract_is_offline_stable_and_current_user_scoped() {
 }
 
 #[test]
+fn vite_root_uses_platform_aware_file_url_conversion() {
+    let config = read("ui/vite.config.ts");
+    assert!(config.contains("import { fileURLToPath } from \"node:url\";"));
+    assert!(config.contains("root: fileURLToPath(new URL(\".\", import.meta.url))"));
+    assert!(!config.contains("import.meta.url).pathname"));
+}
+
+#[test]
 fn release_build_uses_certificate_store_and_explicit_unsigned_development_mode() {
     let installer = read("scripts/build-windows-installer.ps1");
     let signer = read("scripts/sign-windows-resource-binaries.ps1");
