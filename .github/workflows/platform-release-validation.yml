@@ -291,12 +291,39 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
-          npm ci
-          if ($LASTEXITCODE -ne 0) { throw "npm ci 失败。" }
-          & .\scripts\build-windows-installer.ps1 `
-            -RepoRoot $env:GITHUB_WORKSPACE `
-            -Mode Development `
-            -ResourceBaseUrl "https://resources.invalid/development/0.3.0/windows/x86_64/2026.07.4/"
+          function ConvertTo-CiAnnotationValue([string]$Value) {
+            $sanitized = $Value
+            foreach ($root in @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE)) {
+              if (-not [string]::IsNullOrWhiteSpace($root)) {
+                $sanitized = $sanitized.Replace($root, "<runner-path>")
+              }
+            }
+            return $sanitized.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+          }
+          $packageOutput = @()
+          $installerOutput = @()
+          try {
+            & npm.cmd ci 2>&1 | Tee-Object -Variable packageOutput
+            $npmExitCode = $LASTEXITCODE
+            if ($npmExitCode -ne 0) { throw "npm ci 退出码为 $npmExitCode。" }
+            & .\scripts\build-windows-installer.ps1 `
+              -RepoRoot $env:GITHUB_WORKSPACE `
+              -Mode Development `
+              -ResourceBaseUrl "https://resources.invalid/development/0.3.0/windows/x86_64/2026.07.4/" `
+              2>&1 | Tee-Object -Variable installerOutput
+          } catch {
+            $diagnosticLines = @($packageOutput) + @($installerOutput)
+            $diagnostic = @($diagnosticLines |
+              ForEach-Object { [string]$_ } |
+              Where-Object { $_ -match "(?i)(error|failed|failure|invalid|missing|not found|refused|拒绝|失败|不一致|缺少|无效)" } |
+              Select-Object -Last 8) -join " | "
+            if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+              $diagnostic = [string]$_.Exception.Message
+            }
+            $diagnostic = ConvertTo-CiAnnotationValue $diagnostic
+            Write-Host "::error title=Windows x64 NSIS 构建失败::diagnostic=$diagnostic"
+            throw
+          }
       - name: 执行 Windows x64 原生安装、资源与媒体验收
         shell: pwsh
         run: |

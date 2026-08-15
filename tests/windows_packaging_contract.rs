@@ -241,9 +241,13 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(macos.contains("diagnostic=%s"));
     assert!(windows.contains("::error title=Windows x64 原生验收失败"));
     assert!(workflow.contains("::error title=Windows x64 资源构建失败::$Name"));
+    assert!(workflow.contains("::error title=Windows x64 NSIS 构建失败::diagnostic=$diagnostic"));
     assert!(workflow.contains("diagnostic=$diagnostic"));
     assert!(workflow.contains("Tee-Object -Variable nativeOutput"));
+    assert!(workflow.contains("Tee-Object -Variable packageOutput"));
+    assert!(workflow.contains("Tee-Object -Variable installerOutput"));
     assert!(workflow.contains("Select-Object -Last 5"));
+    assert!(workflow.contains("Select-Object -Last 8"));
     assert!(workflow.contains("$env:RUNNER_TEMP, $env:GITHUB_WORKSPACE"));
     assert!(workflow.contains("<runner-path>"));
     for stage in [
