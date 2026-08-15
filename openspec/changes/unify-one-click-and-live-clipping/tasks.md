@@ -65,9 +65,9 @@
 - [x] 8.1 实现隐私安全的漏斗和耗时指标，只记录模式、平台、阶段终态、桶化耗时、批次、候选、采用、首稿和导出聚合数据
 - [x] 8.2 增加遥测负面测试，证明媒体、音频、字幕、理由、主播或直播间标识、本地路径、Prompt、凭据、原始响应和内容指纹不会上报
 - [x] 8.3 计算从相关最后分片完成登记到草稿可审阅的直播首稿延迟，增加 10 分钟目标的边界、积压和时钟测试
-- [ ] 8.4 在 macOS arm64、macOS Intel x86_64 和 Windows x64 验证随包 FFmpeg/FFprobe、Whisper、ASR/VAD 模型的架构、完整性、识别、预览和 H.264/AAC 导出能力
-  - macOS arm64 已在真实目标机使用隔离构建的 `.app` 随包资源通过架构、完整性、VAD、Whisper 中文识别、应用预览和 H.264/AAC 导出；证据见 `verification/8.4-platform-release-validation.md`。
-  - 阻塞：仍缺真实 Intel Mac 和 Windows x64 目标机证据；不得用 Rosetta、交叉编译、开发机系统二进制或契约测试替代。
+- [x] 8.4 在 macOS arm64、macOS Intel x86_64 和 Windows x64 验证随包 FFmpeg/FFprobe、Whisper、ASR/VAD 模型的架构、完整性、识别、预览和 H.264/AAC 导出能力
+  - macOS arm64 已在真实目标机使用隔离构建的 `.app` 随包资源通过架构、完整性、VAD、Whisper 中文识别、应用预览和 H.264/AAC 导出。
+  - macOS Intel x86_64 与 Windows x64 已在原生 GitHub runner 使用随包候选通过相同验收；快照、run、job 和 artifact 证据见 `verification/8.4-platform-release-validation.md`。
 - [x] 8.5 执行本地与直播端到端验收，覆盖选择来源、ASR、高光、自动选择、工程字幕纠错、转场匹配、人工审阅、显式导出、恢复和下一草稿版本
 - [x] 8.6 回归普通 AI 项目、已结束直播导入、手动高光授权、人工候选选择、一键纠错、一键 Agent、历史工程和既有 MP4 导出，确认智能授权不会扩散
 - [x] 8.7 更新用户文档、运行资源发行清单和故障诊断说明，明确两种模式、任务级授权、仅处理完成分片、显式导出及目标平台边界
@@ -80,4 +80,5 @@
 - [x] 9.4 在 AI 智能成片创建页将“直播间”调整为“直播素材”，增加“正在直播 / 直播回放”分段控件，分别加载活动会话和可搜索分页的已结束会话，并展示本机来源、开始时间、时长、分片数及已有任务状态
 - [x] 9.5 补齐直播回放的加载、空、失败、陈旧状态、窄窗口、键盘和辅助技术体验；主播正在直播时仍展示其历史回放，直播结束后原增量任务收尾但不得自动复制为回放任务
 - [x] 9.6 增加 repository、command、编排器和前端集成测试，覆盖回放稳定排序、冻结指纹、活动/空会话拒绝、任务级授权、固定进度、失败恢复、重复事件、与正在直播并存、普通历史导入回归及显式导出门禁
-- [ ] 9.7 更新用户文档和发行验收说明为三种执行模式，执行 OpenSpec 严格校验、格式检查、完整 `make check` 及 macOS arm64、macOS Intel x86_64、Windows x64 原生 CI 验收并记录证据
+- [x] 9.7 更新用户文档和发行验收说明为三种执行模式，执行 OpenSpec 严格校验、格式检查、完整 `make check` 及 macOS arm64、macOS Intel x86_64、Windows x64 原生 CI 验收并记录证据
+  - 最终本地检查、原生 CI 和三平台证据见 `verification/9.7-final-acceptance.md` 与 `verification/8.4-platform-release-validation.md`。
