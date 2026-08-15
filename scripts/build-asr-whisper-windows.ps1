@@ -13,6 +13,34 @@ Set-StrictMode -Version Latest
 $ExpectedSha256 = "279af4ce60dbf397362868f3bacc75b56a4332ac2541cae155070093f6aaf0e3"
 $ExpectedVersion = "1.9.1"
 $ExpectedCommit = "f049fff95a089aa9969deb009cdd4892b3e74916"
+$CiStage = "preflight"
+
+function ConvertTo-CiAnnotationValue {
+    param([string]$Value)
+    $sanitized = $Value.Replace([IO.Path]::GetTempPath(), "<temp>\")
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_WORKSPACE)) {
+        $sanitized = $sanitized.Replace($env:GITHUB_WORKSPACE, "<workspace>")
+    }
+    if ($sanitized.Length -gt 1800) { $sanitized = $sanitized.Substring(0, 1800) }
+    return $sanitized.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+}
+
+function Publish-NativeFailure {
+    param(
+        [string]$Stage,
+        [int]$ExitCode,
+        [object[]]$Output
+    )
+    $diagnostic = @($Output |
+        ForEach-Object { [string]$_ } |
+        Where-Object { $_ -match "(?i)(error|failed|fatal|undefined|not found|no such|MSB\d+|CMake Error)" } |
+        Select-Object -Last 8) -join " | "
+    if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+        $diagnostic = "native command exit $ExitCode"
+    }
+    $diagnostic = ConvertTo-CiAnnotationValue $diagnostic
+    Write-Host "::error title=Windows Whisper native build failed::stage=$Stage, exitCode=$ExitCode, diagnostic=$diagnostic"
+}
 
 function Assert-RegularFile {
     param([string]$Path, [string]$Label)
@@ -49,6 +77,7 @@ $BuildRoot = Join-Path $TemporaryRoot "build"
 $Succeeded = $false
 
 try {
+    $CiStage = "extract-source"
     New-Item -ItemType Directory -Path $TemporaryRoot | Out-Null
     & tar.exe -xf $SourceArchive -C $TemporaryRoot
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $SourceRoot "CMakeLists.txt"))) {
@@ -58,6 +87,8 @@ try {
     # 关闭 native/AVX/AVX2/FMA/BMI2/F16C，使二进制最低要求与 manifest 的 SSE4.2 一致。
     # Whisper/GGML 与 MSVC CRT 均静态链接；Windows 安装包仍携带 VC++ 运行库以覆盖主程序
     # 和其他发行组件的兼容要求。
+    $CiStage = "cmake-configure"
+    $configureOutput = @()
     & cmake.exe -S $SourceRoot -B $BuildRoot -A x64 `
         -DCMAKE_BUILD_TYPE=Release `
         -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
@@ -76,17 +107,24 @@ try {
         -DWHISPER_BUILD_TESTS=OFF `
         -DWHISPER_BUILD_EXAMPLES=ON `
         -DWHISPER_BUILD_SERVER=OFF `
-        -DWHISPER_CURL=OFF
-    if ($LASTEXITCODE -ne 0) {
+        -DWHISPER_CURL=OFF 2>&1 | Tee-Object -Variable configureOutput
+    $configureExitCode = $LASTEXITCODE
+    if ($configureExitCode -ne 0) {
+        Publish-NativeFailure -Stage $CiStage -ExitCode $configureExitCode -Output $configureOutput
         throw "whisper.cpp CMake 配置失败。"
     }
 
+    $CiStage = "cmake-build"
+    $buildOutput = @()
     & cmake.exe --build $BuildRoot --config Release --parallel `
-        --target whisper-cli whisper-vad-speech-segments
-    if ($LASTEXITCODE -ne 0) {
+        --target whisper-cli whisper-vad-speech-segments 2>&1 | Tee-Object -Variable buildOutput
+    $buildExitCode = $LASTEXITCODE
+    if ($buildExitCode -ne 0) {
+        Publish-NativeFailure -Stage $CiStage -ExitCode $buildExitCode -Output $buildOutput
         throw "whisper.cpp Windows x64 构建失败。"
     }
 
+    $CiStage = "locate-sidecars"
     $WhisperCli = Get-ChildItem -LiteralPath $BuildRoot -Recurse -Filter "whisper-cli.exe" |
         Where-Object { $_.FullName -match "[\\/]bin[\\/](Release[\\/])?whisper-cli\.exe$" } |
         Select-Object -First 1
@@ -104,6 +142,7 @@ try {
     Copy-Item -LiteralPath $VadSidecar.FullName -Destination (Join-Path $BinaryRoot "vad-speech-segments.exe")
     Copy-Item -LiteralPath (Join-Path $SourceRoot "LICENSE") -Destination (Join-Path $LicenseRoot "WhisperCpp-MIT.txt")
 
+    $CiStage = "pe-dependency-validation"
     foreach ($Binary in @(
         (Join-Path $BinaryRoot "whisper-cli.exe"),
         (Join-Path $BinaryRoot "vad-speech-segments.exe")
@@ -121,6 +160,7 @@ try {
         }
     }
 
+    $CiStage = "version-validation"
     $VersionOutput = & (Join-Path $BinaryRoot "whisper-cli.exe") --version | Out-String
     if ($LASTEXITCODE -ne 0 -or $VersionOutput -notmatch [Regex]::Escape($ExpectedVersion)) {
         throw "whisper-cli 版本与锁定版本不一致。"
@@ -131,6 +171,7 @@ try {
         [Text.UTF8Encoding]::new($false)
     )
 
+    $CiStage = "build-records"
     $BuildRecord = @(
         "source=whisper.cpp-v1.9.1.tar.gz"
         "source_sha256=$ExpectedSha256"
@@ -151,6 +192,11 @@ try {
 
     Write-Host "Windows x64 whisper.cpp sidecar 已构建到：$OutputRoot"
     $Succeeded = $true
+}
+catch {
+    $diagnostic = ConvertTo-CiAnnotationValue ([string]$_.Exception.Message)
+    Write-Host "::error title=Windows Whisper 构建失败::stage=$CiStage, diagnostic=$diagnostic"
+    throw
 }
 finally {
     if (-not $Succeeded -and (Test-Path -LiteralPath $OutputRoot)) {

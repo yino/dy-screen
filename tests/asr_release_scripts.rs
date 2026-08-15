@@ -112,6 +112,13 @@ fn windows_whisper_build_locks_cpu_baseline_and_static_dependencies() {
         "-DWHISPER_CURL=OFF",
         "dumpbin.exe /dependents",
         "machine \\(x64\\)",
+        "Tee-Object -Variable configureOutput",
+        "Tee-Object -Variable buildOutput",
+        "Windows Whisper native build failed",
+        "stage=$Stage, exitCode=$ExitCode, diagnostic=$diagnostic",
+        "cmake-configure",
+        "cmake-build",
+        "[IO.Path]::GetTempPath()",
     ] {
         assert!(
             script.contains(required),
