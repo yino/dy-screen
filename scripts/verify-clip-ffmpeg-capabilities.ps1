@@ -27,23 +27,36 @@ function Assert-Matches {
     }
 }
 
-$decoders = Get-FfmpegCapabilities "-decoders"
-$demuxers = Get-FfmpegCapabilities "-demuxers"
-$muxers = Get-FfmpegCapabilities "-muxers"
-$filters = Get-FfmpegCapabilities "-filters"
-$encoders = Get-FfmpegCapabilities "-encoders"
+try {
+    $decoders = Get-FfmpegCapabilities "-decoders"
+    $demuxers = Get-FfmpegCapabilities "-demuxers"
+    $muxers = Get-FfmpegCapabilities "-muxers"
+    $filters = Get-FfmpegCapabilities "-filters"
+    $encoders = Get-FfmpegCapabilities "-encoders"
 
-foreach ($decoder in @("h264", "hevc", "aac", "png")) {
-    Assert-Matches $decoders ("^\s*[VAS]\S*\s+" + [Regex]::Escape($decoder) + "\s+") "FFmpeg 缺少 $decoder 解码器。"
-}
-foreach ($demuxer in @("concat", "image2")) {
-    Assert-Matches $demuxers ("^\s*D\s+" + [Regex]::Escape($demuxer) + "(?:\s|,)") "FFmpeg 缺少 $demuxer demuxer。"
-}
-Assert-Matches $muxers '^\s*E\s+mp4(?:\s|,)' "FFmpeg 缺少 MP4 muxer。"
-foreach ($filter in @("aformat", "asetpts", "concat", "fade", "format", "overlay", "pad", "scale", "setsar", "setpts", "volume")) {
-    Assert-Matches $filters ("^\s*\S+\s+" + [Regex]::Escape($filter) + "\s+") "FFmpeg 缺少 $filter 滤镜。"
-}
-Assert-Matches $encoders '^\s*[VAS]\S*\s+aac\s+' "FFmpeg 缺少 AAC 编码器。"
-Assert-Matches $encoders '^\s*[VAS]\S*\s+(?:h264_videotoolbox|h264_mf|libx264)\s+' "FFmpeg 没有受支持的 H.264 编码器。"
+    foreach ($decoder in @("h264", "hevc", "aac", "png")) {
+        Assert-Matches $decoders ("^\s*[VAS]\S*\s+" + [Regex]::Escape($decoder) + "\s+") "FFmpeg 缺少 $decoder 解码器。"
+    }
+    foreach ($demuxer in @("concat", "image2")) {
+        Assert-Matches $demuxers ("^\s*D\s+" + [Regex]::Escape($demuxer) + "(?:\s|,)") "FFmpeg 缺少 $demuxer demuxer。"
+    }
+    Assert-Matches $muxers '^\s*E\s+mp4(?:\s|,)' "FFmpeg 缺少 MP4 muxer。"
+    foreach ($filter in @("aformat", "asetpts", "concat", "fade", "format", "overlay", "pad", "scale", "setsar", "setpts", "volume")) {
+        Assert-Matches $filters ("^\s*\S+\s+" + [Regex]::Escape($filter) + "\s+") "FFmpeg 缺少 $filter 滤镜。"
+    }
+    Assert-Matches $encoders '^\s*[VAS]\S*\s+aac\s+' "FFmpeg 缺少 AAC 编码器。"
+    Assert-Matches $encoders '^\s*[VAS]\S*\s+(?:h264_videotoolbox|h264_mf|libx264)\s+' "FFmpeg 没有受支持的 H.264 编码器。"
 
-Write-Host "H.264/HEVC 桥接素材预览和带 ASR 字幕的剪辑导出能力检查通过。"
+    Write-Host "H.264/HEVC 桥接素材预览和带 ASR 字幕的剪辑导出能力检查通过。"
+}
+catch {
+    $diagnostic = [string]$_.Exception.Message
+    foreach ($root in @($env:RUNNER_TEMP, $env:GITHUB_WORKSPACE)) {
+        if (-not [string]::IsNullOrWhiteSpace($root)) {
+            $diagnostic = $diagnostic.Replace($root, "<runner-path>")
+        }
+    }
+    $diagnostic = $diagnostic.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+    Write-Host "::error title=Windows FFmpeg 剪辑能力校验失败::diagnostic=$diagnostic"
+    throw
+}

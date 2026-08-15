@@ -149,9 +149,13 @@ fn release_build_uses_certificate_store_and_explicit_unsigned_development_mode()
         "timestampUrl",
         "verify-signature",
         "sign-windows-resource-binaries.ps1",
+        "& (Join-Path $repo \"scripts\\verify-clip-ffmpeg-capabilities.ps1\")",
     ] {
         assert!(installer.contains(required), "NSIS 构建缺少 {required}");
     }
+    assert!(!installer.contains(
+        "Invoke-Checked -FileName \"powershell.exe\" -Label \"Windows FFmpeg 剪辑能力校验\""
+    ));
     assert!(signer.contains("signtool.exe sign /sha1"));
     assert!(signer.contains("TimeStamperCertificate"));
     assert!(!signer.to_ascii_lowercase().contains(".pfx"));
@@ -240,6 +244,13 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(macos.contains("::error title=macOS Intel 原生验收失败"));
     assert!(macos.contains("diagnostic=%s"));
     assert!(windows.contains("::error title=Windows x64 原生验收失败"));
+    assert!(windows.contains("[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName"));
+    assert!(windows.contains("-Name \"ffmpeg-capabilities\" -FileName $powerShellHost"));
+    let ffmpeg_capabilities = read("scripts/verify-clip-ffmpeg-capabilities.ps1");
+    assert!(
+        ffmpeg_capabilities
+            .contains("::error title=Windows FFmpeg 剪辑能力校验失败::diagnostic=$diagnostic")
+    );
     assert!(workflow.contains("::error title=Windows x64 资源构建失败::$Name"));
     assert!(workflow.contains("::error title=Windows x64 NSIS 构建失败::diagnostic=$diagnostic"));
     assert!(workflow.contains("diagnostic=$diagnostic"));

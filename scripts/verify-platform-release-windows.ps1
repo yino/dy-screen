@@ -214,6 +214,8 @@ if (Test-Path -LiteralPath $script:LogRoot) { throw "平台发行日志目录已
 $script:Steps = [Collections.Generic.List[object]]::new()
 $installerSha256 = Get-Sha256 $installerAbsolute
 $uninstallAttempted = $false
+$powerShellHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+Assert-RegularFile -Path $powerShellHost -Label "当前 PowerShell 主机"
 
 try {
     Invoke-EvidenceStep -Name "install" -FileName $installerAbsolute -WorkingDirectory ([IO.Path]::GetDirectoryName($installerAbsolute)) `
@@ -251,7 +253,7 @@ try {
         "run", "--offline", "--bin", "asr-bundle", "--", "verify",
         "--root", $resourceRoot, "--platform", "windows-x86-64"
     ) | Out-Null
-    Invoke-EvidenceStep -Name "ffmpeg-capabilities" -FileName "powershell.exe" -WorkingDirectory $repo -Arguments @(
+    Invoke-EvidenceStep -Name "ffmpeg-capabilities" -FileName $powerShellHost -WorkingDirectory $repo -Arguments @(
         "-NoProfile", "-NonInteractive", "-File",
         (Join-Path $repo "scripts\verify-clip-ffmpeg-capabilities.ps1"), "-Ffmpeg", $ffmpeg
     ) | Out-Null

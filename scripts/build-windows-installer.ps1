@@ -54,11 +54,8 @@ Invoke-Checked -FileName $Cargo -Label "Windows 资源校验" -Arguments @(
     "run", "--offline", "--bin", "asr-bundle", "--", "verify",
     "--root", $stage, "--platform", "windows-x86-64"
 )
-Invoke-Checked -FileName "powershell.exe" -Label "Windows FFmpeg 剪辑能力校验" -Arguments @(
-    "-NoProfile", "-NonInteractive", "-File",
-    (Join-Path $repo "scripts\verify-clip-ffmpeg-capabilities.ps1"),
-    "-Ffmpeg", (Join-Path $stage "bin\windows-x86_64\ffmpeg.exe")
-)
+& (Join-Path $repo "scripts\verify-clip-ffmpeg-capabilities.ps1") `
+    -Ffmpeg (Join-Path $stage "bin\windows-x86_64\ffmpeg.exe")
 
 $release = $Mode -eq "Release"
 $thumbprint = $null
