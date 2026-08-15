@@ -13,6 +13,13 @@ Set-StrictMode -Version Latest
 
 $ExpectedSha256 = "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
 $ExpectedVersion = "8.1.2"
+$CiStage = "preflight"
+
+function ConvertTo-CiAnnotationValue {
+    param([string]$Value)
+    $sanitized = $Value.Replace([IO.Path]::GetTempPath(), "<temp>\")
+    return $sanitized.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+}
 
 function Assert-RegularFile {
     param([string]$Path, [string]$Label)
@@ -117,9 +124,23 @@ cp "$install_root/bin/ffprobe.exe" "$output_root/bin/windows-x86_64/ffprobe.exe"
 cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
 '@
     [IO.File]::WriteAllText($buildScript, $script, [Text.UTF8Encoding]::new($false))
-    & $bash $buildScript ([IO.Path]::GetFullPath($SourceArchive)) ([IO.Path]::GetFullPath($OutputRoot))
-    if ($LASTEXITCODE -ne 0) { throw "FFmpeg Windows x64 构建失败。" }
+    $CiStage = "configure-build"
+    & $bash $buildScript ([IO.Path]::GetFullPath($SourceArchive)) ([IO.Path]::GetFullPath($OutputRoot)) 2>&1 |
+        Tee-Object -Variable buildOutput
+    $buildExitCode = $LASTEXITCODE
+    if ($buildExitCode -ne 0) {
+        $diagnostic = @($buildOutput |
+            ForEach-Object { [string]$_ } |
+            Where-Object { $_ -match "(?i)(error|failed|not found|unknown|undefined|no such)" } |
+            Select-Object -Last 5) -join " | "
+        if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+            $diagnostic = "bash exit $buildExitCode"
+        }
+        Write-Host "::error title=Windows FFmpeg configure/build failed::$(ConvertTo-CiAnnotationValue $diagnostic)"
+        throw "FFmpeg Windows x64 构建失败。"
+    }
 
+    $CiStage = "pe-dependency-validation"
     $ffmpeg = Join-Path $OutputRoot "bin\windows-x86_64\ffmpeg.exe"
     $ffprobe = Join-Path $OutputRoot "bin\windows-x86_64\ffprobe.exe"
     foreach ($binary in @($ffmpeg, $ffprobe)) {
@@ -128,6 +149,7 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
         Assert-NoBundledRuntimeDependency -Path $binary -Label "FFmpeg 原生程序"
     }
 
+    $CiStage = "capability-validation"
     $version = & $ffmpeg -hide_banner -version 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or $version -notmatch "ffmpeg version\s+$([Regex]::Escape($ExpectedVersion))") {
         throw "FFmpeg 版本与锁定版本不一致。"
@@ -158,6 +180,7 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
         if ($listings.filters -notmatch "(?m)^\s*\S+\s+$([Regex]::Escape($filter))\s+") { throw "FFmpeg 缺少 $filter 滤镜。" }
     }
 
+    $CiStage = "build-records"
     [IO.File]::WriteAllText((Join-Path $OutputRoot "ffmpeg-version.txt"), $version, [Text.UTF8Encoding]::new($false))
     $probeVersion = & $ffprobe -hide_banner -version 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0 -or $probeVersion -notmatch "ffprobe version\s+$([Regex]::Escape($ExpectedVersion))") {
@@ -179,6 +202,7 @@ cp "$source_root/COPYING.LGPLv2.1" "$output_root/licenses/FFmpeg-LGPL-2.1.txt"
     Write-Host "Windows x64 FFmpeg 已构建到受控输出目录。"
 }
 catch {
+    Write-Host "::error title=Windows FFmpeg 构建失败::$CiStage"
     if (Test-Path -LiteralPath $OutputRoot) {
         Remove-Item -LiteralPath $OutputRoot -Recurse -Force
     }

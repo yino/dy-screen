@@ -58,6 +58,16 @@ fn windows_ffmpeg_builder_pins_lgpl_source_and_all_runtime_capabilities() {
     assert!(!script.contains("libx264"));
     assert!(!script.contains("--enable-gpl"));
     assert!(!script.contains("--enable-nonfree"));
+    for stage in [
+        "configure-build",
+        "pe-dependency-validation",
+        "capability-validation",
+        "build-records",
+    ] {
+        assert!(script.contains(stage), "Windows FFmpeg 缺少诊断阶段 {stage}");
+    }
+    assert!(script.contains("Windows FFmpeg configure/build failed"));
+    assert!(script.contains("ConvertTo-CiAnnotationValue"));
 }
 
 #[test]
