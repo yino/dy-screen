@@ -986,6 +986,9 @@ fn verify_windows_resources_when_applicable(
     if platform.os != "windows" {
         return Ok(());
     }
+    let Some(runtime_file) = platform.runtime_file.as_deref() else {
+        return Err("Windows 资源必须声明 x86_64、CPU、SSE4.2 和 VC++ 运行库".to_owned());
+    };
     if platform.arch != "x86_64"
         || platform.accelerator != "cpu"
         || !platform
@@ -996,11 +999,11 @@ fn verify_windows_resources_when_applicable(
             .runtime
             .as_deref()
             .is_none_or(|runtime| runtime.trim().is_empty())
-        || platform.runtime_file.is_none()
     {
         return Err("Windows 资源必须声明 x86_64、CPU、SSE4.2 和 VC++ 运行库".to_owned());
     }
 
+    let runtime_file = runtime_file.replace('\\', "/");
     let declared = platform_paths(platform)
         .into_iter()
         .map(|(path, _)| path.replace('\\', "/"))
@@ -1013,7 +1016,11 @@ fn verify_windows_resources_when_applicable(
         if !matches!(extension.to_ascii_lowercase().as_str(), "exe" | "dll") {
             return Err(format!("Windows 原生资源路径不是 PE 文件：{relative}"));
         }
-        verify_x64_pe(&root.join(relative))?;
+        if relative == &runtime_file {
+            verify_windows_runtime_bootstrapper_pe(&root.join(relative))?;
+        } else {
+            verify_x64_pe(&root.join(relative))?;
+        }
     }
 
     let mut native_files = Vec::new();
@@ -1062,6 +1069,26 @@ fn collect_native_files(
 }
 
 fn verify_x64_pe(path: &Path) -> Result<(), String> {
+    if read_pe_machine(path)? != 0x8664 {
+        return Err(format!(
+            "Windows 原生资源 {} 不是 x64 PE 文件",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_windows_runtime_bootstrapper_pe(path: &Path) -> Result<(), String> {
+    if !matches!(read_pe_machine(path)?, 0x014c | 0x8664) {
+        return Err(format!(
+            "Windows VC++ x64 运行库 {} 不是受支持的 x86/x64 PE bootstrapper",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_pe_machine(path: &Path) -> Result<u16, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("无法读取 Windows 原生资源 {}：{error}", path.display()))?;
     if bytes.len() < 0x46 || bytes.get(..2) != Some(b"MZ") {
@@ -1075,14 +1102,13 @@ fn verify_x64_pe(path: &Path) -> Result<(), String> {
     if pe_offset < 0x40
         || pe_offset.checked_add(6).is_none_or(|end| end > bytes.len())
         || bytes.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0")
-        || bytes.get(pe_offset + 4..pe_offset + 6) != Some(&[0x64, 0x86])
     {
-        return Err(format!(
-            "Windows 原生资源 {} 不是 x64 PE 文件",
-            path.display()
-        ));
+        return Err(format!("Windows 原生资源 {} 不是 PE 文件", path.display()));
     }
-    Ok(())
+    Ok(u16::from_le_bytes([
+        bytes[pe_offset + 4],
+        bytes[pe_offset + 5],
+    ]))
 }
 
 fn verify_hashed_file(
@@ -1296,13 +1322,21 @@ mod windows_resource_tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn fake_x64_pe() -> Vec<u8> {
+    fn fake_pe(machine: u16) -> Vec<u8> {
         let mut bytes = vec![0u8; 0x80];
         bytes[0..2].copy_from_slice(b"MZ");
         bytes[0x3c..0x40].copy_from_slice(&(0x40u32).to_le_bytes());
         bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
-        bytes[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
         bytes
+    }
+
+    fn fake_x64_pe() -> Vec<u8> {
+        fake_pe(0x8664)
+    }
+
+    fn fake_x86_pe() -> Vec<u8> {
+        fake_pe(0x014c)
     }
 
     fn write_file(root: &Path, relative: &str, bytes: &[u8]) {
@@ -1328,10 +1362,14 @@ mod windows_resource_tests {
             "bin/windows-x86_64/vad-speech-segments.exe",
             "bin/windows-x86_64/ffmpeg.exe",
             "bin/windows-x86_64/ffprobe.exe",
-            "runtime/windows-x86_64/vc_redist.x64.exe",
         ] {
             write_file(root, relative, &fake_x64_pe());
         }
+        write_file(
+            root,
+            "runtime/windows-x86_64/vc_redist.x64.exe",
+            &fake_x86_pe(),
+        );
         let manifest = serde_json::json!({
             "schemaVersion":1,
             "bundleVersion":"windows-test",

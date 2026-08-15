@@ -220,12 +220,20 @@ jobs:
             return $sanitized.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
           }
           function Invoke-NativeStage([string]$Name, [scriptblock]$Action) {
+            $nativeOutput = @()
             try {
-              & $Action
+              & $Action 2>&1 | Tee-Object -Variable nativeOutput
               $exitCode = $LASTEXITCODE
               if ($exitCode -ne 0) { throw "$Name 退出码为 $exitCode。" }
             } catch {
-              $diagnostic = ConvertTo-CiAnnotationValue ([string]$_.Exception.Message)
+              $diagnostic = @($nativeOutput |
+                ForEach-Object { [string]$_ } |
+                Where-Object { $_ -match "(?i)(error|failed|mismatch|invalid|missing|not found|拒绝|失败|不一致|缺少|无效)" } |
+                Select-Object -Last 5) -join " | "
+              if ([string]::IsNullOrWhiteSpace($diagnostic)) {
+                $diagnostic = [string]$_.Exception.Message
+              }
+              $diagnostic = ConvertTo-CiAnnotationValue $diagnostic
               Write-Host "::error title=Windows x64 资源构建失败::$Name, diagnostic=$diagnostic"
               throw
             }

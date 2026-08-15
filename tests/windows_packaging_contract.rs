@@ -233,12 +233,7 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(workflow.contains("$ErrorActionPreference = \"Continue\""));
     assert!(workflow.contains("锁定发行输入下载失败::$Name (curl exit $curlExitCode)"));
     assert!(workflow.contains("local name=$1 url=$2 output=$3 expected=$4 exit_code=0"));
-    assert_eq!(
-        workflow
-            .matches("--retry 5 --retry-all-errors")
-            .count(),
-        2
-    );
+    assert_eq!(workflow.matches("--retry 5 --retry-all-errors").count(), 2);
     assert!(workflow.contains("锁定发行输入下载失败::%s (curl exit %s)"));
     assert!(!workflow.contains("shell: powershell"));
     assert_eq!(workflow.matches("shell: pwsh").count(), 5);
@@ -247,6 +242,8 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(windows.contains("::error title=Windows x64 原生验收失败"));
     assert!(workflow.contains("::error title=Windows x64 资源构建失败::$Name"));
     assert!(workflow.contains("diagnostic=$diagnostic"));
+    assert!(workflow.contains("Tee-Object -Variable nativeOutput"));
+    assert!(workflow.contains("Select-Object -Last 5"));
     assert!(workflow.contains("$env:RUNNER_TEMP, $env:GITHUB_WORKSPACE"));
     assert!(workflow.contains("<runner-path>"));
     for stage in [
