@@ -252,8 +252,22 @@ fn native_platform_release_validation_pins_inputs_and_requires_real_media_execut
     assert!(macos.contains("::error title=macOS Intel 原生验收失败"));
     assert!(macos.contains("diagnostic=%s"));
     assert!(windows.contains("::error title=Windows x64 原生验收失败"));
+    assert!(windows.contains("::error title=Windows x64 原生验收超时"));
     assert!(windows.contains("[Diagnostics.Process]::GetCurrentProcess().MainModule.FileName"));
     assert!(windows.contains("-Name \"ffmpeg-capabilities\" -FileName $powerShellHost"));
+    assert!(windows.contains("[ValidateRange(1, 3600)]"));
+    assert!(windows.contains("$process.WaitForExit(30000)"));
+    assert!(windows.contains("taskkill.exe"));
+    assert!(windows.contains("/PID $process.Id /T /F"));
+    assert!(windows.contains("status=running timeoutSeconds=$TimeoutSeconds"));
+    assert!(
+        windows.contains("status=$(if ($result.TimedOut) { 'timed-out' } else { 'finished' })")
+    );
+    assert!(windows.contains("timedOut = $result.TimedOut"));
+    assert_eq!(windows.matches("Invoke-EvidenceStep -Name \"").count(), 8);
+    assert_eq!(windows.matches("-TimeoutSeconds ").count(), 10);
+    assert!(workflow.contains("windows-x64:\n    if:"));
+    assert!(workflow.contains("windows-x64:\n    if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'windows-x64' }}\n    runs-on: windows-2022\n    timeout-minutes: 300"));
     let ffmpeg_capabilities = read("scripts/verify-clip-ffmpeg-capabilities.ps1");
     assert!(
         ffmpeg_capabilities

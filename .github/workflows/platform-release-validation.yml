@@ -151,7 +151,7 @@ jobs:
   windows-x64:
     if: ${{ github.event_name == 'push' || inputs.target == 'all' || inputs.target == 'windows-x64' }}
     runs-on: windows-2022
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

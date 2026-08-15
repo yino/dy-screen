@@ -93,7 +93,9 @@ function Invoke-CapturedProcess {
         [string]$FileName,
         [string[]]$Arguments,
         [string]$WorkingDirectory,
-        [hashtable]$Environment = @{}
+        [hashtable]$Environment = @{},
+        [ValidateRange(1, 3600)]
+        [int]$TimeoutSeconds
     )
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $FileName
@@ -114,13 +116,30 @@ function Invoke-CapturedProcess {
     if (-not $process.Start()) { throw "无法启动平台发行验收进程。" }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
-    $process.WaitForExit()
+    $timedOut = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while (-not $process.WaitForExit(30000)) {
+        if ([DateTime]::UtcNow -ge $deadline) {
+            $timedOut = $true
+            break
+        }
+        Write-Host "Windows x64 原生验收步骤仍在执行：pid=$($process.Id), elapsedSeconds=$([int]$stopwatch.Elapsed.TotalSeconds)"
+    }
+    if ($timedOut) {
+        $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+        try { & $taskkill /PID $process.Id /T /F 2>&1 | Out-Null } catch {}
+        if (-not $process.WaitForExit(30000)) {
+            try { $process.Kill() } catch {}
+            [void]$process.WaitForExit(5000)
+        }
+    }
     $stopwatch.Stop()
     $result = [pscustomobject]@{
-        ExitCode = $process.ExitCode
+        ExitCode = if ($process.HasExited) { $process.ExitCode } else { -1 }
         WallMs = [int64]$stopwatch.ElapsedMilliseconds
-        Stdout = $stdoutTask.GetAwaiter().GetResult()
-        Stderr = $stderrTask.GetAwaiter().GetResult()
+        Stdout = if ($stdoutTask.Wait(5000)) { $stdoutTask.GetAwaiter().GetResult() } else { "[stdout capture incomplete]" }
+        Stderr = if ($stderrTask.Wait(5000)) { $stderrTask.GetAwaiter().GetResult() } else { "[stderr capture incomplete]" }
+        TimedOut = $timedOut
     }
     $process.Dispose()
     return $result
@@ -132,14 +151,23 @@ function Invoke-EvidenceStep {
         [string]$FileName,
         [string[]]$Arguments,
         [string]$WorkingDirectory,
-        [hashtable]$Environment = @{}
+        [hashtable]$Environment = @{},
+        [ValidateRange(1, 3600)]
+        [int]$TimeoutSeconds
     )
-    $result = Invoke-CapturedProcess -FileName $FileName -Arguments $Arguments `
-        -WorkingDirectory $WorkingDirectory -Environment $Environment
-    $combined = $result.Stdout + $result.Stderr
+    $logPath = Join-Path $script:LogRoot ($Name + ".log")
     [IO.File]::WriteAllText(
-        (Join-Path $script:LogRoot ($Name + ".log")),
-        $combined,
+        $logPath,
+        "step=$Name status=running timeoutSeconds=$TimeoutSeconds`r`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    Write-Host "Windows x64 原生验收步骤开始：step=$Name, timeoutSeconds=$TimeoutSeconds"
+    $result = Invoke-CapturedProcess -FileName $FileName -Arguments $Arguments `
+        -WorkingDirectory $WorkingDirectory -Environment $Environment -TimeoutSeconds $TimeoutSeconds
+    $combined = $result.Stdout + $result.Stderr
+    [IO.File]::AppendAllText(
+        $logPath,
+        $combined + "`r`nstep=$Name status=$(if ($result.TimedOut) { 'timed-out' } else { 'finished' }) wallMs=$($result.WallMs)`r`n",
         [Text.UTF8Encoding]::new($false)
     )
     $outputSha256 = Get-TextSha256 $combined
@@ -148,7 +176,13 @@ function Invoke-EvidenceStep {
         exitCode = $result.ExitCode
         wallMs = $result.WallMs
         outputSha256 = $outputSha256
+        timeoutSeconds = $TimeoutSeconds
+        timedOut = $result.TimedOut
     })
+    if ($result.TimedOut) {
+        Write-Host "::error title=Windows x64 原生验收超时::step=$Name, timeoutSeconds=$TimeoutSeconds, logSha256=$outputSha256"
+        throw "Windows 平台发行验收步骤超时：$Name。"
+    }
     if ($result.ExitCode -ne 0) {
         Write-Host "::error title=Windows x64 原生验收失败::step=$Name, exitCode=$($result.ExitCode), logSha256=$outputSha256"
         throw "Windows 平台发行验收步骤失败：$Name。"
@@ -219,7 +253,7 @@ Assert-RegularFile -Path $powerShellHost -Label "当前 PowerShell 主机"
 
 try {
     Invoke-EvidenceStep -Name "install" -FileName $installerAbsolute -WorkingDirectory ([IO.Path]::GetDirectoryName($installerAbsolute)) `
-        -Arguments @("/S", "/D=$installDirectoryAbsolute") | Out-Null
+        -Arguments @("/S", "/D=$installDirectoryAbsolute") -TimeoutSeconds 600 | Out-Null
 
     $appBinary = Join-Path $installDirectoryAbsolute "dy-screen-app.exe"
     $resourceRoot = Join-Path $installDirectoryAbsolute "resources\asr"
@@ -252,22 +286,22 @@ try {
     Invoke-EvidenceStep -Name "resource-integrity" -FileName $Cargo -WorkingDirectory $repo -Arguments @(
         "run", "--offline", "--bin", "asr-bundle", "--", "verify",
         "--root", $resourceRoot, "--platform", "windows-x86-64"
-    ) | Out-Null
+    ) -TimeoutSeconds 900 | Out-Null
     Invoke-EvidenceStep -Name "ffmpeg-capabilities" -FileName $powerShellHost -WorkingDirectory $repo -Arguments @(
         "-NoProfile", "-NonInteractive", "-File",
         (Join-Path $repo "scripts\verify-clip-ffmpeg-capabilities.ps1"), "-Ffmpeg", $ffmpeg
-    ) | Out-Null
+    ) -TimeoutSeconds 900 | Out-Null
     $asrEnvironment = @{ ASR_RESOURCE_ROOT = $resourceRoot }
     Invoke-EvidenceStep -Name "vad" -FileName $Cargo -WorkingDirectory $repo -Environment $asrEnvironment -Arguments @(
         "test", "--offline", "--test", "asr_vad_integration",
         "real_silero_vad_detects_speech_and_rejects_silence_and_music",
         "--", "--ignored", "--exact", "--nocapture"
-    ) | Out-Null
+    ) -TimeoutSeconds 1800 | Out-Null
     Invoke-EvidenceStep -Name "whisper" -FileName $Cargo -WorkingDirectory $repo -Environment $asrEnvironment -Arguments @(
         "test", "--offline", "--test", "asr_whisper_integration",
         "real_whisper_engine_transcribes_fixture_and_exits_cleanly",
         "--", "--ignored", "--exact", "--nocapture"
-    ) | Out-Null
+    ) -TimeoutSeconds 1800 | Out-Null
     $clipEnvironment = @{
         DY_SCREEN_REQUIRE_CLIP_PLATFORM_VALIDATION = "1"
         DY_SCREEN_CLIP_FFMPEG = $ffmpeg
@@ -277,12 +311,12 @@ try {
         "test", "--offline", "--manifest-path", "src-tauri/Cargo.toml", "--lib",
         "transition_assets::tests::real_h264_and_hevc_samples_keep_audio_and_generate_compatible_preview",
         "--", "--exact", "--nocapture"
-    ) | Out-Null
+    ) -TimeoutSeconds 2700 | Out-Null
     Invoke-EvidenceStep -Name "export" -FileName $Cargo -WorkingDirectory $repo -Environment $clipEnvironment -Arguments @(
         "test", "--offline", "--manifest-path", "src-tauri/Cargo.toml", "--lib",
         "ai::clip_export::tests::exports_mixed_source_dimensions_to_a_playable_mp4",
         "--", "--exact", "--nocapture"
-    ) | Out-Null
+    ) -TimeoutSeconds 2700 | Out-Null
 
     $appSha256 = Get-Sha256 $appBinary
     $resourceManifestSha256 = Get-Sha256 $manifestPath
@@ -299,7 +333,7 @@ try {
 
     $uninstallAttempted = $true
     Invoke-EvidenceStep -Name "uninstall" -FileName $uninstaller -WorkingDirectory $installDirectoryAbsolute `
-        -Arguments @("/S") | Out-Null
+        -Arguments @("/S") -TimeoutSeconds 600 | Out-Null
     if (-not (Wait-PathRemoved -Path $installDirectoryAbsolute)) {
         throw "NSIS 卸载后安装目录仍存在。"
     }
@@ -332,6 +366,9 @@ try {
 }
 finally {
     if (-not $uninstallAttempted -and (Test-Path -LiteralPath (Join-Path $installDirectoryAbsolute "uninstall.exe"))) {
-        try { & (Join-Path $installDirectoryAbsolute "uninstall.exe") /S | Out-Null } catch {}
+        try {
+            Invoke-CapturedProcess -FileName (Join-Path $installDirectoryAbsolute "uninstall.exe") `
+                -Arguments @("/S") -WorkingDirectory $installDirectoryAbsolute -TimeoutSeconds 300 | Out-Null
+        } catch {}
     }
 }
