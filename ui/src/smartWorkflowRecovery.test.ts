@@ -38,6 +38,8 @@ function detail(generation: number, sequence: number): AiSmartWorkflowDetail {
     batches: [],
     attempts: [],
     drafts: [],
+    frozenInputCount: 1,
+    processedInputCount: sequence >= 2 ? 1 : 0,
   };
 }
 

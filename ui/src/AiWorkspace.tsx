@@ -57,7 +57,10 @@ import type {
   AiInputStatus,
   AiJobEvent,
   AiActiveLiveSession,
+  AiSmartReplaySession,
+  AiSmartReplaySessionCursor,
   AiSmartStage,
+  AiSmartWorkflowMode,
   AiSmartWorkflowDetail,
   AiProject,
   AiProjectDetail,
@@ -428,10 +431,20 @@ function SmartClippingHome({
   llmSettings: LlmProviderSettings | null;
   onOpenDraft: (detail: AiClipProjectDetail) => void;
 }) {
-  const [mode, setMode] = useState<"local" | "live">("local");
+  const [mode, setMode] = useState<AiSmartWorkflowMode>("local");
   const [grants, setGrants] = useState<Array<{ grantId: string; displayName: string }>>([]);
   const [sessions, setSessions] = useState<AiActiveLiveSession[]>([]);
   const [sessionId, setSessionId] = useState<number | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+  const [replaySessions, setReplaySessions] = useState<AiSmartReplaySession[]>([]);
+  const [replaySessionId, setReplaySessionId] = useState<number | null>(null);
+  const [replaySearch, setReplaySearch] = useState("");
+  const [replayCursor, setReplayCursor] = useState<AiSmartReplaySessionCursor | null>(null);
+  const [replayLoading, setReplayLoading] = useState(false);
+  const [replayLoadingMore, setReplayLoadingMore] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
+  const [duplicateConfirmed, setDuplicateConfirmed] = useState(false);
   const [authorized, setAuthorized] = useState(false);
   const [snapshot, setSnapshot] = useState<SmartWorkflowSnapshot>({
     workflows: [],
@@ -440,6 +453,7 @@ function SmartClippingHome({
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const replayRequestRef = useRef(0);
 
   useEffect(() => {
     let disposed = false;
@@ -460,33 +474,101 @@ function SmartClippingHome({
     };
   }, [api]);
 
+  const loadLiveSessions = useCallback(async () => {
+    setLiveLoading(true);
+    setLiveError(null);
+    try {
+      const items = await api.listActiveLiveSessions();
+      setSessions(items);
+      setSessionId((current) => items.some((item) => item.sessionId === current)
+        ? current
+        : items[0]?.sessionId ?? null);
+    } catch (failure) {
+      setLiveError(safeError(failure, "无法读取正在录制的直播间"));
+    } finally {
+      setLiveLoading(false);
+    }
+  }, [api]);
+
+  const loadReplaySessions = useCallback(async (
+    cursor: AiSmartReplaySessionCursor | null,
+    append: boolean,
+  ) => {
+    const requestId = ++replayRequestRef.current;
+    if (append) setReplayLoadingMore(true);
+    else setReplayLoading(true);
+    setReplayError(null);
+    try {
+      const page = await api.listSmartReplaySessions(replaySearch, cursor, 20);
+      if (requestId !== replayRequestRef.current) return;
+      setReplaySessions((current) => {
+        return append
+          ? [...current, ...page.items.filter((item) => !current.some((existing) => existing.sessionId === item.sessionId))]
+          : page.items;
+      });
+      setReplaySessionId((selected) => {
+        if (append && selected !== null) return selected;
+        return page.items.some((item) => item.sessionId === selected)
+          ? selected
+          : page.items[0]?.sessionId ?? null;
+      });
+      setReplayCursor(page.nextCursor);
+    } catch (failure) {
+      if (requestId === replayRequestRef.current) {
+        setReplayError(safeError(failure, "无法读取本机直播回放"));
+      }
+    } finally {
+      if (requestId === replayRequestRef.current) {
+        setReplayLoading(false);
+        setReplayLoadingMore(false);
+      }
+    }
+  }, [api, replaySearch]);
+
   useEffect(() => {
-    let disposed = false;
     if (mode !== "live") return;
-    void api.listActiveLiveSessions()
-      .then((items) => {
-        if (disposed) return;
-        setSessions(items);
-        setSessionId((current) => current ?? items[0]?.sessionId ?? null);
-      })
-      .catch((failure) => !disposed && setError(safeError(failure, "无法读取正在录制的直播间")));
-    return () => {
-      disposed = true;
-    };
-  }, [api, mode]);
+    void loadLiveSessions();
+  }, [loadLiveSessions, mode]);
+
+  useEffect(() => {
+    if (mode !== "replay") return;
+    const timer = window.setTimeout(() => {
+      setDuplicateConfirmed(false);
+      void loadReplaySessions(null, false);
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [loadReplaySessions, mode]);
 
   const selectedDetail = selectedWorkflowId === null
     ? null
     : snapshot.details.get(selectedWorkflowId) ?? null;
-  const sourceReady = mode === "local" ? grants.length > 0 : sessionId !== null;
+  const selectedReplay = replaySessions.find((session) => session.sessionId === replaySessionId) ?? null;
+  const sourceReady = mode === "local"
+    ? grants.length > 0
+    : mode === "live"
+      ? sessionId !== null
+      : selectedReplay !== null && selectedReplay.unavailableVideoCount === 0;
   const gatesReady = Boolean(environment?.ready && llmSettings?.keyConfigured);
-  const canCreate = sourceReady && gatesReady && authorized && !busy;
+  const duplicateReady = mode !== "replay"
+    || selectedReplay?.existingWorkflowId === null
+    || duplicateConfirmed;
+  const canCreate = sourceReady && gatesReady && duplicateReady && authorized && !busy;
   const configuration = {
-    name: mode === "local" ? "本地智能成片" : "直播智能成片",
+    name: mode === "local"
+      ? "本地智能成片"
+      : mode === "live"
+        ? "正在直播智能成片"
+        : "直播回放智能成片",
     provider: llmSettings?.provider ?? "deepseek",
     modelId: llmSettings?.modelId ?? "deepseek-chat",
     textScope: "selected_clip_subtitles" as const,
     outputPreference: "reviewable_compilation",
+  };
+
+  const selectMode = (next: AiSmartWorkflowMode) => {
+    setMode(next);
+    setAuthorized(false);
+    setDuplicateConfirmed(false);
   };
 
   const refreshWorkflow = async (workflowId: number) => {
@@ -527,10 +609,17 @@ function SmartClippingHome({
             grantIds: grants.map((grant) => grant.grantId),
             authorizationConfirmed: true,
           })
-        : await api.createLiveSmartWorkflow({
+        : mode === "live"
+          ? await api.createLiveSmartWorkflow({
             configuration,
             sessionId: sessionId!,
             authorizationConfirmed: true,
+          })
+          : await api.createReplaySmartWorkflow({
+            configuration,
+            sessionId: replaySessionId!,
+            authorizationConfirmed: true,
+            duplicateConfirmed,
           });
       setSelectedWorkflowId(detail.workflow.id);
       setSnapshot((current) => {
@@ -546,8 +635,20 @@ function SmartClippingHome({
       });
       setGrants([]);
       setAuthorized(false);
+      setDuplicateConfirmed(false);
+      if (mode === "replay") {
+        setReplaySessions((current) => current.map((item) => item.sessionId === replaySessionId
+          ? {
+              ...item,
+              existingWorkflowId: detail.workflow.id,
+              existingWorkflowStatus: detail.workflow.status,
+            }
+          : item));
+      }
     } catch (failure) {
       setError(safeError(failure, "智能成片任务创建失败"));
+      if (mode === "live") void loadLiveSessions();
+      if (mode === "replay") void loadReplaySessions(null, false);
     } finally {
       setBusy(false);
     }
@@ -594,8 +695,8 @@ function SmartClippingHome({
       <div className="smart-create-layout">
         <div className="smart-create-form">
           <div className="smart-mode-control" role="group" aria-label="智能成片输入模式">
-            <button className={mode === "local" ? "active" : ""} onClick={() => { setMode("local"); setAuthorized(false); }}><FolderOpen size={16} />本地视频</button>
-            <button className={mode === "live" ? "active" : ""} onClick={() => { setMode("live"); setAuthorized(false); }}><Radio size={16} />直播间</button>
+            <button aria-pressed={mode === "local"} className={mode === "local" ? "active" : ""} onClick={() => selectMode("local")}><FolderOpen size={16} />本地视频</button>
+            <button aria-pressed={mode !== "local"} className={mode !== "local" ? "active" : ""} onClick={() => selectMode(mode === "local" ? "live" : mode)}><Radio size={16} />直播素材</button>
           </div>
 
           {mode === "local" ? (
@@ -606,13 +707,50 @@ function SmartClippingHome({
               </div>
             </div>
           ) : (
-            <div className="smart-live-picker">
-              {sessions.length === 0 ? <div className="smart-empty-inline">当前没有正在录制的受信直播间</div> : sessions.map((session) => (
-                <label key={session.sessionId} className={sessionId === session.sessionId ? "selected" : ""}>
-                  <input type="radio" name="smart-live-session" checked={sessionId === session.sessionId} onChange={() => { setSessionId(session.sessionId); setAuthorized(false); }} />
-                  <Radio size={15} /><span><strong>{session.streamerName}</strong><small>{formatSessionTime(session.startedAt)} 开始录制</small></span>
-                </label>
-              ))}
+            <div className="smart-live-source">
+              <div className="smart-live-mode-control" role="group" aria-label="直播素材模式">
+                <button aria-pressed={mode === "live"} className={mode === "live" ? "active" : ""} onClick={() => selectMode("live")}><Radio size={15} />正在直播</button>
+                <button aria-pressed={mode === "replay"} className={mode === "replay" ? "active" : ""} onClick={() => selectMode("replay")}><RotateCcw size={15} />直播回放</button>
+              </div>
+
+              {mode === "live" ? (
+                <div className="smart-live-picker" aria-busy={liveLoading}>
+                  {liveLoading && <div className="smart-empty-inline" role="status"><LoaderCircle className="spin" size={15} />正在读取受信直播场次</div>}
+                  {!liveLoading && liveError && <div className="smart-source-error" role="alert"><span>{liveError}</span><button className="secondary-button" onClick={() => void loadLiveSessions()}><RefreshCw size={14} />重试</button></div>}
+                  {!liveLoading && !liveError && sessions.length === 0 && <div className="smart-empty-inline">当前没有正在录制的受信直播间</div>}
+                  {!liveLoading && !liveError && sessions.map((session) => (
+                    <label key={session.sessionId} className={sessionId === session.sessionId ? "selected" : ""}>
+                      <input type="radio" name="smart-live-session" checked={sessionId === session.sessionId} onChange={() => { setSessionId(session.sessionId); setAuthorized(false); }} />
+                      <Radio size={15} /><span><strong>{session.streamerName}</strong><small>{formatSessionTime(session.startedAt)} 开始录制</small></span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div className="smart-replay-picker" aria-busy={replayLoading || replayLoadingMore}>
+                  <div className="smart-replay-tools">
+                    <label><Search size={14} /><input aria-label="搜索直播回放" value={replaySearch} onChange={(event) => setReplaySearch(event.target.value)} placeholder="主播、日期或场次 ID" /></label>
+                    <button aria-label="刷新直播回放" title="刷新直播回放" disabled={replayLoading} onClick={() => void loadReplaySessions(null, false)}><RefreshCw className={replayLoading ? "spin" : ""} size={15} /></button>
+                  </div>
+                  {replayLoading && <div className="smart-empty-inline" role="status"><LoaderCircle className="spin" size={15} />正在读取本机直播回放</div>}
+                  {!replayLoading && replayError && <div className="smart-source-error" role="alert"><span>{replayError}</span><button className="secondary-button" onClick={() => void loadReplaySessions(null, false)}><RefreshCw size={14} />重试</button></div>}
+                  {!replayLoading && !replayError && replaySessions.length === 0 && <div className="smart-empty-inline">没有匹配的本机已完成录制</div>}
+                  {!replayLoading && !replayError && replaySessions.map((session) => {
+                    const unavailable = session.unavailableVideoCount > 0;
+                    return <label key={session.sessionId} className={`${replaySessionId === session.sessionId ? "selected" : ""} ${unavailable ? "unavailable" : ""}`}>
+                      <input type="radio" name="smart-replay-session" disabled={unavailable} checked={replaySessionId === session.sessionId} onChange={() => { setReplaySessionId(session.sessionId); setAuthorized(false); setDuplicateConfirmed(false); }} />
+                      <Video size={15} />
+                      <span>
+                        <strong>{session.streamerName}</strong>
+                        <small>本机已完成录制 · {formatSessionTime(session.startedAt)} · {formatDuration(session.totalDurationMs)} · {session.videoCount} 个分片</small>
+                        {session.existingWorkflowId !== null && <em>已有任务 · {session.existingWorkflowStatus ? smartStatusLabels[session.existingWorkflowStatus] : `#${session.existingWorkflowId}`}</em>}
+                        {unavailable && <em>{session.unavailableVideoCount} 个分片已失效，请修复录像后重试</em>}
+                      </span>
+                    </label>;
+                  })}
+                  {!replayLoading && !replayError && replayCursor && <button className="secondary-button smart-replay-more" disabled={replayLoadingMore} onClick={() => void loadReplaySessions(replayCursor, true)}>{replayLoadingMore ? <LoaderCircle className="spin" size={14} /> : <ChevronRight size={14} />}加载更多回放</button>}
+                  <small className="smart-replay-note">仅使用本机已登记录像，不支持平台回放 URL 或下载。</small>
+                </div>
+              )}
             </div>
           )}
 
@@ -623,7 +761,8 @@ function SmartClippingHome({
               <span><b>发送范围</b>入选片段的规范化字幕与工程字幕副本</span>
               <span><b>导出</b>必须审阅后由你明确选择目标</span>
             </div>
-            <label className="smart-auth-confirm"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} />我确认仅为当前{mode === "local" ? "任务" : "直播场次"}授权自动高光、纠错与转场匹配</label>
+            <label className="smart-auth-confirm"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} />我确认仅为当前{mode === "live" ? "直播场次" : mode === "replay" ? "回放任务及冻结分片" : "任务"}授权自动高光、纠错与转场匹配</label>
+            {mode === "replay" && selectedReplay?.existingWorkflowId != null && <label className="smart-auth-confirm smart-duplicate-confirm"><input type="checkbox" checked={duplicateConfirmed} onChange={(event) => setDuplicateConfirmed(event.target.checked)} />该场回放已有智能任务，我确认重新处理并创建独立任务</label>}
             <div className="smart-gates">
               <span className={environment?.ready ? "ready" : "blocked"}>{environment?.ready ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}ASR 资源</span>
               <span className={llmSettings?.keyConfigured ? "ready" : "blocked"}>{llmSettings?.keyConfigured ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}Provider</span>
@@ -638,7 +777,7 @@ function SmartClippingHome({
           {snapshot.workflows.length === 0 ? <div className="smart-empty-inline">创建后的任务会在这里持续更新</div> : snapshot.workflows.map((workflow) => (
             <button key={workflow.id} className={selectedWorkflowId === workflow.id ? "active" : ""} onClick={() => { setSelectedWorkflowId(workflow.id); void refreshWorkflow(workflow.id); }}>
               <span className={`smart-task-dot ${workflow.status}`} />
-              <span><strong>{workflow.name}</strong><small>{workflow.mode === "local" ? "本地视频" : "直播间"} · {smartStatusLabels[workflow.status]}</small></span>
+              <span><strong>{workflow.name}</strong><small>{workflow.mode === "local" ? "本地视频" : workflow.mode === "replay" ? "直播回放" : "正在直播"} · {smartStatusLabels[workflow.status]}</small></span>
               <span className="smart-task-stage">{smartStageLabels[workflow.stage]}</span>
             </button>
           ))}
@@ -658,8 +797,13 @@ function SmartClippingHome({
             })}
           </div>
           <div className="smart-metrics">
-            <span><b>{selectedDetail.batches.length}</b>批次</span>
-            <span><b>{selectedDetail.workflow.pendingBatchCount}</b>积压</span>
+            {selectedDetail.workflow.mode === "replay" ? <>
+              <span><b>{selectedDetail.processedInputCount}/{selectedDetail.frozenInputCount}</b>已处理分片</span>
+              <span><b>{selectedDetail.frozenInputCount === 0 ? 0 : Math.round(selectedDetail.processedInputCount / selectedDetail.frozenInputCount * 100)}%</b>固定进度</span>
+            </> : <>
+              <span><b>{selectedDetail.batches.length}</b>批次</span>
+              <span><b>{selectedDetail.workflow.pendingBatchCount}</b>{selectedDetail.workflow.mode === "live" ? "积压" : "待处理"}</span>
+            </>}
             <span><b>{selectedDetail.workflow.candidateCount}</b>候选</span>
             <span><b>{selectedDetail.workflow.selectedCount}</b>自动入选</span>
             <span><b>{selectedDetail.drafts.length}</b>草稿版本</span>

@@ -176,6 +176,8 @@ function smartWorkflowDetail(
   };
   return {
     workflow,
+    frozenInputCount: 3,
+    processedInputCount: 3,
     batches: [{
       id: 601,
       workflowId: workflow.id,
@@ -316,6 +318,8 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     createLocalSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能成片"),
     listActiveLiveSessions: vi.fn().mockResolvedValue([]),
     createLiveSmartWorkflow: vi.fn().mockRejectedValue("测试未配置直播智能成片"),
+    listSmartReplaySessions: vi.fn().mockResolvedValue({ items: [], nextCursor: null }),
+    createReplaySmartWorkflow: vi.fn().mockRejectedValue("测试未配置回放智能成片"),
     authorizeSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务授权"),
     listSmartWorkflows: vi.fn().mockResolvedValue([]),
     getSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务详情"),
@@ -1254,7 +1258,7 @@ describe("App", () => {
     render(<App api={api} />);
 
     await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
-    await user.click(screen.getByRole("button", { name: "直播间" }));
+    await user.click(screen.getByRole("button", { name: "直播素材" }));
     expect(await screen.findByText("正在录制的直播间")).toBeInTheDocument();
     expect(screen.queryByRole("textbox", { name: /直播/ })).not.toBeInTheDocument();
     expect(screen.queryByText(/URL/)).not.toBeInTheDocument();
@@ -1264,6 +1268,108 @@ describe("App", () => {
       sessionId: 88,
       authorizationConfirmed: true,
     }));
+  });
+
+  it("直播素材同时提供正在直播与可搜索分页的本机回放，并确认重复任务", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.listActiveLiveSessions = vi.fn().mockResolvedValue([{
+      sessionId: 91,
+      streamerName: "同一主播当前直播",
+      startedAt: "2026-08-14T08:00:00Z",
+    }]);
+    const firstReplay = {
+      sessionId: 81,
+      streamerName: "同一主播历史回放",
+      startedAt: "2026-08-13T08:00:00Z",
+      endedAt: "2026-08-13T09:30:00Z",
+      videoCount: 8,
+      totalDurationMs: 5_400_000,
+      unavailableVideoCount: 0,
+      existingWorkflowId: 401,
+      existingWorkflowStatus: "completed" as const,
+    };
+    const secondReplay = {
+      ...firstReplay,
+      sessionId: 80,
+      streamerName: "更早的本机回放",
+      startedAt: "2026-08-12T08:00:00Z",
+      endedAt: "2026-08-12T09:00:00Z",
+      videoCount: 4,
+      totalDurationMs: 3_600_000,
+      existingWorkflowId: null,
+      existingWorkflowStatus: null,
+    };
+    const nextCursor = { startedAt: firstReplay.startedAt, sessionId: firstReplay.sessionId };
+    api.listSmartReplaySessions = vi.fn(async (_search = "", cursor = null) => cursor
+      ? { items: [secondReplay], nextCursor: null }
+      : { items: [firstReplay], nextCursor });
+    const replayDetail = {
+      ...smartWorkflowDetail({
+        id: 601,
+        mode: "replay",
+        name: "直播回放智能成片",
+        sourceSessionId: 81,
+        sourceSummary: "同一主播历史回放 · 本机直播回放 · 8 个冻结分片",
+        pendingBatchCount: 0,
+      }),
+      frozenInputCount: 8,
+      processedInputCount: 8,
+    };
+    api.createReplaySmartWorkflow = vi.fn().mockResolvedValue(replayDetail);
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    await user.click(screen.getByRole("button", { name: "直播素材" }));
+    expect(await screen.findByText("同一主播当前直播")).toBeInTheDocument();
+    const replayModeButton = screen.getByRole("button", { name: "直播回放" });
+    replayModeButton.focus();
+    await user.keyboard("{Enter}");
+    expect(replayModeButton).toHaveAttribute("aria-pressed", "true");
+    expect(await screen.findByText("同一主播历史回放")).toBeInTheDocument();
+    expect(screen.getByText(/本机已完成录制.*8 个分片/)).toBeInTheDocument();
+    expect(screen.getByText("已有任务 · 已完成")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/https?:\/\//)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "加载更多回放" }));
+    expect(await screen.findByText("更早的本机回放")).toBeInTheDocument();
+    expect(api.listSmartReplaySessions).toHaveBeenCalledWith("", nextCursor, 20);
+
+    const search = screen.getByRole("textbox", { name: "搜索直播回放" });
+    await user.type(search, "昨天");
+    await waitFor(() => expect(api.listSmartReplaySessions).toHaveBeenLastCalledWith("昨天", null, 20));
+
+    const createButton = screen.getByRole("button", { name: "创建并启动" });
+    await user.click(screen.getByRole("checkbox", { name: /回放任务及冻结分片/ }));
+    expect(createButton).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: /已有智能任务.*重新处理/ }));
+    expect(createButton).toBeEnabled();
+    await user.click(createButton);
+
+    expect(api.createReplaySmartWorkflow).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 81,
+      authorizationConfirmed: true,
+      duplicateConfirmed: true,
+    }));
+    expect(await screen.findByText("8/8")).toBeInTheDocument();
+    expect(screen.getByText("100%")).toBeInTheDocument();
+    expect(screen.getByText(/直播回放 · 可审阅/)).toBeInTheDocument();
+  });
+
+  it("直播回放目录失败后可重试并展示明确空状态", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    api.listSmartReplaySessions = vi.fn()
+      .mockRejectedValueOnce(new Error("回放目录暂时不可用"))
+      .mockResolvedValue({ items: [], nextCursor: null });
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    await user.click(screen.getByRole("button", { name: "直播素材" }));
+    await user.click(screen.getByRole("button", { name: "直播回放" }));
+    expect(await screen.findByText("回放目录暂时不可用")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText("没有匹配的本机已完成录制")).toBeInTheDocument();
   });
 
   it("智能任务显示长脱敏错误并支持局部重试和任务取消", async () => {
@@ -1411,6 +1517,7 @@ describe("App", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App api={api} />);
     await screen.findByText("还没有监控主播");
+    await waitFor(() => expect(listener).toBeTypeOf("function"));
 
     await act(async () => {
       listener?.({ kind: "exit_confirmation_requested", streamerId: null });

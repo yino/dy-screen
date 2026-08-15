@@ -4,6 +4,7 @@
 //! 层验证的受信来源，并以 SQLite 事务隔离任务代次、阶段尝试和草稿所有权。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,7 +21,8 @@ use crate::transition_matching::{TransitionMatchingError, TransitionMatchingWork
 use super::{
     AiActiveLiveSession, AiInputStatus, AiJobController, AiProjectService, AiProjectStatus,
     AiRepository, AiRepositoryError, AiSmartBatchStatus, AiSmartCandidate, AiSmartCandidateSource,
-    AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AiSmartStage, AiSmartStageAttempt,
+    AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AiSmartReplaySession,
+    AiSmartReplaySessionCursor, AiSmartReplaySessionPage, AiSmartStage, AiSmartStageAttempt,
     AiSmartStageAttemptStatus, AiSmartWorkflow, AiSmartWorkflowBatch, AiSmartWorkflowDetail,
     AiSmartWorkflowEvent, AiSmartWorkflowMetric, AiSmartWorkflowMode, AiSmartWorkflowStatus,
     AiTranscriptProjection, AnalysisSegment, ClipTextCorrectionError, ClipTextCorrectionWorkflow,
@@ -50,14 +52,30 @@ impl SmartWorkflowRepository {
 
     pub fn create(&self, input: &NewAiSmartWorkflow) -> Result<AiSmartWorkflowDetail> {
         validate_workflow_input(input)?;
-        if input.mode == AiSmartWorkflowMode::Live {
-            let session = self.database.get_session(
-                input
-                    .source_session_id
-                    .ok_or_else(|| invalid("直播任务必须绑定录制会话"))?,
-            )?;
-            if session.ended_at.is_some() || session.status != "recording" {
-                return Err(invalid("只能选择系统当前正在录制的直播会话"));
+        if let Some(session_id) = input.source_session_id {
+            let session = self.database.get_session(session_id)?;
+            match input.mode {
+                AiSmartWorkflowMode::Live => {
+                    if session.ended_at.is_some() || session.status != "recording" {
+                        return Err(invalid("只能选择系统当前正在录制的直播会话"));
+                    }
+                }
+                AiSmartWorkflowMode::Replay => {
+                    let videos = self.database.list_session_videos(session_id)?;
+                    if session.ended_at.is_none() {
+                        return Err(invalid("直播回放必须选择已结束的录制会话"));
+                    }
+                    if videos.is_empty()
+                        || videos
+                            .iter()
+                            .any(|video| video.status != "complete" || video.ended_at.is_none())
+                    {
+                        return Err(invalid("直播回放必须包含已完成登记的录像分片"));
+                    }
+                }
+                AiSmartWorkflowMode::Local => {
+                    return Err(invalid("本地模式不能绑定录制会话"));
+                }
             }
         }
         let now = Utc::now().to_rfc3339();
@@ -164,6 +182,114 @@ impl SmartWorkflowRepository {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn list_replay_sessions(
+        &self,
+        search: Option<&str>,
+        cursor: Option<&AiSmartReplaySessionCursor>,
+        limit: usize,
+    ) -> Result<AiSmartReplaySessionPage> {
+        if let Some(cursor) = cursor
+            && (cursor.session_id <= 0
+                || chrono::DateTime::parse_from_rfc3339(&cursor.started_at).is_err())
+        {
+            return Err(invalid("直播回放分页游标无效"));
+        }
+        let search_pattern = replay_search_pattern(search)?;
+        let page_size = limit.clamp(1, 50);
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(
+            r#"SELECT session.id, streamer.name, session.started_at,
+                      COALESCE(session.ended_at, ''), workflow.id, workflow.status
+               FROM recording_sessions session
+               JOIN streamers streamer ON streamer.id = session.streamer_id
+               LEFT JOIN ai_smart_workflows workflow ON workflow.id = (
+                   SELECT candidate.id FROM ai_smart_workflows candidate
+                   WHERE candidate.mode = 'replay'
+                     AND candidate.source_session_id = session.id
+                   ORDER BY candidate.id DESC LIMIT 1
+               )
+               WHERE session.ended_at IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM videos video WHERE video.session_id = session.id)
+                 AND (
+                     ?1 IS NULL
+                     OR lower(streamer.name) LIKE ?1 ESCAPE '\'
+                     OR lower(COALESCE(streamer.web_rid, '')) LIKE ?1 ESCAPE '\'
+                     OR CAST(session.id AS TEXT) LIKE ?1 ESCAPE '\'
+                     OR strftime('%Y-%m-%d %H:%M', session.started_at, 'localtime') LIKE ?1 ESCAPE '\'
+                 )
+                 AND (
+                     ?2 IS NULL OR session.started_at < ?2
+                     OR (session.started_at = ?2 AND session.id < ?3)
+                 )
+               ORDER BY session.started_at DESC, session.id DESC
+               LIMIT ?4"#,
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    search_pattern.as_deref(),
+                    cursor.map(|value| value.started_at.as_str()),
+                    cursor.map(|value| value.session_id),
+                    i64::try_from(page_size + 1).unwrap_or(51),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+
+        let mut items = Vec::with_capacity(rows.len());
+        for (session_id, streamer_name, started_at, ended_at, workflow_id, workflow_status) in rows
+        {
+            let videos = self.database.list_session_videos(session_id)?;
+            items.push(AiSmartReplaySession {
+                session_id,
+                streamer_name,
+                started_at,
+                ended_at,
+                video_count: videos.len(),
+                total_duration_ms: videos
+                    .iter()
+                    .filter_map(|video| video.duration_seconds)
+                    .filter_map(|seconds| u64::try_from(seconds).ok())
+                    .map(|seconds| seconds.saturating_mul(1_000))
+                    .sum(),
+                unavailable_video_count: videos
+                    .iter()
+                    .filter(|video| {
+                        video.status != "complete"
+                            || video.ended_at.is_none()
+                            || video.audio_present == Some(false)
+                            || !Path::new(&video.path).is_file()
+                    })
+                    .count(),
+                existing_workflow_id: workflow_id,
+                existing_workflow_status: workflow_status
+                    .as_deref()
+                    .and_then(AiSmartWorkflowStatus::parse),
+            });
+        }
+        let has_more = items.len() > page_size;
+        items.truncate(page_size);
+        let next_cursor = has_more.then(|| {
+            let last = items.last().expect("回放下一页必须有当前页末项");
+            AiSmartReplaySessionCursor {
+                started_at: last.started_at.clone(),
+                session_id: last.session_id,
+            }
+        });
+        Ok(AiSmartReplaySessionPage { items, next_cursor })
+    }
+
     pub fn get(&self, workflow_id: i64) -> Result<AiSmartWorkflowDetail> {
         let connection = self.database.connection()?;
         let workflow = connection
@@ -209,11 +335,24 @@ impl SmartWorkflowRepository {
             .query_map([workflow_id], map_draft)?
             .map(parse_draft_row)
             .collect::<Result<Vec<_>>>()?;
+        let (frozen_input_count, processed_input_count) = connection.query_row(
+            r#"SELECT COUNT(input.id),
+                      COALESCE(SUM(CASE WHEN input.status IN (
+                          'completed', 'skipped', 'cancelled', 'failed'
+                      ) THEN 1 ELSE 0 END), 0)
+               FROM ai_smart_workflow_batches batch
+               JOIN ai_project_inputs input ON input.project_id = batch.project_id
+               WHERE batch.workflow_id = ?1"#,
+            [workflow_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
         Ok(AiSmartWorkflowDetail {
             workflow,
             batches,
             attempts,
             drafts,
+            frozen_input_count: non_negative_u64(frozen_input_count, "冻结输入数量")?,
+            processed_input_count: non_negative_u64(processed_input_count, "已处理输入数量")?,
         })
     }
 
@@ -315,6 +454,9 @@ impl SmartWorkflowRepository {
             {
                 return Err(invalid("直播批次只接受绑定会话中已完成且有音轨的分片"));
             }
+        } else if workflow_snapshot.mode == AiSmartWorkflowMode::Replay && input.video_id.is_some()
+        {
+            return Err(invalid("直播回放使用整场冻结批次，不能追加单个视频"));
         }
         let mut connection = self.database.connection()?;
         let transaction = connection.transaction()?;
@@ -1341,10 +1483,25 @@ fn validate_workflow_input(input: &NewAiSmartWorkflow) -> Result<()> {
     required(&input.model_id, "模型")?;
     required(&input.text_scope, "文本范围")?;
     required(&input.configuration_fingerprint, "配置指纹")?;
-    if (input.mode == AiSmartWorkflowMode::Live) != input.source_session_id.is_some() {
+    if (input.mode != AiSmartWorkflowMode::Local) != input.source_session_id.is_some() {
         return Err(invalid("直播模式必须且仅能绑定录制会话"));
     }
     Ok(())
+}
+
+fn replay_search_pattern(search: Option<&str>) -> Result<Option<String>> {
+    let Some(search) = search.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if search.chars().count() > 128 || search.chars().any(char::is_control) {
+        return Err(invalid("直播回放搜索条件无效"));
+    }
+    let escaped = search
+        .to_lowercase()
+        .replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_");
+    Ok(Some(format!("%{escaped}%")))
 }
 
 fn validate_candidate_input(input: &NewAiSmartCandidate) -> Result<()> {
@@ -1739,6 +1896,181 @@ impl SmartClippingWorkflow {
         Ok(detail)
     }
 
+    pub async fn create_replay(
+        &self,
+        configuration: SmartWorkflowConfiguration,
+        session_id: i64,
+        authorization_confirmed: bool,
+        duplicate_confirmed: bool,
+    ) -> SmartWorkflowResult<AiSmartWorkflowDetail> {
+        if !authorization_confirmed {
+            return Err(SmartWorkflowError::new(
+                "smart_authorization_required",
+                "必须确认当前直播回放任务的 Provider 和最小文本发送范围",
+                false,
+            ));
+        }
+        validate_configuration(&configuration)?;
+        self.validate_gates(true).await?;
+        let existing = self
+            .workflows
+            .list()
+            .map_err(repository_error)?
+            .into_iter()
+            .find(|workflow| {
+                workflow.mode == AiSmartWorkflowMode::Replay
+                    && workflow.source_session_id == Some(session_id)
+            });
+        if existing.is_some() && !duplicate_confirmed {
+            return Err(SmartWorkflowError::new(
+                "smart_replay_duplicate_confirmation_required",
+                "该场回放已有智能成片任务，确认重新处理后再创建",
+                false,
+            ));
+        }
+        let session = self
+            .workflows
+            .database
+            .get_session(session_id)
+            .map_err(|_| {
+                SmartWorkflowError::new(
+                    "smart_replay_session_unavailable",
+                    "选择的直播回放不存在或已不可用",
+                    false,
+                )
+            })?;
+        if session.ended_at.is_none() {
+            return Err(SmartWorkflowError::new(
+                "smart_replay_session_still_recording",
+                "该场直播仍在录制，请改用正在直播模式",
+                false,
+            ));
+        }
+        let frozen_videos = self
+            .workflows
+            .database
+            .list_session_videos(session_id)
+            .map_err(|_| {
+                SmartWorkflowError::new(
+                    "smart_replay_session_unavailable",
+                    "无法读取该场直播的本机录像分片",
+                    true,
+                )
+            })?;
+        if frozen_videos.is_empty() {
+            return Err(SmartWorkflowError::new(
+                "smart_replay_session_empty",
+                "该场直播没有可用于智能成片的本机录像分片",
+                false,
+            ));
+        }
+
+        let profile = self.controller.default_profile().map_err(command_error)?;
+        let project = self
+            .project_service
+            .create_draft(&configuration.name, &profile)
+            .map_err(service_error)?;
+        let imported = match self
+            .project_service
+            .select_completed_session(project.id, session_id, CancellationToken::new())
+            .await
+        {
+            Ok(imported) => imported,
+            Err(error) => {
+                let _ = self.repository.delete_project(project.id);
+                return Err(service_error(error));
+            }
+        };
+        if imported.added.is_empty()
+            || imported.unavailable_count != 0
+            || imported.added_count != frozen_videos.len()
+        {
+            let _ = self.repository.delete_project(project.id);
+            return Err(SmartWorkflowError::new(
+                "smart_replay_source_incomplete",
+                "直播回放包含缺失、未完成或无音轨分片，修复录像后再试",
+                false,
+            ));
+        }
+        let source_fingerprint = aggregate_input_fingerprint(
+            imported
+                .added
+                .iter()
+                .map(|input| input.source_fingerprint_hash.as_str()),
+        );
+        let configuration_fingerprint = configuration_fingerprint(
+            AiSmartWorkflowMode::Replay,
+            Some(session_id),
+            &configuration,
+            &source_fingerprint,
+        )?;
+        let streamer_name = self
+            .workflows
+            .database
+            .get_streamer(session.streamer_id)
+            .map(|streamer| streamer.name)
+            .unwrap_or_else(|_| "已结束直播".to_owned());
+        let created = match self.workflows.create(&NewAiSmartWorkflow {
+            name: configuration.name.clone(),
+            mode: AiSmartWorkflowMode::Replay,
+            source_session_id: Some(session_id),
+            source_summary: format!(
+                "{} · 本机直播回放 · {} 个冻结分片",
+                streamer_name,
+                imported.added.len()
+            ),
+            provider: configuration.provider.clone(),
+            model_id: configuration.model_id.clone(),
+            text_scope: configuration.text_scope.clone(),
+            configuration_fingerprint: configuration_fingerprint.clone(),
+        }) {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = self.repository.delete_project(project.id);
+                return Err(repository_error(error));
+            }
+        };
+        let authorized = self
+            .workflows
+            .authorize(
+                created.workflow.id,
+                created.workflow.generation,
+                &authorization_digest(created.workflow.id, &configuration_fingerprint),
+                &configuration_fingerprint,
+            )
+            .map_err(repository_error)?;
+        let batch = self
+            .workflows
+            .add_batch(
+                created.workflow.id,
+                &NewAiSmartWorkflowBatch {
+                    video_id: None,
+                    source_fingerprint,
+                    finalized_at: session
+                        .ended_at
+                        .clone()
+                        .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                },
+            )
+            .map_err(repository_error)?;
+        self.project_service
+            .start_analysis(project.id)
+            .await
+            .map_err(|error| self.fail_before_spawn(created.workflow.id, error))?;
+        self.controller
+            .enqueue_project(project.id)
+            .await
+            .map_err(|error| self.fail_command_before_spawn(created.workflow.id, error))?;
+        self.workflows
+            .attach_batch_project(batch.id, project.id, None, AiSmartBatchStatus::Queued)
+            .map_err(repository_error)?;
+        self.publish_current(created.workflow.id, Some(batch.id));
+        self.spawn(created.workflow.id, authorized.workflow.generation)?;
+        self.workflows
+            .get(created.workflow.id)
+            .map_err(repository_error)
+    }
+
     pub async fn ingest_finalized_video(&self, video_id: i64) -> SmartWorkflowResult<usize> {
         let video = self.workflows.database.get_video(video_id).map_err(|_| {
             SmartWorkflowError::new("smart_video_unavailable", "完成分片登记不可用", true)
@@ -1920,6 +2252,17 @@ impl SmartClippingWorkflow {
     pub fn list_active_live_sessions(&self) -> SmartWorkflowResult<Vec<AiActiveLiveSession>> {
         self.workflows
             .list_active_live_sessions()
+            .map_err(repository_error)
+    }
+
+    pub fn list_replay_sessions(
+        &self,
+        search: Option<&str>,
+        cursor: Option<&AiSmartReplaySessionCursor>,
+        limit: usize,
+    ) -> SmartWorkflowResult<AiSmartReplaySessionPage> {
+        self.workflows
+            .list_replay_sessions(search, cursor, limit)
             .map_err(repository_error)
     }
 
@@ -2168,7 +2511,7 @@ impl SmartClippingWorkflow {
                     }
                     self.publish_current(workflow_id, Some(batch.id));
                 }
-                if initial.workflow.mode == AiSmartWorkflowMode::Local {
+                if initial.workflow.mode != AiSmartWorkflowMode::Live {
                     return Err(error);
                 }
             }
@@ -3175,12 +3518,12 @@ pub fn smart_workflow_metric(
             chrono::DateTime::parse_from_rfc3339(&candidate.first_finalized_at).ok()
         })
         .max();
-    let first_draft_latency_ms =
-        first_reviewable
-            .zip(relevant_finalized)
-            .and_then(|(reviewable, finalized)| {
-                u64::try_from((reviewable - finalized).num_milliseconds()).ok()
-            });
+    let first_draft_latency_ms = (detail.workflow.mode == AiSmartWorkflowMode::Live)
+        .then_some(first_reviewable.zip(relevant_finalized))
+        .flatten()
+        .and_then(|(reviewable, finalized)| {
+            u64::try_from((reviewable - finalized).num_milliseconds()).ok()
+        });
     AiSmartWorkflowMetric {
         mode: detail.workflow.mode.as_str().to_owned(),
         platform: safe_platform(platform),
@@ -3314,6 +3657,8 @@ mod metric_tests {
                 created_at: "2026-08-14T00:00:00Z".to_owned(),
                 updated_at: reviewable_at.to_owned(),
             }],
+            frozen_input_count: 0,
+            processed_input_count: 0,
         }
     }
 

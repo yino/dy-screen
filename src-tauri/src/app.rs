@@ -1894,6 +1894,8 @@ pub fn run() {
             ai_create_local_smart_workflow,
             ai_list_active_live_sessions,
             ai_create_live_smart_workflow,
+            ai_list_smart_replay_sessions,
+            ai_create_replay_smart_workflow,
             ai_authorize_smart_workflow,
             ai_list_smart_workflows,
             ai_get_smart_workflow,

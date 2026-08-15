@@ -4473,6 +4473,108 @@ pub(crate) fn migrate_ai_v23(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v24 增加已结束直播回放智能任务，同时保持既有 live 行为和索引语义。
+pub(crate) fn migrate_ai_v24(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 24",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+
+    connection.pragma_update(None, "foreign_keys", "OFF")?;
+    let migration = (|| -> crate::database::Result<()> {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            r#"
+            CREATE TABLE ai_smart_workflows_v24 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+                mode TEXT NOT NULL CHECK(mode IN ('local', 'replay', 'live')),
+                status TEXT NOT NULL CHECK(status IN (
+                    'draft', 'queued', 'running', 'awaiting_selection', 'review_ready',
+                    'paused', 'completed', 'cancelled', 'failed'
+                )),
+                stage TEXT NOT NULL CHECK(stage IN (
+                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition', 'review'
+                )),
+                generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
+                source_session_id INTEGER REFERENCES recording_sessions(id) ON DELETE RESTRICT,
+                source_summary TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                text_scope TEXT NOT NULL,
+                authorization_digest TEXT,
+                authorized_at TEXT,
+                configuration_fingerprint TEXT NOT NULL,
+                active_draft_generation INTEGER CHECK(active_draft_generation IS NULL OR active_draft_generation > 0),
+                live_cursor_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+                event_sequence INTEGER NOT NULL DEFAULT 0 CHECK(event_sequence >= 0),
+                candidate_count INTEGER NOT NULL DEFAULT 0 CHECK(candidate_count >= 0),
+                selected_count INTEGER NOT NULL DEFAULT 0 CHECK(selected_count >= 0),
+                pending_batch_count INTEGER NOT NULL DEFAULT 0 CHECK(pending_batch_count >= 0),
+                last_error_code TEXT,
+                last_error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                live_start_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+                CHECK(
+                    (mode IN ('live', 'replay') AND source_session_id IS NOT NULL)
+                    OR (mode = 'local' AND source_session_id IS NULL)
+                ),
+                CHECK((authorization_digest IS NULL) = (authorized_at IS NULL))
+            );
+
+            INSERT INTO ai_smart_workflows_v24(
+                id, name, mode, status, stage, generation, source_session_id,
+                source_summary, provider, model_id, text_scope, authorization_digest,
+                authorized_at, configuration_fingerprint, active_draft_generation,
+                live_cursor_video_id, event_sequence, candidate_count, selected_count,
+                pending_batch_count, last_error_code, last_error_message, created_at,
+                updated_at, live_start_video_id
+            )
+            SELECT id, name, mode, status, stage, generation, source_session_id,
+                   source_summary, provider, model_id, text_scope, authorization_digest,
+                   authorized_at, configuration_fingerprint, active_draft_generation,
+                   live_cursor_video_id, event_sequence, candidate_count, selected_count,
+                   pending_batch_count, last_error_code, last_error_message, created_at,
+                   updated_at, live_start_video_id
+            FROM ai_smart_workflows;
+
+            DROP TABLE ai_smart_workflows;
+            ALTER TABLE ai_smart_workflows_v24 RENAME TO ai_smart_workflows;
+            CREATE INDEX idx_ai_smart_workflows_status_updated
+                ON ai_smart_workflows(status, updated_at DESC, id DESC);
+            CREATE UNIQUE INDEX idx_ai_smart_workflows_active_live_session
+                ON ai_smart_workflows(source_session_id)
+                WHERE mode = 'live' AND status NOT IN ('completed', 'cancelled');
+            INSERT INTO schema_migrations(version, applied_at)
+                VALUES(24, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+            "#,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    let restore_foreign_keys = connection.pragma_update(None, "foreign_keys", "ON");
+    migration?;
+    restore_foreign_keys?;
+    let violations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if violations != 0 {
+        return Err(DatabaseError::MigrationIntegrity(format!(
+            "AI v24 迁移发现 {violations} 条外键异常"
+        )));
+    }
+    Ok(())
+}
+
 type ProjectRow = (
     i64,
     String,
@@ -5282,6 +5384,117 @@ mod smart_migration_tests {
                 .unwrap(),
             1
         );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn v24_preserves_live_rows_and_enforces_replay_source_contract() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
+                CREATE TABLE recording_sessions(id INTEGER PRIMARY KEY);
+                CREATE TABLE videos(id INTEGER PRIMARY KEY);
+                INSERT INTO recording_sessions(id) VALUES(7);
+                CREATE TABLE ai_smart_workflows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    mode TEXT NOT NULL CHECK(mode IN ('local', 'live')),
+                    status TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 1,
+                    source_session_id INTEGER REFERENCES recording_sessions(id) ON DELETE RESTRICT,
+                    source_summary TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    text_scope TEXT NOT NULL,
+                    authorization_digest TEXT,
+                    authorized_at TEXT,
+                    configuration_fingerprint TEXT NOT NULL,
+                    active_draft_generation INTEGER,
+                    live_cursor_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+                    event_sequence INTEGER NOT NULL DEFAULT 0,
+                    candidate_count INTEGER NOT NULL DEFAULT 0,
+                    selected_count INTEGER NOT NULL DEFAULT 0,
+                    pending_batch_count INTEGER NOT NULL DEFAULT 0,
+                    last_error_code TEXT,
+                    last_error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    live_start_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+                    CHECK(
+                        (mode = 'live' AND source_session_id IS NOT NULL)
+                        OR (mode = 'local' AND source_session_id IS NULL)
+                    ),
+                    CHECK((authorization_digest IS NULL) = (authorized_at IS NULL))
+                );
+                INSERT INTO ai_smart_workflows(
+                    id, name, mode, status, stage, source_session_id, source_summary,
+                    provider, model_id, text_scope, configuration_fingerprint,
+                    created_at, updated_at
+                ) VALUES(
+                    11, '历史边播边剪', 'live', 'running', 'asr', 7, '历史直播场次',
+                    'deepseek', 'deepseek-chat', 'selected_clip_subtitles', 'live-config',
+                    'before', 'before'
+                );
+                "#,
+            )
+            .unwrap();
+
+        migrate_ai_v24(&mut connection).unwrap();
+        migrate_ai_v24(&mut connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT mode, source_session_id FROM ai_smart_workflows WHERE id = 11",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("live".to_owned(), 7)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 24",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let insert = |connection: &Connection, mode: &str, session_id: Option<i64>, name: &str| {
+            connection.execute(
+                r#"INSERT INTO ai_smart_workflows(
+                       name, mode, status, stage, source_session_id, source_summary,
+                       provider, model_id, text_scope, configuration_fingerprint,
+                       created_at, updated_at
+                   ) VALUES(?1, ?2, 'draft', 'preflight', ?3, '受信来源',
+                            'deepseek', 'deepseek-chat', 'selected_clip_subtitles',
+                            'config', 'now', 'now')"#,
+                params![name, mode, session_id],
+            )
+        };
+        assert!(insert(&connection, "replay", Some(7), "历史回放").is_ok());
+        assert!(insert(&connection, "replay", None, "无来源回放").is_err());
+        assert!(insert(&connection, "local", Some(7), "错误本地任务").is_err());
+        assert!(insert(&connection, "live", Some(7), "重复活动直播").is_err());
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {

@@ -453,7 +453,7 @@ export interface AiJobEvent {
   message: string;
 }
 
-export type AiSmartWorkflowMode = "local" | "live";
+export type AiSmartWorkflowMode = "local" | "replay" | "live";
 export type AiSmartWorkflowStatus =
   | "draft"
   | "queued"
@@ -587,6 +587,8 @@ export interface AiSmartWorkflowDetail {
   batches: AiSmartWorkflowBatch[];
   attempts: AiSmartStageAttempt[];
   drafts: AiSmartDraft[];
+  frozenInputCount: number;
+  processedInputCount: number;
 }
 
 export interface AiSmartWorkflowEvent {
@@ -604,6 +606,28 @@ export interface AiActiveLiveSession {
   sessionId: number;
   streamerName: string;
   startedAt: string;
+}
+
+export interface AiSmartReplaySessionCursor {
+  startedAt: string;
+  sessionId: number;
+}
+
+export interface AiSmartReplaySession {
+  sessionId: number;
+  streamerName: string;
+  startedAt: string;
+  endedAt: string;
+  videoCount: number;
+  totalDurationMs: number;
+  unavailableVideoCount: number;
+  existingWorkflowId: number | null;
+  existingWorkflowStatus: AiSmartWorkflowStatus | null;
+}
+
+export interface AiSmartReplaySessionPage {
+  items: AiSmartReplaySession[];
+  nextCursor: AiSmartReplaySessionCursor | null;
 }
 
 export interface LlmProviderSettings {
@@ -1025,6 +1049,17 @@ export interface ClientApi {
     configuration: SmartWorkflowConfiguration;
     sessionId: number;
     authorizationConfirmed: boolean;
+  }): Promise<AiSmartWorkflowDetail>;
+  listSmartReplaySessions(
+    search?: string,
+    cursor?: AiSmartReplaySessionCursor | null,
+    limit?: number,
+  ): Promise<AiSmartReplaySessionPage>;
+  createReplaySmartWorkflow(input: {
+    configuration: SmartWorkflowConfiguration;
+    sessionId: number;
+    authorizationConfirmed: boolean;
+    duplicateConfirmed: boolean;
   }): Promise<AiSmartWorkflowDetail>;
   authorizeSmartWorkflow(input: {
     workflowId: number;

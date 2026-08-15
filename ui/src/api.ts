@@ -11,6 +11,7 @@ import type {
   AiHighlightRun,
   AiJobEvent,
   AiActiveLiveSession,
+  AiSmartReplaySessionPage,
   AiSmartWorkflow,
   AiSmartWorkflowDetail,
   AiSmartWorkflowEvent,
@@ -143,6 +144,14 @@ const tauriApi: ClientApi = {
     invoke<AiActiveLiveSession[]>("ai_list_active_live_sessions"),
   createLiveSmartWorkflow: (input) =>
     invoke<AiSmartWorkflowDetail>("ai_create_live_smart_workflow", { input }),
+  listSmartReplaySessions: (search = "", cursor = null, limit = 20) =>
+    invoke<AiSmartReplaySessionPage>("ai_list_smart_replay_sessions", {
+      search,
+      cursor,
+      limit,
+    }),
+  createReplaySmartWorkflow: (input) =>
+    invoke<AiSmartWorkflowDetail>("ai_create_replay_smart_workflow", { input }),
   authorizeSmartWorkflow: (input) =>
     invoke<AiSmartWorkflowDetail>("ai_authorize_smart_workflow", { input }),
   listSmartWorkflows: () =>
@@ -575,6 +584,8 @@ export function createBrowserApi(): ClientApi {
         updatedAt: "2026-08-14T10:42:18+08:00",
       },
     ],
+    frozenInputCount: 3,
+    processedInputCount: 3,
   });
 
   const normalizeTags = (tags: StreamerTagInput[]): StreamerTag[] => {
@@ -894,6 +905,23 @@ export function createBrowserApi(): ClientApi {
     }] : [],
     createLiveSmartWorkflow: async () => {
       throw new Error("浏览器演示模式不能订阅录制会话或调用 Provider");
+    },
+    listSmartReplaySessions: async () => visualQaSmart ? {
+      items: [{
+        sessionId: 77,
+        streamerName: "夏季新品发布直播间",
+        startedAt: "2026-08-13T19:30:00+08:00",
+        endedAt: "2026-08-13T21:18:00+08:00",
+        videoCount: 8,
+        totalDurationMs: 6_480_000,
+        unavailableVideoCount: 0,
+        existingWorkflowId: null,
+        existingWorkflowStatus: null,
+      }],
+      nextCursor: null,
+    } : { items: [], nextCursor: null },
+    createReplaySmartWorkflow: async () => {
+      throw new Error("浏览器演示模式不能读取本机直播回放或调用 Provider");
     },
     authorizeSmartWorkflow: async () => {
       throw new Error("浏览器演示模式不能授权真实智能任务");

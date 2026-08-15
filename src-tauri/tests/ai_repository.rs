@@ -420,6 +420,16 @@ fn ai_migration_is_idempotent_preserves_existing_data_and_has_foreign_keys() {
             .unwrap(),
         1
     );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 24",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
     assert!(
         connection
             .query_row(

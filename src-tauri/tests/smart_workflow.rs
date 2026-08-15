@@ -46,6 +46,16 @@ fn profile() -> RecognitionProfile {
     }
 }
 
+fn smart_configuration(name: &str) -> SmartWorkflowConfiguration {
+    SmartWorkflowConfiguration {
+        name: name.to_owned(),
+        provider: "deepseek".to_owned(),
+        model_id: "deepseek-chat".to_owned(),
+        text_scope: "selected_clip_subtitles".to_owned(),
+        output_preference: "reviewable_compilation".to_owned(),
+    }
+}
+
 fn completed_highlight(repository: &AiRepository, label: &str, position: i64) -> (i64, i64, i64) {
     let project = repository.create_project(label, &profile()).unwrap();
     let fingerprint = SourceFingerprint {
@@ -395,11 +405,12 @@ impl HighlightAgentProvider for SmartHighlightProvider {
             .iter()
             .find(|segment| segment["readOnlyContext"] == false)
             .unwrap();
+        let input_id = segment["inputId"].as_i64().unwrap();
         Ok(CandidateAgentOutput {
             candidates: vec![HighlightCandidateDraft {
-                candidate_key: "smart-highlight".to_owned(),
+                candidate_key: format!("smart-highlight-{input_id}"),
                 title: "智能高光".to_owned(),
-                input_id: segment["inputId"].as_i64().unwrap(),
+                input_id,
                 segment_ids: vec![segment["id"].as_str().unwrap().to_owned()],
                 start_ms: segment["startMs"].as_u64().unwrap(),
                 end_ms: segment["endMs"].as_u64().unwrap(),
@@ -424,13 +435,13 @@ impl HighlightAgentProvider for SmartHighlightProvider {
         _cancellation: CancellationToken,
     ) -> Result<RankingAgentOutput, LlmError> {
         let payload: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
-        let key = payload["candidates"][0]["candidateKey"]
-            .as_str()
+        let scores = payload["candidates"]
+            .as_array()
             .unwrap()
-            .to_owned();
-        Ok(RankingAgentOutput {
-            scores: vec![HighlightCandidateScore {
-                candidate_key: key,
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| HighlightCandidateScore {
+                candidate_key: candidate["candidateKey"].as_str().unwrap().to_owned(),
                 total_score: 90.0,
                 hook_score: 90.0,
                 information_score: 90.0,
@@ -438,9 +449,12 @@ impl HighlightAgentProvider for SmartHighlightProvider {
                 tag_relevance_score: 90.0,
                 completeness_score: 90.0,
                 shareability_score: 90.0,
-                rank: 1,
+                rank: u32::try_from(index + 1).unwrap(),
                 reason: "测试高光".to_owned(),
-            }],
+            })
+            .collect();
+        Ok(RankingAgentOutput {
+            scores,
             token_usage: 1,
         })
     }
@@ -1090,6 +1104,343 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
     assert_eq!(controller.cancel_count.load(Ordering::SeqCst), 0);
 
     run_live_workflow_end_to_end().await;
+}
+
+#[tokio::test]
+async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
+    let directory = tempdir().unwrap();
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let streamer = database
+        .add_streamer(&NewStreamer::room(
+            "回放测试主播",
+            "replay-99001",
+            "room-replay-99001",
+            true,
+        ))
+        .unwrap();
+    let replay_session = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database.mark_session_recording(replay_session.id).unwrap();
+    let session_started_at =
+        chrono::DateTime::parse_from_rfc3339(&replay_session.started_at).unwrap();
+
+    let late_path = directory.path().join("replay-late.mp4");
+    std::fs::write(&late_path, b"late finalized replay segment").unwrap();
+    let late_video = database
+        .add_video(&NewVideo {
+            session_id: replay_session.id,
+            path: late_path.to_string_lossy().into_owned(),
+            started_at: Some((session_started_at + chrono::Duration::minutes(2)).to_rfc3339()),
+            ended_at: Some(
+                (session_started_at + chrono::Duration::minutes(2) + chrono::Duration::seconds(30))
+                    .to_rfc3339(),
+            ),
+            duration_seconds: Some(30),
+            size_bytes: 29,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    let early_path = directory.path().join("replay-early.mp4");
+    std::fs::write(&early_path, b"early finalized replay segment").unwrap();
+    let early_video = database
+        .add_video(&NewVideo {
+            session_id: replay_session.id,
+            path: early_path.to_string_lossy().into_owned(),
+            started_at: Some((session_started_at + chrono::Duration::minutes(1)).to_rfc3339()),
+            ended_at: Some(
+                (session_started_at + chrono::Duration::minutes(1) + chrono::Duration::seconds(30))
+                    .to_rfc3339(),
+            ),
+            duration_seconds: Some(30),
+            size_bytes: 30,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    database
+        .finish_session(replay_session.id, "completed", None)
+        .unwrap();
+
+    let active_session = database
+        .start_session(streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database.mark_session_recording(active_session.id).unwrap();
+    let empty_streamer = database
+        .add_streamer(&NewStreamer::room(
+            "空回放主播",
+            "replay-empty",
+            "room-replay-empty",
+            true,
+        ))
+        .unwrap();
+    let empty_session = database
+        .start_session(empty_streamer.id, directory.path().to_str().unwrap())
+        .unwrap();
+    database.mark_session_recording(empty_session.id).unwrap();
+    database
+        .finish_session(empty_session.id, "completed", None)
+        .unwrap();
+
+    let repository = AiRepository::new(database.clone());
+    let controller = Arc::new(CompletingController {
+        repository: repository.clone(),
+        enqueue_count: AtomicUsize::new(0),
+        cancel_count: AtomicUsize::new(0),
+    });
+    let project_service = AiProjectService::new(
+        database.clone(),
+        Arc::new(SmartInspector),
+        Arc::new(SmartPreflight),
+    );
+    let credentials: Arc<dyn CredentialStore> = Arc::new(MemoryCredentialStore::new());
+    credentials.set("sk-test").unwrap();
+    let highlight = Arc::new(HighlightWorkflow::new(
+        repository.clone(),
+        Arc::new(SmartHighlightProvider),
+        credentials.clone(),
+    ));
+    let correction_provider = Arc::new(FailOnceCorrectionProvider::default());
+    let correction = ClipTextCorrectionWorkflow::new(
+        repository.clone(),
+        correction_provider.clone(),
+        credentials.clone(),
+    );
+    let assets = TransitionMaterialAssetService::new(
+        TransitionMaterialRepository::new(database.clone()),
+        TransitionMaterialCache::new(directory.path().join("replay-transition-cache")).unwrap(),
+        CancellationToken::new(),
+        MaterialAssetRegistry::default(),
+    )
+    .unwrap();
+    let transition = TransitionMatchingWorkflow::new(
+        TransitionMaterialRepository::new(database.clone()),
+        repository.clone(),
+        Arc::new(EmptyTransitionProvider),
+        credentials,
+        assets,
+    );
+    let workflow = SmartClippingWorkflow::new(
+        database.clone(),
+        project_service,
+        controller.clone(),
+        highlight,
+        correction,
+        transition,
+        Arc::new(ReadyGate),
+    );
+
+    let directory_page = workflow
+        .list_replay_sessions(Some("回放测试主播"), None, 20)
+        .unwrap();
+    assert_eq!(directory_page.items.len(), 1);
+    assert_eq!(directory_page.items[0].session_id, replay_session.id);
+    assert_eq!(directory_page.items[0].video_count, 2);
+    assert_eq!(directory_page.items[0].total_duration_ms, 60_000);
+    assert_eq!(directory_page.items[0].unavailable_video_count, 0);
+    assert!(
+        workflow
+            .list_replay_sessions(Some("空回放主播"), None, 20)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+
+    let unauthorized = workflow
+        .create_replay(
+            smart_configuration("未授权回放"),
+            replay_session.id,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unauthorized.code, "smart_authorization_required");
+    let active = workflow
+        .create_replay(
+            smart_configuration("活动场次回放"),
+            active_session.id,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(active.code, "smart_replay_session_still_recording");
+    let empty = workflow
+        .create_replay(
+            smart_configuration("空场次回放"),
+            empty_session.id,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(empty.code, "smart_replay_session_empty");
+    let missing = workflow
+        .create_replay(smart_configuration("缺失场次回放"), i64::MAX, true, false)
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code, "smart_replay_session_unavailable");
+
+    let created = workflow
+        .create_replay(
+            smart_configuration("完整直播回放"),
+            replay_session.id,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.workflow.mode, AiSmartWorkflowMode::Replay);
+    let workflow_id = created.workflow.id;
+    let failed = wait_for_smart_workflow(&workflow, workflow_id, |detail| {
+        detail.workflow.status == AiSmartWorkflowStatus::Failed
+            && detail.workflow.stage == AiSmartStage::Correction
+    })
+    .await;
+    assert_eq!(failed.frozen_input_count, 2);
+    assert_eq!(failed.processed_input_count, 2);
+    let batch_id = failed.batches[0].id;
+    let completed_asr_attempts = failed
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.stage == AiSmartStage::Asr
+                && attempt.status == AiSmartStageAttemptStatus::Completed
+        })
+        .count();
+    let completed_highlight_attempts = failed
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.stage == AiSmartStage::Highlight
+                && attempt.status == AiSmartStageAttemptStatus::Completed
+        })
+        .count();
+    workflow
+        .retry_stage(
+            workflow_id,
+            failed.workflow.generation,
+            AiSmartStage::Correction,
+            Some(batch_id),
+        )
+        .await
+        .unwrap();
+    let completed = wait_for_smart_workflow(&workflow, workflow_id, |detail| {
+        detail.workflow.status == AiSmartWorkflowStatus::ReviewReady
+    })
+    .await;
+    assert_eq!(correction_provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        completed
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.stage == AiSmartStage::Asr
+                    && attempt.status == AiSmartStageAttemptStatus::Completed
+            })
+            .count(),
+        completed_asr_attempts
+    );
+    assert_eq!(
+        completed
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.stage == AiSmartStage::Highlight
+                    && attempt.status == AiSmartStageAttemptStatus::Completed
+            })
+            .count(),
+        completed_highlight_attempts
+    );
+    assert_eq!(completed.batches.len(), 1);
+    assert_eq!(completed.frozen_input_count, 2);
+    assert_eq!(completed.processed_input_count, 2);
+    assert_eq!(completed.workflow.pending_batch_count, 0);
+    assert_eq!(completed.drafts.len(), 1);
+    let batch = &completed.batches[0];
+    assert_eq!(batch.source_fingerprint.len(), 64);
+    let frozen_fingerprint = batch.source_fingerprint.clone();
+    let frozen_project = repository.get_project(batch.project_id.unwrap()).unwrap();
+    assert_eq!(
+        frozen_project
+            .inputs
+            .iter()
+            .filter_map(|input| input.video_id)
+            .collect::<Vec<_>>(),
+        vec![early_video, late_video]
+    );
+    assert_eq!(
+        repository
+            .get_clip_project(completed.drafts[0].clip_project_id)
+            .unwrap()
+            .project
+            .export_status
+            .as_str(),
+        "idle"
+    );
+
+    let duplicate = workflow
+        .create_replay(
+            smart_configuration("重复直播回放"),
+            replay_session.id,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        duplicate.code,
+        "smart_replay_duplicate_confirmation_required"
+    );
+    let directory_page = workflow.list_replay_sessions(None, None, 20).unwrap();
+    let replay_item = directory_page
+        .items
+        .iter()
+        .find(|item| item.session_id == replay_session.id)
+        .unwrap();
+    assert_eq!(replay_item.existing_workflow_id, Some(workflow_id));
+    assert_eq!(
+        replay_item.existing_workflow_status,
+        Some(AiSmartWorkflowStatus::ReviewReady)
+    );
+
+    let later_path = directory.path().join("replay-added-after-freeze.mp4");
+    std::fs::write(&later_path, b"late directory update after task freeze").unwrap();
+    let later_video = database
+        .add_video(&NewVideo {
+            session_id: replay_session.id,
+            path: later_path.to_string_lossy().into_owned(),
+            started_at: Some((session_started_at + chrono::Duration::minutes(3)).to_rfc3339()),
+            ended_at: Some(
+                (session_started_at + chrono::Duration::minutes(3) + chrono::Duration::seconds(30))
+                    .to_rfc3339(),
+            ),
+            duration_seconds: Some(30),
+            size_bytes: 39,
+            audio_present: Some(true),
+            status: "complete".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(
+        workflow.ingest_finalized_video(later_video).await.unwrap(),
+        0
+    );
+    let unchanged = workflow.get(workflow_id).unwrap();
+    assert_eq!(unchanged.frozen_input_count, 2);
+    assert_eq!(unchanged.processed_input_count, 2);
+    assert_eq!(unchanged.batches[0].source_fingerprint, frozen_fingerprint);
+    assert_eq!(
+        repository
+            .get_project(unchanged.batches[0].project_id.unwrap())
+            .unwrap()
+            .inputs
+            .len(),
+        2
+    );
+    assert_eq!(controller.enqueue_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

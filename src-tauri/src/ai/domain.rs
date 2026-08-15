@@ -598,15 +598,17 @@ pub struct AiClipProject {
 #[serde(rename_all = "snake_case")]
 pub enum AiSmartWorkflowMode {
     Local,
+    Replay,
     Live,
 }
 
 impl AiSmartWorkflowMode {
-    pub const ALL: [Self; 2] = [Self::Local, Self::Live];
+    pub const ALL: [Self; 3] = [Self::Local, Self::Replay, Self::Live];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::Replay => "replay",
             Self::Live => "live",
         }
     }
@@ -1012,6 +1014,8 @@ pub struct AiSmartWorkflowDetail {
     pub batches: Vec<AiSmartWorkflowBatch>,
     pub attempts: Vec<AiSmartStageAttempt>,
     pub drafts: Vec<AiSmartDraft>,
+    pub frozen_input_count: u64,
+    pub processed_input_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1038,6 +1042,15 @@ pub struct CreateLiveSmartWorkflowInput {
     pub configuration: SmartWorkflowConfiguration,
     pub session_id: i64,
     pub authorization_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateReplaySmartWorkflowInput {
+    pub configuration: SmartWorkflowConfiguration,
+    pub session_id: i64,
+    pub authorization_confirmed: bool,
+    pub duplicate_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1094,6 +1107,34 @@ pub struct AiActiveLiveSession {
     pub session_id: i64,
     pub streamer_name: String,
     pub started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSmartReplaySessionCursor {
+    pub started_at: String,
+    pub session_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSmartReplaySession {
+    pub session_id: i64,
+    pub streamer_name: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub video_count: usize,
+    pub total_duration_ms: u64,
+    pub unavailable_video_count: usize,
+    pub existing_workflow_id: Option<i64>,
+    pub existing_workflow_status: Option<AiSmartWorkflowStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSmartReplaySessionPage {
+    pub items: Vec<AiSmartReplaySession>,
+    pub next_cursor: Option<AiSmartReplaySessionCursor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

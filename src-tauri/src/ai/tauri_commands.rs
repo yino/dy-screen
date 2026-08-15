@@ -12,10 +12,11 @@ use super::{
     AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun,
     AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiReplaySessionCursor,
     AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerPage, AiSessionImportView,
-    AiSessionOption, AiSmartWorkflow, AiSmartWorkflowDetail, AiTranscriptProjection,
-    AiTrustedFileGrant, AuthorizeSmartWorkflowInput, CreateLiveSmartWorkflowInput,
-    CreateLocalSmartWorkflowInput, LlmProviderSettings, ProviderDiagnostic,
-    RetrySmartWorkflowStageInput, SmartClippingWorkflow, SmartWorkflowError,
+    AiSessionOption, AiSmartReplaySessionCursor, AiSmartReplaySessionPage, AiSmartWorkflow,
+    AiSmartWorkflowDetail, AiTranscriptProjection, AiTrustedFileGrant, AuthorizeSmartWorkflowInput,
+    CreateLiveSmartWorkflowInput, CreateLocalSmartWorkflowInput, CreateReplaySmartWorkflowInput,
+    LlmProviderSettings, ProviderDiagnostic, RetrySmartWorkflowStageInput, SmartClippingWorkflow,
+    SmartWorkflowError,
 };
 
 pub struct AiDesktopState {
@@ -163,6 +164,34 @@ pub(crate) async fn ai_create_live_smart_workflow(
             input.configuration,
             input.session_id,
             input.authorization_confirmed,
+        )
+        .await
+}
+
+#[tauri::command]
+pub(crate) fn ai_list_smart_replay_sessions(
+    search: Option<String>,
+    cursor: Option<AiSmartReplaySessionCursor>,
+    limit: Option<usize>,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartReplaySessionPage, SmartWorkflowError> {
+    state
+        .workflow
+        .list_replay_sessions(search.as_deref(), cursor.as_ref(), limit.unwrap_or(20))
+}
+
+#[tauri::command]
+pub(crate) async fn ai_create_replay_smart_workflow(
+    input: CreateReplaySmartWorkflowInput,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state
+        .workflow
+        .create_replay(
+            input.configuration,
+            input.session_id,
+            input.authorization_confirmed,
+            input.duplicate_confirmed,
         )
         .await
 }
@@ -700,10 +729,45 @@ fn export_name(project_name: &str, extension: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::export_name;
+    use super::{CreateReplaySmartWorkflowInput, export_name};
 
     #[test]
     fn export_file_name_does_not_allow_path_components() {
         assert_eq!(export_name("../主播/直播", "txt"), "___主播_直播-转写.txt");
+    }
+
+    #[test]
+    fn replay_command_contract_accepts_only_registered_session_identity() {
+        let input = serde_json::from_value::<CreateReplaySmartWorkflowInput>(serde_json::json!({
+            "configuration": {
+                "name": "直播回放智能成片",
+                "provider": "deepseek",
+                "modelId": "deepseek-chat",
+                "textScope": "selected_clip_subtitles",
+                "outputPreference": "reviewable_compilation"
+            },
+            "sessionId": 88,
+            "authorizationConfirmed": true,
+            "duplicateConfirmed": false
+        }))
+        .unwrap();
+        assert_eq!(input.session_id, 88);
+
+        assert!(
+            serde_json::from_value::<CreateReplaySmartWorkflowInput>(serde_json::json!({
+                "configuration": {
+                    "name": "直播回放智能成片",
+                    "provider": "deepseek",
+                    "modelId": "deepseek-chat",
+                    "textScope": "selected_clip_subtitles",
+                    "outputPreference": "reviewable_compilation"
+                },
+                "sessionId": 88,
+                "replayUrl": "https://example.invalid/replay/88",
+                "authorizationConfirmed": true,
+                "duplicateConfirmed": false
+            }))
+            .is_err()
+        );
     }
 }
