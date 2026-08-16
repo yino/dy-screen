@@ -169,6 +169,11 @@ function errorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+function isRuntimeResourceNotice(message: string | null): boolean {
+  return message?.includes("运行资源尚未准备完成") === true
+    || message?.includes("受控媒体资源尚未准备完成") === true;
+}
+
 function toVideoFilters(filters: HistoryFilters): VideoFilters {
   const days = filters.date === "today" ? 1 : filters.date === "7days" ? 7 : filters.date === "30days" ? 30 : 0;
   return {
@@ -259,7 +264,9 @@ export function App({ api }: AppProps) {
   const [browserAccess, setBrowserAccess] = useState<BrowserAccessState | null>(null);
   const [accessBusy, setAccessBusy] = useState<"verify" | "check" | "clear" | null>(null);
   const [priorityBusyId, setPriorityBusyId] = useState<number | null>(null);
+  const resourceReady = api.runtimeResourceStatus ? resourceStatus?.ready === true : true;
   const browserAccessRef = useRef<BrowserAccessState | null>(null);
+  const resourceReadyRef = useRef(resourceReady);
   const selectedIdRef = useRef(selectedId);
   const pageRef = useRef(page);
   const historyPageRef = useRef(historyPage);
@@ -270,6 +277,15 @@ export function App({ api }: AppProps) {
   historyPageRef.current = historyPage;
   historyStreamerIdRef.current = historyStreamerId;
   historyFiltersRef.current = historyFilters;
+  resourceReadyRef.current = resourceReady;
+
+  const acceptRuntimeResourceStatus = useCallback((status: RuntimeResourceView) => {
+    resourceReadyRef.current = status.ready;
+    setResourceStatus(status);
+    if (status.ready) {
+      setNotice((current) => isRuntimeResourceNotice(current) ? null : current);
+    }
+  }, []);
 
   const acceptBrowserAccess = useCallback((state: BrowserAccessState): boolean => {
     if (isOlderBrowserAccessState(state, browserAccessRef.current)) return false;
@@ -332,7 +348,7 @@ export function App({ api }: AppProps) {
       if (api.subscribeRuntimeResources) {
         const handler = await api.subscribeRuntimeResources((event: RuntimeResourceEvent) => {
           if (disposed) return;
-          setResourceStatus(event.status);
+          acceptRuntimeResourceStatus(event.status);
           if (event.status.ready) {
             setPage((current) => current === "resources" ? "monitor" : current);
           }
@@ -346,7 +362,7 @@ export function App({ api }: AppProps) {
       if (api.runtimeResourceStatus) {
         const status = await api.runtimeResourceStatus().catch(() => null);
         if (disposed || !status) return;
-        setResourceStatus(status);
+        acceptRuntimeResourceStatus(status);
         if (!status.ready) setPage("resources");
       }
     })();
@@ -368,8 +384,10 @@ export function App({ api }: AppProps) {
       if (event.kind === "session_changed") {
         setReplayDirectoryVersion((version) => version + 1);
       }
-      if (selectedIdRef.current) void refreshCurrentVideos(selectedIdRef.current);
-      if (pageRef.current === "library") {
+      if (resourceReadyRef.current && selectedIdRef.current) {
+        void refreshCurrentVideos(selectedIdRef.current);
+      }
+      if (resourceReadyRef.current && pageRef.current === "library") {
         void refreshHistoryVideos(
           historyStreamerIdRef.current,
           historyPageRef.current,
@@ -385,7 +403,7 @@ export function App({ api }: AppProps) {
       unsubscribe?.();
       resourceUnsubscribe?.();
     };
-  }, [activation?.active, api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
+  }, [acceptRuntimeResourceStatus, activation?.active, api, refreshCurrentVideos, refreshDashboard, refreshHistoryVideos]);
 
   useEffect(() => {
     let disposed = false;
@@ -419,7 +437,7 @@ export function App({ api }: AppProps) {
     setResourceBusy("recheck");
     try {
       const status = await api.runtimeResourceRecheck();
-      setResourceStatus(status);
+      acceptRuntimeResourceStatus(status);
       if (status.ready) setPage("monitor");
     } catch (error) {
       setNotice(errorMessage(error, "资源检查失败"));
@@ -433,7 +451,7 @@ export function App({ api }: AppProps) {
     setResourceBusy("download");
     try {
       const status = await api.runtimeResourceDownload();
-      setResourceStatus(status);
+      acceptRuntimeResourceStatus(status);
       if (status.ready) setPage("monitor");
     } catch (error) {
       setNotice(errorMessage(error, "资源下载失败"));
@@ -531,7 +549,7 @@ export function App({ api }: AppProps) {
     let disposed = false;
     let activeBatchId: string | null = null;
     setThumbnailBatch(null);
-    if (page !== "library" || historyVideos.length === 0) return undefined;
+    if (!resourceReady || page !== "library" || historyVideos.length === 0) return undefined;
     void api.requestVideoThumbnails(historyVideos.map((video) => video.id))
       .then((batch) => {
         activeBatchId = batch.batchId;
@@ -548,10 +566,11 @@ export function App({ api }: AppProps) {
       disposed = true;
       if (activeBatchId) void api.releaseVideoThumbnailBatch(activeBatchId);
     };
-  }, [activation?.active, api, historyVideos, page]);
+  }, [activation?.active, api, historyVideos, page, resourceReady]);
 
   useEffect(() => {
     if (activation?.active !== true) return undefined;
+    if (!resourceReady) return undefined;
     if (!thumbnailBatch?.items.some((item) => item.state === "queued")) return undefined;
     let disposed = false;
     const batchId = thumbnailBatch.batchId;
@@ -567,17 +586,18 @@ export function App({ api }: AppProps) {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [activation?.active, api, thumbnailBatch]);
+  }, [activation?.active, api, resourceReady, thumbnailBatch]);
 
   useEffect(() => {
     if (activation?.active !== true) return;
+    if (!resourceReady) return;
     if (selectedId) void refreshCurrentVideos(selectedId);
     else setCurrentVideos([]);
-  }, [activation?.active, refreshCurrentVideos, selectedId]);
+  }, [activation?.active, refreshCurrentVideos, resourceReady, selectedId]);
 
   useEffect(() => {
     if (activation?.active !== true) return;
-    if (page === "library") {
+    if (resourceReady && page === "library") {
       void refreshHistoryVideos(
         historyStreamerIdRef.current,
         historyPageRef.current,
@@ -588,7 +608,7 @@ export function App({ api }: AppProps) {
       void api.getSettings().then(setSettings).catch(() => undefined);
       void api.diagnoseEnvironment().then(setEnvironment).catch(() => undefined);
     }
-  }, [activation?.active, api, page, refreshHistoryVideos]);
+  }, [activation?.active, api, page, refreshHistoryVideos, resourceReady]);
 
   const sortedStreamers = useMemo(
     () =>
@@ -606,7 +626,7 @@ export function App({ api }: AppProps) {
       setNotice("客户端激活后才能使用主功能");
       return;
     }
-    if (resourceStatus && !resourceStatus.ready && nextPage !== "resources" && nextPage !== "settings") {
+    if (!resourceReady && nextPage !== "resources" && nextPage !== "settings") {
       setNotice("运行资源尚未准备完成，主功能暂不可用");
       return;
     }
@@ -748,7 +768,7 @@ export function App({ api }: AppProps) {
         page={page}
         open={mobileNavOpen}
           activeRecordings={dashboard.activeRecordings}
-        resourceReady={resourceStatus?.ready ?? true}
+        resourceReady={resourceReady}
         onNavigate={navigate}
         onClose={() => setMobileNavOpen(false)}
       />

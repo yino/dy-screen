@@ -516,10 +516,12 @@ describe("App", () => {
     render(<App api={api} />);
 
     expect(await screen.findByRole("heading", { name: "准备本地运行资源" })).toBeInTheDocument();
+    expect(api.listCurrentVideos).not.toHaveBeenCalled();
     expect(await screen.findByRole("button", { name: "监控中心" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "下载并安装资源" }));
     expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "监控中心" })).not.toBeDisabled();
+    await waitFor(() => expect(api.listCurrentVideos).toHaveBeenCalledWith(streamer.id));
   });
 
   it("后台校验期间先显示可响应的状态页，完成后自动进入监控中心", async () => {
@@ -538,6 +540,7 @@ describe("App", () => {
     render(<App api={api} />);
 
     expect(await screen.findByRole("heading", { name: "正在校验本地运行资源" })).toBeInTheDocument();
+    expect(api.listCurrentVideos).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "下载并安装资源" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "重新检测" })).toBeDisabled();
     act(() => publishResource?.({
@@ -551,6 +554,8 @@ describe("App", () => {
     }));
 
     expect(await screen.findByRole("heading", { name: "监控中心" })).toBeInTheDocument();
+    await waitFor(() => expect(api.listCurrentVideos).toHaveBeenCalledWith(streamer.id));
+    expect(screen.queryByText("运行资源尚未准备完成，请先完成资源下载和校验")).not.toBeInTheDocument();
   });
 
   it("先监听资源事件再读取初始状态，避免遗漏后台校验完成事件", async () => {
