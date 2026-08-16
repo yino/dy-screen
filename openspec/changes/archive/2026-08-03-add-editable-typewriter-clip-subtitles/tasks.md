@@ -1,7 +1,7 @@
 ## 1. 数据模型与迁移契约
 
 - [x] 1.1 先增加从现有数据库升级的失败测试，覆盖新字幕表、外键、唯一约束、幂等 migration、原工程和原 ASR 数据保留
-- [x] 1.2 增加 `ai_clip_subtitles` additive migration 和必要索引，确保片段删除级联且不删除录像、ASR、高光或已导出文件
+- [x] 1.2 增加 `ai_clip_subtitles` additive migration 和必要索引，确保片段删除级联且不删除录像、ASR、精彩或已导出文件
 - [x] 1.3 扩展 Rust 领域模型、Tauri DTO 和 TypeScript 类型，区分工程字幕原文、当前文本、隐藏状态、工程时间及后端显示帧
 - [x] 1.4 增加字幕更新与恢复 command 契约测试，拒绝前端提交时间戳、原文、字体、路径、滤镜或 FFmpeg 参数
 

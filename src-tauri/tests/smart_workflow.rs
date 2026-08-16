@@ -146,7 +146,7 @@ fn completed_highlight(repository: &AiRepository, label: &str, position: i64) ->
         .remove(0);
     let draft = HighlightCandidateDraft {
         candidate_key: format!("candidate-{label}"),
-        title: format!("{label} 高光"),
+        title: format!("{label} 精彩"),
         input_id: input.id,
         segment_ids: vec![format!("segment-{label}")],
         start_ms: 1_000,
@@ -157,7 +157,7 @@ fn completed_highlight(repository: &AiRepository, label: &str, position: i64) ->
         tag_relevance_score: 90.0,
         completeness_score: 90.0,
         shareability_score: 88.0,
-        reason: "测试高光".to_owned(),
+        reason: "测试精彩".to_owned(),
         matched_tags: vec![label.to_owned()],
     };
     let score = HighlightCandidateScore {
@@ -170,7 +170,7 @@ fn completed_highlight(repository: &AiRepository, label: &str, position: i64) ->
         completeness_score: 90.0,
         shareability_score: 88.0,
         rank: 1,
-        reason: "测试高光".to_owned(),
+        reason: "测试精彩".to_owned(),
     };
     let candidate = repository
         .replace_highlight_results(run.id, &[(chunk.id, draft)], &[score])
@@ -302,8 +302,8 @@ impl AiJobController for CompletingController {
                     &[TranscriptSegmentDraft {
                         source_start_ms: 1_000,
                         source_end_ms: 21_000,
-                        raw_text: "这是一段足够长的测试高光字幕".to_owned(),
-                        normalized_text: "这是一段足够长的测试高光字幕。".to_owned(),
+                        raw_text: "这是一段足够长的测试精彩字幕".to_owned(),
+                        normalized_text: "这是一段足够长的测试精彩字幕。".to_owned(),
                         confidence: Some(0.95),
                     }],
                 )
@@ -409,7 +409,7 @@ impl HighlightAgentProvider for SmartHighlightProvider {
         Ok(CandidateAgentOutput {
             candidates: vec![HighlightCandidateDraft {
                 candidate_key: format!("smart-highlight-{input_id}"),
-                title: "智能高光".to_owned(),
+                title: "智能精彩".to_owned(),
                 input_id,
                 segment_ids: vec![segment["id"].as_str().unwrap().to_owned()],
                 start_ms: segment["startMs"].as_u64().unwrap(),
@@ -420,7 +420,7 @@ impl HighlightAgentProvider for SmartHighlightProvider {
                 tag_relevance_score: 90.0,
                 completeness_score: 90.0,
                 shareability_score: 90.0,
-                reason: "测试高光".to_owned(),
+                reason: "测试精彩".to_owned(),
                 matched_tags: Vec::new(),
             }],
             token_usage: 1,
@@ -450,7 +450,7 @@ impl HighlightAgentProvider for SmartHighlightProvider {
                 completeness_score: 90.0,
                 shareability_score: 90.0,
                 rank: u32::try_from(index + 1).unwrap(),
-                reason: "测试高光".to_owned(),
+                reason: "测试精彩".to_owned(),
             })
             .collect();
         Ok(RankingAgentOutput {
@@ -817,6 +817,124 @@ fn live_batches_follow_source_time_and_candidate_ledger_keeps_continuous_ranges(
 }
 
 #[test]
+fn awaiting_selection_adopts_the_top_three_scores_and_requeues_the_latest_batch() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let repository = AiRepository::new(database.clone());
+    let workflows = SmartWorkflowRepository::new(database);
+    let workflow = local_workflow(&workflows);
+    workflows
+        .authorize(workflow.workflow.id, 1, "authorization-v1", "config-v1")
+        .unwrap();
+
+    let mut batch_ids = Vec::new();
+    let mut candidate_ids = Vec::new();
+    for (index, score) in [61_u8, 69, 55, 68].into_iter().enumerate() {
+        let label = format!("默认候选-{index}");
+        let (project_id, run_id, candidate_id) =
+            completed_highlight(&repository, &label, 20 + index as i64);
+        repository.select_highlight_candidates(run_id, &[]).unwrap();
+        let input_id = repository.list_highlight_candidates(run_id).unwrap()[0].input_id;
+        let batch = workflows
+            .add_batch(
+                workflow.workflow.id,
+                &NewAiSmartWorkflowBatch {
+                    video_id: None,
+                    source_fingerprint: format!("fallback-source-{index}"),
+                    finalized_at: format!("2026-08-14T00:0{index}:00Z"),
+                },
+            )
+            .unwrap();
+        workflows
+            .attach_batch_project(
+                batch.id,
+                project_id,
+                Some(run_id),
+                AiSmartBatchStatus::Completed,
+            )
+            .unwrap();
+        workflows
+            .update_batch_status(batch.id, AiSmartBatchStatus::Completed, None)
+            .unwrap();
+        workflows
+            .upsert_candidate(
+                workflow.workflow.id,
+                &NewAiSmartCandidate {
+                    dedupe_key: format!("fallback-candidate-{index}"),
+                    semantic_fingerprint: format!("fallback-semantic-{index}"),
+                    canonical_candidate_id: candidate_id,
+                    total_score: score,
+                    qualified: false,
+                    selected: false,
+                    session_start_ms: index as u64 * 30_000,
+                    session_end_ms: index as u64 * 30_000 + 20_000,
+                    first_finalized_at: format!("2026-08-14T00:0{index}:00Z"),
+                    sources: vec![NewAiSmartCandidateSource {
+                        batch_id: batch.id,
+                        candidate_id,
+                        video_id: None,
+                        input_id,
+                        stable_segment_ids: vec![format!("segment-{label}")],
+                        source_start_ms: 1_000,
+                        source_end_ms: 20_000,
+                        session_start_ms: index as u64 * 30_000,
+                        session_end_ms: index as u64 * 30_000 + 20_000,
+                    }],
+                },
+            )
+            .unwrap();
+        batch_ids.push(batch.id);
+        candidate_ids.push((candidate_id, score));
+    }
+    workflows
+        .transition(
+            workflow.workflow.id,
+            1,
+            AiSmartWorkflowStatus::Running,
+            AiSmartStage::Highlight,
+            None,
+        )
+        .unwrap();
+    workflows
+        .transition(
+            workflow.workflow.id,
+            1,
+            AiSmartWorkflowStatus::AwaitingSelection,
+            AiSmartStage::Highlight,
+            None,
+        )
+        .unwrap();
+
+    let (detail, requeued_batch_id) = workflows
+        .apply_top_candidate_fallback(workflow.workflow.id, 1, 3)
+        .unwrap();
+    assert_eq!(requeued_batch_id, *batch_ids.last().unwrap());
+    assert_eq!(detail.workflow.status, AiSmartWorkflowStatus::Queued);
+    assert_eq!(detail.workflow.stage, AiSmartStage::Highlight);
+    assert_eq!(detail.workflow.selected_count, 3);
+    assert_eq!(detail.workflow.pending_batch_count, 1);
+
+    let mut selected_scores = workflows
+        .list_candidates(workflow.workflow.id)
+        .unwrap()
+        .into_iter()
+        .filter(|candidate| candidate.selected)
+        .map(|candidate| candidate.total_score)
+        .collect::<Vec<_>>();
+    selected_scores.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(selected_scores, vec![69, 68, 61]);
+    let (_, selected_source_ids) = workflows
+        .selected_clip_inputs(workflow.workflow.id)
+        .unwrap();
+    assert_eq!(selected_source_ids.len(), 3);
+    assert!(!selected_source_ids.contains(&candidate_ids[2].0));
+    assert_eq!(
+        workflows.get_batch(requeued_batch_id).unwrap().status,
+        AiSmartBatchStatus::Queued
+    );
+}
+
+#[test]
 fn multi_source_draft_rejects_foreign_candidates_and_freezes_user_edits_and_export() {
     let database = Database::open_in_memory().unwrap();
     database.migrate().unwrap();
@@ -883,7 +1001,7 @@ fn multi_source_draft_rejects_foreign_candidates_and_freezes_user_edits_and_expo
         .create_smart_clip_project(
             workflow.workflow.id,
             1,
-            "直播高光合辑",
+            "直播精彩合辑",
             &[
                 AiSmartClipSourceInput {
                     highlight_run_id: run_a,
@@ -1233,7 +1351,7 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
     );
 
     let directory_page = workflow
-        .list_replay_sessions(Some("回放测试主播"), None, 20)
+        .list_replay_sessions(Some(streamer.id), None, None, 20)
         .unwrap();
     assert_eq!(directory_page.items.len(), 1);
     assert_eq!(directory_page.items[0].session_id, replay_session.id);
@@ -1242,7 +1360,7 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
     assert_eq!(directory_page.items[0].unavailable_video_count, 0);
     assert!(
         workflow
-            .list_replay_sessions(Some("空回放主播"), None, 20)
+            .list_replay_sessions(Some(empty_streamer.id), None, None, 20)
             .unwrap()
             .items
             .is_empty()
@@ -1395,7 +1513,9 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
         duplicate.code,
         "smart_replay_duplicate_confirmation_required"
     );
-    let directory_page = workflow.list_replay_sessions(None, None, 20).unwrap();
+    let directory_page = workflow
+        .list_replay_sessions(Some(streamer.id), None, None, 20)
+        .unwrap();
     let replay_item = directory_page
         .items
         .iter()

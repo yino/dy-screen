@@ -1617,7 +1617,7 @@ async fn ai_start_clip_export(
         dialog_app
             .dialog()
             .file()
-            .set_title("导出高光剪辑 MP4")
+            .set_title("导出精彩剪辑 MP4")
             .set_file_name(file_name)
             .add_filter("MP4 视频", &["mp4"])
             .blocking_save_file()
@@ -1659,7 +1659,7 @@ async fn ai_start_clip_export(
         destination
             .file_stem()
             .and_then(|name| name.to_str())
-            .unwrap_or("高光剪辑")
+            .unwrap_or("精彩剪辑")
     ));
     let database = state.database.clone();
     let tasks = state.clip_export_tasks.clone();
@@ -1900,6 +1900,7 @@ pub fn run() {
             ai_list_smart_workflows,
             ai_get_smart_workflow,
             ai_cancel_smart_workflow,
+            ai_confirm_smart_highlight_fallback,
             ai_retry_smart_workflow_stage,
             ai_open_smart_draft,
             ai_import_local_grants,

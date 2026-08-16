@@ -2,7 +2,7 @@
 
 设置页当前由 `SettingsPage` 在一个 `<form>` 内顺序渲染六张卡片，`.settings-layout` 使用两列 CSS Grid。Grid 的隐式行会由同行最高卡片决定高度，因此“桌面行为”等高卡片会在另一列下方制造大片空白。页面同时混用 8-11px 说明文字、10px 标签、39-42px 表单控件和多套按钮规则，英文栏目提示还使用 1.6px 字间距；这些数值在截图对应的 1703-1904px 桌面窗口中仍显得过密且难读。
 
-普通设置由外层表单统一保存，高光分析 Provider 则使用独立 API、Key 凭据和操作按钮。布局调整必须保持这两套提交语义隔离。项目中另有活动变更 `add-synced-ai-transition-materials`，实现时不得修改或覆盖其 OpenSpec 产物，并应在触碰共享 `App.tsx`、`styles.css` 时基于当时工作区合并。
+普通设置由外层表单统一保存，精彩分析 Provider 则使用独立 API、Key 凭据和操作按钮。布局调整必须保持这两套提交语义隔离。项目中另有活动变更 `add-synced-ai-transition-materials`，实现时不得修改或覆盖其 OpenSpec 产物，并应在触碰共享 `App.tsx`、`styles.css` 时基于当时工作区合并。
 
 ## Goals / Non-Goals
 
@@ -25,7 +25,7 @@
 
 ### 1. 使用两个显式列容器，而不是单个行网格
 
-`SettingsPage` 将渲染一个有界的 `.settings-layout`，内部包含 `.settings-column` 左右两个垂直栈。左列依次放置录像设置、桌面行为、抖音访问会话；右列依次放置运行环境、客户端授权、高光分析 Provider。每列使用自身的 `display: grid` 或纵向 flex 和统一间距，卡片高度只影响本列。
+`SettingsPage` 将渲染一个有界的 `.settings-layout`，内部包含 `.settings-column` 左右两个垂直栈。左列依次放置录像设置、桌面行为、抖音访问会话；右列依次放置运行环境、客户端授权、精彩分析 Provider。每列使用自身的 `display: grid` 或纵向 flex 和统一间距，卡片高度只影响本列。
 
 选择显式列容器，是因为它能直接消除 Grid 同行高度耦合，并提供确定的 DOM、键盘和屏幕阅读器顺序。未采用 CSS multi-column 或 masonry：前者会产生不稳定的阅读/焦点顺序，后者兼容性和可测试性不足。窄屏时两列容器变为单列，顺序为完整左列后完整右列，与用户确认的逻辑分组一致。
 

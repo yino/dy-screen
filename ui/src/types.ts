@@ -1051,6 +1051,7 @@ export interface ClientApi {
     authorizationConfirmed: boolean;
   }): Promise<AiSmartWorkflowDetail>;
   listSmartReplaySessions(
+    streamerId: number | null,
     search?: string,
     cursor?: AiSmartReplaySessionCursor | null,
     limit?: number,
@@ -1070,6 +1071,7 @@ export interface ClientApi {
   listSmartWorkflows(): Promise<AiSmartWorkflow[]>;
   getSmartWorkflow(workflowId: number): Promise<AiSmartWorkflowDetail>;
   cancelSmartWorkflow(workflowId: number, expectedGeneration: number): Promise<AiSmartWorkflowDetail>;
+  confirmSmartHighlightFallback(workflowId: number, expectedGeneration: number): Promise<AiSmartWorkflowDetail>;
   retrySmartWorkflowStage(input: {
     workflowId: number;
     expectedGeneration: number;

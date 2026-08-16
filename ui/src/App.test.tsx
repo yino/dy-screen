@@ -324,6 +324,7 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
     listSmartWorkflows: vi.fn().mockResolvedValue([]),
     getSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务详情"),
     cancelSmartWorkflow: vi.fn().mockRejectedValue("测试未配置智能任务取消"),
+    confirmSmartHighlightFallback: vi.fn().mockRejectedValue("测试未配置默认精彩确认"),
     retrySmartWorkflowStage: vi.fn().mockRejectedValue("测试未配置智能任务重试"),
     openSmartDraft: vi.fn().mockRejectedValue("测试未配置智能草稿"),
     importAiLocalGrants: vi.fn().mockResolvedValue({ added: [], rejected: [] }),
@@ -804,7 +805,7 @@ describe("App", () => {
     render(<App api={createApi()} />);
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
-    await screen.findByRole("heading", { name: "高光与剪辑 Agent" });
+    await screen.findByRole("heading", { name: "精彩与剪辑 Agent" });
 
     const primaryColumn = screen.getByTestId("settings-column-primary");
     const secondaryColumn = screen.getByTestId("settings-column-secondary");
@@ -816,7 +817,7 @@ describe("App", () => {
     expect(within(secondaryColumn).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
       "运行环境",
       "客户端授权",
-      "高光与剪辑 Agent",
+      "精彩与剪辑 Agent",
     ]);
   });
 
@@ -1212,26 +1213,28 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     expect(await screen.findByText("还没有 AI 分析项目")).toBeInTheDocument();
     expect(screen.getByText("视频和转写全程保留在本机")).toBeInTheDocument();
+    expect(screen.queryByText("新建成品")).not.toBeInTheDocument();
     expect(api.pickAiLocalVideos).not.toHaveBeenCalled();
     expect(api.requestAiInputPreview).not.toHaveBeenCalled();
   });
 
-  it("智能成片本地创建必须经过来源、资源和一次授权门禁", async () => {
+  it("一键成品是独立菜单且本地创建必须经过来源、资源和一次授权门禁", async () => {
     const user = userEvent.setup();
     const api = createApi();
     api.pickAiLocalVideos = vi.fn().mockResolvedValue([
-      { grantId: "grant-smart-a", displayName: "本地高光 A.mp4" },
-      { grantId: "grant-smart-b", displayName: "本地高光 B.mov" },
+      { grantId: "grant-smart-a", displayName: "本地精彩 A.mp4" },
+      { grantId: "grant-smart-b", displayName: "本地精彩 B.mov" },
     ]);
-    const created = smartWorkflowDetail({ mode: "local", name: "本地智能成片", sourceSessionId: null });
+    const created = smartWorkflowDetail({ mode: "local", name: "本地一键成品", sourceSessionId: null });
     api.createLocalSmartWorkflow = vi.fn().mockResolvedValue(created);
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
-    const createButton = await screen.findByRole("button", { name: "创建并启动" });
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    expect(await screen.findByRole("heading", { name: "新建成品" })).toBeInTheDocument();
+    const createButton = await screen.findByRole("button", { name: "开始生成" });
     expect(createButton).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "选择视频" }));
-    expect(await screen.findByText("本地高光 A.mp4")).toBeInTheDocument();
+    expect(await screen.findByText(/本地精彩 A\.mp4/)).toBeInTheDocument();
     expect(createButton).toBeDisabled();
     await user.click(screen.getByRole("checkbox", { name: /仅为当前任务授权/ }));
     expect(createButton).toBeEnabled();
@@ -1239,7 +1242,7 @@ describe("App", () => {
 
     expect(api.createLocalSmartWorkflow).toHaveBeenCalledWith({
       configuration: {
-        name: "本地智能成片",
+        name: "本地一键成品",
         provider: "deepseek",
         modelId: "deepseek-chat",
         textScope: "selected_clip_subtitles",
@@ -1248,10 +1251,92 @@ describe("App", () => {
       grantIds: ["grant-smart-a", "grant-smart-b"],
       authorizationConfirmed: true,
     });
-    expect(screen.queryByRole("button", { name: "导出 MP4" })).not.toBeInTheDocument();
+    const progressTrack = screen.getByRole("list", { name: /成品生成进度 100%/ });
+    expect(within(progressTrack).getAllByRole("listitem")).toHaveLength(6);
+    expect(screen.getByRole("progressbar", { name: "成品生成总进度" })).toHaveAttribute("aria-valuenow", "100");
+    expect(screen.getByRole("button", { name: "编辑" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "导出" })).toBeInTheDocument();
   });
 
-  it("直播智能成片只展示受信录制会话且不接受 URL", async () => {
+  it("一键成品无自动精彩时确认采用评分前 3 个并继续", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const awaiting = {
+      ...smartWorkflowDetail({
+        status: "awaiting_selection",
+        stage: "highlight",
+        candidateCount: 5,
+        selectedCount: 0,
+      }),
+      drafts: [],
+    };
+    const resumed = {
+      ...smartWorkflowDetail({
+        status: "queued",
+        stage: "highlight",
+        candidateCount: 5,
+        selectedCount: 3,
+      }),
+      drafts: [],
+    };
+    api.listSmartWorkflows = vi.fn().mockResolvedValue([awaiting.workflow]);
+    api.getSmartWorkflow = vi.fn().mockResolvedValue(awaiting);
+    api.confirmSmartHighlightFallback = vi.fn().mockResolvedValue(resumed);
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    expect(await screen.findByText("等待确认精彩")).toBeInTheDocument();
+    const progress = screen.getByRole("progressbar", { name: "首版生成总进度" });
+    expect(progress).toHaveAttribute("aria-valuenow", "35");
+    expect(progress.closest(".one-click-progress-console")).toHaveClass("warning");
+    expect(await screen.findByText("确认默认精彩")).toBeInTheDocument();
+    expect(screen.getByText(/是否采用评分最高的 3 个候选继续/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "采用前 3 个并继续" }));
+
+    expect(api.confirmSmartHighlightFallback).toHaveBeenCalledWith(501, 1);
+    expect(api.cancelSmartWorkflow).not.toHaveBeenCalled();
+    expect(await screen.findByText("已采用评分最高的 3 个候选，继续生成成品")).toBeInTheDocument();
+    expect(screen.queryByText("确认默认精彩")).not.toBeInTheDocument();
+  });
+
+  it("一键成品拒绝默认精彩后取消任务且不执行后续阶段", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const awaiting = {
+      ...smartWorkflowDetail({
+        status: "awaiting_selection",
+        stage: "highlight",
+        candidateCount: 2,
+        selectedCount: 0,
+      }),
+      drafts: [],
+    };
+    const cancelled = {
+      ...smartWorkflowDetail({
+        status: "cancelled",
+        stage: "highlight",
+        generation: 2,
+        candidateCount: 2,
+        selectedCount: 0,
+      }),
+      drafts: [],
+    };
+    api.listSmartWorkflows = vi.fn().mockResolvedValue([awaiting.workflow]);
+    api.getSmartWorkflow = vi.fn().mockResolvedValue(awaiting);
+    api.cancelSmartWorkflow = vi.fn().mockResolvedValue(cancelled);
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    expect(await screen.findByRole("button", { name: "采用前 2 个并继续" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "停止生成" }));
+
+    expect(api.cancelSmartWorkflow).toHaveBeenCalledWith(501, 1);
+    expect(api.confirmSmartHighlightFallback).not.toHaveBeenCalled();
+    expect(await screen.findByText("已停止生成，后续阶段不会执行")).toBeInTheDocument();
+    expect(screen.queryByText("确认默认精彩")).not.toBeInTheDocument();
+  });
+
+  it("正在直播一键成品只展示受信录制会话且使用首版进度", async () => {
     const user = userEvent.setup();
     const api = createApi();
     api.listActiveLiveSessions = vi.fn().mockResolvedValue([{
@@ -1262,17 +1347,19 @@ describe("App", () => {
     api.createLiveSmartWorkflow = vi.fn().mockResolvedValue(smartWorkflowDetail());
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
-    await user.click(screen.getByRole("button", { name: "直播素材" }));
-    expect(await screen.findByText("正在录制的直播间")).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    await user.click(screen.getByRole("button", { name: "正在直播" }));
+    expect(await screen.findByRole("option", { name: /正在录制的直播间/ })).toBeInTheDocument();
     expect(screen.queryByRole("textbox", { name: /直播/ })).not.toBeInTheDocument();
     expect(screen.queryByText(/URL/)).not.toBeInTheDocument();
     await user.click(screen.getByRole("checkbox", { name: /仅为当前直播场次授权/ }));
-    await user.click(screen.getByRole("button", { name: "创建并启动" }));
+    await user.click(screen.getByRole("button", { name: "开始生成" }));
     expect(api.createLiveSmartWorkflow).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 88,
       authorizationConfirmed: true,
     }));
+    expect(screen.getByRole("progressbar", { name: "首版生成总进度" })).toHaveAttribute("aria-valuenow", "100");
+    expect(screen.getByText("直播继续时自动准备下一版")).toBeInTheDocument();
   });
 
   it("直播素材同时提供正在直播与可搜索分页的本机回放，并确认重复任务", async () => {
@@ -1306,7 +1393,22 @@ describe("App", () => {
       existingWorkflowStatus: null,
     };
     const nextCursor = { startedAt: firstReplay.startedAt, sessionId: firstReplay.sessionId };
-    api.listSmartReplaySessions = vi.fn(async (_search = "", cursor = null) => cursor
+    api.listAiReplayStreamers = vi.fn().mockResolvedValue({
+      items: [{
+        streamerId: 18,
+        name: "同一主播",
+        tags: ["带货"],
+        webRid: "1800",
+        archived: false,
+        monitorEnabled: true,
+        liveStatus: "live",
+        monitorStatus: "recording",
+        replayCount: 2,
+        latestEndedAt: firstReplay.endedAt,
+      }],
+      nextCursor: null,
+    });
+    api.listSmartReplaySessions = vi.fn(async (_streamerId, _search = "", cursor = null) => cursor
       ? { items: [secondReplay], nextCursor: null }
       : { items: [firstReplay], nextCursor });
     const replayDetail = {
@@ -1324,30 +1426,36 @@ describe("App", () => {
     api.createReplaySmartWorkflow = vi.fn().mockResolvedValue(replayDetail);
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
-    await user.click(screen.getByRole("button", { name: "直播素材" }));
-    expect(await screen.findByText("同一主播当前直播")).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    await user.click(screen.getByRole("button", { name: "正在直播" }));
+    expect(await screen.findByRole("option", { name: /同一主播当前直播/ })).toBeInTheDocument();
     const replayModeButton = screen.getByRole("button", { name: "直播回放" });
     replayModeButton.focus();
     await user.keyboard("{Enter}");
     expect(replayModeButton).toHaveAttribute("aria-pressed", "true");
-    expect(await screen.findByText("同一主播历史回放")).toBeInTheDocument();
-    expect(screen.getByText(/本机已完成录制.*8 个分片/)).toBeInTheDocument();
-    expect(screen.getByText("已有任务 · 已完成")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "选择直播回放" })).toBeDisabled();
+    await user.click(screen.getByRole("combobox", { name: "选择回放主播" }));
+    await user.click(await screen.findByRole("option", { name: /同一主播.*2 场回放/ }));
+    await waitFor(() => expect(api.listSmartReplaySessions).toHaveBeenCalledWith(18, "", null, 20));
     expect(screen.queryByPlaceholderText(/https?:\/\//)).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "加载更多回放" }));
-    expect(await screen.findByText("更早的本机回放")).toBeInTheDocument();
-    expect(api.listSmartReplaySessions).toHaveBeenCalledWith("", nextCursor, 20);
+    await user.click(screen.getByRole("combobox", { name: "选择直播回放" }));
+    expect(await screen.findByRole("option", { name: /会话 81.*8 个分片.*已有任务/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "加载更多" }));
+    expect(await screen.findByRole("option", { name: /会话 80.*4 个分片/ })).toBeInTheDocument();
+    expect(api.listSmartReplaySessions).toHaveBeenCalledWith(18, "", nextCursor, 20);
+    await user.click(screen.getByRole("option", { name: /会话 81.*8 个分片.*已有任务/ }));
 
-    const search = screen.getByRole("textbox", { name: "搜索直播回放" });
+    await user.click(screen.getByRole("combobox", { name: "选择直播回放" }));
+    const search = screen.getByRole("textbox", { name: "选择直播回放搜索" });
     await user.type(search, "昨天");
-    await waitFor(() => expect(api.listSmartReplaySessions).toHaveBeenLastCalledWith("昨天", null, 20));
+    await waitFor(() => expect(api.listSmartReplaySessions).toHaveBeenLastCalledWith(18, "昨天", null, 20));
+    await user.keyboard("{Escape}");
 
-    const createButton = screen.getByRole("button", { name: "创建并启动" });
+    const createButton = screen.getByRole("button", { name: "开始生成" });
     await user.click(screen.getByRole("checkbox", { name: /回放任务及冻结分片/ }));
     expect(createButton).toBeDisabled();
-    await user.click(screen.getByRole("checkbox", { name: /已有智能任务.*重新处理/ }));
+    await user.click(screen.getByRole("checkbox", { name: /已有一键成品任务.*重新处理/ }));
     expect(createButton).toBeEnabled();
     await user.click(createButton);
 
@@ -1356,9 +1464,8 @@ describe("App", () => {
       authorizationConfirmed: true,
       duplicateConfirmed: true,
     }));
-    expect(await screen.findByText("8/8")).toBeInTheDocument();
-    expect(screen.getByText("100%")).toBeInTheDocument();
-    expect(screen.getByText(/直播回放 · 可审阅/)).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "成品生成总进度" })).toHaveAttribute("aria-valuenow", "100");
+    expect(screen.getByRole("heading", { name: "成片 v2" })).toBeInTheDocument();
   });
 
   it("直播回放目录失败后可重试并展示明确空状态", async () => {
@@ -1367,14 +1474,83 @@ describe("App", () => {
     api.listSmartReplaySessions = vi.fn()
       .mockRejectedValueOnce(new Error("回放目录暂时不可用"))
       .mockResolvedValue({ items: [], nextCursor: null });
+    api.listAiReplayStreamers = vi.fn().mockResolvedValue({
+      items: [{
+        streamerId: 18,
+        name: "小鱼直播间",
+        tags: [],
+        webRid: "1800",
+        archived: false,
+        monitorEnabled: true,
+        liveStatus: "offline",
+        monitorStatus: "waiting",
+        replayCount: 1,
+        latestEndedAt: "2026-08-13T09:30:00Z",
+      }],
+      nextCursor: null,
+    });
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
-    await user.click(screen.getByRole("button", { name: "直播素材" }));
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
     await user.click(screen.getByRole("button", { name: "直播回放" }));
+    await user.click(screen.getByRole("combobox", { name: "选择回放主播" }));
+    await user.click(await screen.findByRole("option", { name: /小鱼直播间/ }));
+    await user.click(screen.getByRole("combobox", { name: "选择直播回放" }));
     expect(await screen.findByText("回放目录暂时不可用")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试" }));
-    expect(await screen.findByText("没有匹配的本机已完成录制")).toBeInTheDocument();
+    expect(await screen.findByText("该主播没有可用的已结束回放")).toBeInTheDocument();
+  });
+
+  it("切换回放主播会清空旧场次和当前授权并加载联动目录", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const streamerOption = (streamerId: number, name: string) => ({
+      streamerId,
+      name,
+      tags: [],
+      webRid: String(streamerId),
+      archived: false,
+      monitorEnabled: true,
+      liveStatus: "offline",
+      monitorStatus: "waiting",
+      replayCount: 1,
+      latestEndedAt: "2026-08-13T09:30:00Z",
+    });
+    api.listAiReplayStreamers = vi.fn().mockResolvedValue({
+      items: [streamerOption(18, "主播甲"), streamerOption(19, "主播乙")],
+      nextCursor: null,
+    });
+    api.listSmartReplaySessions = vi.fn(async (streamerId) => ({
+      items: [{
+        sessionId: streamerId === 18 ? 81 : 91,
+        streamerName: streamerId === 18 ? "主播甲" : "主播乙",
+        startedAt: "2026-08-13T08:00:00Z",
+        endedAt: "2026-08-13T09:30:00Z",
+        videoCount: 8,
+        totalDurationMs: 5_400_000,
+        unavailableVideoCount: 0,
+        existingWorkflowId: null,
+        existingWorkflowStatus: null,
+      }],
+      nextCursor: null,
+    }));
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    await user.click(screen.getByRole("button", { name: "直播回放" }));
+    await user.click(screen.getByRole("combobox", { name: "选择回放主播" }));
+    await user.click(await screen.findByRole("option", { name: /主播甲/ }));
+    await user.click(screen.getByRole("combobox", { name: "选择直播回放" }));
+    await user.click(await screen.findByRole("option", { name: /会话 81/ }));
+    const authorization = screen.getByRole("checkbox", { name: /回放任务及冻结分片/ });
+    await user.click(authorization);
+    expect(authorization).toBeChecked();
+
+    await user.click(screen.getByRole("combobox", { name: "选择回放主播" }));
+    await user.click(await screen.findByRole("option", { name: /主播乙/ }));
+    expect(authorization).not.toBeChecked();
+    expect(screen.getByRole("combobox", { name: "选择直播回放" })).toHaveTextContent("再选择直播回放");
+    await waitFor(() => expect(api.listSmartReplaySessions).toHaveBeenCalledWith(19, "", null, 20));
   });
 
   it("智能任务显示长脱敏错误并支持局部重试和任务取消", async () => {
@@ -1399,20 +1575,20 @@ describe("App", () => {
     });
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
     expect(await screen.findByText(longError)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "重试失败阶段" }));
+    await user.click(screen.getByRole("button", { name: "重试此阶段" }));
     expect(api.retrySmartWorkflowStage).toHaveBeenCalledWith({
       workflowId: failed.workflow.id,
       expectedGeneration: 1,
       stage: "correction",
       batchId: 601,
     });
-    await user.click(screen.getByRole("button", { name: "取消任务" }));
+    await user.click(screen.getByRole("button", { name: "取消当前任务" }));
     expect(api.cancelSmartWorkflow).toHaveBeenCalledWith(failed.workflow.id, 1);
   });
 
-  it("智能草稿区分人工所有权、冻结和下一版并可打开审阅", async () => {
+  it("一键成品完成后显示预览、编辑和导出入口", async () => {
     const user = userEvent.setup();
     const api = createApi();
     const detail = smartWorkflowDetail();
@@ -1421,13 +1597,15 @@ describe("App", () => {
     api.openSmartDraft = vi.fn().mockRejectedValue("测试打开动作");
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
-    expect(await screen.findByText(/已转为人工编辑 · 导出已冻结 · 存在下一版草稿/)).toBeInTheDocument();
-    expect(screen.getByText(/自动更新中 · 可审阅/)).toBeInTheDocument();
-    const reviewButtons = screen.getAllByRole("button", { name: "审阅成片" });
-    await user.click(reviewButtons[1]);
+    await user.click(await screen.findByRole("button", { name: "一键成品" }));
+    expect(await screen.findByRole("heading", { name: "首版成片 v2" })).toBeInTheDocument();
+    expect(screen.getByText("成品已准备就绪")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "首版生成总进度" })).toHaveAttribute("aria-valuenow", "100");
+    expect(screen.getByText("自动版本 · 可编辑、可导出")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "导出" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "编辑" }));
     expect(api.openSmartDraft).toHaveBeenCalledWith(902);
-    expect(await screen.findByText("测试打开动作")).toBeInTheDocument();
+    expect((await screen.findAllByText("测试打开动作")).length).toBeGreaterThan(0);
   });
 
   it("AI 环境不可用时保留项目浏览并展示重新检测和安装修复说明", async () => {

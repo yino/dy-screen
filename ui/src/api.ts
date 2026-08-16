@@ -144,8 +144,9 @@ const tauriApi: ClientApi = {
     invoke<AiActiveLiveSession[]>("ai_list_active_live_sessions"),
   createLiveSmartWorkflow: (input) =>
     invoke<AiSmartWorkflowDetail>("ai_create_live_smart_workflow", { input }),
-  listSmartReplaySessions: (search = "", cursor = null, limit = 20) =>
+  listSmartReplaySessions: (streamerId, search = "", cursor = null, limit = 20) =>
     invoke<AiSmartReplaySessionPage>("ai_list_smart_replay_sessions", {
+      streamerId,
       search,
       cursor,
       limit,
@@ -160,6 +161,11 @@ const tauriApi: ClientApi = {
     invoke<AiSmartWorkflowDetail>("ai_get_smart_workflow", { workflowId }),
   cancelSmartWorkflow: (workflowId, expectedGeneration) =>
     invoke<AiSmartWorkflowDetail>("ai_cancel_smart_workflow", {
+      workflowId,
+      expectedGeneration,
+    }),
+  confirmSmartHighlightFallback: (workflowId, expectedGeneration) =>
+    invoke<AiSmartWorkflowDetail>("ai_confirm_smart_highlight_fallback", {
       workflowId,
       expectedGeneration,
     }),
@@ -336,7 +342,9 @@ export function createBrowserApi(): ClientApi {
     : null;
   const visualQaSettings = visualQaState === "settings";
   const visualQaResources = visualQaState === "resources";
-  const visualQaSmart = visualQaState === "smart";
+  const visualQaSmartFallback = visualQaState === "smart-fallback";
+  const visualQaSmartProgress = visualQaState === "smart-progress";
+  const visualQaSmart = visualQaState === "smart" || visualQaSmartFallback || visualQaSmartProgress;
   const thumbnailBatches = new Map<string, ThumbnailBatch>();
   const desktopAccessUnavailable = (): BrowserAccessState => ({
     status: visualQaSettings ? "verification_required" : "session_expired",
@@ -448,8 +456,8 @@ export function createBrowserApi(): ClientApi {
       id: 501,
       name: "夏季新品直播智能成片",
       mode: "live",
-      status: "failed",
-      stage: "correction",
+      status: visualQaSmartFallback ? "awaiting_selection" : visualQaSmartProgress ? "running" : "failed",
+      stage: visualQaSmartFallback ? "highlight" : "correction",
       generation: 3,
       sourceSessionId: 88,
       sourceSummary: "受信直播会话 · 已持续录制 01:42:18 · 仅处理完成登记的分片",
@@ -463,11 +471,11 @@ export function createBrowserApi(): ClientApi {
       liveCursorVideoId: 103,
       liveStartVideoId: 100,
       eventSequence: 17,
-      candidateCount: 12,
-      selectedCount: 5,
-      pendingBatchCount: 2,
-      lastErrorCode: "provider_timeout",
-      lastErrorMessage: "字幕纠错 Provider 在等待响应时超过了当前超时限制。本次失败只影响这个智能批次，直播录制与后续完成分片登记仍在继续；已完成的 ASR、高光候选和第一版草稿均已保留。请检查网络、模型额度或超时配置后重试失败阶段。此段开发态长文本用于检查窄窗口、字体放大和辅助技术模式下是否能完整换行，且不会遮挡重试、取消或审阅操作。",
+      candidateCount: visualQaSmartFallback ? 7 : 12,
+      selectedCount: visualQaSmartFallback ? 0 : 5,
+      pendingBatchCount: visualQaSmartFallback ? 0 : 2,
+      lastErrorCode: visualQaSmartFallback || visualQaSmartProgress ? null : "provider_timeout",
+      lastErrorMessage: visualQaSmartFallback || visualQaSmartProgress ? null : "字幕纠错 Provider 在等待响应时超过了当前超时限制。本次失败只影响这个智能批次，直播录制与后续完成分片登记仍在继续；已完成的 ASR、精彩候选和第一版草稿均已保留。请检查网络、模型额度或超时配置后重试失败阶段。此段开发态长文本用于检查窄窗口、字体放大和辅助技术模式下是否能完整换行，且不会遮挡重试、取消或审阅操作。",
       createdAt: "2026-08-14T09:00:00+08:00",
       updatedAt: "2026-08-14T10:42:18+08:00",
     },
@@ -495,10 +503,10 @@ export function createBrowserApi(): ClientApi {
         sourceFingerprint: "browser-qa-source-2",
         projectId: 702,
         highlightRunId: 802,
-        status: "failed",
+        status: visualQaSmartProgress ? "completed" : "failed",
         finalizedAt: "2026-08-14T09:30:00+08:00",
-        lastErrorCode: "provider_timeout",
-        lastErrorMessage: "字幕纠错服务暂时不可用",
+        lastErrorCode: visualQaSmartProgress ? null : "provider_timeout",
+        lastErrorMessage: visualQaSmartProgress ? null : "字幕纠错服务暂时不可用",
         createdAt: "2026-08-14T09:30:01+08:00",
         updatedAt: "2026-08-14T10:42:18+08:00",
       },
@@ -518,7 +526,7 @@ export function createBrowserApi(): ClientApi {
         updatedAt: "2026-08-14T09:52:00+08:00",
       },
     ],
-    attempts: [
+    attempts: visualQaSmartFallback ? [] : [
       {
         id: 901,
         workflowId: 501,
@@ -545,18 +553,18 @@ export function createBrowserApi(): ClientApi {
         stage: "correction",
         inputFingerprint: "browser-qa-correction",
         attemptGeneration: 2,
-        status: "failed",
+        status: visualQaSmartProgress ? "running" : "failed",
         progress: 58,
         resultKind: null,
         resultId: null,
         durationMs: 30_000,
-        lastErrorCode: "provider_timeout",
-        lastErrorMessage: "字幕纠错服务暂时不可用",
+        lastErrorCode: visualQaSmartProgress ? null : "provider_timeout",
+        lastErrorMessage: visualQaSmartProgress ? null : "字幕纠错服务暂时不可用",
         createdAt: "2026-08-14T10:41:48+08:00",
         updatedAt: "2026-08-14T10:42:18+08:00",
       },
     ],
-    drafts: [
+    drafts: visualQaSmartFallback || visualQaSmartProgress ? [] : [
       {
         id: 1001,
         workflowId: 501,
@@ -934,6 +942,9 @@ export function createBrowserApi(): ClientApi {
     cancelSmartWorkflow: async () => {
       throw new Error("浏览器演示模式没有运行中的智能任务");
     },
+    confirmSmartHighlightFallback: async () => {
+      throw new Error("浏览器演示模式不能确认本机精彩候选");
+    },
     retrySmartWorkflowStage: async () => {
       throw new Error("浏览器演示模式不能调用 Provider");
     },
@@ -942,7 +953,21 @@ export function createBrowserApi(): ClientApi {
     },
     importAiLocalGrants: async () => ({ added: [], rejected: [] }),
     listAiCompletedSessions: async () => [],
-    listAiReplayStreamers: async () => ({ items: [], nextCursor: null }),
+    listAiReplayStreamers: async () => visualQaSmart ? ({
+      items: [{
+        streamerId: 64549713569,
+        name: "夏季新品发布直播间",
+        tags: ["新品", "品牌直播"],
+        webRid: "292895634635",
+        archived: false,
+        monitorEnabled: true,
+        liveStatus: "live",
+        monitorStatus: "recording",
+        replayCount: 6,
+        latestEndedAt: "2026-08-13T21:18:00+08:00",
+      }],
+      nextCursor: null,
+    }) : ({ items: [], nextCursor: null }),
     listAiReplaySessions: async () => ({ items: [], nextCursor: null }),
     addAiCompletedSession: async () => {
       throw new Error("浏览器演示模式不能读取录像会话");
@@ -1045,7 +1070,7 @@ export function createBrowserApi(): ClientApi {
     listQualifiedAiHighlightCandidates: async (): Promise<AiHighlightCandidatePage> => ({ items: [], page: 0, pageSize: 50, totalCandidates: 0, qualifiedCandidates: 0, selectedCandidates: 0 }),
     listSelectedAiHighlightCandidates: async (): Promise<AiHighlightCandidatePage> => ({ items: [], page: 0, pageSize: 50, totalCandidates: 0, qualifiedCandidates: 0, selectedCandidates: 0 }),
     selectAiHighlightCandidates: async () => [],
-    setAiHighlightCandidateSelected: async () => { throw new Error("浏览器演示模式不能修改本地高光选择"); },
+    setAiHighlightCandidateSelected: async () => { throw new Error("浏览器演示模式不能修改本地精彩选择"); },
     openAiClipProject: async () => { throw new Error("浏览器演示模式不能创建本地剪辑工程"); },
     getAiClipProject: async () => { throw new Error("浏览器演示模式不能读取本地剪辑工程"); },
     updateAiClipSegment: async () => { throw new Error("浏览器演示模式不能修改本地剪辑工程"); },

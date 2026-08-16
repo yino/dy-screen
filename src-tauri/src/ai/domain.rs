@@ -42,7 +42,7 @@ impl AiHighlightRunStatus {
             "partial" => Ok(Self::Partial),
             "cancelled" => Ok(Self::Cancelled),
             "failed" => Ok(Self::Failed),
-            _ => Err(AiRepositoryError::Integrity("高光运行状态无效".to_owned())),
+            _ => Err(AiRepositoryError::Integrity("精彩运行状态无效".to_owned())),
         }
     }
 }

@@ -462,7 +462,7 @@ impl AiCommandService {
         let workflow = self.highlight_workflow.as_ref().ok_or_else(|| {
             AiCommandError::new(
                 "llm_provider_unavailable",
-                "高光分析 Provider 尚未配置",
+                "精彩分析 Provider 尚未配置",
                 true,
             )
         })?;
@@ -480,7 +480,7 @@ impl AiCommandService {
         let workflow = self.highlight_workflow.as_ref().ok_or_else(|| {
             AiCommandError::new(
                 "llm_provider_unavailable",
-                "高光分析 Provider 尚未配置",
+                "精彩分析 Provider 尚未配置",
                 true,
             )
         })?;
@@ -491,7 +491,7 @@ impl AiCommandService {
         if !run.user_authorized {
             return Err(AiCommandError::new(
                 "highlight_authorization_required",
-                "该高光运行没有用户授权，不能自动恢复",
+                "该精彩运行没有用户授权，不能自动恢复",
                 false,
             ));
         }
@@ -512,7 +512,7 @@ impl AiCommandService {
             .map_err(|_| {
                 AiCommandError::new(
                     "highlight_task_state_unavailable",
-                    "高光分析任务状态不可用",
+                    "精彩分析任务状态不可用",
                     true,
                 )
             })?
@@ -539,7 +539,7 @@ impl AiCommandService {
         let workflow = self.highlight_workflow.as_ref().ok_or_else(|| {
             AiCommandError::new(
                 "llm_provider_unavailable",
-                "高光分析 Provider 尚未配置",
+                "精彩分析 Provider 尚未配置",
                 true,
             )
         })?;

@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: 安全配置 DeepSeek Provider
-系统 SHALL 只允许配置官方 DeepSeek Provider、用户自定义模型 ID、受控请求参数以及非敏感的合格/优秀高光阈值，并 MUST NOT 在第一版接受任意 Base URL、代理地址或浏览器端 Provider 配置。合格与优秀阈值 MUST 为 0–100 的整数，且优秀阈值 MUST 不低于合格阈值。
+系统 SHALL 只允许配置官方 DeepSeek Provider、用户自定义模型 ID、受控请求参数以及非敏感的合格/优秀精彩阈值，并 MUST NOT 在第一版接受任意 Base URL、代理地址或浏览器端 Provider 配置。合格与优秀阈值 MUST 为 0–100 的整数，且优秀阈值 MUST 不低于合格阈值。
 
 #### Scenario: 保存 DeepSeek 设置
 - **WHEN** 用户提交有效模型 ID、API Key、合格阈值和优秀阈值

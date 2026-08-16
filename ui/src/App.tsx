@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   ChevronRight,
   CircleOff,
+  Clapperboard,
   Clock3,
   Download,
   ExternalLink,
@@ -60,8 +61,9 @@ import type {
   VideoFilters,
 } from "./types";
 import { AiWorkspace } from "./AiWorkspace";
+import { OneClickProductPage } from "./OneClickProductPage";
 
-type Page = "monitor" | "library" | "ai" | "settings" | "resources";
+type Page = "monitor" | "library" | "one-click" | "ai" | "settings" | "resources";
 type HistoryFilters = { search: string; status: string; date: string };
 type ActivePreview = { video: VideoItem; snapshot: PreviewSnapshot };
 
@@ -889,6 +891,10 @@ export function App({ api }: AppProps) {
           />
         )}
 
+        {page === "one-click" && (
+          <OneClickProductPage api={api} />
+        )}
+
         {(page === "ai" || aiWorkspaceMounted) && (
           <div hidden={page !== "ai"}>
             <AiWorkspace api={api} active={page === "ai"} replayDirectoryVersion={replayDirectoryVersion} />
@@ -977,6 +983,7 @@ function activationStatusLabel(state: ActivationState | null): string {
 function pageTitle(page: Page): string {
   if (page === "monitor") return "监控中心";
   if (page === "library") return "视频资料库";
+  if (page === "one-click") return "一键成品";
   if (page === "ai") return "AI 剪辑";
   if (page === "resources") return "准备运行资源";
   return "应用设置";
@@ -1001,6 +1008,7 @@ function Sidebar({
     ...(!resourceReady ? [{ key: "resources" as Page, label: "准备运行资源", icon: Download as typeof LayoutDashboard }] : []),
     { key: "monitor", label: "监控中心", icon: LayoutDashboard },
     { key: "library", label: "视频库", icon: FileVideo2 },
+    { key: "one-click", label: "一键成品", icon: Clapperboard },
     { key: "ai", label: "AI 剪辑", icon: Sparkles },
     { key: "settings", label: "设置", icon: Settings },
   ];
@@ -1104,7 +1112,7 @@ function ResourcePreparationPage({
           )}
           <button className="secondary-button" onClick={onRecheck} disabled={busy !== null || verifying}><RefreshCw size={15} />重新检测</button>
         </div>
-        <p className="resource-lock-note"><ShieldCheck size={15} />资源就绪后自动解锁监控、录制、视频库和 AI 剪辑。</p>
+        <p className="resource-lock-note"><ShieldCheck size={15} />资源就绪后自动解锁监控、录制、视频库、一键成品和 AI 剪辑。</p>
       </section>
     </div>
   );
@@ -1950,7 +1958,7 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
           {llm && (
             <section className="panel settings-card provider-settings-card">
               <div className="panel-header">
-                <div><p className="section-kicker">DEEPSEEK</p><h2>高光与剪辑 Agent</h2></div>
+                <div><p className="section-kicker">DEEPSEEK</p><h2>精彩与剪辑 Agent</h2></div>
                 <Sparkles size={21} />
               </div>
               <label htmlFor="settings-llm-model">模型 ID<input id="settings-llm-model" value={llm.modelId} onChange={(event) => updateLlm({ modelId: event.target.value })} /></label>
@@ -1960,7 +1968,7 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
                 <label htmlFor="settings-qualified-score">合格片段阈值<input id="settings-qualified-score" aria-label="合格片段阈值" type="number" min="0" max="100" value={llm.qualifiedScore} onChange={(event) => updateLlm({ qualifiedScore: Number(event.target.value) })} /></label>
                 <label htmlFor="settings-excellent-score">优秀片段阈值<input id="settings-excellent-score" aria-label="优秀片段阈值" type="number" min="0" max="100" value={llm.excellentScore} onChange={(event) => updateLlm({ excellentScore: Number(event.target.value) })} /></label>
               </div>
-              <p className="settings-help">达到合格阈值的片段会显示在高光候选；达到优秀阈值的片段会在首次分析完成时自动选中。每次高光分析会冻结当时的阈值。</p>
+              <p className="settings-help">达到合格阈值的片段会显示在精彩候选；达到优秀阈值的片段会在首次分析完成时自动选中。每次精彩分析会冻结当时的阈值。</p>
               <label htmlFor="settings-transition-auto-score">转场自动应用阈值（0–10 分）<input id="settings-transition-auto-score" aria-label="转场自动应用阈值" type="number" min="0" max="10" step="1" value={llm.transitionAutoApplyScore} onChange={(event) => updateLlm({ transitionAutoApplyScore: Number(event.target.value) })} /></label>
               <p className="settings-help">一键 Agent 会先匹配场景、再独立评分；总分达到该阈值才自动应用。每次运行会冻结当时的阈值，默认 8 分。</p>
               <div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>

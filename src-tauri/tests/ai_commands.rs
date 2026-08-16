@@ -347,7 +347,7 @@ fn highlight_resume_from_sync_tauri_command_thread_does_not_require_a_tokio_reac
     let repository = AiRepository::new(database.clone());
     let (commands, _) = command_service(database, Arc::new(AtomicUsize::new(0)));
     let project = repository
-        .create_project("同步恢复高光", &ReadyControllerProfile::profile())
+        .create_project("同步恢复精彩", &ReadyControllerProfile::profile())
         .unwrap();
     let source_path = "/tmp/sync-highlight-resume.mp4";
     let input = repository
@@ -420,7 +420,7 @@ fn highlight_resume_from_sync_tauri_command_thread_does_not_require_a_tokio_reac
         ) {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "后台高光恢复未结束");
+        assert!(std::time::Instant::now() < deadline, "后台精彩恢复未结束");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }

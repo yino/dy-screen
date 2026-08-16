@@ -191,7 +191,7 @@ help:
 		'  make test-migration  执行三层身份数据库迁移测试' \
 		'  make test-supervisor-profile 执行主页/直播间双阶段状态机测试' \
 		'  make test-tags       执行主播标签后端、迁移和前端测试' \
-		'  make test-ai         执行 AI 调度、SQLite、高光工作流和凭据 fake 测试' \
+		'  make test-ai         执行 AI 调度、SQLite、精彩工作流和凭据 fake 测试' \
 		'  make accept-deepseek 启动桌面端，使用设置页的系统凭据和“测试连接”进行显式真实验收' \
 		'  make test-tag-migration 执行主播标签 SQLite migration 测试' \
 		'  make test-tag-repository 执行主播标签 repository 与生命周期测试' \
@@ -665,8 +665,8 @@ test-ai: test-ai-scheduler test-ai-repository test-ai-credentials test-ai-workfl
 accept-deepseek: doctor
 	@printf '%s\n' \
 		'真实 DeepSeek 验收只通过桌面端设置页执行，不把 Key 放入命令行、日志或 SQLite。' \
-		'启动后进入“设置 → 高光分析 Provider”，保存模型和系统凭据，再点击“测试连接”。' \
-		'连接诊断只发送固定提示；确认成功后再在已完成 ASR 项目中显式点击“开始高光分析”。'
+		'启动后进入“设置 → 精彩分析 Provider”，保存模型和系统凭据，再点击“测试连接”。' \
+		'连接诊断只发送固定提示；确认成功后再在已完成 ASR 项目中显式点击“开始精彩分析”。'
 	"$(NPM)" run tauri:dev
 
 test-access-core:

@@ -572,7 +572,7 @@ impl AiRepository {
         self.recompute_project_progress(project_id)
     }
 
-    /// 标记项目正在删除，阻止新的调度、重试和高光运行。
+    /// 标记项目正在删除，阻止新的调度、重试和精彩运行。
     pub fn mark_project_deleting(&self, project_id: i64) -> Result<AiProject> {
         let project = self.get_project_row(project_id)?;
         if !matches!(
@@ -738,7 +738,7 @@ impl AiRepository {
     pub fn create_highlight_run(&self, input: NewAiHighlightRun) -> Result<AiHighlightRun> {
         if !input.user_authorized {
             return Err(AiRepositoryError::InvalidState(
-                "高光分析必须由用户显式授权".to_owned(),
+                "精彩分析必须由用户显式授权".to_owned(),
             ));
         }
         let project = self.get_project_row(input.project_id)?;
@@ -747,7 +747,7 @@ impl AiRepository {
             AiProjectStatus::Completed | AiProjectStatus::CompletedWithErrors
         ) {
             return Err(AiRepositoryError::InvalidState(
-                "只有 ASR 完成的项目可以进行高光分析".to_owned(),
+                "只有 ASR 完成的项目可以进行精彩分析".to_owned(),
             ));
         }
         if input.analysis_fingerprint.trim().is_empty() {
@@ -758,7 +758,7 @@ impl AiRepository {
             || input.excellent_score < input.qualified_score
         {
             return Err(AiRepositoryError::Integrity(
-                "高光运行阈值必须在 0 到 100 之间，且优秀阈值不能低于合格阈值".to_owned(),
+                "精彩运行阈值必须在 0 到 100 之间，且优秀阈值不能低于合格阈值".to_owned(),
             ));
         }
         let tags_json = serde_json::to_string(&input.tags_snapshot)
@@ -802,7 +802,7 @@ impl AiRepository {
                         |row| row.get(0),
                     )
                     .optional()?
-                    .ok_or(AiRepositoryError::Integrity("高光运行指纹冲突".to_owned()))?
+                    .ok_or(AiRepositoryError::Integrity("精彩运行指纹冲突".to_owned()))?
             }
             Err(error) => return Err(error.into()),
         };
@@ -820,7 +820,7 @@ impl AiRepository {
                 map_highlight_run,
             )
             .optional()?
-            .ok_or(AiRepositoryError::NotFound("高光运行"))?;
+            .ok_or(AiRepositoryError::NotFound("精彩运行"))?;
         parse_highlight_run(row)
     }
 
@@ -879,7 +879,7 @@ impl AiRepository {
         for chunk in chunks {
             if chunk.segment_ids.is_empty() {
                 return Err(AiRepositoryError::Integrity(
-                    "高光分块不能没有句段".to_owned(),
+                    "精彩分块不能没有句段".to_owned(),
                 ));
             }
             transaction.execute(
@@ -928,7 +928,7 @@ impl AiRepository {
         )?;
         let count = |value: i64| {
             u64::try_from(value)
-                .map_err(|_| AiRepositoryError::Integrity("高光批次统计无效".to_owned()))
+                .map_err(|_| AiRepositoryError::Integrity("精彩批次统计无效".to_owned()))
         };
         Ok(AiHighlightProgress {
             run_id,
@@ -951,7 +951,7 @@ impl AiRepository {
         )?;
         if changed == 0 {
             return Err(AiRepositoryError::InvalidState(
-                "高光批次不存在或已经完成".to_owned(),
+                "精彩批次不存在或已经完成".to_owned(),
             ));
         }
         transaction.execute(
@@ -970,7 +970,7 @@ impl AiRepository {
         token_usage: u64,
     ) -> Result<()> {
         let drafts_json = serde_json::to_string(drafts)
-            .map_err(|_| AiRepositoryError::Serialization("高光候选草稿无法序列化".to_owned()))?;
+            .map_err(|_| AiRepositoryError::Serialization("精彩候选草稿无法序列化".to_owned()))?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.database.connection()?;
         let transaction = connection.transaction()?;
@@ -980,7 +980,7 @@ impl AiRepository {
         )?;
         if changed == 0 {
             return Err(AiRepositoryError::InvalidState(
-                "高光批次不存在或已经完成".to_owned(),
+                "精彩批次不存在或已经完成".to_owned(),
             ));
         }
         transaction.execute(
@@ -1029,7 +1029,7 @@ impl AiRepository {
             .map(|(row, drafts_json)| {
                 let chunk = parse_highlight_chunk(row)?;
                 let drafts = serde_json::from_str(&drafts_json)
-                    .map_err(|_| AiRepositoryError::Integrity("高光候选草稿快照损坏".to_owned()))?;
+                    .map_err(|_| AiRepositoryError::Integrity("精彩候选草稿快照损坏".to_owned()))?;
                 Ok((chunk, drafts))
             })
             .collect()
@@ -1193,7 +1193,7 @@ impl AiRepository {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
             )
             .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => AiRepositoryError::NotFound("高光运行"),
+                rusqlite::Error::QueryReturnedNoRows => AiRepositoryError::NotFound("精彩运行"),
                 error => AiRepositoryError::Sqlite(error),
             })?;
         let offset = i64::from(page)
@@ -1250,7 +1250,7 @@ impl AiRepository {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
             )
             .map_err(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => AiRepositoryError::NotFound("高光运行"),
+                rusqlite::Error::QueryReturnedNoRows => AiRepositoryError::NotFound("精彩运行"),
                 error => AiRepositoryError::Sqlite(error),
             })?;
         let offset = i64::from(page)
@@ -1298,7 +1298,7 @@ impl AiRepository {
                 params![run_id, id],
             )?;
             if changed == 0 {
-                return Err(AiRepositoryError::NotFound("高光候选"));
+                return Err(AiRepositoryError::NotFound("精彩候选"));
             }
         }
         transaction.commit()?;
@@ -1323,13 +1323,13 @@ impl AiRepository {
         )?;
         if changed == 0 {
             return Err(AiRepositoryError::InvalidState(
-                "只能选择达到本次合格阈值的高光候选".to_owned(),
+                "只能选择达到本次合格阈值的精彩候选".to_owned(),
             ));
         }
         self.list_highlight_candidates(run_id)?
             .into_iter()
             .find(|candidate| candidate.id == candidate_id)
-            .ok_or(AiRepositoryError::NotFound("高光候选"))
+            .ok_or(AiRepositoryError::NotFound("精彩候选"))
     }
 
     pub fn get_or_create_clip_project(&self, run_id: i64) -> Result<AiClipProjectDetail> {
@@ -1360,18 +1360,18 @@ impl AiRepository {
             )?;
             if !matches!(status.as_str(), "completed" | "partial") {
                 return Err(AiRepositoryError::InvalidState(
-                    "高光分析尚未完成，暂时不能创建剪辑工程".to_owned(),
+                    "精彩分析尚未完成，暂时不能创建剪辑工程".to_owned(),
                 ));
             }
             if selected_count == 0 {
                 return Err(AiRepositoryError::InvalidState(
-                    "请至少选择一个高光候选后再编辑视频".to_owned(),
+                    "请至少选择一个精彩候选后再编辑视频".to_owned(),
                 ));
             }
             let now = Utc::now().to_rfc3339();
             transaction.execute(
                 "INSERT INTO ai_clip_projects(highlight_run_id, name, export_status, export_progress, created_at, updated_at) VALUES(?1, ?2, 'idle', 0, ?3, ?3)",
-                params![run_id, format!("{} - 高光剪辑", project_name), now],
+                params![run_id, format!("{} - 精彩剪辑", project_name), now],
             )?;
             let id = transaction.last_insert_rowid();
             transaction.execute(
@@ -2413,7 +2413,7 @@ impl AiRepository {
     }
 
     /// 智能编排器使用的纠错提交路径。它与人工纠错共享同一套逐字幕比较和
-    /// 原子提交规则，但成功时保持自动化所有权，避免后续直播高光被错误地
+    /// 原子提交规则，但成功时保持自动化所有权，避免后续直播精彩被错误地
     /// 路由到新草稿代次。
     pub fn apply_automated_clip_text_corrections(
         &self,
@@ -3521,7 +3521,7 @@ pub(crate) fn migrate_ai_v4(connection: &mut Connection) -> crate::database::Res
     Ok(())
 }
 
-/// v7 为可恢复调度和高光分析增加持久化边界。
+/// v7 为可恢复调度和精彩分析增加持久化边界。
 ///
 /// 该迁移不保存凭据。旧版本的项目表使用 CHECK 约束，必须在事务中重建
 /// 表才能安全加入 deleting 状态；其它新增列均带有兼容旧数据的默认值。
@@ -3735,7 +3735,7 @@ pub(crate) fn migrate_ai_v7(connection: &mut Connection) -> crate::database::Res
     migration
 }
 
-/// v9 保存逐批候选草稿，使长时间高光分析可以展示真实进度并在中断后继续。
+/// v9 保存逐批候选草稿，使长时间精彩分析可以展示真实进度并在中断后继续。
 pub(crate) fn migrate_ai_v9(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
         .query_row(
@@ -3785,7 +3785,7 @@ pub(crate) fn migrate_ai_v9(connection: &mut Connection) -> crate::database::Res
     Ok(())
 }
 
-/// v12 冻结高光筛选阈值，保证历史运行的推荐和自动选择语义稳定。
+/// v12 冻结精彩筛选阈值，保证历史运行的推荐和自动选择语义稳定。
 pub(crate) fn migrate_ai_v12(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
         .query_row(
@@ -4197,7 +4197,7 @@ pub(crate) fn migrate_ai_v21(connection: &mut Connection) -> crate::database::Re
 }
 
 /// v22 为统一智能成片建立父任务/批次/阶段/候选/草稿结构，并将剪辑工程
-/// 从单一高光运行唯一绑定迁移为显式来源集合。
+/// 从单一精彩运行唯一绑定迁移为显式来源集合。
 pub(crate) fn migrate_ai_v22(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
         .query_row(
@@ -4896,7 +4896,7 @@ fn parse_highlight_run(row: HighlightRunRow) -> Result<AiHighlightRun> {
         model_id: row.3,
         prompt_version: row.4,
         tags_snapshot: serde_json::from_str(&row.5)
-            .map_err(|_| AiRepositoryError::Integrity("高光标签快照损坏".to_owned()))?,
+            .map_err(|_| AiRepositoryError::Integrity("精彩标签快照损坏".to_owned()))?,
         skills_snapshot: serde_json::from_str(&row.6)
             .map_err(|_| AiRepositoryError::Integrity("Skills 快照损坏".to_owned()))?,
         analysis_goal: row.7,
@@ -5223,7 +5223,7 @@ fn validate_candidate_draft(
         || end_ms - start_ms > 90_000
     {
         return Err(AiRepositoryError::Integrity(
-            "高光候选必须引用句段且时长在 15 到 90 秒之间".to_owned(),
+            "精彩候选必须引用句段且时长在 15 到 90 秒之间".to_owned(),
         ));
     }
     Ok(())
@@ -5245,7 +5245,7 @@ fn validate_score(score: &HighlightCandidateScore) -> Result<()> {
         || score.rank == 0
     {
         return Err(AiRepositoryError::Integrity(
-            "高光评分必须在 0 到 100 之间且排名有效".to_owned(),
+            "精彩评分必须在 0 到 100 之间且排名有效".to_owned(),
         ));
     }
     Ok(())

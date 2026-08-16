@@ -35,7 +35,7 @@
 
 - [x] 4.1 扩展主播列表、详情、dashboard 和创建/编辑 command DTO，使 Rust 与前端稳定传输 `tags` 数组
 - [x] 4.2 增加只读标签名称建议 command，并验证返回值不包含其他主播的 Prompt 指导或内部敏感信息
-- [x] 4.3 增加内部只读 `StreamerPromptContext` 查询接口或服务方法，不注册模型、Prompt、ASR、高光或切片后台任务
+- [x] 4.3 增加内部只读 `StreamerPromptContext` 查询接口或服务方法，不注册模型、Prompt、ASR、精彩或切片后台任务
 - [x] 4.4 添加 command 集成测试，覆盖标签排序、空数组、字段错误和上下文结构化输出
 - [x] 4.5 检查事件、日志和错误脱敏，确认不会输出完整非法指导、签名直播流 URL、页面载荷或任何模型调用内容
 
@@ -55,7 +55,7 @@
 
 - [x] 6.1 添加从创建带标签主播、重启数据库、编辑顺序、归档恢复到读取 `StreamerPromptContext` 的端到端测试
 - [x] 6.2 添加无历史临时主页主播发现重复入口后的端到端测试，验证标签合并、临时记录删除和单 worker约束
-- [x] 6.3 检查代码和依赖中未新增 LLM SDK、Prompt 模板、自动标签推断、ASR 调用、高光评分或切片实现，并确认不修改 `add-user-triggered-ai-asr` 活动变更
+- [x] 6.3 检查代码和依赖中未新增 LLM SDK、Prompt 模板、自动标签推断、ASR 调用、精彩评分或切片实现，并确认不修改 `add-user-triggered-ai-asr` 活动变更
 - [x] 6.4 更新中文 README，说明主播标签用途、数量限制、可选指导、当前仅作预留以及未来 LLM 可能重点提取“带货”“搞笑”等相关句子
 - [x] 6.5 更新 Makefile 帮助和定向测试目标，使开发者可以运行标签 migration、repository、服务和前端组件测试
 - [x] 6.6 运行 Rust 格式检查、两个 crate 的 Clippy、核心测试、Tauri 测试、前端测试和类型构建，确保监听、录制、视频库、预览和个人主页发现无回归

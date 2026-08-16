@@ -850,7 +850,7 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
     let database = Database::open(&database_path).unwrap();
     database.migrate().unwrap();
     let repository = AiRepository::new(database);
-    let project = repository.create_project("高光候选", &profile()).unwrap();
+    let project = repository.create_project("精彩候选", &profile()).unwrap();
     let project_input = repository
         .add_input(project.id, input("/tmp/highlight.mp4", 0))
         .unwrap();

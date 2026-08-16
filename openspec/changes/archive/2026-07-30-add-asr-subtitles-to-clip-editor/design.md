@@ -1,6 +1,6 @@
 ## Context
 
-剪辑工程由高光候选快照组成，每个片段引用一个已经完成 ASR 的 `ai_project_inputs` 输入和源内毫秒范围。`transcript_segments` 已保存稳定句段 ID、规范化文本及源内开始/结束时间，但当前 `AiClipProjectDetail` 和 FFmpeg 导出计划都没有读取这些数据。
+剪辑工程由精彩候选快照组成，每个片段引用一个已经完成 ASR 的 `ai_project_inputs` 输入和源内毫秒范围。`transcript_segments` 已保存稳定句段 ID、规范化文本及源内开始/结束时间，但当前 `AiClipProjectDetail` 和 FFmpeg 导出计划都没有读取这些数据。
 
 应用分发的是 `--disable-everything` 的精简 LGPL FFmpeg。当前资源没有 `libass/subtitles/drawtext`，引入 libass 会额外带来 FreeType、FriBidi、HarfBuzz、字体发现和多平台动态库分发复杂度。因此不能假设开发机的完整 FFmpeg 能力，也不能让前端传入 SRT/ASS 路径或滤镜表达式。
 
@@ -47,7 +47,7 @@
 
 ### 4. 字幕作为导出的完整性门禁
 
-由高光候选建立的每个片段理论上都应有 ASR 句段。若任一片段没有相交的规范化文本，编辑器仍允许预览和调整，但 `subtitlesComplete=false`，导出命令在保存对话框前拒绝启动，并提示返回 ASR 补全或移除无字幕片段。这样不会静默生成一部分有字幕、一部分无字幕的成品。
+由精彩候选建立的每个片段理论上都应有 ASR 句段。若任一片段没有相交的规范化文本，编辑器仍允许预览和调整，但 `subtitlesComplete=false`，导出命令在保存对话框前拒绝启动，并提示返回 ASR 补全或移除无字幕片段。这样不会静默生成一部分有字幕、一部分无字幕的成品。
 
 仅有片段边缘短暂无字幕属于正常情况，透明空白区间会保留原画面。这里的完整性按“每个剪辑片段至少有一条有效字幕”判断，而不是要求全时段连续覆盖。
 

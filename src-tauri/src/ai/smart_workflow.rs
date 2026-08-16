@@ -184,10 +184,14 @@ impl SmartWorkflowRepository {
 
     pub fn list_replay_sessions(
         &self,
+        streamer_id: Option<i64>,
         search: Option<&str>,
         cursor: Option<&AiSmartReplaySessionCursor>,
         limit: usize,
     ) -> Result<AiSmartReplaySessionPage> {
+        if streamer_id.is_some_and(|value| value <= 0) {
+            return Err(invalid("直播回放主播无效"));
+        }
         if let Some(cursor) = cursor
             && (cursor.session_id <= 0
                 || chrono::DateTime::parse_from_rfc3339(&cursor.started_at).is_err())
@@ -209,24 +213,24 @@ impl SmartWorkflowRepository {
                    ORDER BY candidate.id DESC LIMIT 1
                )
                WHERE session.ended_at IS NOT NULL
+                 AND (?1 IS NULL OR session.streamer_id = ?1)
                  AND EXISTS (SELECT 1 FROM videos video WHERE video.session_id = session.id)
                  AND (
-                     ?1 IS NULL
-                     OR lower(streamer.name) LIKE ?1 ESCAPE '\'
-                     OR lower(COALESCE(streamer.web_rid, '')) LIKE ?1 ESCAPE '\'
-                     OR CAST(session.id AS TEXT) LIKE ?1 ESCAPE '\'
-                     OR strftime('%Y-%m-%d %H:%M', session.started_at, 'localtime') LIKE ?1 ESCAPE '\'
+                     ?2 IS NULL
+                     OR CAST(session.id AS TEXT) LIKE ?2 ESCAPE '\'
+                     OR strftime('%Y-%m-%d %H:%M', session.started_at, 'localtime') LIKE ?2 ESCAPE '\'
                  )
                  AND (
-                     ?2 IS NULL OR session.started_at < ?2
-                     OR (session.started_at = ?2 AND session.id < ?3)
+                     ?3 IS NULL OR session.started_at < ?3
+                     OR (session.started_at = ?3 AND session.id < ?4)
                  )
                ORDER BY session.started_at DESC, session.id DESC
-               LIMIT ?4"#,
+               LIMIT ?5"#,
         )?;
         let rows = statement
             .query_map(
                 params![
+                    streamer_id,
                     search_pattern.as_deref(),
                     cursor.map(|value| value.started_at.as_str()),
                     cursor.map(|value| value.session_id),
@@ -847,6 +851,131 @@ impl SmartWorkflowRepository {
         ids.into_iter().map(|id| self.get_candidate(id)).collect()
     }
 
+    pub fn apply_top_candidate_fallback(
+        &self,
+        workflow_id: i64,
+        expected_generation: u32,
+        limit: usize,
+    ) -> Result<(AiSmartWorkflowDetail, i64)> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let (generation, status) = transaction
+            .query_row(
+                "SELECT generation, status FROM ai_smart_workflows WHERE id = ?1",
+                [workflow_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(AiRepositoryError::NotFound("智能成片任务"))?;
+        if generation != i64::from(expected_generation) {
+            return Err(invalid("任务代次已变化，请刷新后重试"));
+        }
+        if status != AiSmartWorkflowStatus::AwaitingSelection.as_str() {
+            return Err(invalid("当前任务不需要确认默认精彩"));
+        }
+
+        let candidate_limit = limit.clamp(1, 3);
+        let mut statement = transaction.prepare(
+            r#"SELECT candidate.id
+               FROM ai_smart_candidates candidate
+               WHERE candidate.workflow_id = ?1
+                 AND EXISTS (
+                     SELECT 1 FROM ai_smart_candidate_sources source
+                     WHERE source.smart_candidate_id = candidate.id
+                 )
+               ORDER BY candidate.total_score DESC, candidate.session_start_ms,
+                        candidate.session_end_ms, candidate.id
+               LIMIT ?2"#,
+        )?;
+        let selected_ids = statement
+            .query_map(
+                params![workflow_id, i64::try_from(candidate_limit).unwrap_or(3),],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        if selected_ids.is_empty() {
+            return Err(invalid("当前没有可采用的精彩候选"));
+        }
+
+        let batch_id = transaction
+            .query_row(
+                r#"SELECT id FROM ai_smart_workflow_batches
+                   WHERE workflow_id = ?1 AND project_id IS NOT NULL
+                     AND highlight_run_id IS NOT NULL AND status = 'completed'
+                   ORDER BY position DESC, id DESC LIMIT 1"#,
+                [workflow_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| invalid("没有可恢复的精彩分析批次"))?;
+
+        transaction.execute(
+            r#"UPDATE ai_highlight_candidates SET selected = 0
+               WHERE run_id IN (
+                   SELECT highlight_run_id FROM ai_smart_workflow_batches
+                   WHERE workflow_id = ?1 AND highlight_run_id IS NOT NULL
+               )"#,
+            [workflow_id],
+        )?;
+        transaction.execute(
+            "UPDATE ai_smart_candidates SET selected = 0 WHERE workflow_id = ?1",
+            [workflow_id],
+        )?;
+        for candidate_id in &selected_ids {
+            let changed = transaction.execute(
+                r#"UPDATE ai_smart_candidates SET selected = 1
+                   WHERE id = ?1 AND workflow_id = ?2"#,
+                params![candidate_id, workflow_id],
+            )?;
+            if changed == 0 {
+                return Err(invalid("默认精彩候选已变化，请刷新后重试"));
+            }
+            transaction.execute(
+                r#"UPDATE ai_highlight_candidates SET selected = 1
+                   WHERE id IN (
+                       SELECT source.candidate_id FROM ai_smart_candidate_sources source
+                       WHERE source.smart_candidate_id = ?1
+                   )"#,
+                [candidate_id],
+            )?;
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let changed = transaction.execute(
+            r#"UPDATE ai_smart_workflow_batches
+               SET status = 'queued', last_error_code = NULL, last_error_message = NULL,
+                   updated_at = ?1
+               WHERE id = ?2 AND workflow_id = ?3 AND status = 'completed'"#,
+            params![now, batch_id, workflow_id],
+        )?;
+        if changed == 0 {
+            return Err(invalid("精彩分析批次已变化，请刷新后重试"));
+        }
+        let changed = transaction.execute(
+            r#"UPDATE ai_smart_workflows
+               SET status = 'queued', stage = 'highlight', selected_count = ?1,
+                   pending_batch_count = (
+                       SELECT COUNT(*) FROM ai_smart_workflow_batches
+                       WHERE workflow_id = ?2 AND status IN ('pending', 'queued', 'asr', 'highlight')
+                   ), last_error_code = NULL, last_error_message = NULL,
+                   event_sequence = event_sequence + 1, updated_at = ?3
+               WHERE id = ?2 AND generation = ?4 AND status = 'awaiting_selection'"#,
+            params![
+                i64::try_from(selected_ids.len()).unwrap_or(3),
+                workflow_id,
+                now,
+                i64::from(expected_generation),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(invalid("任务状态已变化，请刷新后重试"));
+        }
+        transaction.commit()?;
+        drop(connection);
+        Ok((self.get(workflow_id)?, batch_id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn finish_attempt(
         &self,
@@ -1191,7 +1320,7 @@ impl SmartWorkflowRepository {
                 },
             )
             .optional()?
-            .ok_or(AiRepositoryError::NotFound("智能高光候选"))?;
+            .ok_or(AiRepositoryError::NotFound("智能精彩候选"))?;
         Ok(AiSmartCandidate {
             id: row.0,
             workflow_id: row.1,
@@ -2257,12 +2386,13 @@ impl SmartClippingWorkflow {
 
     pub fn list_replay_sessions(
         &self,
+        streamer_id: Option<i64>,
         search: Option<&str>,
         cursor: Option<&AiSmartReplaySessionCursor>,
         limit: usize,
     ) -> SmartWorkflowResult<AiSmartReplaySessionPage> {
         self.workflows
-            .list_replay_sessions(search, cursor, limit)
+            .list_replay_sessions(streamer_id, search, cursor, limit)
             .map_err(repository_error)
     }
 
@@ -2329,6 +2459,43 @@ impl SmartClippingWorkflow {
         }
         self.publish_current(workflow_id, None);
         Ok(detail)
+    }
+
+    pub async fn confirm_highlight_fallback(
+        &self,
+        workflow_id: i64,
+        expected_generation: u32,
+    ) -> SmartWorkflowResult<AiSmartWorkflowDetail> {
+        let detail = self.workflows.get(workflow_id).map_err(repository_error)?;
+        if detail.workflow.generation != expected_generation {
+            return Err(SmartWorkflowError::new(
+                "smart_generation_conflict",
+                "任务代次已变化，请刷新后重试",
+                false,
+            ));
+        }
+        if detail.workflow.status != AiSmartWorkflowStatus::AwaitingSelection {
+            return Err(SmartWorkflowError::new(
+                "smart_highlight_confirmation_unavailable",
+                "当前任务不需要确认默认精彩",
+                false,
+            ));
+        }
+        if detail.workflow.candidate_count == 0 {
+            return Err(SmartWorkflowError::new(
+                "smart_highlight_candidates_empty",
+                "当前没有可采用的精彩候选",
+                false,
+            ));
+        }
+        self.validate_authorization(&detail.workflow).await?;
+        let (updated, batch_id) = self
+            .workflows
+            .apply_top_candidate_fallback(workflow_id, expected_generation, 3)
+            .map_err(repository_error)?;
+        self.spawn(workflow_id, expected_generation)?;
+        self.publish_current(workflow_id, Some(batch_id));
+        Ok(updated)
     }
 
     pub async fn retry_stage(
@@ -2638,7 +2805,7 @@ impl SmartClippingWorkflow {
         )?;
         let run = if highlight_attempt.status == AiSmartStageAttemptStatus::Completed {
             let run_id = highlight_attempt.result_id.ok_or_else(|| {
-                SmartWorkflowError::new("smart_cached_result_missing", "高光缓存结果引用缺失", true)
+                SmartWorkflowError::new("smart_cached_result_missing", "精彩缓存结果引用缺失", true)
             })?;
             self.repository
                 .get_highlight_run(run_id)
@@ -2726,7 +2893,7 @@ impl SmartClippingWorkflow {
                 .ok_or_else(|| {
                     SmartWorkflowError::new(
                         "smart_candidate_source_invalid",
-                        "高光候选无法映射到受信项目输入",
+                        "精彩候选无法映射到受信项目输入",
                         false,
                     )
                 })?;
@@ -2740,7 +2907,7 @@ impl SmartClippingWorkflow {
             }) {
                 return Err(SmartWorkflowError::new(
                     "smart_candidate_segments_invalid",
-                    "高光候选引用了未登记的稳定句段",
+                    "精彩候选引用了未登记的稳定句段",
                     false,
                 ));
             }
@@ -2799,7 +2966,7 @@ impl SmartClippingWorkflow {
                     workflow_id,
                     expected_generation,
                     AiSmartWorkflowStatus::AwaitingSelection,
-                    AiSmartStage::Draft,
+                    AiSmartStage::Highlight,
                     None,
                 )
                 .map_err(repository_error)?;

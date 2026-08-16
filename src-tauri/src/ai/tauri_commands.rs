@@ -170,14 +170,18 @@ pub(crate) async fn ai_create_live_smart_workflow(
 
 #[tauri::command]
 pub(crate) fn ai_list_smart_replay_sessions(
+    streamer_id: Option<i64>,
     search: Option<String>,
     cursor: Option<AiSmartReplaySessionCursor>,
     limit: Option<usize>,
     state: State<'_, SmartClippingDesktopState>,
 ) -> Result<AiSmartReplaySessionPage, SmartWorkflowError> {
-    state
-        .workflow
-        .list_replay_sessions(search.as_deref(), cursor.as_ref(), limit.unwrap_or(20))
+    state.workflow.list_replay_sessions(
+        streamer_id,
+        search.as_deref(),
+        cursor.as_ref(),
+        limit.unwrap_or(20),
+    )
 }
 
 #[tauri::command]
@@ -236,6 +240,18 @@ pub(crate) async fn ai_cancel_smart_workflow(
     state
         .workflow
         .cancel(workflow_id, expected_generation)
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn ai_confirm_smart_highlight_fallback(
+    workflow_id: i64,
+    expected_generation: u32,
+    state: State<'_, SmartClippingDesktopState>,
+) -> Result<AiSmartWorkflowDetail, SmartWorkflowError> {
+    state
+        .workflow
+        .confirm_highlight_fallback(workflow_id, expected_generation)
         .await
 }
 
