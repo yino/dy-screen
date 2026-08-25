@@ -26,6 +26,7 @@ use super::{
 };
 
 const BUNDLED_MANIFEST: &str = include_str!("../../../resources/asr/manifest.json");
+const PROJECT_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct ReloadableMediaInspector {
@@ -700,7 +701,7 @@ impl AiJobController for LocalAsrRuntime {
             .and_then(|scheduler| scheduler.clone())
         {
             scheduler
-                .cancel_project_and_wait(project_id, Duration::from_secs(15))
+                .cancel_project_and_wait(project_id, PROJECT_CANCEL_TIMEOUT)
                 .await
                 .map_err(command_asr_error)?;
         }
@@ -995,10 +996,16 @@ fn mark_scheduler_terminal(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::DatabaseRecordingGate;
+    use super::{DatabaseRecordingGate, PROJECT_CANCEL_TIMEOUT};
     use crate::database::Database;
     use crate::domain::NewStreamer;
     use dy_screen::asr::RecordingActivityGate;
+    use std::time::Duration;
+
+    #[test]
+    fn project_cancel_timeout_is_thirty_seconds() {
+        assert_eq!(PROJECT_CANCEL_TIMEOUT, Duration::from_secs(30));
+    }
 
     #[test]
     fn recording_gate_allows_parallel_asr_by_default_and_supports_priority_mode() {

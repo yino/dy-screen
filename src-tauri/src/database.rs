@@ -1684,12 +1684,19 @@ impl Database {
         self.connection()?.execute(
             r#"
             UPDATE streamers
-            SET monitor_status = CASE
+            SET live_status = CASE
+                    WHEN monitor_enabled = 1 AND archived = 0 THEN 'checking'
+                    ELSE 'offline'
+                END,
+                monitor_status = CASE
                     WHEN monitor_enabled = 1 AND archived = 0 THEN 'waiting'
                     ELSE 'paused'
                 END,
                 updated_at = ?1
-            WHERE monitor_status IN ('recording', 'waiting_resource')
+            WHERE (
+                    monitor_status IN ('recording', 'waiting_resource')
+                    OR (monitor_status IN ('waiting', 'waiting_first_live') AND live_status = 'live')
+                )
               AND NOT EXISTS (
                   SELECT 1
                   FROM recording_sessions rs
@@ -2561,4 +2568,27 @@ where
         .get(key)
         .and_then(|value| value.parse().ok())
         .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_startup_clears_stale_live_status() {
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let streamer = database
+            .add_streamer(&NewStreamer::room("测试主播", "room-1", "room-1", true))
+            .unwrap();
+
+        database
+            .update_streamer_status(streamer.id, "live", "waiting", None)
+            .unwrap();
+        database.reconcile_startup().unwrap();
+
+        let restored = database.get_streamer(streamer.id).unwrap();
+        assert_eq!(restored.live_status, "checking");
+        assert_eq!(restored.monitor_status, "waiting");
+    }
 }

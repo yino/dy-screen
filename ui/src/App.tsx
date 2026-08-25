@@ -1169,7 +1169,8 @@ function MonitorPage({
 }) {
   const liveCount = dashboard.streamers.filter((item) => item.liveStatus === "live").length;
   const waitingCount = dashboard.streamers.filter((item) =>
-    item.monitorStatus === "waiting" || item.monitorStatus === "waiting_first_live"
+    item.liveStatus !== "live"
+      && (item.monitorStatus === "waiting" || item.monitorStatus === "waiting_first_live")
   ).length;
   const priorityOrder = [...dashboard.streamers].sort((left, right) =>
     left.recordingPriority - right.recordingPriority || left.id - right.id);
@@ -1342,7 +1343,11 @@ function StreamerRow({ streamer, browserAccess, selected, priorityBusy, canMoveU
       : "身份待确认";
   const browserResolving = browserAccess?.status === "browser_resolving"
     && browserAccess.activeStreamerId === streamer.id;
-  const monitorLabel = browserResolving ? "浏览器解析中" : monitorLabels[streamer.monitorStatus];
+  const monitorLabel = browserResolving
+    ? "浏览器解析中"
+    : streamer.liveStatus === "live" && streamer.monitorStatus === "waiting"
+      ? "等待录制"
+      : monitorLabels[streamer.monitorStatus];
   const monitorKind = streamer.monitorStatus === "recording"
     ? "recording"
     : ["recording_error", "profile_error", "access_restricted", "verification_required", "layout_changed", "entry_invalid", "identity_conflict"].includes(streamer.monitorStatus)

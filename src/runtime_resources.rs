@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 pub const RUNTIME_MANIFEST_SCHEMA: u32 = 2;
+pub const RUNTIME_RESOURCE_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 /// 应用发布时替换为正式 Ed25519 公钥。该值固定在二进制中，永远不从远端 manifest 读取。
 pub const EMBEDDED_MANIFEST_PUBLIC_KEY: [u8; 32] = [
     0x6a, 0x1f, 0x2c, 0x7b, 0x88, 0x5e, 0x13, 0x42, 0x19, 0x9d, 0x73, 0x04, 0x6f, 0x2a, 0x91, 0x55,
@@ -591,7 +593,7 @@ impl RuntimeDownloader {
     pub fn new(base_url: &str, max_bytes: u64) -> Result<Self, RuntimeResourceError> {
         let base_url = validate_base_url(base_url)?;
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(RUNTIME_RESOURCE_CONNECT_TIMEOUT)
             .timeout(std::time::Duration::from_secs(120))
             .user_agent("dy-screen-runtime-resource/1")
             .build()
@@ -871,6 +873,14 @@ pub struct ResourceProgressPublisher(pub Arc<dyn Fn(ResourceProgress) + Send + S
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn runtime_resource_connect_timeout_is_thirty_seconds() {
+        assert_eq!(
+            RUNTIME_RESOURCE_CONNECT_TIMEOUT,
+            std::time::Duration::from_secs(30)
+        );
+    }
 
     fn manifest(root: &Path) -> RuntimeManifest {
         let file = root.join("bin/tool");

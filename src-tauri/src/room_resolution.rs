@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::domain::{BrowserAccessState, BrowserAccessStatus};
 
 pub const DEFAULT_BROWSER_STICKY_DURATION: Duration = Duration::from_secs(30 * 60);
-pub const DEFAULT_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_BROWSER_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_BROWSER_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 pub const DEFAULT_VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_BROWSER_PROBE_LOG_HEARTBEAT: Duration = Duration::from_secs(30);
@@ -1448,5 +1448,15 @@ fn safe_content_type(value: String) -> Option<String> {
         None
     } else {
         Some(normalized.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_probe_timeout_is_thirty_seconds() {
+        assert_eq!(DEFAULT_BROWSER_PROBE_TIMEOUT, Duration::from_secs(30));
     }
 }

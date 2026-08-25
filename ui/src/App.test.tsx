@@ -619,6 +619,13 @@ describe("App", () => {
       },
       {
         ...streamer,
+        id: 44,
+        name: "直播中待录制主播",
+        liveStatus: "live",
+        monitorStatus: "waiting",
+      },
+      {
+        ...streamer,
         id: 43,
         name: "风控主播",
         liveStatus: "error",
@@ -633,12 +640,16 @@ describe("App", () => {
     const rowFor = (name: string) => rows.find((row) => row.textContent?.includes(name));
     const offlineRow = rowFor("未开播主播");
     const liveRow = rowFor("直播中主播");
+    const liveWaitingRow = rowFor("直播中待录制主播");
     const verificationRow = rowFor("风控主播");
     expect(offlineRow).toHaveTextContent("未开播");
     expect(offlineRow).toHaveTextContent("等待开播");
     expect(offlineRow).not.toHaveTextContent("需要访问验证");
     expect(liveRow).toHaveTextContent("直播中");
     expect(liveRow).not.toHaveTextContent("需要访问验证");
+    expect(liveWaitingRow).toHaveTextContent("直播中");
+    expect(liveWaitingRow).toHaveTextContent("等待录制");
+    expect(liveWaitingRow).not.toHaveTextContent("等待开播");
     expect(verificationRow).toHaveTextContent("需要访问验证");
   });
 

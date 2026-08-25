@@ -16,7 +16,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const DEFAULT_API_BASE_URL: &str = "http://localhost/api/";
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -995,6 +995,11 @@ mod tests {
         let config = ApiConfig::from_env();
         assert!(!config.base_url.is_empty());
         assert!(["win", "mac", "general"].contains(&config.platform.as_str()));
+    }
+
+    #[test]
+    fn default_request_timeout_allows_slow_activation_response() {
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
