@@ -3111,8 +3111,8 @@ impl AiRepository {
             INSERT INTO asr_artifacts(
                 source_video_id, source_fingerprint_json, source_fingerprint_hash,
                 recognition_profile_hash, engine_id, engine_version, model_id,
-                model_version, status, created_at, last_used_at
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?9)
+                model_version, provider, fallback_reason, status, created_at, last_used_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?11)
             "#,
             params![
                 input.source_fingerprint.video_id,
@@ -3123,6 +3123,8 @@ impl AiRepository {
                 input.engine_version,
                 input.model_id,
                 input.model_version,
+                input.provider,
+                input.fallback_reason,
                 now,
             ],
         )?;
@@ -3270,6 +3272,20 @@ impl AiRepository {
             return Err(AiRepositoryError::NotFound("项目输入"));
         }
         Ok(())
+    }
+
+    pub fn artifact_for_input(&self, input_id: i64) -> Result<Option<AsrArtifact>> {
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                &artifact_select(
+                    "WHERE id = (SELECT artifact_id FROM ai_project_inputs WHERE id = ?1)",
+                ),
+                [input_id],
+                map_artifact,
+            )
+            .optional()?;
+        row.map(parse_artifact).transpose()
     }
 
     pub fn list_segments_for_input(&self, input_id: i64) -> Result<Vec<TranscriptSegment>> {
@@ -4473,6 +4489,56 @@ pub(crate) fn migrate_ai_v23(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v25 为 ASR 产物记录实际 provider 和脱敏回退原因。
+pub(crate) fn migrate_ai_v25(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 25",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    let has_provider: bool = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('asr_artifacts') WHERE name = 'provider'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_provider {
+        transaction.execute(
+            "ALTER TABLE asr_artifacts ADD COLUMN provider TEXT NOT NULL DEFAULT 'local'",
+            [],
+        )?;
+    }
+    let has_fallback: bool = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('asr_artifacts') WHERE name = 'fallback_reason'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_fallback {
+        transaction.execute(
+            "ALTER TABLE asr_artifacts ADD COLUMN fallback_reason TEXT",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(25, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// v24 增加已结束直播回放智能任务，同时保持既有 live 行为和索引语义。
 pub(crate) fn migrate_ai_v24(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
@@ -4742,6 +4808,8 @@ type ArtifactRow = (
     String,
     String,
     String,
+    Option<String>,
+    String,
     Option<i64>,
     Option<String>,
     String,
@@ -4756,8 +4824,8 @@ fn artifact_select(suffix: &str) -> String {
         r#"
         SELECT id, source_fingerprint_json, source_fingerprint_hash,
                recognition_profile_hash, engine_id, engine_version, model_id,
-               model_version, status, duration_ms, language, created_at,
-               published_at, last_used_at
+               model_version, provider, fallback_reason, status, duration_ms,
+               language, created_at, published_at, last_used_at
         FROM asr_artifacts {suffix}
         "#
     )
@@ -4779,6 +4847,8 @@ fn map_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
     ))
 }
 
@@ -4793,12 +4863,14 @@ fn parse_artifact(row: ArtifactRow) -> Result<AsrArtifact> {
         engine_version: row.5,
         model_id: row.6,
         model_version: row.7,
-        status: AiArtifactStatus::parse(&row.8)?,
-        duration_ms: row.9.map(|value| value as u64),
-        language: row.10,
-        created_at: row.11,
-        published_at: row.12,
-        last_used_at: row.13,
+        provider: row.8,
+        fallback_reason: row.9,
+        status: AiArtifactStatus::parse(&row.10)?,
+        duration_ms: row.11.map(|value| value as u64),
+        language: row.12,
+        created_at: row.13,
+        published_at: row.14,
+        last_used_at: row.15,
     })
 }
 

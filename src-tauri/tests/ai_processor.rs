@@ -174,6 +174,8 @@ impl AsrEngine for FakeEngine {
             identity: self.identity(),
             detected_language: Some("zh".to_owned()),
             audio_duration_ms: request.audio.duration_ms,
+            provider: "local".to_owned(),
+            fallback_reason: None,
             segments: vec![AsrSegment {
                 start_ms: 100,
                 end_ms: 3_900,
@@ -465,6 +467,8 @@ async fn source_model_vad_hotword_changes_and_pending_artifacts_are_cache_misses
                     engine_version: profile.engine_version.clone(),
                     model_id: profile.model_id.clone(),
                     model_version: profile.model_version.clone(),
+                    provider: "local".to_owned(),
+                    fallback_reason: None,
                 })
                 .unwrap();
         }

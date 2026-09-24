@@ -78,6 +78,8 @@ fn result_allows_missing_confidence_but_rejects_fabricated_ranges() {
         },
         detected_language: Some("zh".to_owned()),
         audio_duration_ms: 4_000,
+        provider: "local".to_owned(),
+        fallback_reason: None,
         segments: vec![AsrSegment {
             start_ms: 100,
             end_ms: 3_900,

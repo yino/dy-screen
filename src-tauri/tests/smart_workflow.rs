@@ -87,6 +87,8 @@ fn completed_highlight(repository: &AiRepository, label: &str, position: i64) ->
             engine_version: "1".to_owned(),
             model_id: "test-model".to_owned(),
             model_version: "1".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
         })
         .unwrap();
     repository
@@ -292,6 +294,8 @@ impl AiJobController for CompletingController {
                     engine_version: "1".to_owned(),
                     model_id: "test-model".to_owned(),
                     model_version: "1".to_owned(),
+                    provider: "local".to_owned(),
+                    fallback_reason: None,
                 })
                 .unwrap();
             self.repository
@@ -348,6 +352,7 @@ impl AiJobController for CompletingController {
                 message: "测试资源就绪".to_owned(),
             }],
             message: "测试资源就绪".to_owned(),
+            cloud_asr_available: false,
             runtime: None,
         })
     }

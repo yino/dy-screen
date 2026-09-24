@@ -38,6 +38,10 @@ pub struct AiTranscriptInputProjection {
     pub progress_percent: u8,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    /// 识别实际使用的 provider，例如 `local` 或 `aliyun`。
+    pub provider: Option<String>,
+    /// 云端不可用时的脱敏回退原因。
+    pub fallback_reason: Option<String>,
     /// 失败、取消或无人声输入在项目逻辑时间轴上保留的空洞。
     pub gap_duration_ms: Option<u64>,
     pub segments: Vec<AiTranscriptSegmentProjection>,
@@ -77,6 +81,7 @@ impl AiTranscriptProjection {
             } else {
                 None
             };
+            let artifact = repository.artifact_for_input(input.id)?;
             inputs.push(AiTranscriptInputProjection {
                 input_id: input.id,
                 position: input.position,
@@ -89,6 +94,8 @@ impl AiTranscriptProjection {
                 progress_percent: input.progress_percent,
                 error_code: input.last_error_code,
                 error_message: input.last_error_message,
+                provider: artifact.as_ref().map(|value| value.provider.clone()),
+                fallback_reason: artifact.and_then(|value| value.fallback_reason),
                 gap_duration_ms,
                 segments,
             });

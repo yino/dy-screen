@@ -1063,6 +1063,8 @@ mod tests {
                 engine_version: "test".to_owned(),
                 model_id: "small".to_owned(),
                 model_version: "test".to_owned(),
+                provider: "local".to_owned(),
+                fallback_reason: None,
             })
             .unwrap();
         assert_eq!(artifact.status, AiArtifactStatus::Pending);

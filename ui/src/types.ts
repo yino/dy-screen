@@ -379,6 +379,7 @@ export interface AiEnvironmentDiagnostic {
   modelVersion: string;
   checks: AiEnvironmentCheck[];
   message: string;
+  cloudAsrAvailable?: boolean;
   runtime?: AiRuntimeResourceDiagnostic | null;
 }
 
@@ -433,6 +434,8 @@ export interface AiTranscriptInput {
   progressPercent: number;
   errorCode: string | null;
   errorMessage: string | null;
+  provider?: "aliyun" | "local" | string;
+  fallbackReason?: string | null;
   gapDurationMs: number | null;
   segments: AiTranscriptSegment[];
 }

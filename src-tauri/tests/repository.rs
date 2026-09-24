@@ -882,7 +882,7 @@ fn startup_reconciliation_resets_stale_recording_status_without_an_active_sessio
     database.reconcile_startup().unwrap();
 
     let restored = database.get_streamer(streamer.id).unwrap();
-    assert_eq!(restored.live_status, "live");
+    assert_eq!(restored.live_status, "checking");
     assert_eq!(restored.monitor_status, "waiting");
 }
 

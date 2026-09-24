@@ -361,6 +361,10 @@ pub struct NewAsrArtifact {
     pub engine_version: String,
     pub model_id: String,
     pub model_version: String,
+    /// 实际使用的识别 provider：`local` | `aliyun`。
+    pub provider: String,
+    /// 云端不可用时的脱敏回退原因；直接走本地时为空。
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,6 +381,10 @@ pub struct AsrArtifact {
     pub status: AiArtifactStatus,
     pub duration_ms: Option<u64>,
     pub language: Option<String>,
+    /// 实际使用的识别 provider：`local` | `aliyun`。
+    pub provider: String,
+    /// 云端不可用时的脱敏回退原因。
+    pub fallback_reason: Option<String>,
     pub created_at: String,
     pub published_at: Option<String>,
     pub last_used_at: String,

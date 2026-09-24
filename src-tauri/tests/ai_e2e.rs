@@ -175,6 +175,8 @@ impl AsrEngine for E2eEngine {
             identity: self.identity(),
             detected_language: Some("zh".to_owned()),
             audio_duration_ms: request.audio.duration_ms,
+            provider: "local".to_owned(),
+            fallback_reason: None,
             segments: vec![AsrSegment {
                 start_ms: 100,
                 end_ms: 3_900,

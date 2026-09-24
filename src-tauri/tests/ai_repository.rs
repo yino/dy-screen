@@ -636,6 +636,8 @@ fn artifact_publish_is_atomic_reusable_and_uses_stable_segment_ids() {
             engine_version: "v1.9.1".to_owned(),
             model_id: "whisper-small-multilingual-q5_1".to_owned(),
             model_version: "small-q5_1@5359861".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
         })
         .unwrap();
     assert_eq!(artifact.status, AiArtifactStatus::Pending);
@@ -797,6 +799,8 @@ fn video_deletion_invalidates_then_cleans_artifacts_without_deleting_media_or_mo
             engine_version: "v1.9.1".to_owned(),
             model_id: "whisper-small-multilingual-q5_1".to_owned(),
             model_version: "small-q5_1@5359861".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
         })
         .unwrap();
     repository
@@ -862,6 +866,8 @@ fn highlight_run_is_authorized_snapshot_and_candidate_selection_is_atomic() {
             engine_version: "v1.9.1".to_owned(),
             model_id: "whisper-small-multilingual-q5_1".to_owned(),
             model_version: "small-q5_1@5359861".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
         })
         .unwrap();
     repository

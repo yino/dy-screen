@@ -13,6 +13,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const DEFAULT_API_BASE_URL: &str = "http://localhost/api/";
@@ -408,12 +409,70 @@ pub struct TelemetryResponse {
     pub rejected: u32,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiLlmAkResponse {
+    pub ak: String,
+    pub expire_at: i64,
+    pub provider: String,
+}
+
+/// 只在内存中保存尚未过期的 AI 临时密钥。
+#[derive(Clone, Default)]
+pub struct AiLlmAkCache {
+    value: Arc<Mutex<Option<(String, AiLlmAkResponse)>>>,
+}
+
+impl AiLlmAkCache {
+    /// 创建空缓存。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 返回尚未进入安全提前量的临时密钥；过期值会立即丢弃。
+    pub fn get_valid(&self, scope: &str, now_unix_seconds: i64) -> Option<AiLlmAkResponse> {
+        let mut value = self.value.lock().ok()?;
+        let valid = value
+            .as_ref()
+            .filter(|(cached_scope, item)| {
+                cached_scope == scope && item.expire_at > now_unix_seconds.saturating_add(30)
+            })
+            .map(|(_, item)| item.clone());
+        if valid.is_none() {
+            *value = None;
+        }
+        valid
+    }
+
+    /// 用服务端返回值替换缓存；不接受不符合 provider/有效期约束的值。
+    pub fn put(&self, scope: String, value: AiLlmAkResponse) -> Result<(), ApiError> {
+        if value.ak.trim().is_empty()
+            || value.expire_at <= chrono::Utc::now().timestamp().saturating_add(30)
+            || value.provider != "ALI"
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        self.value
+            .lock()
+            .map_err(|_| ApiError::Configuration)
+            .map(|mut slot| *slot = Some((scope, value)))
+    }
+
+    /// 清除内存中的临时密钥。
+    pub fn clear(&self) {
+        if let Ok(mut value) = self.value.lock() {
+            *value = None;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
     config: ApiConfig,
     codec: Arc<dyn RequestCodec>,
     diagnostics: Arc<dyn ApiDiagnosticSink>,
+    ai_llm_ak_cache: AiLlmAkCache,
 }
 
 impl ApiClient {
@@ -450,11 +509,17 @@ impl ApiClient {
             config,
             codec,
             diagnostics,
+            ai_llm_ak_cache: AiLlmAkCache::new(),
         })
     }
 
     pub fn config(&self) -> &ApiConfig {
         &self.config
+    }
+
+    /// 清除当前进程内缓存的 AI 临时密钥。
+    pub fn clear_ai_llm_ak_cache(&self) {
+        self.ai_llm_ak_cache.clear();
     }
 
     pub async fn activate(
@@ -576,6 +641,53 @@ impl ApiClient {
             })?;
         self.decode_response(response, false, true, started, diagnostic)
             .await
+    }
+
+    pub async fn ai_llm_ak(
+        &self,
+        device_id: &str,
+        activate_code: &str,
+    ) -> Result<AiLlmAkResponse, ApiError> {
+        let scope = ai_token_scope(device_id, activate_code);
+        if let Some(value) = self
+            .ai_llm_ak_cache
+            .get_valid(&scope, chrono::Utc::now().timestamp())
+        {
+            return Ok(value);
+        }
+        let headers = client_headers(device_id, activate_code)?;
+        let started = Instant::now();
+        let diagnostic = RequestDiagnostic::authorized(
+            "ai_llm_ak",
+            "GET",
+            "client/ai/llm-ak",
+            device_id,
+            activate_code,
+        );
+        let response = self
+            .client
+            .get(self.endpoint("client/ai/llm-ak"))
+            .headers(headers)
+            .header(ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|error| {
+                let error = map_reqwest_error(error);
+                self.emit_failure(
+                    &diagnostic,
+                    started,
+                    &ResponseMetadata::default(),
+                    &error,
+                    None,
+                );
+                error
+            })?;
+        let value: AiLlmAkResponse = self
+            .decode_response(response, false, false, started, diagnostic)
+            .await?
+            .ok_or(ApiError::InvalidResponse)?;
+        self.ai_llm_ak_cache.put(scope, value.clone())?;
+        Ok(value)
     }
 
     pub async fn telemetry(
@@ -868,6 +980,8 @@ fn business_error_category(code: i32) -> &'static str {
         1001 | 2001 => "header_contract",
         1002..=1006 | 2002..=2004 => "authorization_invalid",
         1007 | 9000 => "retryable_service",
+        3001 | 3003 | 3004 => "ai_quota",
+        3002 => "ai_token_service",
         9101..=9105 => "protocol_recoverable",
         _ => "business",
     }
@@ -887,6 +1001,10 @@ fn business_safe_message(code: i32) -> String {
         2003 => "设备尚未绑定，请重新激活".to_owned(),
         2004 => "设备与激活码绑定不匹配，请重新激活".to_owned(),
         9000 => "授权服务暂时异常，请稍后重试".to_owned(),
+        3001 => "当前账号未开通 AI 服务，已切换到本地转写".to_owned(),
+        3002 => "AI 临时密钥获取失败，已切换到本地转写".to_owned(),
+        3003 => "AI 转写次数已用完，已切换到本地转写".to_owned(),
+        3004 => "AI 转写时长额度已用完，已切换到本地转写".to_owned(),
         9101 => "授权协议正文无效，请稍后重试".to_owned(),
         9102 => "授权协议签名校验失败，请重新激活".to_owned(),
         9103 => "授权请求被判定为重复请求，请稍后重试".to_owned(),
@@ -894,6 +1012,14 @@ fn business_safe_message(code: i32) -> String {
         9105 => "授权会话状态不同步，正在重新确认".to_owned(),
         _ => "服务端拒绝了本次请求".to_owned(),
     }
+}
+
+fn ai_token_scope(device_id: &str, activate_code: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(activate_code.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn client_headers(device_id: &str, activate_code: &str) -> Result<HeaderMap, ApiError> {
@@ -1000,6 +1126,83 @@ mod tests {
     #[test]
     fn default_request_timeout_allows_slow_activation_response() {
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn ai_llm_ak_cache_discards_expired_and_invalid_values() {
+        let cache = AiLlmAkCache::new();
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            cache
+                .put(
+                    "scope-a".to_owned(),
+                    AiLlmAkResponse {
+                        ak: "st-near-expiry".to_owned(),
+                        expire_at: now + 10,
+                        provider: "ALI".to_owned(),
+                    }
+                )
+                .is_err()
+        );
+        cache
+            .put(
+                "scope-a".to_owned(),
+                AiLlmAkResponse {
+                    ak: "st-valid".to_owned(),
+                    expire_at: now + 120,
+                    provider: "ALI".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(cache.get_valid("scope-a", now).unwrap().ak, "st-valid");
+        assert!(cache.get_valid("scope-b", now).is_none());
+        assert!(cache.get_valid("scope-a", now + 100).is_none());
+        assert!(
+            cache
+                .put(
+                    "scope-a".to_owned(),
+                    AiLlmAkResponse {
+                        ak: "temporary".to_owned(),
+                        expire_at: now + 120,
+                        provider: "OTHER".to_owned(),
+                    }
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decodes_ai_llm_ak_and_rejects_invalid_provider_or_expiry() {
+        let value: AiLlmAkResponse = decode_envelope_payload(
+            serde_json::json!({
+                "code": 200,
+                "data": {"ak": "st-temp", "expireAt": 123, "provider": "ALI"}
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(value.provider, "ALI");
+        assert_eq!(value.expire_at, 123);
+        assert!(value.ak.starts_with("st-"));
+
+        for code in [3001, 3002, 3003, 3004] {
+            let error = decode_envelope_payload::<AiLlmAkResponse>(
+                serde_json::json!({"code": code, "data": null}),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), Some(code));
+            assert!(error.safe_message().contains("AI") || error.safe_message().contains("额度"));
+        }
+    }
+
+    #[test]
+    fn classifies_ai_quota_errors_without_leaking_upstream_details() {
+        assert_eq!(business_error_category(3001), "ai_quota");
+        assert_eq!(business_error_category(3003), "ai_quota");
+        assert_eq!(business_error_category(3004), "ai_quota");
+        assert_eq!(business_error_category(3002), "ai_token_service");
+        assert!(!business_safe_message(3003).contains("st-"));
     }
 
     #[test]

@@ -7,14 +7,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dy_screen::asr::{
     AsrBundleManifest, AsrEngine, AsrError, AsrErrorKind, AsrJobExecutor, AsrResourceResolver,
-    EngineResult, FfmpegAudioPreparer, FfprobeMediaInspector, MediaInspector,
-    RecordingActivityGate, ResolvedAsrResources, ResourcePreflight, SchedulerEvent,
-    SchedulerEventSink, SchedulerJob, TextNormalizer, TranscriptionScheduler, VadConfig,
-    WhisperCppEngine, WhisperCppVadEngine,
+    CloudFirstAsrEngine, DashScopeAsrClient, DashScopeAsrConfig, EngineResult, FfmpegAudioPreparer,
+    FfprobeMediaInspector, MediaInspector, RecordingActivityGate, ResolvedAsrResources,
+    ResourcePreflight, SchedulerEvent, SchedulerEventSink, SchedulerJob,
+    SharedTemporaryAudioPublisher, TextNormalizer, TranscriptionScheduler,
+    UnavailableTemporaryAudioPublisher, VadConfig, WhisperCppEngine, WhisperCppVadEngine,
 };
 use dy_screen::runtime_resources::RuntimeManifest;
 use tokio_util::sync::CancellationToken;
 
+use crate::activation::ActivationService;
+use crate::api::ApiError;
 use crate::database::Database;
 
 use super::processor::build_job_event;
@@ -175,6 +178,7 @@ impl LocalAsrEnvironment {
                         message: error.safe_message.clone(),
                     }],
                     message: error.safe_message,
+                    cloud_asr_available: false,
                     runtime: self.runtime_diagnostic(),
                 };
             }
@@ -212,6 +216,7 @@ impl LocalAsrEnvironment {
                     model_version: report.identity.model_version,
                     checks,
                     message,
+                    cloud_asr_available: false,
                     runtime: self.runtime_diagnostic(),
                 }
             }
@@ -228,6 +233,7 @@ impl LocalAsrEnvironment {
                     message: "本地 ASR 环境检查异常退出，请重新检测".to_owned(),
                 }],
                 message: "本地 ASR 环境检查异常退出，请重新检测".to_owned(),
+                cloud_asr_available: false,
                 runtime: self.runtime_diagnostic(),
             },
         }
@@ -394,11 +400,63 @@ pub struct LocalAsrRuntime {
     database: Database,
     temporary_root: PathBuf,
     publisher: Arc<dyn AiJobPublisher>,
+    token_provider: Option<Arc<dyn dy_screen::asr::TemporaryAiTokenProvider>>,
     inspector_switch: Arc<Mutex<Arc<dyn MediaInspector>>>,
     lifecycle: AiLifecycle,
 }
 
+struct ActivationTokenProvider {
+    activation: ActivationService,
+}
+
+#[async_trait]
+impl dy_screen::asr::TemporaryAiTokenProvider for ActivationTokenProvider {
+    async fn token(&self) -> EngineResult<String> {
+        let (device_id, activate_code) = self.activation.credentials().ok_or_else(|| {
+            AsrError::new(
+                AsrErrorKind::EnvironmentUnavailable,
+                "ai_authorization_unavailable",
+                "当前没有有效的 AI 授权",
+                false,
+            )
+        })?;
+        self.activation
+            .api()
+            .ai_llm_ak(&device_id, &activate_code)
+            .await
+            .map(|value| value.ak)
+            .map_err(|error| {
+                let retryable = matches!(error, ApiError::Transport | ApiError::Timeout);
+                AsrError::new(
+                    AsrErrorKind::ProcessFailed,
+                    format!("ai_token_{}", error.category()),
+                    error.safe_message(),
+                    retryable,
+                )
+            })
+    }
+}
+
 impl LocalAsrRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_activation(
+        database: Database,
+        resource_root: PathBuf,
+        fallback_ffprobe: PathBuf,
+        temporary_root: PathBuf,
+        publisher: Arc<dyn AiJobPublisher>,
+        activation: ActivationService,
+    ) -> LocalAsrComponents {
+        Self::build_internal(
+            database,
+            resource_root,
+            fallback_ffprobe,
+            temporary_root,
+            publisher,
+            Some(Arc::new(ActivationTokenProvider { activation })),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         database: Database,
@@ -406,6 +464,24 @@ impl LocalAsrRuntime {
         fallback_ffprobe: PathBuf,
         temporary_root: PathBuf,
         publisher: Arc<dyn AiJobPublisher>,
+    ) -> LocalAsrComponents {
+        Self::build_internal(
+            database,
+            resource_root,
+            fallback_ffprobe,
+            temporary_root,
+            publisher,
+            None,
+        )
+    }
+
+    fn build_internal(
+        database: Database,
+        resource_root: PathBuf,
+        fallback_ffprobe: PathBuf,
+        temporary_root: PathBuf,
+        publisher: Arc<dyn AiJobPublisher>,
+        token_provider: Option<Arc<dyn dy_screen::asr::TemporaryAiTokenProvider>>,
     ) -> LocalAsrComponents {
         let repository = AiRepository::new(database.clone());
         let environment = Arc::new(LocalAsrEnvironment::load(resource_root));
@@ -435,6 +511,7 @@ impl LocalAsrRuntime {
                 publisher.clone(),
                 inspector.clone(),
                 &normalization_version,
+                token_provider.clone(),
             )
             .ok()
             .map(Arc::new)
@@ -446,6 +523,7 @@ impl LocalAsrRuntime {
             database,
             temporary_root: temporary_root.clone(),
             publisher,
+            token_provider,
             inspector_switch,
             lifecycle: AiLifecycle::new(repository, temporary_root),
         });
@@ -480,6 +558,7 @@ impl LocalAsrRuntime {
                 current: self.inspector_switch.clone(),
             }),
             &normalization_version,
+            self.token_provider.clone(),
         )
         .map_err(command_asr_error)
         .map(Arc::new)?;
@@ -529,6 +608,7 @@ impl LocalAsrRuntime {
                     current: self.inspector_switch.clone(),
                 }),
                 &normalization_version,
+                self.token_provider.clone(),
             )
             .map_err(command_asr_error)?,
         );
@@ -921,6 +1001,7 @@ impl SchedulerEventSink for RuntimeSchedulerEvents {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scheduler(
     database: Database,
     repository: AiRepository,
@@ -929,6 +1010,7 @@ fn build_scheduler(
     publisher: Arc<dyn AiJobPublisher>,
     inspector: Arc<dyn MediaInspector>,
     normalization_version: &str,
+    token_provider: Option<Arc<dyn dy_screen::asr::TemporaryAiTokenProvider>>,
 ) -> Result<TranscriptionScheduler, AsrError> {
     let mapping = std::fs::read_to_string(&resources.normalization_mapping).map_err(|_| {
         AsrError::new(
@@ -939,10 +1021,18 @@ fn build_scheduler(
         )
     })?;
     let vad_config = VadConfig::default();
-    let engine: Arc<dyn AsrEngine> = Arc::new(WhisperCppEngine::new(
+    let local_engine: Arc<dyn AsrEngine> = Arc::new(WhisperCppEngine::new(
         resources.clone(),
         ResourcePreflight::native(),
         vad_config.clone(),
+    ));
+    let audio_publisher: SharedTemporaryAudioPublisher =
+        Arc::new(UnavailableTemporaryAudioPublisher);
+    let engine: Arc<dyn AsrEngine> = Arc::new(CloudFirstAsrEngine::new(
+        local_engine,
+        audio_publisher,
+        token_provider,
+        DashScopeAsrClient::new(DashScopeAsrConfig::default())?,
     ));
     let processor = AiInputProcessor::new(
         repository.clone(),

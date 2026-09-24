@@ -270,15 +270,46 @@ pub struct AsrResult {
     pub detected_language: Option<String>,
     /// 用于校验所有句段边界的音频总时长。
     pub audio_duration_ms: u64,
+    /// 实际使用的非敏感 provider 标识，例如 `local` 或 `aliyun`。
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// 云端不可用时的脱敏回退原因。
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
     /// 按起始时间排序且互不重叠的原始识别句段。
     pub segments: Vec<AsrSegment>,
     /// 不影响产物发布的可展示警告。
     pub warnings: Vec<AsrWarning>,
 }
 
+fn default_provider() -> String {
+    "local".to_owned()
+}
+
 impl AsrResult {
     /// 校验所有句段都位于音频范围内且按时间有序、互不重叠。
     pub fn validate(&self) -> EngineResult<()> {
+        if self.provider.trim().is_empty()
+            || self.provider.len() > 32
+            || self.provider.chars().any(char::is_control)
+        {
+            return Err(AsrError::new(
+                super::error::AsrErrorKind::MalformedOutput,
+                "invalid_provider",
+                "识别引擎返回了无效 provider",
+                false,
+            ));
+        }
+        if self.fallback_reason.as_deref().is_some_and(|reason| {
+            reason.trim().is_empty() || reason.len() > 128 || reason.chars().any(char::is_control)
+        }) {
+            return Err(AsrError::new(
+                super::error::AsrErrorKind::MalformedOutput,
+                "invalid_fallback_reason",
+                "识别引擎返回了无效回退原因",
+                false,
+            ));
+        }
         let mut previous_end = 0;
         for segment in &self.segments {
             segment.validate(self.audio_duration_ms)?;

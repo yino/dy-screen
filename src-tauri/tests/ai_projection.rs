@@ -66,6 +66,8 @@ fn projection_preserves_stable_ids_video_boundaries_and_failed_input_gaps_withou
             engine_version: "1".to_owned(),
             model_id: "fake-model".to_owned(),
             model_version: "1".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
         })
         .unwrap();
     let segments = repository
@@ -83,6 +85,9 @@ fn projection_preserves_stable_ids_video_boundaries_and_failed_input_gaps_withou
         )
         .unwrap();
     repository.attach_artifact(first.id, artifact.id).unwrap();
+    let stored = repository.artifact_for_input(first.id).unwrap().unwrap();
+    assert_eq!(stored.provider, "local");
+    assert_eq!(stored.fallback_reason, None);
     repository
         .transition_input(first.id, AiInputStatus::Validating, None)
         .unwrap();

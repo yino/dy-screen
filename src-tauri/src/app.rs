@@ -2007,7 +2007,7 @@ pub fn run() {
 
             let asr_temporary_root = app_cache_dir.join("asr-audio");
             std::fs::create_dir_all(&asr_temporary_root)?;
-            let ai_components = LocalAsrRuntime::build(
+            let ai_components = LocalAsrRuntime::build_with_activation(
                 database.clone(),
                 app_cache_dir.join("runtime-resources-pending"),
                 PathBuf::new(),
@@ -2015,6 +2015,7 @@ pub fn run() {
                 Arc::new(DesktopAiPublisher {
                     app: app.handle().clone(),
                 }),
+                activation.clone(),
             );
             let ai_project_service = AiProjectService::new(
                 database.clone(),

@@ -438,6 +438,8 @@ fn parse_whisper_json(
         identity,
         detected_language: output.result.language,
         audio_duration_ms,
+        provider: "local".to_owned(),
+        fallback_reason: None,
         segments,
         warnings,
     })

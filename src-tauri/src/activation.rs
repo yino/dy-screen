@@ -202,6 +202,7 @@ impl ActivationService {
 
     pub async fn activate(&self, code: &str) -> Result<ActivationStateView, String> {
         let _operation = self.operation_lock.lock().await;
+        self.api.clear_ai_llm_ak_cache();
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let code = normalize_activation_code(code)?;
         let (activation, retried_protocol) = self
@@ -399,6 +400,7 @@ impl ActivationService {
 
     pub async fn clear(&self) -> Result<ActivationStateView, String> {
         let _operation = self.operation_lock.lock().await;
+        self.api.clear_ai_llm_ak_cache();
         self.generation.fetch_add(1, Ordering::AcqRel);
         let device_id_hint = device_hint(&self.device_id);
         let now = Utc::now();

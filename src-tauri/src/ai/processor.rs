@@ -320,6 +320,8 @@ impl AiInputProcessor {
             engine_version: result.identity.engine_version,
             model_id: result.identity.model_id,
             model_version: result.identity.model_version,
+            provider: result.provider.clone(),
+            fallback_reason: result.fallback_reason.as_deref().map(safe_fallback_reason),
         })?;
         let drafts: Vec<TranscriptSegmentDraft> = result
             .segments
@@ -399,6 +401,21 @@ impl AsrProgressSink for ProcessorProgressSink {
         ) {
             self.publisher.publish(snapshot);
         }
+    }
+}
+
+pub(crate) fn safe_fallback_reason(code: &str) -> String {
+    match code {
+        "temporary_audio_publisher_unavailable" => "临时音频发布能力未配置".to_owned(),
+        "ai_authorization_unavailable" => "当前没有有效的 AI 授权".to_owned(),
+        "ai_token_ai_quota" => "AI 转写额度不可用".to_owned(),
+        "ai_token_ai_token_service" => "AI 临时密钥服务暂时不可用".to_owned(),
+        "dashscope_unauthorized" => "云端转写授权已失效".to_owned(),
+        "dashscope_forbidden" => "云端转写权限不足".to_owned(),
+        "dashscope_rate_limited" => "云端转写请求受到限流".to_owned(),
+        "dashscope_service_unavailable" => "云端转写服务暂时不可用".to_owned(),
+        "dashscope_poll_timeout" => "云端转写等待超时".to_owned(),
+        _ => "云端转写不可用".to_owned(),
     }
 }
 

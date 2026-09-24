@@ -118,6 +118,7 @@ impl AiJobController for FakeController {
                 message: "测试资源完整".to_owned(),
             }],
             message: "本地 ASR 环境就绪".to_owned(),
+            cloud_asr_available: false,
             runtime: None,
         })
     }

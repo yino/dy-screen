@@ -117,6 +117,8 @@ pub struct AiEnvironmentDiagnostic {
     pub model_version: String,
     pub checks: Vec<AiEnvironmentCheckView>,
     pub message: String,
+    /// 云端 ASR 当前是否具备临时音频发布能力。
+    pub cloud_asr_available: bool,
     pub runtime: Option<AiRuntimeResourceDiagnostic>,
 }
 

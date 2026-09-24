@@ -167,6 +167,8 @@ async fn explicit_shutdown_cancels_work_invalidates_pending_artifacts_and_cleans
             engine_version: "1".to_owned(),
             model_id: "fake-model".to_owned(),
             model_version: "1".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
         })
         .unwrap();
 

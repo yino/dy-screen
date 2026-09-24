@@ -3,6 +3,7 @@
 //! 模块放在不依赖 Tauri 的根 crate 中，使桌面后台任务、命令行阶段测试和未来其他
 //! 客户端都依赖同一套契约。供应商适配器不得把命令行参数或资源路径泄漏到业务类型。
 
+mod cloud;
 mod contract;
 mod error;
 mod evidence;
@@ -16,6 +17,12 @@ mod transcript;
 mod vad;
 mod whisper_cpp;
 
+pub use cloud::{
+    CloudFirstAsrEngine, DashScopeAsrClient, DashScopeAsrConfig, DashScopeSegment,
+    SharedTemporaryAudioPublisher, TemporaryAiTokenProvider, TemporaryAudioPublisher,
+    TemporaryAudioReference, UnavailableTemporaryAudioPublisher, dashscope_http_error,
+    parse_dashscope_segments,
+};
 pub use contract::{
     AsrCapabilities, AsrConfidenceKind, AsrEngine, AsrEngineIdentity, AsrEnvironmentCheck,
     AsrEnvironmentReport, AsrProgressEvent, AsrProgressSink, AsrProgressStage, AsrRequest,

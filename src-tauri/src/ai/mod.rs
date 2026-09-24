@@ -97,5 +97,5 @@ pub use smart_workflow::{
 
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
-    migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23, migrate_ai_v24,
+    migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23, migrate_ai_v24, migrate_ai_v25,
 };
