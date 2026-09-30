@@ -1,7 +1,8 @@
 # smart-clipping-workflows Specification
 
 ## Purpose
-TBD - created by archiving change unify-one-click-and-live-clipping. Update Purpose after archive.
+用统一的一次性授权智能任务覆盖本地视频与直播素材三种执行模式，自动编排至可审阅草稿而不自动导出，并维护单一活动草稿、冻结代次、阶段尝试恢复与直播首稿时效指标。
+
 ## Requirements
 ### Requirement: 以统一智能成片任务支持三种执行模式
 系统 SHALL 提供一个由本地 Rust 持有的智能成片任务模型，并 SHALL 允许用户在创建时选择“本地视频”“直播回放”或“正在直播”模式。一个任务 MUST 只使用一种模式；本地模式 MUST 冻结通过受信系统选择器确认的一个或多个视频，直播回放模式 MUST 绑定系统已登记、已结束且非空的一场录制会话并冻结其全部合法分片，正在直播模式 MUST 只绑定系统已监听且当前正在录制的一场公开直播会话。系统 MUST NOT 接受任意直播或平台回放 URL，也 MUST NOT 接受正在写入的媒体路径。

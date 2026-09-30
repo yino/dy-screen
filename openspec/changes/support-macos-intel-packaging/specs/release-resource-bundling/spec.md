@@ -22,7 +22,7 @@
 ### Requirement: 将已验证资源映射进 Tauri 安装包
 正式 Tauri 构建 SHALL 在生成 `.app`、`.dmg` 或 Windows NSIS 安装器前完成 staging 和完整性校验，并 SHALL 将当前目标平台和架构的资源映射到受控应用资源目录。
 
-#### Scenario: macOS arm64 发行构建
+#### Scenario: macOS 发行构建
 - **WHEN** 未指定架构且 arm64 macOS 构建机执行 macOS ASR 发行目标，或显式指定 `MACOS_ARCH=aarch64`
 - **THEN** 流程使用 `aarch64-apple-darwin` 主程序和 `macos-aarch64` 资源生成文件名包含 `aarch64` 的 `.app` 与 DMG
 
@@ -49,7 +49,7 @@
 - **WHEN** 发行流水线完成 `macos-aarch64` 或 `macos-x86-64` 资源 staging
 - **THEN** 输出目录分别使用 `macos/aarch64` 或 `macos/x86_64`，且上层 index 的架构字段与资源 manifest 一致
 
-#### Scenario: 生成其他目标资源发布目录
+#### Scenario: 生成资源发布目录
 - **WHEN** 发行流水线完成目标平台资源 staging
 - **THEN** 输出目录包含客户端可直接请求的 index/manifest、签名、公钥指纹、资源包和许可证文件
 

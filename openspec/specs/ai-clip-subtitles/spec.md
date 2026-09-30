@@ -1,7 +1,8 @@
 # ai-clip-subtitles Specification
 
 ## Purpose
-TBD - created by archiving change add-asr-subtitles-to-clip-editor. Update Purpose after archive.
+为剪辑工程提供从稳定 ASR 句段投影的工程字幕副本、编辑器逐字预览与安全的透明层烧录导出，并在字幕来源不完整时阻止导出，保证预览与导出使用同一显示计划。
+
 ## Requirements
 ### Requirement: 从稳定 ASR 句段投影剪辑字幕
 系统 SHALL 只使用剪辑片段所属输入已经发布的 ASR 稳定句段建立工程级字幕副本，并 SHALL 保存原始规范化文本、当前工程文本、隐藏状态和裁剪后的源视频内毫秒时间。系统 MUST 将相交句段裁剪到片段源范围，在首次创建工程、追加片段或旧工程首次打开时以事务幂等建立副本；后续 MUST 按当前片段顺序把副本映射为工程时间，MUST NOT 重新识别、修改 ASR 产物或用新的 ASR 发布覆盖既有副本。

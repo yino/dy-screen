@@ -1,7 +1,8 @@
 # runtime-resource-provisioning Specification
 
 ## Purpose
-TBD - created by archiving change bundle-and-auto-provision-asr-resources. Update Purpose after archive.
+通过版本化签名清单从构建期注入的固定 HTTPS 渠道准备并校验平台运行资源，支持断点下载、原子安装、失败重试与旧版本回滚，并在资源未就绪时阻止主功能越权使用。
+
 ## Requirements
 ### Requirement: 维护受信运行资源清单
 系统 SHALL 使用版本化 manifest 描述当前平台所需的 FFmpeg、FFprobe、Whisper、VAD、模型、规范化字典、许可证和平台运行时，并 SHALL 为每个组件保存版本、相对路径、大小、SHA-256、最低应用版本和许可证引用。

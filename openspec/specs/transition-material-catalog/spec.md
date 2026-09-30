@@ -1,7 +1,8 @@
 # transition-material-catalog Specification
 
 ## Purpose
-TBD - created by archiving change add-synced-ai-transition-materials. Update Purpose after archive.
+从服务端同步版本化的转场素材目录，按 `(assetKey, assetVersion)` 校验不可变标识与受信远程地址，按需下载并校验素材文件，为 WebView 生成兼容预览缓存，并在 SQLite 中保留目录与下载状态。
+
 ## Requirements
 ### Requirement: 同步服务端转场素材目录
 系统 SHALL 以本地已提交的 `catalogVersion` 调用 `GET /api/v1/transition-materials?clientVersion=<catalogVersion>`，并 SHALL 复用统一 Rust API 客户端的业务信封解析、超时、`device_id` 和 `activate_code` 请求头。首次同步 MUST 使用版本 `0`；`changed=true` 时系统 MUST 在完整校验后事务化发布全量目录，`changed=false` 时 MUST 保留当前本地快照。

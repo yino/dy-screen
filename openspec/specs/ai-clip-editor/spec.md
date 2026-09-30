@@ -1,7 +1,8 @@
 # ai-clip-editor Specification
 
 ## Purpose
-TBD - created by archiving change add-ai-clip-editor-and-thresholds. Update Purpose after archive.
+为已选择的精彩提供可恢复的剪辑工程工作台：单轨时间轴、受控片段与桥接素材编辑、工程字幕校对、一键文本纠错与两阶段转场 Agent，并在冻结的工程版本下安全导出 H.264/AAC MP4。
+
 ## Requirements
 ### Requirement: 从已选择精彩建立可恢复剪辑工程
 系统 SHALL 允许用户从一个已完成精彩运行的已选择候选创建或打开普通剪辑工程，并 SHALL 为同一精彩运行维护一个可恢复的默认普通工程。系统还 SHALL 允许已授权智能成片任务从一个或多个关联精彩运行的自动入选候选创建可恢复合辑工程。首次创建时，系统 MUST 按项目输入或规范化直播源时间、候选源内开始时间和稳定 ID 将已选择候选快照为首尾相接的视频片段；普通工程后续候选选择变化 MUST NOT 自动重写既有工程，智能合辑只有在当前草稿仍由自动化拥有、未导出且版本匹配时才可由父任务更新。

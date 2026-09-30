@@ -1,7 +1,8 @@
 # ai-transition-material-matching Specification
 
 ## Purpose
-TBD - created by archiving change add-synced-ai-transition-materials. Update Purpose after archive.
+为剪辑工程的每个相邻片段边界，在本地已同步的版本化 `bridge` 素材目录内用两个无工具权限的受限 Agent 阶段选出最多三个有序候选或明确的 `none`，并按冻结阈值自动应用高分结果、仅展示低分建议。
+
 ## Requirements
 ### Requirement: 从本地目录构建受限匹配上下文
 系统 SHALL 只从当前剪辑工程相邻精彩片段、主播标签和本地已提交素材目录构建匹配上下文。每个边界的输入 MUST 仅包含前一片段尾部和后一片段头部的有界 ASR、素材键与版本、标题、描述、标签和分类；MUST NOT 包含下载 URL、本地路径、Cookie、激活码、设备 ID、视频或音频。匹配可由用户显式启动，或由已授权智能成片任务在自动化拥有的草稿上启动；自动启动 MUST 使用同一上下文、目录和本地校验边界。
