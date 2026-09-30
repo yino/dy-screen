@@ -1518,10 +1518,10 @@ export function AiWorkspace({
     if (!detail) return;
     await api.startAiProject(detail.project.id);
     await refreshProjects(detail.project.id);
-  }, "项目已加入本地识别队列");
+  }, "项目已加入识别队列");
 
   const cancelProject = () => {
-    if (!detail || !window.confirm("取消后会停止当前本地识别并保留已完整发布的结果，确认继续？")) return;
+    if (!detail || !window.confirm("取消后会停止当前识别并保留已完整发布的结果，确认继续？")) return;
     void run(async () => {
       await api.cancelAiProject(detail.project.id);
       await refreshProjects(detail.project.id);

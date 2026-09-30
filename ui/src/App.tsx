@@ -1076,7 +1076,7 @@ function ResourcePreparationPage({
         <div className="resource-card-icon"><HardDrive size={28} /></div>
         <p className="section-kicker">RUNTIME RESOURCE PACK</p>
         <h2 id="resource-title">{verifying ? "正在校验本地运行资源" : "准备本地运行资源"}</h2>
-        <p className="muted-copy">首次使用前必须完成 FFmpeg、Whisper、VAD 和模型校验。资源只保存到本机应用数据目录，不会上传录像或转写内容。</p>
+        <p className="muted-copy">首次使用前必须完成 FFmpeg、Whisper、VAD 和模型校验。资源只保存到本机应用数据目录。默认经百炼直连识别时会按任务授权上传标准音频（16 kHz 单声道 WAV），原始录像不入库也不上传；文本类分析会把规范化转写经同一路径发送。</p>
         <div className="resource-facts">
           <span>平台 <b>{status.platform}</b></span>
           <span>版本 <b>{status.bundleVersion ?? "待下载"}</b></span>
