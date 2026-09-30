@@ -199,6 +199,7 @@ impl CloudCallDiagnosticSink for StderrCloudCallDiagnosticSink {
 #[derive(Clone)]
 pub struct MemoryCloudCallDiagnosticSink {
     events: Arc<std::sync::Mutex<std::collections::VecDeque<CloudCallDiagnostic>>>,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
     capacity: usize,
 }
 
@@ -213,8 +214,24 @@ impl MemoryCloudCallDiagnosticSink {
     pub fn new(capacity: usize) -> Self {
         Self {
             events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            // 默认关闭：调用轨迹属于行为信息，只有用户显式打开才记录。
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capacity: capacity.max(1),
         }
+    }
+
+    /// 打开或关闭记录。关闭时 sink 不保留任何事件。
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        if !enabled {
+            self.clear();
+        }
+    }
+
+    /// 当前是否正在记录。
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 当前已记录的事件（按时间顺序）。
@@ -235,6 +252,10 @@ impl MemoryCloudCallDiagnosticSink {
 
 impl CloudCallDiagnosticSink for MemoryCloudCallDiagnosticSink {
     fn emit(&self, event: CloudCallDiagnostic) {
+        // 关闭状态下一个事件也不留，避免"关了还在悄悄攒"。
+        if !self.is_enabled() {
+            return;
+        }
         if let Ok(mut events) = self.events.lock() {
             if events.len() == self.capacity {
                 events.pop_front();
@@ -2311,6 +2332,15 @@ mod tests {
     #[test]
     fn call_diagnostics_are_redacted_by_construction() {
         let sink = MemoryCloudCallDiagnosticSink::new(8);
+        // 默认关闭：未显式打开时不得记录任何事件。
+        assert!(!sink.is_enabled());
+        sink.emit(diagnostic(
+            "upload", "files", Some(200), std::time::Instant::now(), 1, None, true, false, false,
+            None,
+        ));
+        assert!(sink.events().is_empty(), "开关关闭时不得记录");
+        sink.set_enabled(true);
+        assert!(sink.is_enabled());
         // 模拟一次完整链路：上传 -> 取签名 URL -> 提交 -> 轮询 -> 取结果。
         let stages: [(&'static str, &'static str, Option<u16>, Option<AsrError>, bool, bool, bool); 5] = [
             ("upload", "files", Some(200), None, true, false, false),
@@ -2398,6 +2428,7 @@ mod tests {
     #[test]
     fn diagnostic_sink_keeps_bounded_history() {
         let sink = MemoryCloudCallDiagnosticSink::new(3);
+        sink.set_enabled(true);
         for attempt in 0..5u32 {
             sink.emit(diagnostic(
                 "poll",
@@ -2419,6 +2450,15 @@ mod tests {
         assert_eq!(events[2].attempt, 4);
         sink.clear();
         assert!(sink.events().is_empty());
+        // 关闭开关会同时清空已攒的事件。
+        sink.set_enabled(true);
+        sink.emit(diagnostic(
+            "poll", "tasks/{task_id}", Some(200), std::time::Instant::now(), 9, None, true, true,
+            true, None,
+        ));
+        assert_eq!(sink.events().len(), 1);
+        sink.set_enabled(false);
+        assert!(sink.events().is_empty(), "关闭必须清空并停止记录");
     }
 
     /// 任务 3.2：缺少本地模型不得阻止云端识别。
