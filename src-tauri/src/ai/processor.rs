@@ -19,6 +19,28 @@ use super::{
     SourceFingerprint, TranscriptSegmentDraft,
 };
 
+/// 本地识别引擎在识别配置中的稳定标识；不等于该值时走默认的百炼直连路径。
+pub const LOCAL_ENGINE_ID: &str = "whisper.cpp";
+
+/// 在开始任何昂贵阶段之前判断所选识别路径是否可用。
+///
+/// 云端路径不可用时必须直接失败并保留任务状态：MUST NOT 启动 FFmpeg、VAD 或 ASR，
+/// 也 MUST NOT 静默改用本地识别。本地路径由用户显式选择，其资源检查由调度器负责。
+pub fn ensure_path_available(
+    cloud_path: bool,
+    cloud_ready: bool,
+) -> dy_screen::asr::EngineResult<()> {
+    if cloud_path && !cloud_ready {
+        return Err(AsrError::new(
+            AsrErrorKind::EnvironmentUnavailable,
+            "no_asr_path_available",
+            "云端识别当前不可用，且未显式选择本地识别；请先完成授权或修复本地资源后重试",
+            true,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProcessOutcome {
@@ -210,7 +232,7 @@ impl AiInputProcessor {
                 input_id,
                 "completed",
                 100,
-                "已复用相同视频的本地转写结果",
+                "已复用相同视频的识别结果",
             );
             return Ok(AiProcessOutcome::CacheHit);
         }
@@ -227,6 +249,14 @@ impl AiInputProcessor {
                 false,
             )
             .into());
+        }
+        // 默认路径是百炼直连；只有工程识别配置显式指向本地引擎时才在本地执行。
+        // 该判定必须早于任何昂贵阶段：两条路径都不可用时不得启动 FFmpeg、VAD 或 ASR。
+        let profile = &detail.project.recognition_profile;
+        let cloud_path = profile.engine_id != LOCAL_ENGINE_ID;
+        if cloud_path {
+            let report = self.engine.diagnose().await?;
+            ensure_path_available(cloud_path, report.ready)?;
         }
         self.transition_generation(input_id, generation, AiInputStatus::PreparingAudio, None)?;
         self.publish(
@@ -250,39 +280,38 @@ impl AiInputProcessor {
             .prepare_temporary_wav(&preparation, cancellation.child_token())
             .await?;
 
-        self.transition_generation(input_id, generation, AiInputStatus::DetectingSpeech, None)?;
-        self.publish(
-            project_id,
-            input_id,
-            "detecting_speech",
-            45,
-            "正在检测有效人声",
-        );
-        let speech_regions = self
-            .vad
-            .detect(audio.audio(), &self.vad_config, cancellation.child_token())
-            .await?;
-        if speech_regions.is_empty() {
-            self.transition_generation(input_id, generation, AiInputStatus::Skipped, None)?;
-            self.publish(project_id, input_id, "skipped", 100, "没有检测到有效人声");
-            return Ok(AiProcessOutcome::SkippedNoSpeech);
+        let mut speech_regions_for_request = Vec::new();
+        if cloud_path {
+            // 云端路径处理完整来源音频：VAD 不是前置门禁，其缺失、诊断失败或
+            // 返回空区间都不得阻止云端识别。
+            self.publish(
+                project_id,
+                input_id,
+                "preparing_audio",
+                45,
+                "正在准备云端识别所需的完整音频",
+            );
+        } else {
+            self.transition_generation(input_id, generation, AiInputStatus::DetectingSpeech, None)?;
+            self.publish(
+                project_id,
+                input_id,
+                "detecting_speech",
+                45,
+                "正在检测有效人声",
+            );
+            let speech_regions = self
+                .vad
+                .detect(audio.audio(), &self.vad_config, cancellation.child_token())
+                .await?;
+            if speech_regions.is_empty() {
+                self.transition_generation(input_id, generation, AiInputStatus::Skipped, None)?;
+                self.publish(project_id, input_id, "skipped", 100, "没有检测到有效人声");
+                return Ok(AiProcessOutcome::SkippedNoSpeech);
+            }
+            speech_regions_for_request = speech_regions;
         }
 
-        let profile = &detail.project.recognition_profile;
-        let identity = self.engine.identity();
-        if identity.engine_id != profile.engine_id
-            || identity.engine_version != profile.engine_version
-            || identity.model_id != profile.model_id
-            || identity.model_version != profile.model_version
-        {
-            return Err(AsrError::new(
-                AsrErrorKind::EnvironmentUnavailable,
-                "recognition_profile_mismatch",
-                "当前识别引擎与项目冻结配置不一致",
-                false,
-            )
-            .into());
-        }
         self.transition_generation(input_id, generation, AiInputStatus::Transcribing, None)?;
         self.publish(project_id, input_id, "transcribing", 70, "正在识别语音");
         let progress: Arc<dyn AsrProgressSink> = Arc::new(ProcessorProgressSink {
@@ -299,14 +328,30 @@ impl AiInputProcessor {
                     audio: audio.audio().clone(),
                     language_hint: profile.language_hint.clone(),
                     hotwords: profile.hotwords.clone(),
-                    speech_regions,
+                    speech_regions: speech_regions_for_request,
                     timestamp_policy: TimestampPolicy::Segment,
                     max_threads: self.engine.capabilities().maximum_threads,
+                    engine_id: Some(profile.engine_id.clone()),
                 },
                 progress,
                 cancellation,
             )
             .await?;
+        // 识别配置身份校验必须比对**实际执行引擎**的身份：云端结果不得携带它
+        // 委托的本地引擎身份，否则缓存键与诊断无法区分两条路径。
+        if result.identity.engine_id != profile.engine_id
+            || result.identity.engine_version != profile.engine_version
+            || result.identity.model_id != profile.model_id
+            || result.identity.model_version != profile.model_version
+        {
+            return Err(AsrError::new(
+                AsrErrorKind::EnvironmentUnavailable,
+                "recognition_profile_mismatch",
+                "实际执行引擎与项目冻结配置不一致",
+                false,
+            )
+            .into());
+        }
         if result.segments.is_empty() {
             self.transition_generation(input_id, generation, AiInputStatus::Skipped, None)?;
             self.publish(project_id, input_id, "skipped", 100, "识别结果没有有效文本");
@@ -460,4 +505,29 @@ pub(crate) fn build_job_event(
         stage: stage.to_owned(),
         message: message.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod path_availability_tests {
+    use super::*;
+
+    /// 任务 3.4：两条路径都不可用时必须保留任务状态并引导资源准备。
+    #[test]
+    fn cloud_unavailable_blocks_before_expensive_stages() {
+        let error = ensure_path_available(true, false).expect_err("必须拒绝");
+        assert_eq!(error.code, "no_asr_path_available");
+        assert_eq!(error.kind, AsrErrorKind::EnvironmentUnavailable);
+        assert!(error.retryable, "修复授权或资源后应可重试");
+        // 提示必须引导用户处理授权或资源，且不得暗示会改用本地识别。
+        assert!(error.safe_message.contains("授权") || error.safe_message.contains("资源"));
+        assert!(!error.safe_message.contains("自动"), "不得暗示自动回退");
+    }
+
+    /// 云端可用时必须放行；显式选择本地路径时不由此判定拦截。
+    #[test]
+    fn available_cloud_or_explicit_local_is_allowed() {
+        assert!(ensure_path_available(true, true).is_ok());
+        assert!(ensure_path_available(false, false).is_ok(), "本地路径不由此判定");
+        assert!(ensure_path_available(false, true).is_ok());
+    }
 }

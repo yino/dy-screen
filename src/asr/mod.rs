@@ -18,10 +18,15 @@ mod vad;
 mod whisper_cpp;
 
 pub use cloud::{
-    CloudFirstAsrEngine, DashScopeAsrClient, DashScopeAsrConfig, DashScopeSegment,
-    SharedTemporaryAudioPublisher, TemporaryAiTokenProvider, TemporaryAudioPublisher,
-    TemporaryAudioReference, UnavailableTemporaryAudioPublisher, dashscope_http_error,
-    parse_dashscope_segments,
+    AudioChunk, CLOUD_ENGINE_VERSION, CloudFailureBranch, CloudFirstAsrEngine, DashScopeAsrClient,
+    DashScopeAsrConfig,
+    DashScopeSegment, SharedTemporaryAiTokenProvider, SharedTemporaryAudioPublisher,
+    TemporaryAiTokenProvider, TemporaryAudioPublisher, TemporaryAudioReference,
+    UnavailableTemporaryAudioPublisher, UpstreamCancelOutcome, UpstreamFileUploadPublisher,
+    cancel_outcome, classify_cloud_failure,
+    dashscope_http_error, merge_chunk_segments, parse_dashscope_segments, plan_audio_chunks,
+    resolve_time_overlaps,
+    restore_source_time, stable_segment_id,
 };
 pub use contract::{
     AsrCapabilities, AsrConfidenceKind, AsrEngine, AsrEngineIdentity, AsrEnvironmentCheck,

@@ -249,6 +249,18 @@ pub struct RecognitionProfile {
     pub timestamp_policy: String,
     pub normalization_version: String,
     pub hotwords: Vec<String>,
+    /// 实际调用路径，例如 `cloud` 或 `local`。
+    ///
+    /// `skip_serializing_if` 是**兼容性要求**：升级前写入的识别配置没有该字段，
+    /// 反序列化为 `None` 后必须序列化回完全相同的 JSON，否则既有工程的全部缓存
+    /// 指纹都会变化并被误判为需要重新识别。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// 分块策略标识；`None` 表示未分块。
+    ///
+    /// 与 `provider` 同为兼容字段：参与指纹但不得改变旧配置的指纹。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_strategy: Option<String>,
 }
 
 impl RecognitionProfile {
@@ -1354,4 +1366,9 @@ pub struct RecoverySummary {
     pub projects: usize,
     pub inputs: usize,
     pub artifacts: usize,
+    /// 重启后需要向上游核对状态的付费任务数量（见 `pending_remote_jobs`）。
+    ///
+    /// 这些任务已提交但未确认终态，恢复时必须先查询上游，MUST NOT 直接重新提交。
+    #[serde(default)]
+    pub awaiting_remote_reconcile: usize,
 }

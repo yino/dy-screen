@@ -90,6 +90,12 @@ pub struct AsrRequest {
     pub timestamp_policy: TimestampPolicy,
     /// 此次识别允许使用的最大工作线程数。
     pub max_threads: usize,
+    /// 显式选择的执行引擎标识。
+    ///
+    /// 为空表示使用默认路径（百炼直连）；取值为本地引擎标识时表示用户显式选择
+    /// 本地识别。该字段只做路径选择，**不得**被用作失败后的隐式回退开关。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
 }
 
 impl AsrRequest {

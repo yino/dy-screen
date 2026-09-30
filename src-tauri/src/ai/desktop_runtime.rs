@@ -11,7 +11,8 @@ use dy_screen::asr::{
     FfprobeMediaInspector, MediaInspector, RecordingActivityGate, ResolvedAsrResources,
     ResourcePreflight, SchedulerEvent, SchedulerEventSink, SchedulerJob,
     SharedTemporaryAudioPublisher, TextNormalizer, TranscriptionScheduler,
-    UnavailableTemporaryAudioPublisher, VadConfig, WhisperCppEngine, WhisperCppVadEngine,
+    UnavailableTemporaryAudioPublisher, UpstreamFileUploadPublisher, VadConfig, WhisperCppEngine,
+    WhisperCppVadEngine,
 };
 use dy_screen::runtime_resources::RuntimeManifest;
 use tokio_util::sync::CancellationToken;
@@ -63,6 +64,8 @@ impl MediaInspector for ReloadableMediaInspector {
 pub struct LocalAsrEnvironment {
     resource_root: PathBuf,
     active_resource_root: Arc<Mutex<Option<PathBuf>>>,
+    /// 百炼直连所需的 AI 授权是否已配置；由运行时按实际授权状态维护。
+    cloud_configured: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalAsrEnvironment {
@@ -70,7 +73,20 @@ impl LocalAsrEnvironment {
         Self {
             resource_root,
             active_resource_root: Arc::new(Mutex::new(None)),
+            cloud_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 记录百炼直连凭据是否就绪，供诊断反映真实可用性。
+    pub fn set_cloud_configured(&self, configured: bool) {
+        self.cloud_configured
+            .store(configured, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 百炼直连当前是否具备凭据条件。
+    pub fn cloud_configured(&self) -> bool {
+        self.cloud_configured
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn resource_root(&self) -> &Path {
@@ -128,17 +144,58 @@ impl LocalAsrEnvironment {
         })
     }
 
+    /// 百炼直连、可选本地识别与音频准备三项独立诊断。
+    ///
+    /// 只输出分类与布尔可用性：不含短期 token、URL、签名地址、本地路径或上游任务 ID。
+    fn cloud_checks(&self, local_ready: bool) -> Vec<AiEnvironmentCheckView> {
+        let cloud_ready = self.cloud_configured();
+        vec![
+            AiEnvironmentCheckView {
+                code: "cloud_transcription".to_owned(),
+                passed: cloud_ready,
+                message: if cloud_ready {
+                    "百炼直连转写可用".to_owned()
+                } else {
+                    "缺少可用的 AI 授权，百炼直连转写不可用".to_owned()
+                },
+            },
+            AiEnvironmentCheckView {
+                code: "cloud_audio_publisher".to_owned(),
+                passed: cloud_ready,
+                message: if cloud_ready {
+                    "云端音频直传可用".to_owned()
+                } else {
+                    "云端音频直传不可用".to_owned()
+                },
+            },
+            AiEnvironmentCheckView {
+                code: "local_transcription".to_owned(),
+                passed: local_ready,
+                message: if local_ready {
+                    "本地识别资源就绪（用户显式选择时可用）".to_owned()
+                } else {
+                    "本地识别资源未就绪；不影响百炼直连转写".to_owned()
+                },
+            },
+        ]
+    }
+
     fn default_recognition_profile(&self) -> Result<RecognitionProfile, AiCommandError> {
         let manifest_text = load_asr_manifest_text(&self.active_root())
             .or_else(|_| Ok(BUNDLED_MANIFEST.to_owned()))
             .map_err(command_asr_error)?;
         let manifest = AsrBundleManifest::from_json(&manifest_text).map_err(command_asr_error)?;
         let vad = VadConfig::default();
+        // 默认识别路径是百炼直连，因此默认配置的引擎身份必须是**云端引擎**的真实
+        // 身份，而不是随包本地 manifest 的身份——否则缓存指纹与实际执行引擎不符，
+        // 云端与本地两条路径会互相命中对方的产物。
+        // VAD 参数与规范化版本仍取自随包 manifest：它们同样参与指纹。
+        let dashscope = DashScopeAsrConfig::default();
         Ok(RecognitionProfile {
-            engine_id: manifest.engine.id,
-            engine_version: manifest.engine.version,
-            model_id: manifest.model.logical_id,
-            model_version: manifest.model.version,
+            engine_id: CLOUD_ENGINE_ID.to_owned(),
+            engine_version: dy_screen::asr::CLOUD_ENGINE_VERSION.to_owned(),
+            model_id: dashscope.model.clone(),
+            model_version: dashscope.model,
             language_hint: Some("zh".to_owned()),
             vad_model_id: format!("{}@{}", manifest.vad.logical_id, manifest.vad.version),
             vad_threshold_millis: u32::from(vad.threshold_permille),
@@ -146,6 +203,9 @@ impl LocalAsrEnvironment {
             timestamp_policy: "segment".to_owned(),
             normalization_version: manifest.normalization.version,
             hotwords: Vec::new(),
+            provider: Some("cloud".to_owned()),
+            // 分块策略在实施分块提交后回填；未分块时不写入，以保持与旧配置一致。
+            chunk_strategy: None,
         })
     }
 
@@ -178,7 +238,7 @@ impl LocalAsrEnvironment {
                         message: error.safe_message.clone(),
                     }],
                     message: error.safe_message,
-                    cloud_asr_available: false,
+                    cloud_asr_available: self.cloud_configured(),
                     runtime: self.runtime_diagnostic(),
                 };
             }
@@ -207,6 +267,12 @@ impl LocalAsrEnvironment {
                     .find(|check| !check.passed)
                     .map(|check| check.message.clone())
                     .unwrap_or_else(|| "本地 ASR 环境就绪，识别过程不会上传视频".to_owned());
+                // 三项独立诊断：百炼直连转写、可选本地识别与音频准备。
+                // 注意：ready 仍只表示本地资源就绪，云端可用性由
+                // cloud_asr_available 与 cloud_checks 单独表达，避免资源依赖型
+                // 流程在只有云端可用时被误判为就绪。
+                let mut checks = checks;
+                checks.extend(self.cloud_checks(report.ready));
                 AiEnvironmentDiagnostic {
                     ready,
                     platform: report.platform,
@@ -216,7 +282,7 @@ impl LocalAsrEnvironment {
                     model_version: report.identity.model_version,
                     checks,
                     message,
-                    cloud_asr_available: false,
+                    cloud_asr_available: self.cloud_configured(),
                     runtime: self.runtime_diagnostic(),
                 }
             }
@@ -233,7 +299,7 @@ impl LocalAsrEnvironment {
                     message: "本地 ASR 环境检查异常退出，请重新检测".to_owned(),
                 }],
                 message: "本地 ASR 环境检查异常退出，请重新检测".to_owned(),
-                cloud_asr_available: false,
+                cloud_asr_available: self.cloud_configured(),
                 runtime: self.runtime_diagnostic(),
             },
         }
@@ -409,9 +475,291 @@ struct ActivationTokenProvider {
     activation: ActivationService,
 }
 
+/// 按工程冻结的识别配置在两条一等公民路径之间选择引擎。
+///
+/// 默认路径是百炼直连；只有工程识别配置显式指向本地引擎时才使用本地
+/// `whisper.cpp`。这里不存在"云端失败后自动改用本地"的隐式回退。
+struct ProjectSelectableAsrEngine {
+    cloud: Arc<dyn AsrEngine>,
+    local: Arc<dyn AsrEngine>,
+}
+
+/// 云端引擎在识别配置中的稳定标识。
+const CLOUD_ENGINE_ID: &str = "dashscope-filetrans";
+
+impl ProjectSelectableAsrEngine {
+    fn select(&self, request: &dy_screen::asr::AsrRequest) -> Arc<dyn AsrEngine> {
+        // 默认路径是百炼直连；只有显式选择本地引擎时才走本地。
+        // 未知取值同样走默认路径，而不是静默落到本地。
+        if request.engine_id.as_deref() == Some(crate::ai::processor::LOCAL_ENGINE_ID) {
+            return self.local.clone();
+        }
+        self.cloud.clone()
+    }
+}
+
+#[async_trait]
+impl AsrEngine for ProjectSelectableAsrEngine {
+    fn identity(&self) -> dy_screen::asr::AsrEngineIdentity {
+        // 默认路径是云端；实际执行身份以 engine_id 显式选择为准。
+        self.cloud.identity()
+    }
+
+    fn capabilities(&self) -> dy_screen::asr::AsrCapabilities {
+        self.cloud.capabilities()
+    }
+
+    async fn diagnose(&self) -> EngineResult<dy_screen::asr::AsrEnvironmentReport> {
+        self.cloud.diagnose().await
+    }
+
+    async fn transcribe(
+        &self,
+        request: dy_screen::asr::AsrRequest,
+        progress: Arc<dyn dy_screen::asr::AsrProgressSink>,
+        cancellation: CancellationToken,
+    ) -> EngineResult<dy_screen::asr::AsrResult> {
+        self.select(&request)
+            .transcribe(request, progress, cancellation)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod engine_selection_tests {
+    use super::*;
+    use crate::ai::processor::LOCAL_ENGINE_ID;
+    use dy_screen::asr::{
+        AsrCapabilities, AsrEngineIdentity, AsrEnvironmentReport, AsrProgressSink, AsrRequest,
+        AsrResult, AsrSegment, TimestampPolicy,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 云端替身：按需产出瞬时故障或取消。
+    struct FailingCloud {
+        error: AsrError,
+    }
+
+    #[async_trait]
+    impl AsrEngine for FailingCloud {
+        fn identity(&self) -> AsrEngineIdentity {
+            AsrEngineIdentity {
+                engine_id: CLOUD_ENGINE_ID.into(),
+                engine_version: "1".into(),
+                model_id: "qwen3-asr-flash-filetrans".into(),
+                model_version: "qwen3-asr-flash-filetrans".into(),
+            }
+        }
+        fn capabilities(&self) -> AsrCapabilities {
+            AsrCapabilities {
+                timestamp_policies: vec![TimestampPolicy::Segment],
+                supports_language_hint: true,
+                supports_hotwords: true,
+                confidence_kind: None,
+                maximum_threads: 4,
+            }
+        }
+        async fn diagnose(&self) -> EngineResult<AsrEnvironmentReport> {
+            Ok(AsrEnvironmentReport {
+                ready: true,
+                platform: "test".into(),
+                identity: self.identity(),
+                checks: Vec::new(),
+            })
+        }
+        async fn transcribe(
+            &self,
+            _request: AsrRequest,
+            _progress: Arc<dyn AsrProgressSink>,
+            _cancellation: CancellationToken,
+        ) -> EngineResult<AsrResult> {
+            Err(self.error.clone())
+        }
+    }
+
+    /// 本地替身：被调用即失败，用于断言"隐式回退不存在"。
+    struct ForbiddenLocal {
+        calls: Arc<AtomicU32>,
+    }
+
+    #[async_trait]
+    impl AsrEngine for ForbiddenLocal {
+        fn identity(&self) -> AsrEngineIdentity {
+            AsrEngineIdentity {
+                engine_id: LOCAL_ENGINE_ID.into(),
+                engine_version: "1".into(),
+                model_id: "ggml-base".into(),
+                model_version: "1".into(),
+            }
+        }
+        fn capabilities(&self) -> AsrCapabilities {
+            AsrCapabilities {
+                timestamp_policies: vec![TimestampPolicy::Segment],
+                supports_language_hint: true,
+                supports_hotwords: true,
+                confidence_kind: None,
+                maximum_threads: 4,
+            }
+        }
+        async fn diagnose(&self) -> EngineResult<AsrEnvironmentReport> {
+            Ok(AsrEnvironmentReport {
+                ready: true,
+                platform: "test".into(),
+                identity: self.identity(),
+                checks: Vec::new(),
+            })
+        }
+        async fn transcribe(
+            &self,
+            _request: AsrRequest,
+            _progress: Arc<dyn AsrProgressSink>,
+            _cancellation: CancellationToken,
+        ) -> EngineResult<AsrResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AsrResult {
+                request_id: "test".into(),
+                identity: self.identity(),
+                detected_language: None,
+                audio_duration_ms: 1,
+                provider: "local".into(),
+                fallback_reason: None,
+                segments: vec![AsrSegment {
+                    start_ms: 0,
+                    end_ms: 1,
+                    text: "本地".into(),
+                    confidence: None,
+                }],
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    fn request(engine_id: Option<&str>) -> AsrRequest {
+        use dy_screen::asr::{PreparedAudio, PreparedAudioFormat};
+        AsrRequest {
+            request_id: "req-1".into(),
+            audio: PreparedAudio {
+                path: std::path::PathBuf::from("/tmp/a.wav"),
+                format: PreparedAudioFormat::PcmS16LeWav,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                duration_ms: 1_000,
+            },
+            language_hint: Some("zh".into()),
+            hotwords: Vec::new(),
+            speech_regions: Vec::new(),
+            timestamp_policy: TimestampPolicy::Segment,
+            max_threads: 4,
+            engine_id: engine_id.map(str::to_owned),
+        }
+    }
+
+    async fn run(error: AsrError, engine_id: Option<&str>) -> (EngineResult<AsrResult>, u32) {
+        let local_calls = Arc::new(AtomicU32::new(0));
+        let engine = ProjectSelectableAsrEngine {
+            cloud: Arc::new(FailingCloud { error }),
+            local: Arc::new(ForbiddenLocal {
+                calls: local_calls.clone(),
+            }),
+        };
+        let progress: Arc<dyn AsrProgressSink> = Arc::new(NoopProgress);
+        let result = engine
+            .transcribe(request(engine_id), progress, CancellationToken::new())
+            .await;
+        (result, local_calls.load(Ordering::SeqCst))
+    }
+
+    struct NoopProgress;
+
+    impl AsrProgressSink for NoopProgress {
+        fn publish(&self, _event: dy_screen::asr::AsrProgressEvent) {}
+    }
+
+    /// 任务 8.3：瞬时故障在有界重试后明确失败，且**不调用本地引擎**。
+    #[tokio::test]
+    async fn transient_failure_never_falls_back_to_local() {
+        let (result, local_calls) = run(
+            AsrError::new(
+                AsrErrorKind::ProcessFailed,
+                "cloud_upload_service_unavailable",
+                "瞬时故障",
+                true,
+            ),
+            Some(CLOUD_ENGINE_ID),
+        )
+        .await;
+        let error = result.expect_err("必须明确失败");
+        assert_eq!(error.code, "cloud_upload_service_unavailable");
+        assert_eq!(
+            local_calls, 0,
+            "瞬时故障不得触发本地识别（隐式回退必须不存在）"
+        );
+        assert_eq!(
+            dy_screen::asr::classify_cloud_failure(&error),
+            dy_screen::asr::CloudFailureBranch::Transient
+        );
+    }
+
+    /// 任务 8.4：取消路径不得触发本地识别。
+    #[tokio::test]
+    async fn cancellation_never_touches_local_engine() {
+        let (result, local_calls) = run(AsrError::cancelled(), Some(CLOUD_ENGINE_ID)).await;
+        let error = result.expect_err("取消必须终止");
+        assert_eq!(
+            local_calls, 0,
+            "取消不得静默变成一次本地识别"
+        );
+        assert_eq!(
+            dy_screen::asr::classify_cloud_failure(&error),
+            dy_screen::asr::CloudFailureBranch::Cancelled
+        );
+    }
+
+    /// 任务 8.6 的反向断言：只有显式选择本地引擎时才走本地路径。
+    #[tokio::test]
+    async fn explicit_local_selection_uses_local_engine() {
+        let (result, local_calls) = run(
+            AsrError::new(
+                AsrErrorKind::ProcessFailed,
+                "cloud_upload_service_unavailable",
+                "瞬时故障",
+                true,
+            ),
+            Some(LOCAL_ENGINE_ID),
+        )
+        .await;
+        let value = result.expect("本地路径必须成功");
+        assert_eq!(
+            local_calls, 1,
+            "显式选择本地识别时必须调用本地引擎恰好一次"
+        );
+        assert_eq!(value.provider, "local");
+    }
+
+    /// 未显式选择时默认走云端（百炼直连）。
+    #[tokio::test]
+    async fn default_path_is_cloud() {
+        let (result, local_calls) = run(
+            AsrError::new(
+                AsrErrorKind::ProcessFailed,
+                "cloud_upload_service_unavailable",
+                "瞬时故障",
+                true,
+            ),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "默认路径必须走云端并如实失败");
+        assert_eq!(local_calls, 0, "默认路径不得落到本地");
+    }
+}
+
 #[async_trait]
 impl dy_screen::asr::TemporaryAiTokenProvider for ActivationTokenProvider {
-    async fn token(&self) -> EngineResult<String> {
+    fn is_configured(&self) -> bool {
+        self.activation.credentials().is_some()
+    }
+    async fn temporary_token(&self) -> EngineResult<String> {
         let (device_id, activate_code) = self.activation.credentials().ok_or_else(|| {
             AsrError::new(
                 AsrErrorKind::EnvironmentUnavailable,
@@ -485,6 +833,11 @@ impl LocalAsrRuntime {
     ) -> LocalAsrComponents {
         let repository = AiRepository::new(database.clone());
         let environment = Arc::new(LocalAsrEnvironment::load(resource_root));
+        environment.set_cloud_configured(
+            token_provider
+                .as_ref()
+                .is_some_and(|provider| provider.is_configured()),
+        );
         let resources = environment.resources();
         let inspector_path = resources
             .as_ref()
@@ -585,6 +938,8 @@ impl LocalAsrRuntime {
     /// 授权恢复后重新创建已经停止的本地调度器。资源仍从受控 Runtime
     /// Resource Pack 解析，不接受前端传入可执行路径。
     pub fn resume_after_authorization(&self) -> Result<(), AiCommandError> {
+        // 授权状态变化后刷新百炼直连可用性，使诊断反映真实路径。
+        self.refresh_cloud_availability();
         if self.scheduler_ready() {
             return Ok(());
         }
@@ -691,6 +1046,8 @@ impl LocalAsrRuntime {
     /// 授权失效时停止当前 ASR 并取走调度器；SQLite 项目状态由生命周期
     /// 对账，重新激活后可通过 `resume_after_authorization` 重建并恢复队列。
     pub async fn pause_for_authorization(&self) -> Result<AiRecoveryReport, AiCommandError> {
+        // 授权失效后云端路径不可用；立即反映到诊断。
+        self.refresh_cloud_availability();
         let scheduler = self
             .scheduler
             .lock()
@@ -703,6 +1060,15 @@ impl LocalAsrRuntime {
         } else {
             self.recover_startup()
         }
+    }
+
+    /// 按当前授权状态刷新百炼直连可用性。
+    pub fn refresh_cloud_availability(&self) {
+        let configured = self
+            .token_provider
+            .as_ref()
+            .is_some_and(|provider| provider.is_configured());
+        self.environment.set_cloud_configured(configured);
     }
 
     fn scheduler(&self) -> Result<Arc<TranscriptionScheduler>, AiCommandError> {
@@ -1026,14 +1392,27 @@ fn build_scheduler(
         ResourcePreflight::native(),
         vad_config.clone(),
     ));
-    let audio_publisher: SharedTemporaryAudioPublisher =
-        Arc::new(UnavailableTemporaryAudioPublisher);
+    let dashscope_config = DashScopeAsrConfig::default();
+    let dashscope = DashScopeAsrClient::new(dashscope_config.clone())?;
+    // 三步直传发布器：POST /files 直传 -> GET /files/{id} 取签名临时 URL。
+    // 未配置授权时 is_available() 为 false，云端路径保持不可用并显式诊断。
+    let audio_publisher: SharedTemporaryAudioPublisher = match token_provider.clone() {
+        Some(provider) => Arc::new(UpstreamFileUploadPublisher::new(
+            dashscope_config.base_url.clone(),
+            provider,
+        )?),
+        None => Arc::new(UnavailableTemporaryAudioPublisher),
+    };
     let engine: Arc<dyn AsrEngine> = Arc::new(CloudFirstAsrEngine::new(
-        local_engine,
+        local_engine.clone(),
         audio_publisher,
         token_provider,
-        DashScopeAsrClient::new(DashScopeAsrConfig::default())?,
+        dashscope,
     ));
+    let engine: Arc<dyn AsrEngine> = Arc::new(ProjectSelectableAsrEngine {
+        cloud: engine,
+        local: local_engine,
+    });
     let processor = AiInputProcessor::new(
         repository.clone(),
         inspector,

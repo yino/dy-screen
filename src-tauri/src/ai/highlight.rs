@@ -165,6 +165,10 @@ pub struct AnalysisFingerprintConfig<'a> {
     pub goal: Option<&'a str>,
     pub qualified_score: u8,
     pub excellent_score: u8,
+    /// 实际调用路径与模型的解析结果指纹（由统一调用点产出）。
+    ///
+    /// 路径切换后必须产生不同指纹，否则会拿旧路径产出的结果冒充新路径的结果。
+    pub call_fingerprint: &'a str,
 }
 
 pub fn analysis_fingerprint(
@@ -187,6 +191,8 @@ pub fn analysis_fingerprint(
             .as_bytes(),
     );
     hasher.update(config.model_id.as_bytes());
+    // 实际调用路径与模型必须进入运行指纹：切换路径后不得复用旧结果。
+    hasher.update(config.call_fingerprint.as_bytes());
     hasher.update(config.prompt_version.as_bytes());
     hasher.update(config.goal.unwrap_or_default().as_bytes());
     hasher.update([config.qualified_score, config.excellent_score]);
@@ -283,6 +289,10 @@ impl HighlightWorkflow {
             .cloned()
             .chain(segments.iter().cloned())
             .collect::<Vec<_>>();
+        // 经统一调用点解析本次运行的冻结快照，并把其指纹纳入运行指纹与审计。
+        // 一次运行只解析一次并冻结：本运行的候选发现与全局评分必须使用同一模型。
+        let frozen_call = crate::ai::llm::FrozenModelCall::resolve(&settings)?;
+        let call_fingerprint = frozen_call.fingerprint_input();
         let fingerprint = analysis_fingerprint(
             project_id,
             &fingerprint_segments,
@@ -294,11 +304,13 @@ impl HighlightWorkflow {
                 goal: detail.project.analysis_goal.as_deref(),
                 qualified_score: settings.qualified_score,
                 excellent_score: settings.excellent_score,
+                call_fingerprint: &call_fingerprint,
             },
         );
         let run = self.repository.create_highlight_run(NewAiHighlightRun {
             project_id,
-            model_id: settings.model_id.clone(),
+            // 记录**实际使用**的模型，而不是设置里的原始值：两者可能因本机覆盖而不同。
+            model_id: frozen_call.model_id().to_owned(),
             prompt_version: settings.prompt_version.clone(),
             tags_snapshot: tags.clone(),
             skills_snapshot: skills
@@ -1029,6 +1041,8 @@ mod tests {
             timestamp_policy: "segment".to_owned(),
             normalization_version: "test".to_owned(),
             hotwords: Vec::new(),
+            provider: Some("local".to_owned()),
+            chunk_strategy: None,
         }
     }
 
@@ -1151,6 +1165,7 @@ mod tests {
                 goal: None,
                 qualified_score: 70,
                 excellent_score: 80,
+                call_fingerprint: "cloud_direct|deepseek-chat",
             },
         );
         let mut legacy = Sha256::new();

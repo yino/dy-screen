@@ -26,6 +26,10 @@ pub enum ClipTextCorrectionError {
     NoEligibleSubtitles,
     #[error("DeepSeek Key 尚未配置")]
     Credential,
+    #[error("当前账号未开通 AI 服务，请开通后重试")]
+    NotActivated,
+    #[error("AI 额度已用完，请等待额度恢复")]
+    QuotaExhausted,
     #[error("LLM 返回的文本纠错结果无效")]
     InvalidResponse,
     #[error(transparent)]
@@ -36,12 +40,101 @@ pub enum ClipTextCorrectionError {
 
 pub type Result<T> = std::result::Result<T, ClipTextCorrectionError>;
 
+/// 纠错运行前的授权与额度门禁。
+///
+/// 未开通与额度耗尽是**两种不同的原因**，必须分别判定并分别报告；不得把其中任一
+/// 描述为 Provider 网络故障。
+pub trait ClipCorrectionGate: Send + Sync {
+    /// 客户端是否已激活。
+    fn activation_ready(&self) -> bool;
+    /// 账号是否已开通 AI 服务。
+    fn service_activated(&self) -> bool;
+    /// 当前是否仍有可用额度。
+    fn quota_available(&self) -> bool;
+}
+
+/// 由激活状态驱动的门禁：未激活时明确拒绝。
+///
+/// 开通与额度不在此判定：客户端没有这两个状态的本地权威来源（heartbeat 响应不含
+/// 额度字段），它们由上游业务错误码 3001 / 3003 / 3004 映射而来，见
+/// `map_upstream_business_code`。
+#[derive(Clone)]
+pub struct ActivationCorrectionGate {
+    activation: crate::activation::ActivationService,
+}
+
+impl ActivationCorrectionGate {
+    /// 由激活服务创建门禁。
+    pub fn new(activation: crate::activation::ActivationService) -> Self {
+        Self { activation }
+    }
+}
+
+impl ClipCorrectionGate for ActivationCorrectionGate {
+    fn activation_ready(&self) -> bool {
+        self.activation.is_active()
+    }
+    fn service_activated(&self) -> bool {
+        true
+    }
+    fn quota_available(&self) -> bool {
+        true
+    }
+}
+
+/// 把上游业务错误码映射为可区分的授权/额度原因。
+///
+/// 返回 `None` 表示该错误码不属于授权或额度类别。客户端没有额度的本地权威来源，
+/// 因此额度耗尽只能由上游错误码判定，不能由 heartbeat 推断。
+pub fn map_upstream_business_code(code: i32) -> Option<ClipTextCorrectionError> {
+    match code {
+        3001 => Some(ClipTextCorrectionError::NotActivated),
+        3003 | 3004 => Some(ClipTextCorrectionError::QuotaExhausted),
+        _ => None,
+    }
+}
+
+/// 默认门禁：全部放行，供无授权上下文的调用方与测试使用。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PermissiveCorrectionGate;
+
+impl ClipCorrectionGate for PermissiveCorrectionGate {
+    fn activation_ready(&self) -> bool {
+        true
+    }
+    fn service_activated(&self) -> bool {
+        true
+    }
+    fn quota_available(&self) -> bool {
+        true
+    }
+}
+
+/// 按门禁状态判定本次运行是否可继续。
+///
+/// 判定顺序固定为"激活 → 开通 → 额度"，使错误原因稳定可预期。
+pub fn evaluate_correction_gate(
+    gate: &dyn ClipCorrectionGate,
+) -> std::result::Result<(), ClipTextCorrectionError> {
+    if !gate.activation_ready() {
+        return Err(ClipTextCorrectionError::Credential);
+    }
+    if !gate.service_activated() {
+        return Err(ClipTextCorrectionError::NotActivated);
+    }
+    if !gate.quota_available() {
+        return Err(ClipTextCorrectionError::QuotaExhausted);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ClipTextCorrectionWorkflow {
     repository: AiRepository,
     provider: Arc<dyn SubtitleCorrectionProvider>,
     credentials: Arc<dyn CredentialStore>,
     publisher: Arc<dyn ClipWorkflowPublisher>,
+    gate: Arc<dyn ClipCorrectionGate>,
 }
 
 impl ClipTextCorrectionWorkflow {
@@ -55,7 +148,14 @@ impl ClipTextCorrectionWorkflow {
             provider,
             credentials,
             publisher: Arc::new(SilentClipWorkflowPublisher),
+            gate: Arc::new(PermissiveCorrectionGate),
         }
+    }
+
+    /// 注入授权与额度门禁。
+    pub fn with_gate(mut self, gate: Arc<dyn ClipCorrectionGate>) -> Self {
+        self.gate = gate;
+        self
     }
 
     pub fn with_publisher(mut self, publisher: Arc<dyn ClipWorkflowPublisher>) -> Self {
@@ -108,6 +208,9 @@ impl ClipTextCorrectionWorkflow {
             0,
             "正在准备可纠错字幕",
         );
+        // 授权与额度必须早于任何批次提交判定：不通过时保留字幕不变，
+        // 并给出可区分的原因（未开通 / 额度耗尽）。
+        evaluate_correction_gate(self.gate.as_ref())?;
         let plan = self
             .repository
             .prepare_clip_text_correction(clip_project_id, expected_project_version)?;
@@ -115,6 +218,8 @@ impl ClipTextCorrectionWorkflow {
             return Err(ClipTextCorrectionError::NoEligibleSubtitles);
         }
         let settings = self.repository.get_llm_provider_settings(true)?;
+        // 统一调用点：运行开始前解析一次并冻结，本运行的全部批次共用同一模型。
+        let frozen_call = crate::ai::llm::FrozenModelCall::resolve(&settings)?;
         let api_key = self
             .credentials
             .get()
@@ -126,7 +231,7 @@ impl ClipTextCorrectionWorkflow {
         let run_id = self.repository.begin_clip_text_correction_run(
             clip_project_id,
             plan.project_version,
-            &settings.model_id,
+            frozen_call.model_id(),
             CLIP_TEXT_CORRECTION_PROMPT_VERSION,
             &fingerprint,
             plan.targets.len(),
@@ -174,9 +279,11 @@ impl ClipTextCorrectionWorkflow {
             let output = match self
                 .provider
                 .correct_subtitles(
-                    &settings,
                     &api_key,
-                    SubtitleCorrectionRequest { prompt },
+                    SubtitleCorrectionRequest {
+                        prompt,
+                        frozen: frozen_call.clone(),
+                    },
                     cancellation.clone(),
                 )
                 .await
@@ -445,7 +552,6 @@ mod tests {
     impl SubtitleCorrectionProvider for FailSecondBatchProvider {
         async fn correct_subtitles(
             &self,
-            _settings: &super::super::LlmProviderSettings,
             _api_key: &str,
             _request: SubtitleCorrectionRequest,
             _cancellation: CancellationToken,
@@ -619,5 +725,148 @@ mod tests {
         assert_eq!(version, 1);
         assert_eq!(changed, 0);
         assert_eq!(run, ("failed".to_owned(), 1));
+    }
+}
+
+#[cfg(test)]
+mod correction_gate_tests {
+    use super::*;
+
+    struct FixedGate {
+        activation: bool,
+        activated: bool,
+        quota: bool,
+    }
+
+    impl ClipCorrectionGate for FixedGate {
+        fn activation_ready(&self) -> bool {
+            self.activation
+        }
+        fn service_activated(&self) -> bool {
+            self.activated
+        }
+        fn quota_available(&self) -> bool {
+            self.quota
+        }
+    }
+
+    fn gate(activation: bool, activated: bool, quota: bool) -> FixedGate {
+        FixedGate {
+            activation,
+            activated,
+            quota,
+        }
+    }
+
+    /// 任务 4.4：未开通与额度耗尽必须是可区分的原因，且都不被描述为网络故障。
+    #[test]
+    fn gate_reports_distinguishable_authorization_causes() {
+        // 全部就绪时放行。
+        assert!(evaluate_correction_gate(&gate(true, true, true)).is_ok());
+        // 未开通。
+        let not_activated = evaluate_correction_gate(&gate(true, false, true)).unwrap_err();
+        // 额度耗尽。
+        let quota = evaluate_correction_gate(&gate(true, true, false)).unwrap_err();
+        assert!(matches!(not_activated, ClipTextCorrectionError::NotActivated));
+        assert!(matches!(quota, ClipTextCorrectionError::QuotaExhausted));
+        // 两者必须可区分（不得合并成同一个原因）。
+        assert_ne!(not_activated.to_string(), quota.to_string());
+        // 原因说明必须可操作，且不得暗示网络故障。
+        for error in [&not_activated, &quota] {
+            let message = error.to_string();
+            assert!(
+                !message.contains("网络") && !message.contains("Provider"),
+                "授权/额度问题不得被描述为网络故障: {message}"
+            );
+        }
+        assert!(not_activated.to_string().contains("未开通"));
+        assert!(quota.to_string().contains("额度"));
+        // 未激活优先于未开通：判定顺序稳定。
+        let inactive = evaluate_correction_gate(&gate(false, false, false)).unwrap_err();
+        assert!(matches!(inactive, ClipTextCorrectionError::Credential));
+    }
+
+    /// 默认门禁放行，保持无授权上下文调用方的既有行为不变。
+    #[test]
+    fn permissive_gate_keeps_default_behavior() {
+        assert!(evaluate_correction_gate(&PermissiveCorrectionGate).is_ok());
+    }
+
+    /// 额度耗尽只能由上游业务错误码判定；客户端没有额度的本地权威来源。
+    #[test]
+    fn upstream_business_codes_map_to_distinguishable_causes() {
+        assert!(matches!(
+            map_upstream_business_code(3001),
+            Some(ClipTextCorrectionError::NotActivated)
+        ));
+        assert!(matches!(
+            map_upstream_business_code(3003),
+            Some(ClipTextCorrectionError::QuotaExhausted)
+        ));
+        assert!(matches!(
+            map_upstream_business_code(3004),
+            Some(ClipTextCorrectionError::QuotaExhausted)
+        ));
+        // 未开通与额度耗尽不得映射成同一原因。
+        assert_ne!(
+            map_upstream_business_code(3001).unwrap().to_string(),
+            map_upstream_business_code(3003).unwrap().to_string()
+        );
+        // 与授权/额度无关的错误码不得被误判。
+        for code in [1001, 1007, 2001, 9000, 0] {
+            assert!(
+                map_upstream_business_code(code).is_none(),
+                "错误码 {code} 不属于授权或额度类别"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod correction_batching_equivalence_tests {
+    use super::*;
+
+    fn target(subtitle_id: i64, text: &str) -> ClipTextCorrectionTarget {
+        ClipTextCorrectionTarget {
+            subtitle_id,
+            text: text.to_owned(),
+        }
+    }
+
+    /// 任务 4.1 的等价性断言：转换到统一调用点**没有改变**分批边界与批次顺序。
+    ///
+    /// 模型解析来源的变化不得影响批处理：同一组目标在同一上限下必须得到逐字相同的
+    /// 批次划分，且目标顺序保持输入顺序。
+    #[test]
+    fn model_resolution_does_not_change_batch_boundaries_or_order() {
+        let targets = vec![
+            target(0, &"甲".repeat(30)),
+            target(1, &"乙".repeat(30)),
+            target(2, &"丙".repeat(30)),
+            target(3, &"丁".repeat(10)),
+        ];
+        let batches = batch_targets(&targets, 70);
+        // 边界由字符数决定：30+30 <= 70 同批；再加 30 超限则开新批。
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![2, 2], "分批边界必须与转换前一致: {sizes:?}");
+        // 顺序必须保持输入顺序，跨批不重排。
+        let order: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| batch.iter().map(|item| item.subtitle_id))
+            .collect();
+        assert_eq!(order, vec![0, 1, 2, 3], "批次顺序必须保持输入顺序");
+        // 同一输入重复计算必须得到相同划分（确定性）。
+        let again = batch_targets(&targets, 70);
+        assert_eq!(
+            sizes,
+            again.iter().map(Vec::len).collect::<Vec<_>>(),
+            "分批必须确定"
+        );
+        // 单条超出上限时不得死循环、也不得丢条目。
+        let oversized = batch_targets(&[target(0, &"长".repeat(200))], 70);
+        assert_eq!(oversized.len(), 1);
+        assert_eq!(oversized[0].len(), 1);
+        // 空输入产出空批次。
+        assert!(batch_targets(&[], 70).is_empty());
     }
 }

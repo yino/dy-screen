@@ -28,7 +28,9 @@ pub use clip_subtitle::{
     ClipSubtitleAssets, build_clip_subtitle_frames, render_clip_subtitle_assets,
 };
 pub use clip_text_correction::{
-    CLIP_TEXT_CORRECTION_PROMPT_VERSION, ClipTextCorrectionError, ClipTextCorrectionWorkflow,
+    ActivationCorrectionGate, CLIP_TEXT_CORRECTION_PROMPT_VERSION, ClipCorrectionGate,
+    ClipTextCorrectionError, ClipTextCorrectionWorkflow, evaluate_correction_gate,
+    map_upstream_business_code,
 };
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
@@ -98,4 +100,5 @@ pub use smart_workflow::{
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
     migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23, migrate_ai_v24, migrate_ai_v25,
+    migrate_ai_v26,
 };

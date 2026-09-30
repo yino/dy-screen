@@ -51,6 +51,37 @@ pub enum AiRepositoryError {
     ClipExportInProgress,
     #[error("字幕内容无效：{0}")]
     InvalidClipSubtitle(String),
+    #[error("同一幂等键已用于不同输入，拒绝复用")]
+    IdempotencyConflict,
+}
+
+/// 本地付费任务幂等记录；付费提交前先落盘，用于重启后找回同一上游任务。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteJobRecord {
+    /// 稳定请求标识。
+    pub request_id: String,
+    /// 任务类型，例如 `asr`。
+    pub task_type: String,
+    /// 输入指纹。
+    pub input_hash: String,
+    /// 上游任务标识；未取到时为空。
+    pub upstream_task_id: Option<String>,
+    /// 记录状态。
+    pub status: String,
+    /// 是否需要向用户确认上游是否已受理。
+    pub reconcile_required: bool,
+}
+
+/// 幂等键的三元组（账号维度在本机即当前安装）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteJobKey {
+    /// 稳定请求标识。
+    pub request_id: String,
+    /// 任务类型。
+    pub task_type: String,
+    /// 输入指纹。
+    pub input_hash: String,
 }
 
 pub type Result<T> = std::result::Result<T, AiRepositoryError>;
@@ -3100,8 +3131,151 @@ impl AiRepository {
         self.get_project_row(project_id)
     }
 
-    pub fn create_artifact(&self, input: NewAsrArtifact) -> Result<AsrArtifact> {
-        let source_hash = input.source_fingerprint.fingerprint()?;
+    /// 付费提交前的本地幂等落盘。
+    ///
+    /// 语义：同键同输入返回已有记录（`reused`）；同键不同输入拒绝并返回
+    /// `IdempotencyConflict`。该记录必须在调用上游之前写入，进程崩溃或断电后
+    /// 仍能按 `request_id` 找回同一个上游任务，从而不产生第二次付费提交。
+    pub fn record_remote_job(&self, key: &RemoteJobKey, upstream_task_id: Option<&str>) -> Result<RemoteJobRecord> {
+        if key.request_id.trim().is_empty() || key.task_type.trim().is_empty() {
+            return Err(AiRepositoryError::Integrity(
+                "幂等请求标识与任务类型不能为空".to_owned(),
+            ));
+        }
+        if key.input_hash.trim().is_empty() {
+            return Err(AiRepositoryError::Integrity(
+                "幂等输入指纹不能为空".to_owned(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.database.connection()?;
+        let existing = connection
+            .query_row(
+                "SELECT input_hash, upstream_task_id, status, reconcile_required
+                   FROM ai_remote_job_records WHERE request_id = ?1 AND task_type = ?2",
+                params![key.request_id, key.task_type],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((input_hash, stored_task_id, _status, reconcile_required)) = existing {
+            if input_hash != key.input_hash {
+                return Err(AiRepositoryError::IdempotencyConflict);
+            }
+            // 同键同输入：只补齐上游任务标识（已有值不被覆盖），状态保持可复用。
+            let effective_task_id = upstream_task_id
+                .map(str::to_owned)
+                .or_else(|| stored_task_id.clone());
+            connection.execute(
+                "UPDATE ai_remote_job_records
+                    SET upstream_task_id = COALESCE(upstream_task_id, ?1),
+                        status = 'reused',
+                        updated_at = ?2
+                  WHERE request_id = ?3 AND task_type = ?4",
+                params![
+                    upstream_task_id,
+                    now,
+                    key.request_id,
+                    key.task_type
+                ],
+            )?;
+            return Ok(RemoteJobRecord {
+                request_id: key.request_id.clone(),
+                task_type: key.task_type.clone(),
+                input_hash,
+                upstream_task_id: effective_task_id,
+                status: "reused".to_owned(),
+                reconcile_required: reconcile_required != 0,
+            });
+        }
+        let status = if upstream_task_id.is_some() {
+            "submitted"
+        } else {
+            // 已提交但未取到上游任务标识：必须进入待对账，不得自动重新提交。
+            "awaiting_reconcile"
+        };
+        let reconcile_required = i64::from(upstream_task_id.is_none());
+        connection.execute(
+            "INSERT INTO ai_remote_job_records(
+                 request_id, task_type, input_hash, upstream_task_id,
+                 status, reconcile_required, created_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                key.request_id,
+                key.task_type,
+                key.input_hash,
+                upstream_task_id,
+                status,
+                reconcile_required,
+                now
+            ],
+        )?;
+        Ok(RemoteJobRecord {
+            request_id: key.request_id.clone(),
+            task_type: key.task_type.clone(),
+            input_hash: key.input_hash.clone(),
+            upstream_task_id: upstream_task_id.map(str::to_owned),
+            status: status.to_owned(),
+            reconcile_required: reconcile_required != 0,
+        })
+    }
+
+    /// 按幂等键读取已落盘记录，供重启恢复使用。
+    pub fn remote_job_record(&self, request_id: &str, task_type: &str) -> Result<Option<RemoteJobRecord>> {
+        let connection = self.database.connection()?;
+        let record = connection
+            .query_row(
+                "SELECT request_id, task_type, input_hash, upstream_task_id, status, reconcile_required
+                   FROM ai_remote_job_records WHERE request_id = ?1 AND task_type = ?2",
+                params![request_id, task_type],
+                |row| {
+                    Ok(RemoteJobRecord {
+                        request_id: row.get(0)?,
+                        task_type: row.get(1)?,
+                        input_hash: row.get(2)?,
+                        upstream_task_id: row.get(3)?,
+                        status: row.get(4)?,
+                        reconcile_required: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(record)
+    }
+
+    /// 需要向用户确认上游是否已受理的记录。
+    pub fn records_awaiting_reconcile(&self) -> Result<Vec<RemoteJobRecord>> {
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT request_id, task_type, input_hash, upstream_task_id, status, reconcile_required
+               FROM ai_remote_job_records
+              WHERE reconcile_required = 1 OR status = 'awaiting_reconcile'
+              ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(RemoteJobRecord {
+                request_id: row.get(0)?,
+                task_type: row.get(1)?,
+                input_hash: row.get(2)?,
+                upstream_task_id: row.get(3)?,
+                status: row.get(4)?,
+                reconcile_required: row.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn create_artifact(&self, input: NewAsrArtifact) -> Result<AsrArtifact> {        let source_hash = input.source_fingerprint.fingerprint()?;
         let source_json = serde_json::to_string(&input.source_fingerprint)
             .map_err(|_| AiRepositoryError::Serialization("源指纹无法序列化".to_owned()))?;
         let now = Utc::now().to_rfc3339();
@@ -3329,12 +3503,29 @@ impl AiRepository {
             "UPDATE asr_artifacts SET status = 'invalidated' WHERE status = 'pending'",
             [],
         )?;
+        // 重启时必须先核对已提交的付费任务，而不是直接重新提交。这里只统计需要
+        // 对账的数量；具体核对由 `pending_remote_jobs` 的消费者向上游查询后消解。
+        let awaiting: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM ai_remote_job_records
+              WHERE reconcile_required = 1 OR status = 'awaiting_reconcile'",
+            [],
+            |row| row.get(0),
+        )?;
         transaction.commit()?;
         Ok(RecoverySummary {
             projects,
             inputs,
             artifacts,
+            awaiting_remote_reconcile: usize::try_from(awaiting).unwrap_or(usize::MAX),
         })
+    }
+
+    /// 重启后需要向上游核对的付费任务。
+    ///
+    /// 调用方 MUST 先按这些记录的 `request_id` 与 `upstream_task_id` 查询上游终态：
+    /// 已受理则继续等待或复用，未受理才可释放预留并允许重试。MUST NOT 直接重新提交。
+    pub fn pending_remote_jobs(&self) -> Result<Vec<RemoteJobRecord>> {
+        self.records_awaiting_reconcile()
     }
 
     pub fn invalidate_artifacts_for_video(&self, video_id: i64) -> Result<usize> {
@@ -4489,6 +4680,71 @@ pub(crate) fn migrate_ai_v23(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v26 增加转写身份、分块策略与规范化版本字段，并新增本地幂等记录表。
+///
+/// 迁移只增列、只建表，不重写任何旧行；旧产物保持原有 `provider` 与模型身份。
+pub(crate) fn migrate_ai_v26(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 26",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    // asr_artifacts：识别身份、分块策略与规范化版本（缓存键组成部分）。
+    for (column, definition) in [
+        ("chunk_strategy", "TEXT"),
+        ("normalization_version", "TEXT"),
+        ("vad_parameters", "TEXT"),
+        ("hotwords_fingerprint", "TEXT"),
+    ] {
+        let exists: bool = transaction
+            .query_row(
+                &format!("SELECT 1 FROM pragma_table_info('asr_artifacts') WHERE name = '{column}'"),
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            transaction.execute(
+                &format!("ALTER TABLE asr_artifacts ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    // 本地幂等记录：付费提交前先落盘，重启后可找回同一上游任务。
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_remote_job_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            upstream_task_id TEXT,
+            status TEXT NOT NULL CHECK(status IN ('submitted', 'awaiting_reconcile', 'reused')),
+            reconcile_required INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(request_id, task_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_remote_job_records_state
+            ON ai_remote_job_records(status, reconcile_required);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(26, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// v25 为 ASR 产物记录实际 provider 和脱敏回退原因。
 pub(crate) fn migrate_ai_v25(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
@@ -5321,6 +5577,318 @@ fn validate_score(score: &HighlightCandidateScore) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod remote_job_idempotency_tests {
+    use super::*;
+    use crate::database::Database;
+
+    fn repository() -> AiRepository {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        AiRepository::new(database)
+    }
+
+    fn key(request_id: &str, input_hash: &str) -> RemoteJobKey {
+        RemoteJobKey {
+            request_id: request_id.to_owned(),
+            task_type: "asr".to_owned(),
+            input_hash: input_hash.to_owned(),
+        }
+    }
+
+    /// 任务 9.1 + 9.2：重启恢复必须能按 requestId 找回任务，且不产生重复付费提交。
+    #[test]
+    fn restart_recovery_reports_jobs_needing_upstream_check() {
+        let repository = repository();
+        // 已拿到上游任务标识：不需要对账。
+        repository
+            .record_remote_job(&key("req-a", "hash-a"), Some("task-a"))
+            .expect("record a");
+        // 已提交但未拿到任务标识：必须进入待对账。
+        repository
+            .record_remote_job(&key("req-b", "hash-b"), None)
+            .expect("record b");
+
+        let summary = repository.recover_interrupted().expect("recover");
+        assert_eq!(
+            summary.awaiting_remote_reconcile, 1,
+            "只有缺少上游任务标识的记录需要核对"
+        );
+        let a = repository
+            .remote_job_record("req-a", "asr")
+            .expect("lookup a")
+            .expect("present a");
+        assert_eq!(a.upstream_task_id.as_deref(), Some("task-a"));
+        let b = repository
+            .remote_job_record("req-b", "asr")
+            .expect("lookup b")
+            .expect("present b");
+        assert!(b.reconcile_required);
+        let pending = repository.pending_remote_jobs().expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, "req-b");
+        // 再次恢复不改变结论（幂等）。
+        let again = repository.recover_interrupted().expect("recover twice");
+        assert_eq!(again.awaiting_remote_reconcile, 1);
+    }
+
+    /// 任务 9.3：未完整发布的识别片段不得被标记为可复用。
+    #[test]
+    fn recovery_never_marks_unpublished_artifacts_reusable() {
+        let repository = repository();
+        let summary = repository.recover_interrupted().expect("recover");
+        assert_eq!(summary.artifacts, 0);
+        let connection = repository.database.connection().expect("connection");
+        let reusable: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM asr_artifacts WHERE status = 'published'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count published");
+        assert_eq!(reusable, 0, "恢复不得把未发布产物当作可复用");
+    }
+
+    /// 任务 7.2：在升级前的旧库快照上执行迁移，旧产物的身份与缓存命中行为必须不变。
+    #[test]
+    fn migration_v26_preserves_legacy_artifact_identity() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database.clone());
+        // 构造一行"升级前"的产物：只有 v25 及以前存在的列，身份为本地引擎。
+        // 源指纹使用真实指纹，以便稍后验证缓存命中行为未被迁移改变。
+        let source = SourceFingerprint {
+            normalized_path: "/tmp/legacy.mkv".into(),
+            size_bytes: 1,
+            modified_at_ms: 1,
+            video_id: None,
+        };
+        let source_json = serde_json::to_string(&source).expect("serialize source");
+        let source_hash = source.fingerprint().expect("source fingerprint");
+        {
+            let connection = database.connection().expect("connection");
+            connection
+                .execute(
+                    r#"INSERT INTO asr_artifacts(
+                           source_video_id, source_fingerprint_json, source_fingerprint_hash,
+                           recognition_profile_hash, engine_id, engine_version, model_id,
+                           model_version, status, duration_ms, language, created_at,
+                           published_at, last_used_at, provider, fallback_reason
+                       ) VALUES(NULL, ?1, ?2, 'profile-hash', 'whisper.cpp', 'legacy',
+                               'small', 'legacy', 'published', 60000, 'zh', '2026-01-01T00:00:00Z',
+                               '2026-01-01T00:00:01Z', '2026-01-01T00:00:01Z', 'local', 'old_reason')"#,
+                    params![source_json, source_hash],
+                )
+                .expect("insert legacy artifact");
+        }
+        // 再次执行迁移（幂等），并确认新增列不参与旧行重写。
+        database.migrate().expect("migrate again");
+        let connection = database.connection().expect("connection");
+        let (provider, engine_id, model_id, fallback): (String, String, String, Option<String>) =
+            connection
+                .query_row(
+                    "SELECT provider, engine_id, model_id, fallback_reason FROM asr_artifacts WHERE source_fingerprint_hash = ?1",
+                    params![source_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("legacy row must survive");
+        assert_eq!(provider, "local", "旧产物 provider 不得被迁移改写");
+        assert_eq!(engine_id, "whisper.cpp", "旧产物引擎身份不得被改写");
+        assert_eq!(model_id, "small");
+        assert_eq!(fallback.as_deref(), Some("old_reason"));
+        // 新增列对旧行必须为空（只增列、不填值）。
+        let (chunk, normalization): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT chunk_strategy, normalization_version FROM asr_artifacts WHERE source_fingerprint_hash = ?1",
+                params![source_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("columns exist");
+        assert!(chunk.is_none() && normalization.is_none(), "旧行不得被回填新列");
+        drop(connection);
+        // 缓存命中行为不变：同一源指纹与识别配置指纹仍命中该已发布产物。
+        let hit = repository
+            .find_published_artifact(&source, "profile-hash")
+            .expect("lookup must not fail")
+            .expect("升级后旧产物仍必须可被缓存命中");
+        assert_eq!(hit.provider, "local");
+        assert_eq!(hit.engine_id, "whisper.cpp");
+        assert_eq!(hit.model_id, "small");
+        // 识别配置指纹不同则不得命中（旧行为不变）。
+        assert!(
+            repository
+                .find_published_artifact(&source, "other-profile")
+                .expect("lookup")
+                .is_none(),
+            "识别配置指纹不同时不得复用旧产物"
+        );
+    }
+
+    /// 任务 2.3 + 2.6：提交前落盘；同键同输入复用，同键不同输入拒绝。
+    #[test]
+    fn same_key_same_input_reuses_and_different_input_is_rejected() {
+        let repository = repository();
+        let first = repository
+            .record_remote_job(&key("req-1", "hash-a"), Some("task-1"))
+            .expect("first record");
+        assert_eq!(first.status, "submitted");
+        assert_eq!(first.upstream_task_id.as_deref(), Some("task-1"));
+        assert!(!first.reconcile_required);
+
+        // 同键同输入：复用同一记录，不新建、不换上游任务。
+        let again = repository
+            .record_remote_job(&key("req-1", "hash-a"), Some("task-1"))
+            .expect("reuse");
+        assert_eq!(again.status, "reused");
+        assert_eq!(again.upstream_task_id.as_deref(), Some("task-1"));
+
+        // 同键不同输入：必须拒绝。
+        let conflict = repository
+            .record_remote_job(&key("req-1", "hash-b"), Some("task-2"))
+            .expect_err("conflict");
+        assert!(matches!(conflict, AiRepositoryError::IdempotencyConflict));
+        // 冲突后原记录不得被覆盖。
+        let unchanged = repository
+            .remote_job_record("req-1", "asr")
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(unchanged.input_hash, "hash-a");
+        assert_eq!(unchanged.upstream_task_id.as_deref(), Some("task-1"));
+
+        // 不同键各自独立。
+        let other = repository
+            .record_remote_job(&key("req-2", "hash-b"), Some("task-9"))
+            .expect("other key");
+        assert_eq!(other.status, "submitted");
+    }
+
+    /// 任务 9.4：已提交但缺少上游任务标识必须进入待对账，不得自动重新提交。
+    #[test]
+    fn submitted_without_task_id_awaits_reconcile() {
+        let repository = repository();
+        let record = repository
+            .record_remote_job(&key("req-3", "hash-c"), None)
+            .expect("record without task id");
+        assert_eq!(record.status, "awaiting_reconcile");
+        assert!(record.reconcile_required);
+        let pending = repository.records_awaiting_reconcile().expect("list");
+        assert!(
+            pending.iter().any(|item| item.request_id == "req-3"),
+            "待对账记录必须可查询: {pending:?}"
+        );
+        // 后续取到上游任务标识时可补齐，且不再需要人工对账标记的账号级语义不变。
+        let filled = repository
+            .record_remote_job(&key("req-3", "hash-c"), Some("task-3"))
+            .expect("fill task id");
+        assert_eq!(filled.upstream_task_id.as_deref(), Some("task-3"));
+        assert!(filled.reconcile_required, "历史对账标记保留以便复核");
+    }
+
+    /// 任务 2.3：进程在提交后立即退出，重启仍能按 requestId 找回原任务。
+    #[test]
+    fn record_survives_reopen_and_is_queryable_by_request_id() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        repository
+            .record_remote_job(&key("req-recover", "hash-d"), Some("task-recover"))
+            .expect("record");
+        // 用同一连接句柄新建仓库实例，模拟重启后重新打开数据库。
+        let reopened = AiRepository::new(database);
+        let found = reopened
+            .remote_job_record("req-recover", "asr")
+            .expect("lookup")
+            .expect("present after reopen");
+        assert_eq!(found.upstream_task_id.as_deref(), Some("task-recover"));
+        assert_eq!(found.input_hash, "hash-d");
+    }
+}
+
+#[cfg(test)]
+mod recognition_identity_fingerprint_tests {
+    use super::*;
+
+    /// 升级前的识别配置 JSON（没有 provider / chunkStrategy 字段）。
+    const LEGACY_PROFILE_JSON: &str = r#"{
+        "engineId": "dashscope-filetrans",
+        "engineVersion": "1",
+        "modelId": "qwen3-asr-flash-filetrans",
+        "modelVersion": "qwen3-asr-flash-filetrans",
+        "languageHint": "zh",
+        "vadModelId": "ggml-vad@1",
+        "vadThresholdMillis": 120,
+        "vadPaddingMs": 300,
+        "timestampPolicy": "segment",
+        "normalizationVersion": "OpenCC ver.1.4.1",
+        "hotwords": ["品牌名"]
+    }"#;
+
+    fn profile(provider: Option<&str>, chunk: Option<&str>) -> RecognitionProfile {
+        let mut value: RecognitionProfile = serde_json::from_str(LEGACY_PROFILE_JSON).unwrap();
+        value.provider = provider.map(str::to_owned);
+        value.chunk_strategy = chunk.map(str::to_owned);
+        value
+    }
+
+    /// 任务 7.2：升级不得改变既有工程的缓存指纹，否则所有旧工程会被误判为需重识别。
+    #[test]
+    fn legacy_profile_fingerprint_is_unchanged_by_added_fields() {
+        let legacy: RecognitionProfile = serde_json::from_str(LEGACY_PROFILE_JSON).unwrap();
+        assert!(legacy.provider.is_none());
+        assert!(legacy.chunk_strategy.is_none());
+        // 反序列化后必须序列化回完全相同的 JSON（不新增键）。
+        let round_trip = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !round_trip.contains("provider") && !round_trip.contains("chunkStrategy"),
+            "旧配置的新增字段不得进入序列化结果: {round_trip}"
+        );
+        // 与"显式给出 None"的配置指纹相同。
+        assert_eq!(
+            legacy.fingerprint().unwrap(),
+            profile(None, None).fingerprint().unwrap()
+        );
+        // 指纹稳定：同一输入多次计算结果一致。
+        assert_eq!(legacy.fingerprint().unwrap(), legacy.fingerprint().unwrap());
+    }
+
+    /// 任务 7.3：provider 与分块策略任一变化都必须产生新指纹（即不复用旧产物）。
+    #[test]
+    fn provider_and_chunk_strategy_participate_in_fingerprint() {
+        let base = profile(None, None).fingerprint().unwrap();
+        let cloud = profile(Some("cloud"), None).fingerprint().unwrap();
+        let local = profile(Some("local"), None).fingerprint().unwrap();
+        let chunked = profile(Some("cloud"), Some("fixed-overlap-120s-2s"))
+            .fingerprint()
+            .unwrap();
+
+        assert_ne!(base, cloud, "provider 必须参与指纹");
+        assert_ne!(cloud, local, "云端与本地必须是不同指纹");
+        assert_ne!(cloud, chunked, "分块策略必须参与指纹");
+        // 任务 7.4：两条路径不得互相复用产物。
+        assert_ne!(local, chunked);
+        // 热词顺序不影响指纹（既有语义不得回归）。
+        let mut first = profile(Some("cloud"), None);
+        first.hotwords = vec!["b".into(), "a".into()];
+        let mut second = profile(Some("cloud"), None);
+        second.hotwords = vec!["a".into(), "b".into()];
+        assert_eq!(
+            first.fingerprint().unwrap(),
+            second.fingerprint().unwrap(),
+            "热词顺序不得导致无意义缓存失效"
+        );
+    }
+
+    /// 识别配置身份必须与执行引擎一致，不得用本地身份冒充云端。
+    #[test]
+    fn cloud_and_local_profiles_carry_their_own_engine_identity() {
+        let cloud = profile(Some("cloud"), None);
+        let local = profile(Some("local"), None);
+        assert_eq!(cloud.engine_id, "dashscope-filetrans");
+        assert_ne!(cloud.provider, local.provider);
+        assert_ne!(cloud.fingerprint().unwrap(), local.fingerprint().unwrap());
+    }
 }
 
 #[cfg(test)]

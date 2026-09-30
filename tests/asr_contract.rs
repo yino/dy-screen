@@ -23,6 +23,7 @@ fn request() -> AsrRequest {
         }],
         timestamp_policy: TimestampPolicy::Segment,
         max_threads: 4,
+        engine_id: None,
     }
 }
 

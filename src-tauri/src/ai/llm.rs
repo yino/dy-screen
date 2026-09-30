@@ -18,6 +18,11 @@ use tokio_util::sync::CancellationToken;
 use super::repository::AiRepositoryError;
 
 pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+/// 百炼兼容模式根地址：客户端直连上游时的唯一端点。
+pub const DASHSCOPE_COMPATIBLE_BASE_URL: &str =
+    "https://dashscope.aliyuncs.com/compatible-mode/v1";
+
+/// 默认模型标识（百炼通义）。
 pub const DEFAULT_MODEL_ID: &str = "deepseek-chat";
 pub const PROMPT_VERSION: &str = "highlight-v1";
 pub const MAX_AGENT_TURNS: u8 = 3;
@@ -72,9 +77,11 @@ impl Default for LlmProviderSettings {
 
 impl LlmProviderSettings {
     pub fn validate(&self) -> Result<(), LlmError> {
-        if self.provider != "deepseek" {
+        // `provider` 字段承载调用路径：只接受白名单取值，并兼容升级前的 `deepseek`
+        // 旧值（旧值等价于"客户端直连上游"）。生产构建 MUST NOT 接受任意 Provider。
+        if ModelCallPath::parse(&self.provider).is_none() && self.provider != "deepseek" {
             return Err(LlmError::InvalidConfiguration(
-                "当前版本只支持 DeepSeek Provider".to_owned(),
+                "当前版本只支持客户端直连百炼这一条调用路径".to_owned(),
             ));
         }
         if self.model_id.trim().is_empty() || self.model_id.chars().count() > 128 {
@@ -502,6 +509,12 @@ pub struct TransitionScoreRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubtitleCorrectionRequest {
     pub prompt: String,
+    /// 本次运行的冻结模型调用。
+    ///
+    /// 由调用方在运行开始前解析一次并传入，使同一运行内的所有批次使用同一模型，
+    /// 而不是每个批次各自现读设置。该字段不参与序列化。
+    #[serde(skip)]
+    pub frozen: FrozenModelCall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -610,6 +623,178 @@ pub enum LlmError {
     Repository(#[from] AiRepositoryError),
 }
 
+/// 模型调用的实际路径。
+///
+/// 本轮只有"客户端直连百炼"这一条路径；枚举保留是为了让调用点成为唯一切换处，
+/// 而不是让各业务模块各自决定地址与模型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCallPath {
+    /// 客户端用短期 token 直连百炼兼容端点。
+    CloudDirect,
+}
+
+impl ModelCallPath {
+    /// 稳定机器标识。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudDirect => "cloud_direct",
+        }
+    }
+
+    /// 生产构建允许的路径白名单。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cloud_direct" => Some(Self::CloudDirect),
+            _ => None,
+        }
+    }
+}
+
+/// 解析结果的来源，用于回答"为什么这次用了这个模型"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionSource {
+    /// 构建期默认值。
+    BuildDefault,
+    /// 本机覆盖（开发与验证构建）。
+    LocalOverride,
+    /// 单次运行覆盖。
+    RunOverride,
+}
+
+/// 一次运行内冻结的模型调用快照。
+///
+/// 解析发生在运行开始之前；运行期间 MUST NOT 重新解析。缓存键与运行指纹 SHALL
+/// 包含实际路径与模型标识，切换后不得复用由其他配置产出的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCallSnapshot {
+    /// 实际调用路径。
+    pub path: ModelCallPath,
+    /// 上游根地址。
+    pub base_url: String,
+    /// 模型标识。
+    pub model_id: String,
+    /// 请求超时毫秒。
+    pub timeout_ms: u64,
+    /// 该取值的来源。
+    pub source: ResolutionSource,
+}
+
+impl ModelCallSnapshot {
+    /// 运行指纹：路径 + 模型 + 地址经 SHA-256 归一，用于缓存与运行身份。
+    pub fn fingerprint_input(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.path.as_str(),
+            self.model_id,
+            self.base_url.trim_end_matches('/')
+        )
+    }
+}
+
+/// 按「构建期默认 → 本机覆盖 → 单次运行覆盖」解析出冻结快照。
+///
+/// 后者覆盖前者。生产构建 MUST NOT 接受任意 Base URL 或非白名单模型：本函数只
+/// 在构建期默认上产出地址，本机覆盖与运行覆盖只允许改变**白名单内的模型标识**，
+/// 地址始终由构建期默认决定。
+pub fn resolve_model_call(
+    settings: &LlmProviderSettings,
+    local_model_override: Option<&str>,
+    run_model_override: Option<&str>,
+) -> Result<ModelCallSnapshot, LlmError> {
+    let mut model_id = DEFAULT_MODEL_ID.to_owned();
+    let mut source = ResolutionSource::BuildDefault;
+    // 空白覆盖必须视为"未提供"，否则会跳过下层取值、静默回退到硬编码默认模型。
+    let local = local_model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let run = run_model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(value) = local {
+        model_id = value.to_owned();
+        source = ResolutionSource::LocalOverride;
+    }
+    if let Some(value) = run {
+        model_id = value.to_owned();
+        source = ResolutionSource::RunOverride;
+    }
+    // 没有更上层覆盖时，设置页中的模型标识是"本机覆盖"层的显式取值。
+    if local.is_none() && run.is_none() {
+        if settings.model_id.trim().is_empty() {
+            return Err(LlmError::InvalidConfiguration(
+                "模型标识不能为空".to_owned(),
+            ));
+        }
+        model_id = settings.model_id.trim().to_owned();
+        source = ResolutionSource::LocalOverride;
+    }
+    if model_id.chars().count() > 128 {
+        return Err(LlmError::InvalidConfiguration(
+            "模型标识不能超过 128 个字符".to_owned(),
+        ));
+    }
+    if !(1_000..=120_000).contains(&settings.timeout_ms) {
+        return Err(LlmError::InvalidConfiguration(
+            "请求超时必须在 1 秒到 120 秒之间".to_owned(),
+        ));
+    }
+    Ok(ModelCallSnapshot {
+        path: ModelCallPath::CloudDirect,
+        base_url: DASHSCOPE_COMPATIBLE_BASE_URL.to_owned(),
+        model_id,
+        timeout_ms: settings.timeout_ms,
+        source,
+    })
+}
+
+/// 运行内冻结的模型调用。
+///
+/// 一次运行只解析一次；运行期间 MUST NOT 重新解析，因此并发运行不会互相污染，
+/// 一次运行内的多个阶段也不会取到不同模型（例如候选发现与全局评分必须同模型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenModelCall {
+    snapshot: ModelCallSnapshot,
+}
+
+impl Default for FrozenModelCall {
+    /// 构建期默认快照；仅用于反序列化时跳过该字段的填充。
+    fn default() -> Self {
+        Self {
+            snapshot: ModelCallSnapshot {
+                path: ModelCallPath::CloudDirect,
+                base_url: DASHSCOPE_COMPATIBLE_BASE_URL.to_owned(),
+                model_id: DEFAULT_MODEL_ID.to_owned(),
+                timeout_ms: 30_000,
+                source: ResolutionSource::BuildDefault,
+            },
+        }
+    }
+}
+
+impl FrozenModelCall {
+    /// 在运行开始前解析并冻结。
+    pub fn resolve(settings: &LlmProviderSettings) -> Result<Self, LlmError> {
+        Ok(Self {
+            snapshot: resolve_model_call(settings, None, None)?,
+        })
+    }
+
+    /// 只读冻结快照，供调用层取地址、模型与超时。
+    pub fn snapshot_ref(&self) -> &ModelCallSnapshot {
+        &self.snapshot
+    }
+
+    /// 运行指纹输入：实际路径 + 模型 + 地址。
+    pub fn fingerprint_input(&self) -> String {
+        self.snapshot.fingerprint_input()
+    }
+
+    /// 本次运行实际使用的模型标识。
+    pub fn model_id(&self) -> &str {
+        &self.snapshot.model_id
+    }
+}
+
 #[async_trait]
 pub trait HighlightAgentProvider: Send + Sync {
     async fn diagnose(
@@ -657,7 +842,6 @@ pub trait TransitionAgentProvider: Send + Sync {
 pub trait SubtitleCorrectionProvider: Send + Sync {
     async fn correct_subtitles(
         &self,
-        settings: &LlmProviderSettings,
         api_key: &str,
         request: SubtitleCorrectionRequest,
         cancellation: CancellationToken,
@@ -810,13 +994,12 @@ impl TransitionAgentProvider for RigDeepSeekProvider {
 impl SubtitleCorrectionProvider for RigDeepSeekProvider {
     async fn correct_subtitles(
         &self,
-        settings: &LlmProviderSettings,
         api_key: &str,
         request: SubtitleCorrectionRequest,
         cancellation: CancellationToken,
     ) -> Result<SubtitleCorrectionOutput, LlmError> {
-        self.extract_with_preamble(
-            settings,
+        self.extract_with_frozen(
+            &request.frozen,
             api_key,
             &request.prompt,
             "你是受限的中文 ASR 文本纠错 Agent。只修正错别字、同音错词、明显识别错误和标点，保持原意、语气、专名、数字、数组长度与顺序；不润色、不改写、不合并或拆分条目，只输出结构化结果。",
@@ -872,13 +1055,42 @@ impl RigDeepSeekProvider {
     {
         settings.validate()?;
         validate_key(api_key).map_err(|_| LlmError::Credential)?;
+        // 模型、地址与超时一律来自统一调用点的解析结果；本函数 MUST NOT 自行决定
+        // 地址或模型，否则切换会退化成"改多处"。
+        let frozen = FrozenModelCall::resolve(settings)?;
+        self.extract_with_frozen(&frozen, api_key, prompt, preamble, cancellation)
+            .await
+    }
+
+    /// 按调用方冻结的快照执行抽取。
+    ///
+    /// 一次运行内的所有阶段 MUST 复用同一冻结值，使运行期间设置变化不影响本次运行。
+    async fn extract_with_frozen<T>(
+        &self,
+        frozen: &FrozenModelCall,
+        api_key: &str,
+        prompt: &str,
+        preamble: &str,
+        cancellation: CancellationToken,
+    ) -> Result<T, LlmError>
+    where
+        T: JsonSchema
+            + for<'de> Deserialize<'de>
+            + Serialize
+            + ProviderStructuredOutput
+            + Send
+            + Sync
+            + 'static,
+    {
+        let snapshot = frozen.snapshot_ref();
+        validate_key(api_key).map_err(|_| LlmError::Credential)?;
         let client = deepseek::Client::builder()
             .api_key(api_key)
-            .base_url(DEEPSEEK_BASE_URL)
+            .base_url(&snapshot.base_url)
             .build()
             .map_err(|_| LlmError::Provider)?;
         let extractor = client
-            .extractor::<T>(settings.model_id.clone())
+            .extractor::<T>(snapshot.model_id.clone())
             .preamble(preamble)
             .additional_params(serde_json::json!({
                 "thinking": { "type": "disabled" },
@@ -889,7 +1101,7 @@ impl RigDeepSeekProvider {
             .build();
         tokio::select! {
             _ = cancellation.cancelled() => Err(LlmError::Cancelled),
-            result = tokio::time::timeout(Duration::from_millis(settings.timeout_ms), extractor.extract_with_usage(prompt)) => {
+            result = tokio::time::timeout(Duration::from_millis(snapshot.timeout_ms), extractor.extract_with_usage(prompt)) => {
                 let mut response = result
                     .map_err(|_| LlmError::Temporary)?
                     .map_err(map_extraction_error)?;
@@ -976,4 +1188,105 @@ pub(crate) fn settings_from_row(
     };
     settings.validate()?;
     Ok(settings)
+}
+
+#[cfg(test)]
+mod model_call_snapshot_tests {
+    use super::*;
+
+    fn settings(model: &str) -> LlmProviderSettings {
+        LlmProviderSettings {
+            model_id: model.to_owned(),
+            ..LlmProviderSettings::default()
+        }
+    }
+
+    /// 解析优先级：本机覆盖覆盖构建期默认，单次运行覆盖覆盖前两者。
+    #[test]
+    fn resolution_precedence_is_build_then_local_then_run() {
+        let base = resolve_model_call(&settings("qwen-plus"), None, None).expect("resolve");
+        assert_eq!(base.model_id, "qwen-plus");
+        assert_eq!(base.source, ResolutionSource::LocalOverride);
+
+        let local = resolve_model_call(&settings("qwen-plus"), Some("qwen-max"), None)
+            .expect("local override");
+        assert_eq!(local.model_id, "qwen-max");
+        assert_eq!(local.source, ResolutionSource::LocalOverride);
+
+        let run = resolve_model_call(&settings("qwen-plus"), Some("qwen-max"), Some("qwen-turbo"))
+            .expect("run override");
+        assert_eq!(run.model_id, "qwen-turbo");
+        assert_eq!(run.source, ResolutionSource::RunOverride);
+
+        // 空覆盖视为未提供，不得覆盖上一层。
+        let blank = resolve_model_call(&settings("qwen-plus"), Some("  "), None).expect("blank");
+        assert_eq!(blank.model_id, "qwen-plus");
+    }
+
+    /// 地址只由构建期默认决定：任何覆盖都不得改变 Base URL。
+    #[test]
+    fn base_url_is_never_overridable() {
+        for (local, run) in [
+            (None, None),
+            (Some("qwen-max"), None),
+            (Some("qwen-max"), Some("qwen-turbo")),
+        ] {
+            let snapshot = resolve_model_call(&settings("qwen-plus"), local, run).expect("resolve");
+            assert_eq!(
+                snapshot.base_url, DASHSCOPE_COMPATIBLE_BASE_URL,
+                "Base URL 必须固定为构建期默认，不接受覆盖"
+            );
+            assert_eq!(snapshot.path, ModelCallPath::CloudDirect);
+        }
+    }
+
+    /// 快照在运行内冻结：解析一次后，设置变化不得影响已取快照。
+    #[test]
+    fn snapshot_is_frozen_and_fingerprints_identity() {
+        let first = resolve_model_call(&settings("qwen-plus"), None, None).expect("first");
+        // 模拟"运行期间用户改了设置"：再次解析得到新值，但 first 不变。
+        let second = resolve_model_call(&settings("qwen-turbo"), None, None).expect("second");
+        assert_eq!(first.model_id, "qwen-plus", "已冻结的快照不得被后续设置改变");
+        assert_ne!(first.model_id, second.model_id);
+        // 运行指纹必须反映实际路径与模型，切换后不得复用。
+        assert_ne!(first.fingerprint_input(), second.fingerprint_input());
+        assert!(first.fingerprint_input().contains("cloud_direct"));
+        assert!(first.fingerprint_input().contains("qwen-plus"));
+        // 同一输入必须得到同一指纹。
+        let again = resolve_model_call(&settings("qwen-plus"), None, None).expect("again");
+        assert_eq!(first.fingerprint_input(), again.fingerprint_input());
+    }
+
+    /// 非法取值必须被拒绝，而不是静默回退到默认模型。
+    #[test]
+    fn invalid_inputs_are_rejected() {
+        assert!(resolve_model_call(&settings("   "), None, None).is_err());
+        assert!(resolve_model_call(&settings(&"x".repeat(129)), None, None).is_err());
+        let mut broken = settings("qwen-plus");
+        broken.timeout_ms = 0;
+        assert!(resolve_model_call(&broken, None, None).is_err());
+        // 路径白名单：未知路径不解析。
+        assert!(ModelCallPath::parse("gateway").is_none());
+        assert_eq!(
+            ModelCallPath::parse("cloud_direct"),
+            Some(ModelCallPath::CloudDirect)
+        );
+    }
+
+    /// 冻结调用一旦解析，后续设置变化不得影响它——保证一次运行内模型不漂移。
+    #[test]
+    fn frozen_call_does_not_follow_later_settings_changes() {
+        let frozen = FrozenModelCall::resolve(&settings("qwen-plus")).expect("frozen");
+        assert_eq!(frozen.model_id(), "qwen-plus");
+        // 运行期间用户改了设置：已冻结的调用必须保持原值。
+        let changed = FrozenModelCall::resolve(&settings("qwen-turbo")).expect("changed");
+        assert_eq!(frozen.model_id(), "qwen-plus", "冻结后不得重新解析");
+        assert_ne!(frozen.fingerprint_input(), changed.fingerprint_input());
+        // 同一运行内的多个阶段复用同一冻结值（候选发现与全局评分必须同模型）。
+        let same_stage = frozen.clone();
+        assert_eq!(frozen.model_id(), same_stage.model_id());
+        assert_eq!(frozen.fingerprint_input(), same_stage.fingerprint_input());
+        // 指纹必须携带路径标识，使切换路径后不复用旧结果。
+        assert!(frozen.fingerprint_input().starts_with("cloud_direct|"));
+    }
 }

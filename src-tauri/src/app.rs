@@ -2054,7 +2054,10 @@ pub fn run() {
                 Arc::new(RigDeepSeekProvider),
                 credential_store.clone(),
             )
-            .with_publisher(clip_workflow_publisher);
+            .with_publisher(clip_workflow_publisher)
+            .with_gate(Arc::new(crate::ai::ActivationCorrectionGate::new(
+                activation.clone(),
+            )));
             let smart_clipping = SmartClippingWorkflow::new(
                 database.clone(),
                 ai_project_service,

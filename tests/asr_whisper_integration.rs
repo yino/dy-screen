@@ -123,6 +123,7 @@ async fn real_whisper_engine_transcribes_fixture_and_exits_cleanly() {
                 speech_regions: regions,
                 timestamp_policy: TimestampPolicy::Segment,
                 max_threads: 4,
+                engine_id: None,
             },
             progress.clone(),
             CancellationToken::new(),
@@ -206,6 +207,7 @@ async fn real_whisper_running_process_is_cancelled_and_leaves_no_json() {
                 }],
                 timestamp_policy: TimestampPolicy::Segment,
                 max_threads: 4,
+                engine_id: None,
             },
             Arc::new(TranscribingSignal(transcribing)),
             cancellation,
@@ -252,6 +254,7 @@ async fn engine_rejects_cancelled_and_no_speech_requests_before_launching_sideca
         speech_regions: Vec::new(),
         timestamp_policy: TimestampPolicy::Segment,
         max_threads: 1,
+        engine_id: None,
     };
     let progress = Arc::new(ProgressCollector::default());
     let error = engine

@@ -980,7 +980,9 @@ fn business_error_category(code: i32) -> &'static str {
         1001 | 2001 => "header_contract",
         1002..=1006 | 2002..=2004 => "authorization_invalid",
         1007 | 9000 => "retryable_service",
-        3001 | 3003 | 3004 => "ai_quota",
+        // 未开通与额度耗尽必须可区分：前者需要开通，后者需要等待额度恢复。
+        3001 => "ai_not_activated",
+        3003 | 3004 => "ai_quota_exhausted",
         3002 => "ai_token_service",
         9101..=9105 => "protocol_recoverable",
         _ => "business",
@@ -1001,10 +1003,10 @@ fn business_safe_message(code: i32) -> String {
         2003 => "设备尚未绑定，请重新激活".to_owned(),
         2004 => "设备与激活码绑定不匹配，请重新激活".to_owned(),
         9000 => "授权服务暂时异常，请稍后重试".to_owned(),
-        3001 => "当前账号未开通 AI 服务，已切换到本地转写".to_owned(),
-        3002 => "AI 临时密钥获取失败，已切换到本地转写".to_owned(),
-        3003 => "AI 转写次数已用完，已切换到本地转写".to_owned(),
-        3004 => "AI 转写时长额度已用完，已切换到本地转写".to_owned(),
+        3001 => "当前账号未开通 AI 服务，请在应用中开通后重试".to_owned(),
+        3002 => "AI 临时密钥获取失败，请稍后重试".to_owned(),
+        3003 => "AI 转写次数已用完，请等待额度恢复".to_owned(),
+        3004 => "AI 转写时长额度已用完，请等待额度恢复".to_owned(),
         9101 => "授权协议正文无效，请稍后重试".to_owned(),
         9102 => "授权协议签名校验失败，请重新激活".to_owned(),
         9103 => "授权请求被判定为重复请求，请稍后重试".to_owned(),
@@ -1198,11 +1200,21 @@ mod tests {
 
     #[test]
     fn classifies_ai_quota_errors_without_leaking_upstream_details() {
-        assert_eq!(business_error_category(3001), "ai_quota");
-        assert_eq!(business_error_category(3003), "ai_quota");
-        assert_eq!(business_error_category(3004), "ai_quota");
+        // 任务 8.2：未开通与额度耗尽必须是可区分的原因。
+        assert_eq!(business_error_category(3001), "ai_not_activated");
+        assert_eq!(business_error_category(3003), "ai_quota_exhausted");
+        assert_eq!(business_error_category(3004), "ai_quota_exhausted");
         assert_eq!(business_error_category(3002), "ai_token_service");
+        assert_ne!(
+            business_error_category(3001),
+            business_error_category(3003),
+            "未开通与额度耗尽不得归为同一分类"
+        );
         assert!(!business_safe_message(3003).contains("st-"));
+        // 不再声称切换到本地转写：本轮不做隐式回退。
+        for code in [3001, 3002, 3003, 3004] {
+            assert!(!business_safe_message(code).contains("切换到本地"));
+        }
     }
 
     #[test]

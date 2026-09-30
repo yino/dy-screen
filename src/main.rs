@@ -795,6 +795,7 @@ async fn transcribe_video(args: AsrArgs) -> CliResult<bool> {
                 speech_regions: regions,
                 timestamp_policy: TimestampPolicy::Segment,
                 max_threads: resources.maximum_threads,
+                engine_id: None,
             },
             Arc::new(CliAsrProgress { quiet: json }),
             cancellation,
