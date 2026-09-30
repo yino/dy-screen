@@ -814,6 +814,7 @@ pub struct DashScopeSegment {
 pub struct DashScopeAsrClient {
     client: reqwest::Client,
     config: DashScopeAsrConfig,
+    diagnostics: SharedCloudCallDiagnosticSink,
 }
 
 impl DashScopeAsrClient {
@@ -844,7 +845,17 @@ impl DashScopeAsrClient {
                     true,
                 )
             })?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            diagnostics: Arc::new(StderrCloudCallDiagnosticSink),
+        })
+    }
+
+    /// 注入调用诊断接收端。
+    pub fn with_diagnostics(mut self, diagnostics: SharedCloudCallDiagnosticSink) -> Self {
+        self.diagnostics = diagnostics;
+        self
     }
 
     /// 请求上游取消异步任务。
@@ -865,7 +876,8 @@ impl DashScopeAsrClient {
         }
         let token = bearer_value(token)?;
         let url = self.endpoint(&format!("tasks/{}/cancel", urlencoding(task_id)))?;
-        let response = self
+        let started = std::time::Instant::now();
+        let response = match self
             .client
             .post(url)
             .header(AUTHORIZATION, token)
@@ -873,7 +885,32 @@ impl DashScopeAsrClient {
             .body(b"{}".to_vec())
             .send()
             .await
-            .map_err(|error| map_transport_error(error, "dashscope_cancel_failed"))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = map_transport_error(error, "dashscope_cancel_failed");
+                self.diagnostics.emit(diagnostic(
+                    "cancel", "tasks/{task_id}/cancel", None, started, 1, Some(&mapped),
+                    false, false, true, None,
+                ));
+                return Err(mapped);
+            }
+        };
+        let status = response.status().as_u16();
+        let accepted = response.status().is_success();
+        let mapped = if accepted { None } else { Some(dashscope_http_error(status)) };
+        self.diagnostics.emit(diagnostic(
+            "cancel",
+            "tasks/{task_id}/cancel",
+            Some(status),
+            started,
+            1,
+            mapped.as_ref(),
+            false,
+            false,
+            true,
+            None,
+        ));
         // 请求被上游接受即视为已请求取消；是否真正停止由后续终态判定。
         Ok(cancel_outcome(response.status().is_success()))
     }
@@ -914,10 +951,27 @@ impl DashScopeAsrClient {
                 })?,
             )
             .send()
-            .await
-            .map_err(|error| map_transport_error(error, "dashscope_submit_failed"))?;
+            .await;
+        let started = std::time::Instant::now();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = map_transport_error(error, "dashscope_submit_failed");
+                self.diagnostics.emit(diagnostic(
+                    "submit", "services/audio/asr/transcription", None, started, 1,
+                    Some(&mapped), true, true, false, None,
+                ));
+                return Err(mapped);
+            }
+        };
         if !response.status().is_success() {
-            return Err(dashscope_http_error(response.status().as_u16()));
+            let status = response.status().as_u16();
+            let mapped = dashscope_http_error(status);
+            self.diagnostics.emit(diagnostic(
+                "submit", "services/audio/asr/transcription", Some(status), started, 1,
+                Some(&mapped), true, true, false, None,
+            ));
+            return Err(mapped);
         }
         let body = parse_json_response(
             response,
@@ -925,14 +979,19 @@ impl DashScopeAsrClient {
             "云端任务响应无效",
         )
         .await?;
-        body.get("output")
+        let task_id = body
+            .get("output")
             .and_then(|output| output.get("task_id"))
             .and_then(serde_json::Value::as_str)
             .filter(|task_id| !task_id.trim().is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                malformed_cloud_error("dashscope_task_id_missing", "云端任务响应缺少任务标识")
-            })
+            .map(str::to_owned);
+        self.diagnostics.emit(diagnostic(
+            "submit", "services/audio/asr/transcription", Some(200), started, 1, None,
+            true, true, task_id.is_some(), None,
+        ));
+        task_id.ok_or_else(|| {
+            malformed_cloud_error("dashscope_task_id_missing", "云端任务响应缺少任务标识")
+        })
     }
 
     /// 在最大等待时间内轮询任务，返回成功时的详细结果 JSON。
