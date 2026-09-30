@@ -2,7 +2,7 @@
 //!
 //! 本模块刻意不暴露 API Key，也不把 Rig 类型传播到 repository 或 Tauri DTO。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
@@ -623,6 +623,125 @@ pub enum LlmError {
     Repository(#[from] AiRepositoryError),
 }
 
+impl LlmError {
+    /// 稳定错误分类标识，供诊断使用。
+    ///
+    /// 只返回固定的机器可读标识，**不**返回 `Display` 文本：后者的
+    /// `InvalidConfiguration` / `Repository` 分支可能携带用户输入或数据内容。
+    pub fn category_str(&self) -> &'static str {
+        match self {
+            Self::InvalidConfiguration(_) => "invalid_configuration",
+            Self::Credential => "credential",
+            Self::Temporary => "temporary",
+            Self::InvalidResponse => "invalid_response",
+            Self::Cancelled => "cancelled",
+            Self::Provider => "provider",
+            Self::Repository(_) => "repository",
+        }
+    }
+}
+
+/// LLM 调用诊断事件（脱敏）。
+///
+/// 与云端 ASR 的 `CloudCallDiagnostic` 同构但**刻意独立**：两侧可记录的维度不同
+/// （ASR 关心 HTTP 状态与上游标识是否取到，LLM 关心模型、用量与错误分类），
+/// 合并成一个结构只会让字段语义退化成"只在某一路径下成立"。因此这里单独定义。
+///
+/// MUST NOT 记录：prompt 正文、preamble、API Key、短期 token、上游原始响应正文、
+/// Base URL 的主机名与路径细节。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmCallDiagnostic {
+    /// 调用阶段，当前恒为 `llm`。
+    pub stage: &'static str,
+    /// 静态端点后缀，不含主机、查询串与任何标识。
+    pub path: &'static str,
+    /// 本次调用使用的模型标识（公开配置值，不是凭据）。
+    pub model_id: String,
+    /// 本次调用耗时毫秒。
+    pub duration_ms: u64,
+    /// 上游返回的总 token 用量；未取得时为 None。
+    pub token_usage: Option<u64>,
+    /// 稳定错误分类；成功时为 None。
+    pub error_category: Option<String>,
+}
+
+/// LLM 调用诊断的接收端。
+pub trait LlmCallDiagnosticSink: Send + Sync {
+    /// 记录一个脱敏事件。
+    fn emit(&self, event: LlmCallDiagnostic);
+}
+
+/// 默认接收端：把事件以单行 JSON 写到 stderr；语义与云端 ASR 的默认接收端一致。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StderrLlmCallDiagnosticSink;
+
+impl LlmCallDiagnosticSink for StderrLlmCallDiagnosticSink {
+    fn emit(&self, event: LlmCallDiagnostic) {
+        if let Ok(line) = serde_json::to_string(&event) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// 共享诊断接收端。
+pub type SharedLlmCallDiagnosticSink = Arc<dyn LlmCallDiagnosticSink>;
+
+/// 进程级 LLM 调用诊断槽位。
+///
+/// `RigDeepSeekProvider` 是无状态单元结构体（调用方以 `Arc::new(RigDeepSeekProvider)`
+/// 构造），因此接收端放在进程级单例里，而不是每个 Provider 实例各持一份。
+static LLM_CALL_DIAGNOSTICS: OnceLock<RwLock<SharedLlmCallDiagnosticSink>> = OnceLock::new();
+
+fn llm_call_diagnostics_slot() -> &'static RwLock<SharedLlmCallDiagnosticSink> {
+    LLM_CALL_DIAGNOSTICS.get_or_init(|| RwLock::new(Arc::new(StderrLlmCallDiagnosticSink)))
+}
+
+/// 注入进程级 LLM 调用诊断接收端。
+///
+/// 供测试断言脱敏边界，也供后续诊断面板在启动时接管；不注入时保持 stderr 默认。
+pub fn set_llm_call_diagnostics_sink(sink: SharedLlmCallDiagnosticSink) {
+    if let Ok(mut slot) = llm_call_diagnostics_slot().write() {
+        *slot = sink;
+    }
+}
+
+/// 取当前 LLM 调用诊断接收端；锁中毒时恢复默认值，绝不因诊断失败影响调用结果。
+fn llm_call_diagnostics_sink() -> SharedLlmCallDiagnosticSink {
+    match llm_call_diagnostics_slot().read() {
+        Ok(slot) => Arc::clone(&slot),
+        Err(_) => {
+            set_llm_call_diagnostics_sink(Arc::new(StderrLlmCallDiagnosticSink));
+            Arc::new(StderrLlmCallDiagnosticSink)
+        }
+    }
+}
+
+/// 发射一个 LLM 调用诊断事件。
+fn emit_llm_call_diagnostic(event: LlmCallDiagnostic) {
+    llm_call_diagnostics_sink().emit(event);
+}
+
+/// 把一次 LLM 调用结果转成脱敏事件。
+///
+/// 参数里**没有** prompt / preamble / API Key 的位置：脱敏是结构性的，
+/// 而不是靠过滤字符串实现的。
+fn llm_call_diagnostic(
+    snapshot: &ModelCallSnapshot,
+    started: std::time::Instant,
+    token_usage: Option<u64>,
+    error: Option<&LlmError>,
+) -> LlmCallDiagnostic {
+    LlmCallDiagnostic {
+        stage: "llm",
+        path: "chat/completions",
+        model_id: snapshot.model_id.clone(),
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        token_usage,
+        error_category: error.map(LlmError::category_str).map(str::to_owned),
+    }
+}
+
 /// 模型调用的实际路径。
 ///
 /// 本轮只有"客户端直连百炼"这一条路径；枚举保留是为了让调用点成为唯一切换处，
@@ -1083,12 +1202,28 @@ impl RigDeepSeekProvider {
             + 'static,
     {
         let snapshot = frozen.snapshot_ref();
-        validate_key(api_key).map_err(|_| LlmError::Credential)?;
-        let client = deepseek::Client::builder()
+        let started = std::time::Instant::now();
+        if let Err(error) = validate_key(api_key).map_err(|_| LlmError::Credential) {
+            emit_llm_call_diagnostic(llm_call_diagnostic(snapshot, started, None, Some(&error)));
+            return Err(error);
+        }
+        let client = match deepseek::Client::builder()
             .api_key(api_key)
             .base_url(&snapshot.base_url)
             .build()
-            .map_err(|_| LlmError::Provider)?;
+        {
+            Ok(client) => client,
+            Err(_) => {
+                let error = LlmError::Provider;
+                emit_llm_call_diagnostic(llm_call_diagnostic(
+                    snapshot,
+                    started,
+                    None,
+                    Some(&error),
+                ));
+                return Err(error);
+            }
+        };
         let extractor = client
             .extractor::<T>(snapshot.model_id.clone())
             .preamble(preamble)
@@ -1100,17 +1235,52 @@ impl RigDeepSeekProvider {
             .retries(0)
             .build();
         tokio::select! {
-            _ = cancellation.cancelled() => Err(LlmError::Cancelled),
+            _ = cancellation.cancelled() => {
+                let error = LlmError::Cancelled;
+                emit_llm_call_diagnostic(llm_call_diagnostic(
+                    snapshot,
+                    started,
+                    None,
+                    Some(&error),
+                ));
+                Err(error)
+            }
             result = tokio::time::timeout(Duration::from_millis(snapshot.timeout_ms), extractor.extract_with_usage(prompt)) => {
-                let mut response = result
-                    .map_err(|_| LlmError::Temporary)?
-                    .map_err(map_extraction_error)?;
+                let mut response = match result {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
+                        let mapped = map_extraction_error(error);
+                        emit_llm_call_diagnostic(llm_call_diagnostic(
+                            snapshot,
+                            started,
+                            None,
+                            Some(&mapped),
+                        ));
+                        return Err(mapped);
+                    }
+                    Err(_) => {
+                        let error = LlmError::Temporary;
+                        emit_llm_call_diagnostic(llm_call_diagnostic(
+                            snapshot,
+                            started,
+                            None,
+                            Some(&error),
+                        ));
+                        return Err(error);
+                    }
+                };
                 let token_usage = if response.usage.total_tokens > 0 {
                     response.usage.total_tokens
                 } else {
                     response.usage.input_tokens.saturating_add(response.usage.output_tokens)
                 };
                 response.data.set_token_usage(token_usage);
+                emit_llm_call_diagnostic(llm_call_diagnostic(
+                    snapshot,
+                    started,
+                    Some(token_usage),
+                    None,
+                ));
                 Ok(response.data)
             }
         }
@@ -1288,5 +1458,183 @@ mod model_call_snapshot_tests {
         assert_eq!(frozen.fingerprint_input(), same_stage.fingerprint_input());
         // 指纹必须携带路径标识，使切换路径后不复用旧结果。
         assert!(frozen.fingerprint_input().starts_with("cloud_direct|"));
+    }
+}
+
+#[cfg(test)]
+mod llm_call_diagnostic_tests {
+    use super::*;
+
+    /// 测试用捕获接收端：只保留事件，不落到 stderr。
+    struct CapturingSink {
+        events: Mutex<Vec<LlmCallDiagnostic>>,
+    }
+
+    impl CapturingSink {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<LlmCallDiagnostic> {
+            self.events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl LlmCallDiagnosticSink for CapturingSink {
+        fn emit(&self, event: LlmCallDiagnostic) {
+            if let Ok(mut events) = self.events.lock() {
+                events.push(event);
+            }
+        }
+    }
+
+    /// 进程级接收端是全局状态，测试之间必须串行改写。
+    fn sink_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 退出时恢复 stderr 默认接收端，避免污染其他测试。
+    struct RestoreSink;
+
+    impl Drop for RestoreSink {
+        fn drop(&mut self) {
+            set_llm_call_diagnostics_sink(Arc::new(StderrLlmCallDiagnosticSink));
+        }
+    }
+
+    /// 真实调用路径的脱敏边界：prompt / preamble / API Key 都不得进入诊断事件。
+    ///
+    /// 用已取消的 token 驱动 `extract_with_frozen` 的终态分支：不需要外网即可走通
+    /// 真实发射点，而 prompt 与 API Key 确实作为参数传入了这次调用。
+    #[tokio::test]
+    async fn llm_call_diagnostics_never_carry_prompt_or_credentials() {
+        const PROMPT_MARKER: &str = "PROMPT正文标记-7c1f9a";
+        const PREAMBLE_MARKER: &str = "PREAMBLE标记-3b8e2d";
+        const KEY_MARKER: &str = "sk-secret-marker-5e4d";
+        let _guard = sink_guard();
+        let sink = Arc::new(CapturingSink::new());
+        set_llm_call_diagnostics_sink(sink.clone());
+        let _restore = RestoreSink;
+
+        let frozen = FrozenModelCall::resolve(&LlmProviderSettings::default()).expect("frozen");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let prompt = format!("{PROMPT_MARKER}：只输出 JSON");
+        let provider = RigDeepSeekProvider;
+        let result = provider
+            .extract_with_frozen::<ProviderDiagnostic>(
+                &frozen,
+                KEY_MARKER,
+                &prompt,
+                PREAMBLE_MARKER,
+                cancellation,
+            )
+            .await;
+        assert!(result.is_err(), "已取消的调用必须失败");
+        let events = sink.events();
+        assert_eq!(events.len(), 1, "一次调用只发一个终态事件");
+        let event = &events[0];
+        assert_eq!(event.stage, "llm");
+        assert_eq!(event.path, "chat/completions");
+        assert_eq!(event.model_id, frozen.model_id());
+        assert!(event.token_usage.is_none(), "失败调用没有用量");
+        assert!(
+            matches!(
+                event.error_category.as_deref(),
+                Some("cancelled" | "temporary" | "provider" | "credential")
+            ),
+            "错误分类必须是稳定标识: {:?}",
+            event.error_category
+        );
+        let json = serde_json::to_string(event).unwrap();
+        for forbidden in [
+            PROMPT_MARKER,
+            PREAMBLE_MARKER,
+            KEY_MARKER,
+            "sk-",
+            "Bearer",
+            "Authorization",
+            "http://",
+            "https://",
+            "dashscope.aliyuncs.com",
+            "api.deepseek.com",
+            "/tmp/",
+            "/Users/",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "LLM 诊断事件不得包含 {forbidden}: {json}"
+            );
+        }
+    }
+
+    /// 纯构造路径：错误分类稳定、字段集合固定、事件不携带上游地址或配置正文。
+    #[test]
+    fn llm_call_diagnostic_is_redacted_and_has_fixed_fields() {
+        const CONFIG_MARKER: &str = "配置正文标记-4a2b";
+        let frozen = FrozenModelCall::resolve(&LlmProviderSettings::default()).expect("frozen");
+        let snapshot = frozen.snapshot_ref();
+        let started = std::time::Instant::now();
+        let cases = [
+            (
+                LlmError::InvalidConfiguration(CONFIG_MARKER.to_owned()),
+                "invalid_configuration",
+            ),
+            (LlmError::Credential, "credential"),
+            (LlmError::Temporary, "temporary"),
+            (LlmError::InvalidResponse, "invalid_response"),
+            (LlmError::Cancelled, "cancelled"),
+            (LlmError::Provider, "provider"),
+        ];
+        for (error, expected) in cases {
+            let event = llm_call_diagnostic(snapshot, started, None, Some(&error));
+            assert_eq!(event.error_category.as_deref(), Some(expected));
+            assert!(event.token_usage.is_none());
+            // 错误文本可能携带用户输入，诊断只允许记录稳定分类。
+            let json = serde_json::to_string(&event).unwrap();
+            for forbidden in [
+                CONFIG_MARKER,
+                "http://",
+                "https://",
+                "dashscope.aliyuncs.com",
+                "api.deepseek.com",
+            ] {
+                assert!(
+                    !json.contains(forbidden),
+                    "诊断事件不得包含 {forbidden}: {json}"
+                );
+            }
+        }
+        let success = llm_call_diagnostic(snapshot, started, Some(321), None);
+        assert_eq!(success.token_usage, Some(321));
+        assert!(success.error_category.is_none());
+        assert_eq!(success.model_id, snapshot.model_id);
+        assert_eq!(success.stage, "llm");
+        // 字段集合必须固定：任何新增字段都要重新过一遍脱敏评审。
+        let value = serde_json::to_value(&success).unwrap();
+        let mut keys = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "durationMs",
+                "errorCategory",
+                "modelId",
+                "path",
+                "stage",
+                "tokenUsage",
+            ]
+        );
     }
 }

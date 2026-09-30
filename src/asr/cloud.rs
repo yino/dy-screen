@@ -1009,63 +1009,172 @@ impl DashScopeAsrClient {
             ));
         }
         let deadline = Duration::from_secs(self.config.max_wait_seconds.max(1));
+        let started = std::time::Instant::now();
+        // 轮询序号只在终态随诊断发射一次，避免每轮都刷环形缓冲。
+        let mut attempt: u32 = 0;
         let operation = async {
             loop {
                 if cancellation.is_cancelled() {
-                    return Err(AsrError::cancelled());
+                    let cancelled = AsrError::cancelled();
+                    self.diagnostics.emit(diagnostic(
+                        "poll", "tasks/{task_id}", None, started, attempt, Some(&cancelled), false,
+                        false, true, None,
+                    ));
+                    return Err(cancelled);
                 }
-                let url = self.endpoint(&format!("tasks/{}", urlencoding(task_id)))?;
-                let response = self
+                attempt = attempt.saturating_add(1);
+                let url = match self.endpoint(&format!("tasks/{}", urlencoding(task_id))) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        self.diagnostics.emit(diagnostic(
+                            "poll", "tasks/{task_id}", None, started, attempt, Some(&error), false,
+                            false, true, None,
+                        ));
+                        return Err(error);
+                    }
+                };
+                let response = match self
                     .client
                     .get(url)
                     .header(AUTHORIZATION, token.clone())
                     .send()
                     .await
-                    .map_err(|error| map_transport_error(error, "dashscope_poll_failed"))?;
-                if !response.status().is_success() {
-                    return Err(dashscope_http_error(response.status().as_u16()));
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let mapped = map_transport_error(error, "dashscope_poll_failed");
+                        self.diagnostics.emit(diagnostic(
+                            "poll", "tasks/{task_id}", None, started, attempt, Some(&mapped), false,
+                            false, true, None,
+                        ));
+                        return Err(mapped);
+                    }
+                };
+                let status_code = response.status();
+                if !status_code.is_success() {
+                    let mapped = dashscope_http_error(status_code.as_u16());
+                    self.diagnostics.emit(diagnostic(
+                        "poll",
+                        "tasks/{task_id}",
+                        Some(status_code.as_u16()),
+                        started,
+                        attempt,
+                        Some(&mapped),
+                        false,
+                        false,
+                        true,
+                        None,
+                    ));
+                    return Err(mapped);
                 }
-                let body = parse_json_response(
+                let body = match parse_json_response(
                     response,
                     "dashscope_poll_response_invalid",
                     "云端任务状态响应无效",
                 )
-                .await?;
+                .await
+                {
+                    Ok(body) => body,
+                    Err(mapped) => {
+                        self.diagnostics.emit(diagnostic(
+                            "poll",
+                            "tasks/{task_id}",
+                            Some(status_code.as_u16()),
+                            started,
+                            attempt,
+                            Some(&mapped),
+                            false,
+                            false,
+                            true,
+                            None,
+                        ));
+                        return Err(mapped);
+                    }
+                };
                 let status = body
                     .get("output")
                     .and_then(|output| output.get("task_status"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
                 match status {
-                    "SUCCEEDED" => return Ok(body),
+                    "SUCCEEDED" => {
+                        self.diagnostics.emit(diagnostic(
+                            "poll",
+                            "tasks/{task_id}",
+                            Some(status_code.as_u16()),
+                            started,
+                            attempt,
+                            None,
+                            false,
+                            false,
+                            true,
+                            None,
+                        ));
+                        return Ok(body);
+                    }
                     "FAILED" | "CANCELED" | "CANCELLED" => {
-                        return Err(AsrError::new(
+                        let failed = AsrError::new(
                             AsrErrorKind::ProcessFailed,
                             "dashscope_task_failed",
                             "云端转写任务失败，请稍后重试",
                             false,
+                        );
+                        self.diagnostics.emit(diagnostic(
+                            "poll",
+                            "tasks/{task_id}",
+                            Some(status_code.as_u16()),
+                            started,
+                            attempt,
+                            Some(&failed),
+                            false,
+                            false,
+                            true,
+                            None,
                         ));
+                        return Err(failed);
                     }
                     "PENDING" | "RUNNING" => {
                         sleep(Duration::from_millis(self.config.poll_interval_ms.max(100))).await;
                     }
                     _ => {
-                        return Err(malformed_cloud_error(
+                        let mapped = malformed_cloud_error(
                             "dashscope_task_status_invalid",
                             "云端任务状态无效，请稍后重试",
+                        );
+                        self.diagnostics.emit(diagnostic(
+                            "poll",
+                            "tasks/{task_id}",
+                            Some(status_code.as_u16()),
+                            started,
+                            attempt,
+                            Some(&mapped),
+                            false,
+                            false,
+                            true,
+                            None,
                         ));
+                        return Err(mapped);
                     }
                 }
             }
         };
-        timeout(deadline, operation).await.map_err(|_| {
-            AsrError::new(
-                AsrErrorKind::ProcessFailed,
-                "dashscope_poll_timeout",
-                "云端转写等待超时，请稍后重试",
-                true,
-            )
-        })?
+        let outcome = timeout(deadline, operation).await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => {
+                let timed_out = AsrError::new(
+                    AsrErrorKind::ProcessFailed,
+                    "dashscope_poll_timeout",
+                    "云端转写等待超时，请稍后重试",
+                    true,
+                );
+                self.diagnostics.emit(diagnostic(
+                    "poll", "tasks/{task_id}", None, started, attempt, Some(&timed_out), false,
+                    false, true, None,
+                ));
+                Err(timed_out)
+            }
+        }
     }
 
     /// 提交并轮询一次云端转写，转换为统一 ASR 结果。
@@ -1108,27 +1217,122 @@ impl DashScopeAsrClient {
                 None
             };
         let result_body = if let Some(url) = detailed {
-            let parsed_url = reqwest::Url::parse(&url).map_err(|_| {
-                malformed_cloud_error("dashscope_result_url_invalid", "云端详细转写地址无效")
-            })?;
+            let started = std::time::Instant::now();
+            let parsed_url = match reqwest::Url::parse(&url) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    let mapped = malformed_cloud_error(
+                        "dashscope_result_url_invalid",
+                        "云端详细转写地址无效",
+                    );
+                    self.diagnostics.emit(diagnostic(
+                        "result",
+                        "result/{signed}",
+                        None,
+                        started,
+                        1,
+                        Some(&mapped),
+                        false,
+                        true,
+                        true,
+                        None,
+                    ));
+                    return Err(mapped);
+                }
+            };
             // 上游结果地址实测为 http 且带签名与有效期；只接受上游签发的
             // 签名地址，任何其他方案或不带签名有效期的地址一律拒绝。
             let signed = is_upstream_signed_url(&parsed_url);
             if !(parsed_url.scheme() == "https" || (parsed_url.scheme() == "http" && signed)) {
-                return Err(malformed_cloud_error(
-                    "dashscope_result_url_unsafe",
-                    "云端详细转写地址不安全",
+                let mapped =
+                    malformed_cloud_error("dashscope_result_url_unsafe", "云端详细转写地址不安全");
+                self.diagnostics.emit(diagnostic(
+                    "result",
+                    "result/{signed}",
+                    None,
+                    started,
+                    1,
+                    Some(&mapped),
+                    false,
+                    true,
+                    true,
+                    None,
                 ));
+                return Err(mapped);
             }
-            let response =
-                self.client.get(parsed_url).send().await.map_err(|error| {
-                    map_transport_error(error, "dashscope_result_download_failed")
-                })?;
+            let response = match self.client.get(parsed_url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    let mapped = map_transport_error(error, "dashscope_result_download_failed");
+                    self.diagnostics.emit(diagnostic(
+                        "result",
+                        "result/{signed}",
+                        None,
+                        started,
+                        1,
+                        Some(&mapped),
+                        false,
+                        true,
+                        true,
+                        None,
+                    ));
+                    return Err(mapped);
+                }
+            };
             if !response.status().is_success() {
-                return Err(dashscope_http_error(response.status().as_u16()));
+                let status = response.status().as_u16();
+                let mapped = dashscope_http_error(status);
+                self.diagnostics.emit(diagnostic(
+                    "result",
+                    "result/{signed}",
+                    Some(status),
+                    started,
+                    1,
+                    Some(&mapped),
+                    false,
+                    true,
+                    true,
+                    None,
+                ));
+                return Err(mapped);
             }
-            parse_json_response(response, "dashscope_result_invalid", "云端详细转写结果无效")
-                .await?
+            let body = match parse_json_response(
+                response,
+                "dashscope_result_invalid",
+                "云端详细转写结果无效",
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(mapped) => {
+                    self.diagnostics.emit(diagnostic(
+                        "result",
+                        "result/{signed}",
+                        Some(200),
+                        started,
+                        1,
+                        Some(&mapped),
+                        false,
+                        true,
+                        true,
+                        None,
+                    ));
+                    return Err(mapped);
+                }
+            };
+            self.diagnostics.emit(diagnostic(
+                "result",
+                "result/{signed}",
+                Some(200),
+                started,
+                1,
+                None,
+                false,
+                true,
+                true,
+                None,
+            ));
+            body
         } else {
             output.clone()
         };
@@ -2477,6 +2681,196 @@ mod tests {
                     || event.path.starts_with("tasks")
                     || event.path.starts_with("services")
                     || event.path.starts_with("result"),
+                "路径必须是静态模板: {}",
+                event.path
+            );
+        }
+    }
+
+    /// 轮询只在**终态**发射一次诊断，且发射点确实接在真实请求路径上。
+    ///
+    /// 用一个"接受连接后立刻关闭"的本地 TCP 端口冒充 HTTPS 端点：TLS 握手必然
+    /// 失败，于是不需要外网即可走通 `poll` 的传输层失败终态。
+    #[tokio::test]
+    async fn poll_diagnostic_emits_once_on_terminal_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            // 保持端口可连接但立刻断开，使 reqwest 的 TLS 握手立即失败。
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let sink = Arc::new(MemoryCloudCallDiagnosticSink::new(16));
+        sink.set_enabled(true);
+        let client = DashScopeAsrClient::new(DashScopeAsrConfig {
+            base_url: format!("https://127.0.0.1:{port}"),
+            poll_interval_ms: 100,
+            max_wait_seconds: 5,
+            ..DashScopeAsrConfig::default()
+        })
+        .expect("client")
+        .with_diagnostics(sink.clone());
+
+        let error = client
+            .poll("token", "task-1", CancellationToken::new())
+            .await
+            .expect_err("传输层失败必须返回错误");
+        assert_eq!(error.code, "dashscope_poll_failed");
+        let events = sink.events();
+        assert_eq!(events.len(), 1, "终态只发一次，不得每轮都发");
+        let event = &events[0];
+        assert_eq!(event.stage, "poll");
+        assert_eq!(event.path, "tasks/{task_id}");
+        assert_eq!(event.attempt, 1, "首次轮询的序号是 1");
+        assert_eq!(event.http_status, None);
+        assert!(event.has_task_id);
+        assert_eq!(event.error_code.as_deref(), Some("dashscope_poll_failed"));
+        assert_eq!(event.failure_branch.as_deref(), Some("transient"));
+        // 结构性脱敏：序列化结果不得出现任何秘密形态。
+        let json = serde_json::to_string(event).unwrap();
+        for forbidden in [
+            "st-lt-v1",
+            "Bearer",
+            "Authorization",
+            "Signature=",
+            "OSSAccessKeyId",
+            "security-token",
+            "http://",
+            "https://",
+            "/tmp/",
+            "/Users/",
+            "oss://",
+            "127.0.0.1",
+        ] {
+            assert!(!json.contains(forbidden), "诊断事件不得包含 {forbidden}: {json}");
+        }
+    }
+
+    /// 新增阶段（`poll` / `result`）各终态的语义与脱敏边界。
+    ///
+    /// 与 `call_diagnostics_are_redacted_by_construction` 同构：事件结构里没有能
+    /// 承载秘密的字段，因此轮询与结果下载的终态序列化后同样不含任何秘密形态。
+    #[test]
+    fn poll_and_result_diagnostics_are_redacted_and_terminal() {
+        let sink = MemoryCloudCallDiagnosticSink::new(16);
+        sink.set_enabled(true);
+        let now = std::time::Instant::now;
+        let task_failed = AsrError::new(
+            AsrErrorKind::ProcessFailed,
+            "dashscope_task_failed",
+            "云端转写任务失败，请稍后重试",
+            false,
+        );
+        let timed_out = AsrError::new(
+            AsrErrorKind::ProcessFailed,
+            "dashscope_poll_timeout",
+            "云端转写等待超时，请稍后重试",
+            true,
+        );
+        let download_failed = AsrError::new(
+            AsrErrorKind::ProcessFailed,
+            "dashscope_result_download_failed",
+            "云端转写网络不可用",
+            true,
+        );
+        // 轮询四个终态：成功 / 任务失败 / 超时 / 取消。
+        let poll_events = [
+            diagnostic("poll", "tasks/{task_id}", Some(200), now(), 3, None, false, false, true, None),
+            diagnostic(
+                "poll",
+                "tasks/{task_id}",
+                Some(200),
+                now(),
+                2,
+                Some(&task_failed),
+                false,
+                false,
+                true,
+                None,
+            ),
+            diagnostic(
+                "poll",
+                "tasks/{task_id}",
+                None,
+                now(),
+                200,
+                Some(&timed_out),
+                false,
+                false,
+                true,
+                None,
+            ),
+            diagnostic(
+                "poll",
+                "tasks/{task_id}",
+                None,
+                now(),
+                1,
+                Some(&AsrError::cancelled()),
+                false,
+                false,
+                true,
+                None,
+            ),
+        ];
+        // 结果下载四个终态：HTTP 失败 / 成功。
+        let result_events = [
+            diagnostic(
+                "result",
+                "result/{signed}",
+                Some(403),
+                now(),
+                1,
+                Some(&download_failed),
+                false,
+                true,
+                true,
+                None,
+            ),
+            diagnostic(
+                "result", "result/{signed}", Some(200), now(), 1, None, false, true, true, None,
+            ),
+        ];
+        for event in poll_events.iter().chain(result_events.iter()) {
+            sink.emit(event.clone());
+        }
+        let events = sink.events();
+        assert_eq!(events.len(), 6);
+        assert_eq!(events[0].attempt, 3);
+        assert_eq!(events[0].http_status, Some(200));
+        assert!(events[0].error_code.is_none());
+        assert!(events[0].has_task_id);
+        assert_eq!(events[1].error_code.as_deref(), Some("dashscope_task_failed"));
+        assert_eq!(events[2].error_code.as_deref(), Some("dashscope_poll_timeout"));
+        assert_eq!(events[3].error_code.as_deref(), Some("asr_cancelled"));
+        assert_eq!(events[3].failure_branch.as_deref(), Some("cancelled"));
+        assert_eq!(events[4].stage, "result");
+        assert_eq!(events[4].http_status, Some(403));
+        assert_eq!(events[4].failure_branch.as_deref(), Some("transient"));
+        assert!(events[5].error_code.is_none());
+        assert!(events[5].has_signed_url);
+        // 结构性脱敏：序列化结果不得出现任何秘密形态。
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            for forbidden in [
+                "st-lt-v1",
+                "Bearer",
+                "Authorization",
+                "Signature=",
+                "OSSAccessKeyId",
+                "security-token",
+                "http://",
+                "https://",
+                "/tmp/",
+                "/Users/",
+                "oss://",
+            ] {
+                assert!(!json.contains(forbidden), "诊断事件不得包含 {forbidden}: {json}");
+            }
+            // 路径必须是静态模板，不能被填成具体对象。
+            assert!(
+                event.path == "tasks/{task_id}" || event.path == "result/{signed}",
                 "路径必须是静态模板: {}",
                 event.path
             );
