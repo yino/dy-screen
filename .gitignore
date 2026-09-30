@@ -22,3 +22,10 @@
 *.sqlite
 *.sqlite3
 .env
+
+# 探针/实测产出的媒体素材：仅作为本地证据，不入库
+# （文本报告保留在 docs/review/ 下，媒体文件按需本地重新生成）
+docs/review/*.mp4
+docs/review/*.png
+docs/review/*.jpg
+docs/review/*.webm

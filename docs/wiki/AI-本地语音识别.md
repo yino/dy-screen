@@ -2,8 +2,9 @@
 
 ## 功能边界
 
-本页聚焦本地 ASR 子系统：它只把一批视频转换为可定位、可复用、只读的文本结果，不会把字幕
-写进视频，也不会在识别过程中调用 LLM、自动裁剪或渲染成品。
+本页覆盖语音识别（ASR）子系统：默认识别路径是客户端直连百炼的云端转写，本地 `whisper.cpp`
+只在工程识别配置显式选择时使用，两条路径共用同一 `AsrEngine` 契约。识别只把一批视频转换为可定位、
+可复用、只读的文本结果，不会把字幕写进视频，也不会在识别过程中调用 LLM、自动裁剪或渲染成品。
 
 当前 AI 工作区已经提供独立的 DeepSeek 精彩分析。该步骤只在 ASR 完成且用户再次明确授权后
 运行，使用规范化文本和稳定句段 ID，不属于本地 ASR 引擎，也不会作为识别失败的自动回退。
@@ -71,7 +72,7 @@ pub trait AsrEngine: Send + Sync {
 
 `AsrRequest` 只表达音频资产、语言提示、热词、人声范围、时间戳策略和线程上限；`AsrResult` 只表达引擎/模型身份、语言、音频时长、句段、可选置信信息和警告。类型中不存在命令行参数、sidecar 路径或云平台字段。
 
-`WhisperCppEngine` 是本地 Rust Adapter，直接管理受控 `whisper-cli` 子进程。当前另有百炼文件转写适配和云端优先、本地回退路由；但桌面运行时使用不可用的临时音频发布器，不上传本地音频，实际继续走本地识别。未来接入受控的短期 HTTPS 音频发布器后才能使用云端识别；项目、缓存、时间轴和 UI 继续使用统一契约。部署边界见 [`docs/cloud-asr-provider.md`](../cloud-asr-provider.md)。
+`WhisperCppEngine` 是本地 Rust Adapter，直接管理受控 `whisper-cli` 子进程。桌面运行时的默认识别路径是客户端直连百炼：在取得授权临时 token 时装配三步直传发布器（`POST /api/v1/files` 直传 → `GET /api/v1/files/{file_id}` 取上游签发的签名临时 URL），再由 `CloudFirstAsrEngine` 提交异步文件转写并轮询；云端失败即明确失败，不自动回退本地。本地 `WhisperCppEngine` 只在工程识别配置显式选择本地引擎时由 `ProjectSelectableAsrEngine` 选用；项目、缓存、时间轴和 UI 继续使用统一契约。部署边界见 [`docs/cloud-asr-provider.md`](../cloud-asr-provider.md)。
 
 ## 识别阶段
 
@@ -95,7 +96,7 @@ Silero VAD 只判断人声范围。默认阈值为 `0.5`，最短人声 `250 ms`
 
 ### 5. WhisperCppEngine
 
-macOS arm64 资源声明为 Metal，Windows x64 声明为 CPU 并强制 `--no-gpu`。Adapter 使用参数数组处理 Unicode 和空格路径，解析完整 JSON，响应取消，删除结构化临时输出，并把进程错误转换为稳定中文错误。
+macOS arm64 资源声明为 Metal，macOS Intel x86_64 与 Windows x64 资源声明为 CPU 并强制 `--no-gpu`。Adapter 使用参数数组处理 Unicode 和空格路径，解析完整 JSON，响应取消，删除结构化临时输出，并把进程错误转换为稳定中文错误。
 
 Windows loader 的缺失 DLL 状态映射为 `whisper_runtime_missing`，架构或映像不兼容映射为 `whisper_binary_incompatible`；普通异常退出映射为 `whisper_failed`。错误不会包含源路径、命令行或 stderr。
 

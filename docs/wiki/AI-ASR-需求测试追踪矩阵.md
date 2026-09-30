@@ -47,7 +47,7 @@
 | `使用 VAD 筛选有效人声` | `音频包含人声和长静音`<br>`没有检测到有效人声` | `real_silero_vad_detects_speech_and_rejects_silence_and_music`；CLI vad 阶段的人声/无人声输出 | 真实开发机通过 |
 | `通过中立本地 AsrEngine 执行 ASR` | `业务层提交统一请求`<br>`本地环境就绪`<br>`本地环境缺失`<br>`默认识别流程运行` | 中立契约测试；fake Adapter；资源诊断；真实 Metal Whisper；安全边界测试；CLI 完整 ASR | macOS 真实通过；Windows 目标机证据待完成 |
 | `跨平台定位随包 sidecar` | `在 Apple Silicon Mac 运行`<br>`在 Windows x64 运行`<br>`在未支持平台运行` | macOS 封存资源和 Metal 测试；Windows xwin/Adapter/目标脚本；unsupported platform 资源解析测试 | 部分完成：Windows 真实目标机待完成 |
-| `随安装包提供默认模型并严格校验` | `随包资源完整`<br>`随包模型缺失或损坏`<br>`设备资源不足` | `resolver_and_preflight_validate_platform_hash_permissions_memory_and_disk`；`eight_gigabyte_preflight_rejects_low_total_or_available_memory`；asr-bundle 原子暂存和包内资源验证 | 部分完成：正式双平台签名安装包待完成 |
+| `随安装包提供默认模型并严格校验` | `随包资源完整`<br>`随包模型缺失或损坏`<br>`设备资源不足` | `resolver_and_preflight_validate_platform_hash_permissions_memory_and_disk`；`eight_gigabyte_preflight_rejects_low_total_or_available_memory`；asr-bundle 原子暂存和包内资源验证 | 部分完成：正式三平台（macOS arm64、macOS Intel x86_64、Windows x64）签名安装包待完成 |
 | `保存可定位的转写片段` | `模型返回有效片段`<br>`相同产物被另一个项目复用`<br>`模型不提供可靠置信度`<br>`使用项目热词` | Whisper JSON/置信测试；`artifact_publish_is_atomic_reusable_and_uses_stable_segment_ids`；processor 缓存测试；真实热词 CLI | 自动化与真实短句通过 |
 | `构建多视频项目时间轴` | `合并多个成功输入`<br>`连续直播分片出现边界重复`<br>`中间输入失败` | transcript 单元测试；`projection_preserves_stable_ids_video_boundaries_and_failed_input_gaps_without_paths`；直播会话 E2E | 自动化通过 |
 | `提供可复制和导出的转写投影` | `生成当前视频文本投影`<br>`生成项目 JSON 投影`<br>`项目包含失败输入或时间轴空洞` | projection 测试；外部多视频 E2E；AI 工作区复制/TXT/JSON 测试 | 自动化通过 |
@@ -70,3 +70,7 @@
 该变更已按当时“外部证据后补”的决策归档，归档不代表上述六项已经通过。只有六项报告均存在、
 不可覆盖、哈希一致且各自 `allPassed=true`（质量报告按定义通过）后，才能把外部验收状态从
 `77/83` 更新为 `83/83`。在此之前，发行说明和 Wiki 必须继续明确标为“外部门禁未完成”。
+
+上述 9.8 的“两台真实 8 GB 设备”是归档变更当时的口径。当前平台承诺已扩展为 macOS arm64、
+macOS Intel x86_64 与 Windows x64 三者同等，Intel 的发布候选与性能证据必须使用真实 Intel Mac
+单独采集，不能用归档报告或 Apple Silicon 交叉构建替代。

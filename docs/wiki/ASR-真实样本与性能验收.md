@@ -70,11 +70,11 @@ cargo run --offline --bin asr-quality -- evaluate \
 - 样本失败率；
 - 有有效耗时证据样本的平均及最大实时因子（RTF）。
 
-当前 OpenSpec 没有凭空设定产品阈值。报告必须如实保留；若 small 量化模型在商品名、金额或整体可读性上不满足业务需要，应另立“用户明确授权的云端 `AsrEngine` Adapter”变更，不能在本版本自动上传或回退云端。
+当前 OpenSpec 没有凭空设定产品阈值。报告必须如实保留；若本地 small 量化模型在商品名、金额或整体可读性上不满足业务需要，应保留本地结果与评测数据，并在工程识别配置中改用默认识别路径（客户端直连百炼的云端转写），而不是让云端失败静默回退本地或让本地失败静默改用云端。云端路径的中文识别质量与长时性能同样按本节样本要求验收。
 
-## 5. macOS arm64 8 GB 性能采集
+## 5. macOS 8 GB 性能采集（arm64 与 Intel x86_64）
 
-在实际 8 GB Apple Silicon 设备上执行。Tauri 应用包只安装 `dy-screen-app` 主程序，不包含阶段诊断用的 `dy-screen` CLI；性能采集必须使用与正式发行验收相同、单独构建并签名的 release CLI。`--require-8gb` 只接受 7–9 GiB 的物理内存报告，防止误用开发机数据完成任务：
+在实际 8 GB Apple Silicon 或 Intel Mac 设备上执行。Tauri 应用包只安装 `dy-screen-app` 主程序，不包含阶段诊断用的 `dy-screen` CLI；性能采集必须使用与正式发行验收相同、单独构建并签名的 release CLI。`--require-8gb` 只接受 7–9 GiB 的物理内存报告，防止误用开发机数据完成任务：
 
 ```bash
 ./scripts/collect-asr-performance-macos.sh \
@@ -86,6 +86,8 @@ cargo run --offline --bin asr-quality -- evaluate \
 ```
 
 脚本记录平台、架构、物理内存、输入/二进制/manifest 哈希、墙钟耗时、RTF、进程树峰值常驻内存、最大总线程数、最大进程数、前后热状态、源文件不变以及退出两秒后的遗留子进程数。stdout/stderr 只保留大小和 SHA-256。报告中的 `asrBinarySha256` 必须等于同一候选发行报告中的 `asrCliSha256`，否则最终证据审计会拒绝任务 9.8。
+
+macOS Intel x86_64 使用同一脚本，只把 `--output` 改为 `macos-x86_64-8gb.json`，并核对报告中的 `architecture` 为 `x86_64`；该报告必须在真实 Intel Mac 上采集。Apple Silicon 交叉构建的 Intel 产物、Rosetta 转译结果或 macOS arm64 报告都不能替代 Intel 真机证据。
 
 ## 6. Windows x64 功能目标机验收
 
@@ -134,6 +136,8 @@ Windows 脚本使用进程树采样记录峰值 Working Set、最大线程/进�
 - Windows x64 真实 8 GB 设备报告，严格门禁通过；
 - 两端都记录有效 RTF、峰值内存、最大线程数、稳定性/热状态和零遗留子进程；
 - 使用的二进制与资源哈希能够追溯到对应发行包。
+
+当前平台承诺为 macOS arm64、macOS Intel x86_64 与 Windows x64 三者同等，因此还需在真实 Intel Mac 上补充同项报告；在 Intel 报告归档前，不把 Intel 视为已达到同一性能门禁。
 
 ### 任务 9.9
 
