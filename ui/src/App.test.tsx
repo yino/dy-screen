@@ -1223,7 +1223,8 @@ describe("App", () => {
     render(<App api={api} />);
     await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     expect(await screen.findByText("还没有 AI 分析项目")).toBeInTheDocument();
-    expect(screen.getByText("视频和转写全程保留在本机")).toBeInTheDocument();
+    // 默认识别路径已是百炼直连，因此不再声称"转写全程保留在本机"。
+    expect(screen.getByText("语音识别环境已就绪")).toBeInTheDocument();
     expect(screen.queryByText("新建成品")).not.toBeInTheDocument();
     expect(api.pickAiLocalVideos).not.toHaveBeenCalled();
     expect(api.requestAiInputPreview).not.toHaveBeenCalled();
@@ -1633,7 +1634,7 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "AI 剪辑" }));
     expect(await screen.findByText("ASR 模型损坏，请重新安装应用")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新检测" })).toBeInTheDocument();
-    expect(screen.getByText("修复方式：重新安装当前版本应用")).toBeInTheDocument();
+    expect(screen.getByText("修复方式：完成账号开通与授权，或修复并重新检测本地识别资源")).toBeInTheDocument();
   });
 
   it("AI 工作区可以创建草稿并规范化提交热词", async () => {

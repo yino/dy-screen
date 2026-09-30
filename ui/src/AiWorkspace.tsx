@@ -1812,10 +1812,10 @@ export function AiWorkspace({
       <section className={`ai-environment ${environment?.ready ? "ready" : "unavailable"}`}>
         <div className="ai-environment-icon">{environment?.ready ? <CheckCircle2 size={22} /> : <AlertTriangle size={22} />}</div>
         <div>
-          <strong>{environment?.ready && !environment.cloudAsrAvailable ? "视频和转写全程保留在本机" : environment?.ready ? "ASR 环境已就绪" : "本地 ASR 环境暂不可用"}</strong>
-          <p>{environment?.message ?? "正在检测随包本地识别资源"}</p>
-          {environment && <div className="ai-environment-details"><span>{environment.platform}</span><span>{environment.engineId} {environment.engineVersion}</span><span>{environment.modelId}</span><span className={environment.cloudAsrAvailable ? "ok" : "failed"}>{environment.cloudAsrAvailable ? "云端 ASR 可用" : "云端音频发布器未配置，使用本地 ASR"}</span>{environment.runtime && <span className={environment.runtime.signatureValid ? "ok" : "failed"}>资源包 {environment.runtime.bundleVersion} · {environment.runtime.signatureValid ? "签名已校验" : "签名待发行配置"}</span>}{environment.checks.map((check) => <span key={check.code} className={check.passed ? "ok" : "failed"} title={check.message}>{check.passed ? "✓" : "!"} {check.message}</span>)}</div>}
-          {!environment?.ready && <small><span>修复方式：重新安装当前版本应用</span><span>云端不可用时仍需本地资源作为回退。</span></small>}
+          <strong>{environment?.ready ? "语音识别环境已就绪" : "语音识别环境暂不可用"}</strong>
+          <p>{environment?.message ?? "正在检测识别能力"}</p>
+          {environment && <div className="ai-environment-details"><span>{environment.platform}</span><span>{environment.engineId} {environment.engineVersion}</span><span>{environment.modelId}</span><span className={environment.cloudAsrAvailable ? "ok" : "failed"}>{environment.cloudAsrAvailable ? "百炼直连转写可用（默认路径，会上传标准音频）" : "百炼直连转写不可用，且未显式选择本地识别"}</span>{environment.runtime && <span className={environment.runtime.signatureValid ? "ok" : "failed"}>资源包 {environment.runtime.bundleVersion} · {environment.runtime.signatureValid ? "签名已校验" : "签名待发行配置"}</span>}{environment.checks.map((check) => <span key={check.code} className={check.passed ? "ok" : "failed"} title={check.message}>{check.passed ? "✓" : "!"} {check.message}</span>)}</div>}
+          {!environment?.ready && <small><span>修复方式：完成账号开通与授权，或修复并重新检测本地识别资源</span><span>默认路径为百炼直连；云端不可用时不会自动改用本地识别。</span></small>}
         </div>
         <button className="secondary-button" disabled={busy} onClick={() => void run(refreshEnvironment)}><RefreshCw size={15} />重新检测</button>
       </section>
