@@ -142,6 +142,140 @@ impl TemporaryAudioPublisher for UnavailableTemporaryAudioPublisher {
 /// 共享发布器句柄。
 pub type SharedTemporaryAudioPublisher = Arc<dyn TemporaryAudioPublisher>;
 
+/// 上游调用诊断事件（脱敏）。
+///
+/// 只记录可安全暴露的信息：阶段、静态路径、HTTP 状态、耗时、尝试次数、稳定错误码、
+/// 失败分支，以及"是否已取到某类标识"的**布尔量**与体量计数。
+///
+/// MUST NOT 记录：短期 token、完整或签名 URL、本地路径、ASR 正文、
+/// 上游 `file_id` / `task_id` 的取值。需要定位具体对象时，用 `request_id`
+/// 与耗时/状态组合判断，而不是把标识写进日志。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCallDiagnostic {
+    /// 调用阶段：`upload` / `signed_url` / `submit` / `poll` / `result` / `cancel`。
+    pub stage: &'static str,
+    /// 静态请求路径模板，不含查询串与标识。
+    pub path: &'static str,
+    /// HTTP 状态；未发出请求时为 None。
+    pub http_status: Option<u16>,
+    /// 本次阶段耗时毫秒。
+    pub duration_ms: u64,
+    /// 第几次尝试；轮询时表示轮询序号。
+    pub attempt: u32,
+    /// 稳定错误码；成功时为 None。
+    pub error_code: Option<String>,
+    /// 失败分支；成功时为 None。
+    pub failure_branch: Option<String>,
+    /// 是否已取到上游文件标识（只记布尔，不记取值）。
+    pub has_file_id: bool,
+    /// 是否已取到签名临时地址（只记布尔，不记取值）。
+    pub has_signed_url: bool,
+    /// 是否已取到上游任务标识（只记布尔，不记取值）。
+    pub has_task_id: bool,
+    /// 上传音频字节数；与阶段无关时为 None。
+    pub audio_bytes: Option<u64>,
+}
+
+/// 上游调用诊断的接收端。
+pub trait CloudCallDiagnosticSink: Send + Sync {
+    /// 记录一个脱敏事件。
+    fn emit(&self, event: CloudCallDiagnostic);
+}
+
+/// 默认接收端：把事件以单行 JSON 写到 stderr。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StderrCloudCallDiagnosticSink;
+
+impl CloudCallDiagnosticSink for StderrCloudCallDiagnosticSink {
+    fn emit(&self, event: CloudCallDiagnostic) {
+        if let Ok(line) = serde_json::to_string(&event) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// 内存环形缓冲：供诊断面板读取，也供测试断言脱敏边界。
+#[derive(Clone)]
+pub struct MemoryCloudCallDiagnosticSink {
+    events: Arc<std::sync::Mutex<std::collections::VecDeque<CloudCallDiagnostic>>>,
+    capacity: usize,
+}
+
+impl Default for MemoryCloudCallDiagnosticSink {
+    fn default() -> Self {
+        Self::new(256)
+    }
+}
+
+impl MemoryCloudCallDiagnosticSink {
+    /// 创建指定容量的环形缓冲；超出容量时丢弃最旧事件。
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            events: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// 当前已记录的事件（按时间顺序）。
+    pub fn events(&self) -> Vec<CloudCallDiagnostic> {
+        self.events
+            .lock()
+            .map(|events| events.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 清空已记录事件。
+    pub fn clear(&self) {
+        if let Ok(mut events) = self.events.lock() {
+            events.clear();
+        }
+    }
+}
+
+impl CloudCallDiagnosticSink for MemoryCloudCallDiagnosticSink {
+    fn emit(&self, event: CloudCallDiagnostic) {
+        if let Ok(mut events) = self.events.lock() {
+            if events.len() == self.capacity {
+                events.pop_front();
+            }
+            events.push_back(event);
+        }
+    }
+}
+
+/// 共享诊断接收端。
+pub type SharedCloudCallDiagnosticSink = Arc<dyn CloudCallDiagnosticSink>;
+
+/// 把一次调用结果转成脱敏事件。
+#[allow(clippy::too_many_arguments)]
+fn diagnostic(
+    stage: &'static str,
+    path: &'static str,
+    http_status: Option<u16>,
+    started: std::time::Instant,
+    attempt: u32,
+    error: Option<&AsrError>,
+    has_file_id: bool,
+    has_signed_url: bool,
+    has_task_id: bool,
+    audio_bytes: Option<u64>,
+) -> CloudCallDiagnostic {
+    CloudCallDiagnostic {
+        stage,
+        path,
+        http_status,
+        duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        attempt,
+        error_code: error.map(|value| value.code.clone()),
+        failure_branch: error.map(|value| classify_cloud_failure(value).as_str().to_owned()),
+        has_file_id,
+        has_signed_url,
+        has_task_id,
+        audio_bytes,
+    }
+}
+
 /// 上游文件服务传输层；生产实现使用 reqwest，测试可注入确定性替身。
 #[async_trait]
 pub trait CloudFileTransport: Send + Sync {
@@ -156,6 +290,7 @@ pub trait CloudFileTransport: Send + Sync {
 pub struct ReqwestCloudFileTransport {
     client: reqwest::Client,
     base_url: String,
+    diagnostics: SharedCloudCallDiagnosticSink,
 }
 
 impl ReqwestCloudFileTransport {
@@ -182,7 +317,11 @@ impl ReqwestCloudFileTransport {
                     true,
                 )
             })?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            diagnostics: Arc::new(StderrCloudCallDiagnosticSink),
+        })
     }
 
     fn endpoint(&self, path: &str) -> EngineResult<reqwest::Url> {
@@ -205,6 +344,7 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
                 true,
             )
         })?;
+        let audio_bytes = Some(bytes.len() as u64);
         let file_name = audio_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -218,20 +358,38 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             })?;
         let form = reqwest::multipart::Form::new().part("files", part);
         let url = self.endpoint("files")?;
-        let response = self
+        let started = std::time::Instant::now();
+        let response = match self
             .client
             .post(url)
             .header(AUTHORIZATION, token)
             .multipart(form)
             .send()
             .await
-            .map_err(|error| map_transport_error(error, "cloud_upload_failed"))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = map_transport_error(error, "cloud_upload_failed");
+                self.diagnostics.emit(diagnostic(
+                    "upload", "files", None, started, 1, Some(&mapped), false, false, false,
+                    audio_bytes,
+                ));
+                return Err(mapped);
+            }
+        };
         if !response.status().is_success() {
-            return Err(map_upload_http_error(response.status().as_u16()));
+            let status = response.status().as_u16();
+            let mapped = map_upload_http_error(status);
+            self.diagnostics.emit(diagnostic(
+                "upload", "files", Some(status), started, 1, Some(&mapped), false, false, false,
+                audio_bytes,
+            ));
+            return Err(mapped);
         }
         let body =
             parse_json_response(response, "cloud_upload_response_invalid", "上传响应无效").await?;
-        body.get("data")
+        let file_id = body
+            .get("data")
             .and_then(|data| data.get("uploaded_files"))
             .and_then(serde_json::Value::as_array)
             .and_then(|files| files.first())
@@ -239,15 +397,43 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                AsrError::new(
+            .map(str::to_owned);
+        match &file_id {
+            Some(_) => self.diagnostics.emit(diagnostic(
+                "upload",
+                "files",
+                Some(200),
+                started,
+                1,
+                None,
+                true,
+                false,
+                false,
+                audio_bytes,
+            )),
+            None => {
+                let missing = AsrError::new(
                     AsrErrorKind::MalformedOutput,
                     "cloud_upload_file_id_missing",
                     "上传响应缺少文件标识",
                     true,
-                )
-            })
+                );
+                self.diagnostics.emit(diagnostic(
+                    "upload",
+                    "files",
+                    Some(200),
+                    started,
+                    1,
+                    Some(&missing),
+                    false,
+                    false,
+                    false,
+                    audio_bytes,
+                ));
+                return Err(missing);
+            }
+        }
+        Ok(file_id.unwrap_or_default())
     }
 
     async fn fetch_signed_url(&self, file_id: &str, token: &str) -> EngineResult<String> {
@@ -259,16 +445,36 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             ));
         }
         let url = self.endpoint(&format!("files/{file_id}"))?;
-        let response = self
+        let started = std::time::Instant::now();
+        let response = match self
             .client
             .get(url)
             .header(AUTHORIZATION, token)
             .send()
             .await
-            .map_err(|error| map_transport_error(error, "cloud_signed_url_fetch_failed"))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let mapped = map_transport_error(error, "cloud_signed_url_fetch_failed");
+                self.diagnostics.emit(diagnostic(
+                    "signed_url", "files/{file_id}", None, started, 1, Some(&mapped), true,
+                    false, false, None,
+                ));
+                return Err(mapped);
+            }
+        };
         if !response.status().is_success() {
-            return Err(map_signed_url_http_error(response.status().as_u16()));
+            let status = response.status().as_u16();
+            let mapped = map_signed_url_http_error(status);
+            self.diagnostics.emit(diagnostic(
+                "signed_url", "files/{file_id}", Some(status), started, 1, Some(&mapped), true,
+                false, false, None,
+            ));
+            return Err(mapped);
         }
+        self.diagnostics.emit(diagnostic(
+            "signed_url", "files/{file_id}", Some(200), started, 1, None, true, true, false, None,
+        ));
         let body = parse_json_response(
             response,
             "cloud_signed_url_response_invalid",
@@ -2096,6 +2302,123 @@ mod tests {
         assert_eq!(kept.code, "dashscope_task_failed");
         let kept = apply_cleanup_outcome(Err(failure), Err(cleanup_error)).expect_err("保持失败");
         assert_eq!(kept.code, "dashscope_task_failed");
+    }
+
+    /// 调用诊断的脱敏边界：事件结构里**没有**可以承载秘密的字段。
+    ///
+    /// 这是结构性保证而非过滤：`CloudCallDiagnostic` 不含 token / URL / 路径 /
+    /// 正文 / 标识取值字段，因此序列化结果不可能泄漏它们；`has_*` 只表达"是否取到"。
+    #[test]
+    fn call_diagnostics_are_redacted_by_construction() {
+        let sink = MemoryCloudCallDiagnosticSink::new(8);
+        // 模拟一次完整链路：上传 -> 取签名 URL -> 提交 -> 轮询 -> 取结果。
+        let stages: [(&'static str, &'static str, Option<u16>, Option<AsrError>, bool, bool, bool); 5] = [
+            ("upload", "files", Some(200), None, true, false, false),
+            ("signed_url", "files/{file_id}", Some(200), None, true, true, false),
+            ("submit", "services/audio/asr/transcription", Some(200), None, true, true, true),
+            ("poll", "tasks/{task_id}", Some(200), None, true, true, true),
+            (
+                "result",
+                "result/{signed}",
+                Some(403),
+                Some(AsrError::new(
+                    AsrErrorKind::ProcessFailed,
+                    "dashscope_result_download_failed",
+                    "结果下载失败",
+                    true,
+                )),
+                true,
+                true,
+                true,
+            ),
+        ];
+        for (stage, path, status, error, has_file, has_url, has_task) in stages {
+            sink.emit(diagnostic(
+                stage,
+                path,
+                status,
+                std::time::Instant::now(),
+                1,
+                error.as_ref(),
+                has_file,
+                has_url,
+                has_task,
+                Some(96_044),
+            ));
+        }
+        let events = sink.events();
+        assert_eq!(events.len(), 5);
+        // 阶段与错误分类必须可读，否则日志对调试无价值。
+        assert_eq!(events[0].stage, "upload");
+        assert!(events[0].has_file_id);
+        assert!(!events[0].has_signed_url);
+        assert!(events[1].has_signed_url);
+        assert!(events[2].has_task_id);
+        assert_eq!(events[0].audio_bytes, Some(96_044));
+        assert_eq!(
+            events[4].error_code.as_deref(),
+            Some("dashscope_result_download_failed")
+        );
+        assert_eq!(events[4].failure_branch.as_deref(), Some("transient"));
+        assert_eq!(events[4].http_status, Some(403));
+        // 结构性脱敏：序列化结果不得出现任何秘密形态。
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            for forbidden in [
+                "st-lt-v1",
+                "Bearer",
+                "Authorization",
+                "Signature=",
+                "OSSAccessKeyId",
+                "security-token",
+                "http://",
+                "https://",
+                "/tmp/",
+                "/Users/",
+                "oss://",
+            ] {
+                assert!(
+                    !json.contains(forbidden),
+                    "诊断事件不得包含 {forbidden}: {json}"
+                );
+            }
+            // 路径必须是静态模板，不得被填成具体对象。
+            assert!(
+                event.path.starts_with("files")
+                    || event.path.starts_with("tasks")
+                    || event.path.starts_with("services")
+                    || event.path.starts_with("result"),
+                "路径必须是静态模板: {}",
+                event.path
+            );
+        }
+    }
+
+    /// 环形缓冲：容量受限、可清空，且不影响调用方。
+    #[test]
+    fn diagnostic_sink_keeps_bounded_history() {
+        let sink = MemoryCloudCallDiagnosticSink::new(3);
+        for attempt in 0..5u32 {
+            sink.emit(diagnostic(
+                "poll",
+                "tasks/{task_id}",
+                Some(200),
+                std::time::Instant::now(),
+                attempt,
+                None,
+                true,
+                true,
+                true,
+                None,
+            ));
+        }
+        let events = sink.events();
+        assert_eq!(events.len(), 3, "容量必须受限");
+        // 保留最新的事件，最旧的被丢弃。
+        assert_eq!(events[0].attempt, 2);
+        assert_eq!(events[2].attempt, 4);
+        sink.clear();
+        assert!(sink.events().is_empty());
     }
 
     /// 任务 3.2：缺少本地模型不得阻止云端识别。
