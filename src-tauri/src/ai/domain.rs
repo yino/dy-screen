@@ -166,8 +166,10 @@ impl AiInputStatus {
                     | Self::Cancelled
                     | Self::Failed
             ) | (
+                // 音频准备完成后可以直接进入转写：云端路径不执行 VAD，
+                // 因此不会经过 DetectingSpeech；本地路径仍按原顺序经过它。
                 Self::PreparingAudio,
-                Self::DetectingSpeech | Self::Cancelled | Self::Failed
+                Self::DetectingSpeech | Self::Transcribing | Self::Cancelled | Self::Failed
             ) | (
                 Self::DetectingSpeech,
                 Self::Transcribing | Self::Skipped | Self::Cancelled | Self::Failed
