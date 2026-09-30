@@ -228,6 +228,8 @@ fn profile() -> RecognitionProfile {
         timestamp_policy: "segment".to_owned(),
         normalization_version: "zh-normalize-v1".to_owned(),
         hotwords: vec!["商品名".to_owned()],
+        provider: None,
+        chunk_strategy: None,
     }
 }
 

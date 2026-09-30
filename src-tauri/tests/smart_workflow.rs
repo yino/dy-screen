@@ -43,6 +43,8 @@ fn profile() -> RecognitionProfile {
         timestamp_policy: "segment".to_owned(),
         normalization_version: "test-normalizer".to_owned(),
         hotwords: Vec::new(),
+        provider: None,
+        chunk_strategy: None,
     }
 }
 
@@ -471,7 +473,6 @@ struct EchoCorrectionProvider;
 impl SubtitleCorrectionProvider for EchoCorrectionProvider {
     async fn correct_subtitles(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
         _api_key: &str,
         request: SubtitleCorrectionRequest,
         _cancellation: CancellationToken,
@@ -501,7 +502,6 @@ struct FailOnceCorrectionProvider {
 impl SubtitleCorrectionProvider for FailOnceCorrectionProvider {
     async fn correct_subtitles(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
         _api_key: &str,
         request: SubtitleCorrectionRequest,
         _cancellation: CancellationToken,

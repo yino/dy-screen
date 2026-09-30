@@ -198,7 +198,11 @@ impl AiJobPublisher for EventCollector {
 
 fn profile(model_version: &str, hotwords: &[&str], vad_padding_ms: u64) -> RecognitionProfile {
     RecognitionProfile {
-        engine_id: "fake-engine".to_owned(),
+        // 本文件覆盖的是"经 VAD 的本地识别流水线"：v2 的默认路径是百炼直连
+        // （引擎标识非 whisper.cpp），该路径刻意不执行 VAD；只有工程识别配置
+        // 显式指向本地引擎时才会经过 DetectingSpeech 与 VAD。因此这里显式声明
+        // 本地引擎标识（与 `ai::processor::LOCAL_ENGINE_ID` 同值）。
+        engine_id: "whisper.cpp".to_owned(),
         engine_version: "1".to_owned(),
         model_id: "fake-model".to_owned(),
         model_version: model_version.to_owned(),
@@ -209,6 +213,8 @@ fn profile(model_version: &str, hotwords: &[&str], vad_padding_ms: u64) -> Recog
         timestamp_policy: "segment".to_owned(),
         normalization_version: "zh-normalize-v1".to_owned(),
         hotwords: hotwords.iter().map(|word| (*word).to_owned()).collect(),
+        provider: None,
+        chunk_strategy: None,
     }
 }
 

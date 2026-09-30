@@ -26,6 +26,8 @@ fn profile() -> RecognitionProfile {
         timestamp_policy: "segment".to_owned(),
         normalization_version: "zh-normalize-v1".to_owned(),
         hotwords: Vec::new(),
+        provider: None,
+        chunk_strategy: None,
     }
 }
 

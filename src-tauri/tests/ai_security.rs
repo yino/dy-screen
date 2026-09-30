@@ -73,13 +73,17 @@ async fn missing_resource_diagnostic_is_pathless_and_keeps_locked_default_profil
     let diagnostic = components.runtime.diagnose().await.unwrap();
     assert!(!diagnostic.ready);
     assert!(!components.runtime.scheduler_ready());
-    assert_eq!(diagnostic.engine_id, "whisper.cpp");
+    // 默认识别路径是百炼直连：即使本地资源根缺失，默认引擎身份也必须是云端引擎，
+    // 而不是随包本地 manifest 的身份（否则缓存指纹会与实际执行引擎不符）。
+    assert_eq!(diagnostic.engine_id, "dashscope-filetrans");
     assert!(
         !diagnostic
             .message
             .contains(missing_root.to_string_lossy().as_ref())
     );
+    // 本地资源缺失不影响默认配置可用：默认配置本身是云端配置，不需要本地资源。
     let profile = components.runtime.default_profile().unwrap();
-    assert_eq!(profile.engine_id, "whisper.cpp");
-    assert!(profile.model_id.contains("small"));
+    assert_eq!(profile.engine_id, "dashscope-filetrans");
+    assert_eq!(profile.model_id, "qwen3-asr-flash-filetrans");
+    assert_eq!(profile.provider.as_deref(), Some("cloud"));
 }
