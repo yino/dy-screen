@@ -7,7 +7,10 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: {
-    port: 1420,
+    // 开发端口可用 VITE_DEV_PORT 覆盖（默认仍是 1420）。
+    // strictPort 保持开启：端口被占时直接失败，避免与 tauri.conf.json 的
+    // devUrl 静默不一致。
+    port: Number(process.env.VITE_DEV_PORT ?? 1420),
     strictPort: true,
   },
   build: {

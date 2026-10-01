@@ -25,6 +25,12 @@ OUTPUT ?= recordings
 SEGMENT_SECONDS ?= 900
 PROBE_TIMEOUT_SECONDS ?= 3
 JSON ?= 0
+# 开发端口：Vite 与 tauri devUrl 必须一致，因此由同一个变量驱动。
+# 1420 与另一个本地项目（luogen-agent-offline）的默认端口相同，冲突时可用
+# `make app-dev DEV_PORT=1430` 覆盖。
+DEV_PORT ?= 1420
+TAURI_DEV_CMD = DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" VITE_DEV_PORT="$(DEV_PORT)" \
+	"$(NPM)" run tauri:dev -- --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
 ACCESS_FIXTURE_LOG_DIR ?= /private/tmp/dy-screen-access-fixtures
 ACCEPT_ROOM_URL ?= https://live.douyin.com/703940802949
 ACCEPT_ROOM_URLS ?= https://live.douyin.com/703940802949 https://live.douyin.com/168376497175 https://live.douyin.com/452086788686
@@ -284,7 +290,7 @@ frontend-build:
 	"$(NPM)" run build
 
 app-dev:
-	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" "$(NPM)" run tauri:dev
+	$(TAURI_DEV_CMD)
 
 app-build:
 	@printf '%s\n' '普通开发构建：不携带发行运行资源；正式发布请使用 make app-build-resources。'
@@ -667,7 +673,7 @@ accept-deepseek: doctor
 		'真实 DeepSeek 验收只通过桌面端设置页执行，不把 Key 放入命令行、日志或 SQLite。' \
 		'启动后进入“设置 → 精彩分析 Provider”，保存模型和系统凭据，再点击“测试连接”。' \
 		'连接诊断只发送固定提示；确认成功后再在已完成 ASR 项目中显式点击“开始精彩分析”。'
-	"$(NPM)" run tauri:dev
+	$(TAURI_DEV_CMD)
 
 test-access-core:
 	"$(CARGO)" test --test browser_snapshot
@@ -714,14 +720,14 @@ accept-real-room: doctor
 		'真实网络验收不会自动绕过访问验证。' \
 		'启动后请在客户端添加或立即检查：$(ACCEPT_ROOM_URL)' \
 		'观察控制台、访问状态横幅、FFmpeg 启动和录像目录；必要时点击“立即验证”。'
-	"$(NPM)" run tauri:dev
+	$(TAURI_DEV_CMD)
 
 accept-real-multi: doctor
 	@printf '%s\n' \
 		'多房长时验收地址：$(ACCEPT_ROOM_URLS)' \
 		'要求连续观察至少 $(ACCEPT_MINUTES) 分钟，并确认共享会话串行解析、并发录制和一次同会话续录。' \
 		'真实网络验收不会自动进入普通 test/check/CI。'
-	"$(NPM)" run tauri:dev
+	$(TAURI_DEV_CMD)
 
 test: test-frontend test-core test-app
 
