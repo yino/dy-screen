@@ -705,10 +705,7 @@ mod engine_selection_tests {
     async fn cancellation_never_touches_local_engine() {
         let (result, local_calls) = run(AsrError::cancelled(), Some(CLOUD_ENGINE_ID)).await;
         let error = result.expect_err("取消必须终止");
-        assert_eq!(
-            local_calls, 0,
-            "取消不得静默变成一次本地识别"
-        );
+        assert_eq!(local_calls, 0, "取消不得静默变成一次本地识别");
         assert_eq!(
             dy_screen::asr::classify_cloud_failure(&error),
             dy_screen::asr::CloudFailureBranch::Cancelled
@@ -729,10 +726,7 @@ mod engine_selection_tests {
         )
         .await;
         let value = result.expect("本地路径必须成功");
-        assert_eq!(
-            local_calls, 1,
-            "显式选择本地识别时必须调用本地引擎恰好一次"
-        );
+        assert_eq!(local_calls, 1, "显式选择本地识别时必须调用本地引擎恰好一次");
         assert_eq!(value.provider, "local");
     }
 

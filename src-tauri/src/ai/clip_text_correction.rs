@@ -767,7 +767,10 @@ mod correction_gate_tests {
         let not_activated = evaluate_correction_gate(&gate(true, false, true)).unwrap_err();
         // 额度耗尽。
         let quota = evaluate_correction_gate(&gate(true, true, false)).unwrap_err();
-        assert!(matches!(not_activated, ClipTextCorrectionError::NotActivated));
+        assert!(matches!(
+            not_activated,
+            ClipTextCorrectionError::NotActivated
+        ));
         assert!(matches!(quota, ClipTextCorrectionError::QuotaExhausted));
         // 两者必须可区分（不得合并成同一个原因）。
         assert_ne!(not_activated.to_string(), quota.to_string());

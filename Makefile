@@ -28,9 +28,35 @@ JSON ?= 0
 # 开发端口：Vite 与 tauri devUrl 必须一致，因此由同一个变量驱动。
 # 1420 与另一个本地项目（luogen-agent-offline）的默认端口相同，冲突时可用
 # `make app-dev DEV_PORT=1430` 覆盖。
+# 注意：`?=` 只在变量“未定义”时生效，空值或纯空白会被当成已定义，导致 devUrl 退化成
+# http://localhost: —— Vite 会静默改用 5173，而 Tauri 会一直等待 http://localhost/
+# 直到 180 秒超时。因此这里显式剥离空白并回退默认值，再在启动前校验必须是整数。
 DEV_PORT ?= 1420
-TAURI_DEV_CMD = DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" VITE_DEV_PORT="$(DEV_PORT)" \
-	"$(NPM)" run tauri:dev -- --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
+DEV_PORT_RESOLVED := $(or $(strip $(DEV_PORT)),1420)
+# `tauri dev` 被强制结束（关窗口、kill、终端中断）时，beforeDevCommand 的 Vite 可能变成
+# 孤儿进程继续占住端口，于是下一次 `make app-dev` 报 “Port 1420 is already in use”。
+# 这里只按命令行路径清理属于本仓库的残留 Vite；其它项目（例如同样监听
+# 127.0.0.1:1420 的邻居项目）一律不动。
+DEV_CLEAN_OWN_VITE = cleaned=0; \
+	for pid in $$(pgrep -f "$(CURDIR)/node_modules/.bin/vite" 2>/dev/null || true); do \
+		if kill "$$pid" 2>/dev/null; then cleaned=$$((cleaned + 1)); printf '已清理本项目残留 Vite：PID %s\n' "$$pid" >&2; fi; \
+	done; \
+	if [ "$$cleaned" -gt 0 ]; then sleep 1; fi
+DEV_PORT_REPORT = if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:$(DEV_PORT_RESOLVED) -sTCP:LISTEN >/dev/null 2>&1; then \
+		printf '端口 %s 上还有其它监听者（另有项目占用同一端口号时不一定是冲突源）：\n' "$(DEV_PORT_RESOLVED)" >&2; \
+		lsof -nP -iTCP:$(DEV_PORT_RESOLVED) -sTCP:LISTEN >&2; \
+		printf '若启动仍报 “Port %s is already in use”，请改用：make app-dev DEV_PORT=1430\n' "$(DEV_PORT_RESOLVED)" >&2; \
+	fi
+TAURI_DEV_CMD = DEV_PORT="$(DEV_PORT_RESOLVED)"; \
+	case "$$DEV_PORT" in ''|*[!0-9]*) printf '错误：DEV_PORT 必须是整数端口，当前值为 "%s"。\n' "$$DEV_PORT" >&2; exit 2;; esac; \
+	if [ "$$DEV_PORT" -lt 1 ] || [ "$$DEV_PORT" -gt 65535 ]; then printf '错误：DEV_PORT 必须在 1-65535 之间，当前值为 "%s"。\n' "$$DEV_PORT" >&2; exit 2; fi; \
+	$(DEV_CLEAN_OWN_VITE); \
+	$(DEV_PORT_REPORT); \
+	DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" VITE_DEV_PORT="$$DEV_PORT" \
+	"$(NPM)" run tauri:dev -- --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT_RESOLVED)"}}'; \
+	status=$$?; \
+	$(DEV_CLEAN_OWN_VITE); \
+	exit $$status
 ACCESS_FIXTURE_LOG_DIR ?= /private/tmp/dy-screen-access-fixtures
 ACCEPT_ROOM_URL ?= https://live.douyin.com/703940802949
 ACCEPT_ROOM_URLS ?= https://live.douyin.com/703940802949 https://live.douyin.com/168376497175 https://live.douyin.com/452086788686
@@ -118,7 +144,7 @@ JSON_ARG = $(if $(filter 1 true yes on,$(JSON)),--json,)
 ROOM_ARGS = $(foreach room,$(ROOM_URLS),"$(room)")
 ASR_RESOURCE_ROOT_ARG = $(if $(strip $(ASR_RESOURCE_ROOT)),--resource-root "$(ASR_RESOURCE_ROOT)",)
 
-.PHONY: help doctor install web-dev typecheck frontend-build app-dev app-build build-mac-release build-mac-intel-release macos-build-doctor build core-build \
+.PHONY: help doctor install web-dev typecheck frontend-build app-dev app-dev-stop app-build build-mac-release build-mac-intel-release macos-build-doctor build core-build \
 	release fmt fmt-check lint test test-frontend test-core test-app check spec-validate verify \
 	preview-doctor clip-subtitle-doctor test-clip-subtitle test-clip-subtitle-integration test-clip-transition-integration test-transition-catalog-fixture test-preview test-preview-integration thumbnail-doctor test-thumbnail test-thumbnail-integration test-profile test-migration \
 	test-supervisor-profile test-tags test-tag-migration test-tag-repository test-tag-service test-tag-ui \
@@ -144,6 +170,7 @@ help:
 		'  make web-dev         仅预览 React 界面（使用浏览器本地模拟数据）' \
 		'  make frontend-build  类型检查并构建前端' \
 		'  make app-dev         启动 Tauri 开发客户端（禁用强制结束录制的 Rust watcher）' \
+		'  make app-dev-stop    清理本项目残留的 Vite（端口被占用时先执行）' \
 		'  make app-build       构建 macOS .app 安装产物' \
 		'  make build-mac-release MACOS_ARCH=aarch64|x86_64 DY_SCREEN_API_BASE_URL=... 构建架构专属 macOS .app/.dmg' \
 		'  make build-mac-intel-release DY_SCREEN_API_BASE_URL=... 在当前 macOS 构建 Intel x86_64 发布候选包（独立 staging）' \
@@ -236,6 +263,7 @@ help:
 		'  QUALITY=HD1                  FULL_HD1/HD1/SD1/SD2' \
 		'  PROTOCOL=flv                 flv 或 hls' \
 		'  OUTPUT=recordings            CLI 录像根目录' \
+		'  DEV_PORT=1420               开发端口（Vite 与 tauri devUrl 共用，冲突时改这里）' \
 		'  SEGMENT_SECONDS=900          MKV 分片时长（秒）'
 
 doctor:
@@ -291,6 +319,11 @@ frontend-build:
 
 app-dev:
 	$(TAURI_DEV_CMD)
+
+app-dev-stop:
+	@$(DEV_CLEAN_OWN_VITE); \
+	$(DEV_PORT_REPORT); \
+	printf '已检查端口 %s 上的本项目残留开发进程。\n' "$(DEV_PORT_RESOLVED)"
 
 app-build:
 	@printf '%s\n' '普通开发构建：不携带发行运行资源；正式发布请使用 make app-build-resources。'

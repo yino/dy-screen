@@ -19,8 +19,7 @@ use super::repository::AiRepositoryError;
 
 pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 /// 百炼兼容模式根地址：客户端直连上游时的唯一端点。
-pub const DASHSCOPE_COMPATIBLE_BASE_URL: &str =
-    "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DASHSCOPE_COMPATIBLE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 /// 默认模型标识（百炼通义）。
 pub const DEFAULT_MODEL_ID: &str = "deepseek-chat";
@@ -1416,7 +1415,10 @@ mod model_call_snapshot_tests {
         let first = resolve_model_call(&settings("qwen-plus"), None, None).expect("first");
         // 模拟"运行期间用户改了设置"：再次解析得到新值，但 first 不变。
         let second = resolve_model_call(&settings("qwen-turbo"), None, None).expect("second");
-        assert_eq!(first.model_id, "qwen-plus", "已冻结的快照不得被后续设置改变");
+        assert_eq!(
+            first.model_id, "qwen-plus",
+            "已冻结的快照不得被后续设置改变"
+        );
         assert_ne!(first.model_id, second.model_id);
         // 运行指纹必须反映实际路径与模型，切换后不得复用。
         assert_ne!(first.fingerprint_input(), second.fingerprint_input());
@@ -1494,9 +1496,12 @@ mod llm_call_diagnostic_tests {
     }
 
     /// 进程级接收端是全局状态，测试之间必须串行改写。
-    fn sink_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    ///
+    /// 这里用异步互斥量：guard 需要跨越 `.await` 持有，阻塞式 `std::sync::MutexGuard`
+    /// 跨 await 会触发 `clippy::await_holding_lock`，也可能阻塞运行时线程。
+    async fn sink_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     /// 退出时恢复 stderr 默认接收端，避免污染其他测试。
@@ -1517,7 +1522,7 @@ mod llm_call_diagnostic_tests {
         const PROMPT_MARKER: &str = "PROMPT正文标记-7c1f9a";
         const PREAMBLE_MARKER: &str = "PREAMBLE标记-3b8e2d";
         const KEY_MARKER: &str = "sk-secret-marker-5e4d";
-        let _guard = sink_guard();
+        let _guard = sink_guard().await;
         let sink = Arc::new(CapturingSink::new());
         set_llm_call_diagnostics_sink(sink.clone());
         let _restore = RestoreSink;

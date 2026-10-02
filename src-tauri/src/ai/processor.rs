@@ -527,7 +527,10 @@ mod path_availability_tests {
     #[test]
     fn available_cloud_or_explicit_local_is_allowed() {
         assert!(ensure_path_available(true, true).is_ok());
-        assert!(ensure_path_available(false, false).is_ok(), "本地路径不由此判定");
+        assert!(
+            ensure_path_available(false, false).is_ok(),
+            "本地路径不由此判定"
+        );
         assert!(ensure_path_available(false, true).is_ok());
     }
 }

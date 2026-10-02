@@ -31,7 +31,8 @@ use crate::ai::{
 };
 use crate::api::ApiClient;
 use crate::app_lifecycle::{
-    InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, log_lifecycle,
+    InstanceLock, LifecycleEvent, ShutdownGate, ShutdownReason, instance_lock_failure_detail,
+    log_lifecycle, log_lifecycle_detail,
 };
 use crate::app_support::{delete_recording_session, delete_recording_video, validate_settings};
 use crate::clip_workflow::{ClipWorkflowProgress, ClipWorkflowPublisher};
@@ -1958,8 +1959,14 @@ pub fn run() {
                     log_lifecycle(LifecycleEvent::InstanceLockAcquired, None);
                     lock
                 }
-                Err(_) => {
-                    log_lifecycle(LifecycleEvent::InstanceRejected, None);
+                Err(error) => {
+                    // 区分“已有实例在运行”和“锁文件本身不可用”（权限、磁盘、路径异常）：
+                    // 后者此前同样记为 instance_rejected，排查时无法区分。
+                    log_lifecycle_detail(
+                        LifecycleEvent::InstanceRejected,
+                        None,
+                        Some(instance_lock_failure_detail(&error)),
+                    );
                     app.handle().exit(0);
                     return Ok(());
                 }

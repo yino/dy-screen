@@ -392,7 +392,15 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             Err(error) => {
                 let mapped = map_transport_error(error, "cloud_upload_failed");
                 self.diagnostics.emit(diagnostic(
-                    "upload", "files", None, started, 1, Some(&mapped), false, false, false,
+                    "upload",
+                    "files",
+                    None,
+                    started,
+                    1,
+                    Some(&mapped),
+                    false,
+                    false,
+                    false,
                     audio_bytes,
                 ));
                 return Err(mapped);
@@ -402,7 +410,15 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             let status = response.status().as_u16();
             let mapped = map_upload_http_error(status);
             self.diagnostics.emit(diagnostic(
-                "upload", "files", Some(status), started, 1, Some(&mapped), false, false, false,
+                "upload",
+                "files",
+                Some(status),
+                started,
+                1,
+                Some(&mapped),
+                false,
+                false,
+                false,
                 audio_bytes,
             ));
             return Err(mapped);
@@ -478,8 +494,16 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             Err(error) => {
                 let mapped = map_transport_error(error, "cloud_signed_url_fetch_failed");
                 self.diagnostics.emit(diagnostic(
-                    "signed_url", "files/{file_id}", None, started, 1, Some(&mapped), true,
-                    false, false, None,
+                    "signed_url",
+                    "files/{file_id}",
+                    None,
+                    started,
+                    1,
+                    Some(&mapped),
+                    true,
+                    false,
+                    false,
+                    None,
                 ));
                 return Err(mapped);
             }
@@ -488,13 +512,30 @@ impl CloudFileTransport for ReqwestCloudFileTransport {
             let status = response.status().as_u16();
             let mapped = map_signed_url_http_error(status);
             self.diagnostics.emit(diagnostic(
-                "signed_url", "files/{file_id}", Some(status), started, 1, Some(&mapped), true,
-                false, false, None,
+                "signed_url",
+                "files/{file_id}",
+                Some(status),
+                started,
+                1,
+                Some(&mapped),
+                true,
+                false,
+                false,
+                None,
             ));
             return Err(mapped);
         }
         self.diagnostics.emit(diagnostic(
-            "signed_url", "files/{file_id}", Some(200), started, 1, None, true, true, false, None,
+            "signed_url",
+            "files/{file_id}",
+            Some(200),
+            started,
+            1,
+            None,
+            true,
+            true,
+            false,
+            None,
         ));
         let body = parse_json_response(
             response,
@@ -890,15 +931,27 @@ impl DashScopeAsrClient {
             Err(error) => {
                 let mapped = map_transport_error(error, "dashscope_cancel_failed");
                 self.diagnostics.emit(diagnostic(
-                    "cancel", "tasks/{task_id}/cancel", None, started, 1, Some(&mapped),
-                    false, false, true, None,
+                    "cancel",
+                    "tasks/{task_id}/cancel",
+                    None,
+                    started,
+                    1,
+                    Some(&mapped),
+                    false,
+                    false,
+                    true,
+                    None,
                 ));
                 return Err(mapped);
             }
         };
         let status = response.status().as_u16();
         let accepted = response.status().is_success();
-        let mapped = if accepted { None } else { Some(dashscope_http_error(status)) };
+        let mapped = if accepted {
+            None
+        } else {
+            Some(dashscope_http_error(status))
+        };
         self.diagnostics.emit(diagnostic(
             "cancel",
             "tasks/{task_id}/cancel",
@@ -958,8 +1011,16 @@ impl DashScopeAsrClient {
             Err(error) => {
                 let mapped = map_transport_error(error, "dashscope_submit_failed");
                 self.diagnostics.emit(diagnostic(
-                    "submit", "services/audio/asr/transcription", None, started, 1,
-                    Some(&mapped), true, true, false, None,
+                    "submit",
+                    "services/audio/asr/transcription",
+                    None,
+                    started,
+                    1,
+                    Some(&mapped),
+                    true,
+                    true,
+                    false,
+                    None,
                 ));
                 return Err(mapped);
             }
@@ -968,8 +1029,16 @@ impl DashScopeAsrClient {
             let status = response.status().as_u16();
             let mapped = dashscope_http_error(status);
             self.diagnostics.emit(diagnostic(
-                "submit", "services/audio/asr/transcription", Some(status), started, 1,
-                Some(&mapped), true, true, false, None,
+                "submit",
+                "services/audio/asr/transcription",
+                Some(status),
+                started,
+                1,
+                Some(&mapped),
+                true,
+                true,
+                false,
+                None,
             ));
             return Err(mapped);
         }
@@ -986,8 +1055,16 @@ impl DashScopeAsrClient {
             .filter(|task_id| !task_id.trim().is_empty())
             .map(str::to_owned);
         self.diagnostics.emit(diagnostic(
-            "submit", "services/audio/asr/transcription", Some(200), started, 1, None,
-            true, true, task_id.is_some(), None,
+            "submit",
+            "services/audio/asr/transcription",
+            Some(200),
+            started,
+            1,
+            None,
+            true,
+            true,
+            task_id.is_some(),
+            None,
         ));
         task_id.ok_or_else(|| {
             malformed_cloud_error("dashscope_task_id_missing", "云端任务响应缺少任务标识")
@@ -1017,8 +1094,16 @@ impl DashScopeAsrClient {
                 if cancellation.is_cancelled() {
                     let cancelled = AsrError::cancelled();
                     self.diagnostics.emit(diagnostic(
-                        "poll", "tasks/{task_id}", None, started, attempt, Some(&cancelled), false,
-                        false, true, None,
+                        "poll",
+                        "tasks/{task_id}",
+                        None,
+                        started,
+                        attempt,
+                        Some(&cancelled),
+                        false,
+                        false,
+                        true,
+                        None,
                     ));
                     return Err(cancelled);
                 }
@@ -1027,8 +1112,16 @@ impl DashScopeAsrClient {
                     Ok(url) => url,
                     Err(error) => {
                         self.diagnostics.emit(diagnostic(
-                            "poll", "tasks/{task_id}", None, started, attempt, Some(&error), false,
-                            false, true, None,
+                            "poll",
+                            "tasks/{task_id}",
+                            None,
+                            started,
+                            attempt,
+                            Some(&error),
+                            false,
+                            false,
+                            true,
+                            None,
                         ));
                         return Err(error);
                     }
@@ -1044,8 +1137,16 @@ impl DashScopeAsrClient {
                     Err(error) => {
                         let mapped = map_transport_error(error, "dashscope_poll_failed");
                         self.diagnostics.emit(diagnostic(
-                            "poll", "tasks/{task_id}", None, started, attempt, Some(&mapped), false,
-                            false, true, None,
+                            "poll",
+                            "tasks/{task_id}",
+                            None,
+                            started,
+                            attempt,
+                            Some(&mapped),
+                            false,
+                            false,
+                            true,
+                            None,
                         ));
                         return Err(mapped);
                     }
@@ -1169,8 +1270,16 @@ impl DashScopeAsrClient {
                     true,
                 );
                 self.diagnostics.emit(diagnostic(
-                    "poll", "tasks/{task_id}", None, started, attempt, Some(&timed_out), false,
-                    false, true, None,
+                    "poll",
+                    "tasks/{task_id}",
+                    None,
+                    started,
+                    attempt,
+                    Some(&timed_out),
+                    false,
+                    false,
+                    true,
+                    None,
                 ));
                 Err(timed_out)
             }
@@ -2271,10 +2380,7 @@ mod tests {
         // 不变量：块按源时间有序、块间保留重叠（不删除静音）、覆盖无空洞。
         for (index, chunk) in chunks.iter().enumerate() {
             assert!(chunk.length_ms > 0);
-            assert!(
-                chunk.end_ms() <= 300_000,
-                "块不得超出源音频: {chunk:?}"
-            );
+            assert!(chunk.end_ms() <= 300_000, "块不得超出源音频: {chunk:?}");
             if index > 0 {
                 let previous = chunks[index - 1];
                 // 重叠：下一块起点必须早于上一块结束。
@@ -2283,7 +2389,10 @@ mod tests {
                     "块间必须保留重叠而不是无缝拼接: {previous:?} -> {chunk:?}"
                 );
                 // 覆盖：下一块起点不得晚于上一块结束（否则中间出现空洞）。
-                assert_eq!(chunk.offset_ms, previous.offset_ms + previous.length_ms - 2_000);
+                assert_eq!(
+                    chunk.offset_ms,
+                    previous.offset_ms + previous.length_ms - 2_000
+                );
             }
         }
         // 除最后一块外，其余块都应达到上限长度（避免碎片化）。
@@ -2341,10 +2450,7 @@ mod tests {
         assert_eq!(chunk1[0].begin_time, 118_000);
         assert_eq!(chunk1[1].begin_time, 121_000);
 
-        let merged = merge_chunk_segments(
-            chunk0.into_iter().chain(chunk1).collect(),
-            2_000,
-        );
+        let merged = merge_chunk_segments(chunk0.into_iter().chain(chunk1).collect(), 2_000);
         // 重复句段只保留一段，且后续内容不被误删。
         let boundary: Vec<_> = merged
             .iter()
@@ -2395,19 +2501,36 @@ mod tests {
             stable_segment_id(fingerprint, 12_800, 19_600, "  你好世界 ")
         );
         // 时间、文本或源指纹变化都必须产生不同 ID。
-        assert_ne!(first, stable_segment_id(fingerprint, 12_801, 19_600, "你好世界"));
-        assert_ne!(first, stable_segment_id(fingerprint, 12_800, 19_600, "你好世界!"));
-        assert_ne!(first, stable_segment_id("sha256:source-2", 12_800, 19_600, "你好世界"));
+        assert_ne!(
+            first,
+            stable_segment_id(fingerprint, 12_801, 19_600, "你好世界")
+        );
+        assert_ne!(
+            first,
+            stable_segment_id(fingerprint, 12_800, 19_600, "你好世界!")
+        );
+        assert_ne!(
+            first,
+            stable_segment_id("sha256:source-2", 12_800, 19_600, "你好世界")
+        );
         assert!(first.starts_with("seg-"));
         // 一组句段的 ID 序列与到达顺序无关。
-        let forward: Vec<_> = [(0u64, 1_000u64, "a"), (1_000, 2_000, "b"), (2_000, 3_000, "c")]
-            .iter()
-            .map(|(begin, end, text)| stable_segment_id(fingerprint, *begin, *end, text))
-            .collect();
-        let backward: Vec<_> = [(2_000u64, 3_000u64, "c"), (1_000, 2_000, "b"), (0, 1_000, "a")]
-            .iter()
-            .map(|(begin, end, text)| stable_segment_id(fingerprint, *begin, *end, text))
-            .collect();
+        let forward: Vec<_> = [
+            (0u64, 1_000u64, "a"),
+            (1_000, 2_000, "b"),
+            (2_000, 3_000, "c"),
+        ]
+        .iter()
+        .map(|(begin, end, text)| stable_segment_id(fingerprint, *begin, *end, text))
+        .collect();
+        let backward: Vec<_> = [
+            (2_000u64, 3_000u64, "c"),
+            (1_000, 2_000, "b"),
+            (0, 1_000, "a"),
+        ]
+        .iter()
+        .map(|(begin, end, text)| stable_segment_id(fingerprint, *begin, *end, text))
+        .collect();
         let mut expected = forward.clone();
         expected.sort();
         let mut actual = backward.clone();
@@ -2444,10 +2567,26 @@ mod tests {
 
         // 不变量：任何情况下输出都必须严格按源时间单调且互不重叠。
         let segments = vec![
-            DashScopeSegment { begin_time: 0, end_time: 1_000, text: "a".into() },
-            DashScopeSegment { begin_time: 900, end_time: 2_000, text: "b".into() },
-            DashScopeSegment { begin_time: 1_500, end_time: 1_600, text: "c".into() },
-            DashScopeSegment { begin_time: 1_550, end_time: 3_000, text: "d".into() },
+            DashScopeSegment {
+                begin_time: 0,
+                end_time: 1_000,
+                text: "a".into(),
+            },
+            DashScopeSegment {
+                begin_time: 900,
+                end_time: 2_000,
+                text: "b".into(),
+            },
+            DashScopeSegment {
+                begin_time: 1_500,
+                end_time: 1_600,
+                text: "c".into(),
+            },
+            DashScopeSegment {
+                begin_time: 1_550,
+                end_time: 3_000,
+                text: "d".into(),
+            },
         ];
         let resolved = resolve_time_overlaps(segments);
         for pair in resolved.windows(2) {
@@ -2581,7 +2720,12 @@ mod tests {
         assert!(clean.warnings.is_empty());
 
         // 转写本身失败时，清理结果不影响原始失败。
-        let failure = AsrError::new(AsrErrorKind::ProcessFailed, "dashscope_task_failed", "失败", false);
+        let failure = AsrError::new(
+            AsrErrorKind::ProcessFailed,
+            "dashscope_task_failed",
+            "失败",
+            false,
+        );
         let kept = apply_cleanup_outcome(Err(failure.clone()), Ok(())).expect_err("保持失败");
         assert_eq!(kept.code, "dashscope_task_failed");
         let kept = apply_cleanup_outcome(Err(failure), Err(cleanup_error)).expect_err("保持失败");
@@ -2598,17 +2742,50 @@ mod tests {
         // 默认关闭：未显式打开时不得记录任何事件。
         assert!(!sink.is_enabled());
         sink.emit(diagnostic(
-            "upload", "files", Some(200), std::time::Instant::now(), 1, None, true, false, false,
+            "upload",
+            "files",
+            Some(200),
+            std::time::Instant::now(),
+            1,
+            None,
+            true,
+            false,
+            false,
             None,
         ));
         assert!(sink.events().is_empty(), "开关关闭时不得记录");
         sink.set_enabled(true);
         assert!(sink.is_enabled());
         // 模拟一次完整链路：上传 -> 取签名 URL -> 提交 -> 轮询 -> 取结果。
-        let stages: [(&'static str, &'static str, Option<u16>, Option<AsrError>, bool, bool, bool); 5] = [
+        type StageExpectation = (
+            &'static str,
+            &'static str,
+            Option<u16>,
+            Option<AsrError>,
+            bool,
+            bool,
+            bool,
+        );
+        let stages: [StageExpectation; 5] = [
             ("upload", "files", Some(200), None, true, false, false),
-            ("signed_url", "files/{file_id}", Some(200), None, true, true, false),
-            ("submit", "services/audio/asr/transcription", Some(200), None, true, true, true),
+            (
+                "signed_url",
+                "files/{file_id}",
+                Some(200),
+                None,
+                true,
+                true,
+                false,
+            ),
+            (
+                "submit",
+                "services/audio/asr/transcription",
+                Some(200),
+                None,
+                true,
+                true,
+                true,
+            ),
             ("poll", "tasks/{task_id}", Some(200), None, true, true, true),
             (
                 "result",
@@ -2743,7 +2920,10 @@ mod tests {
             "oss://",
             "127.0.0.1",
         ] {
-            assert!(!json.contains(forbidden), "诊断事件不得包含 {forbidden}: {json}");
+            assert!(
+                !json.contains(forbidden),
+                "诊断事件不得包含 {forbidden}: {json}"
+            );
         }
     }
 
@@ -2776,7 +2956,18 @@ mod tests {
         );
         // 轮询四个终态：成功 / 任务失败 / 超时 / 取消。
         let poll_events = [
-            diagnostic("poll", "tasks/{task_id}", Some(200), now(), 3, None, false, false, true, None),
+            diagnostic(
+                "poll",
+                "tasks/{task_id}",
+                Some(200),
+                now(),
+                3,
+                None,
+                false,
+                false,
+                true,
+                None,
+            ),
             diagnostic(
                 "poll",
                 "tasks/{task_id}",
@@ -2829,7 +3020,16 @@ mod tests {
                 None,
             ),
             diagnostic(
-                "result", "result/{signed}", Some(200), now(), 1, None, false, true, true, None,
+                "result",
+                "result/{signed}",
+                Some(200),
+                now(),
+                1,
+                None,
+                false,
+                true,
+                true,
+                None,
             ),
         ];
         for event in poll_events.iter().chain(result_events.iter()) {
@@ -2841,8 +3041,14 @@ mod tests {
         assert_eq!(events[0].http_status, Some(200));
         assert!(events[0].error_code.is_none());
         assert!(events[0].has_task_id);
-        assert_eq!(events[1].error_code.as_deref(), Some("dashscope_task_failed"));
-        assert_eq!(events[2].error_code.as_deref(), Some("dashscope_poll_timeout"));
+        assert_eq!(
+            events[1].error_code.as_deref(),
+            Some("dashscope_task_failed")
+        );
+        assert_eq!(
+            events[2].error_code.as_deref(),
+            Some("dashscope_poll_timeout")
+        );
         assert_eq!(events[3].error_code.as_deref(), Some("asr_cancelled"));
         assert_eq!(events[3].failure_branch.as_deref(), Some("cancelled"));
         assert_eq!(events[4].stage, "result");
@@ -2866,7 +3072,10 @@ mod tests {
                 "/Users/",
                 "oss://",
             ] {
-                assert!(!json.contains(forbidden), "诊断事件不得包含 {forbidden}: {json}");
+                assert!(
+                    !json.contains(forbidden),
+                    "诊断事件不得包含 {forbidden}: {json}"
+                );
             }
             // 路径必须是静态模板，不能被填成具体对象。
             assert!(
@@ -2906,8 +3115,16 @@ mod tests {
         // 关闭开关会同时清空已攒的事件。
         sink.set_enabled(true);
         sink.emit(diagnostic(
-            "poll", "tasks/{task_id}", Some(200), std::time::Instant::now(), 9, None, true, true,
-            true, None,
+            "poll",
+            "tasks/{task_id}",
+            Some(200),
+            std::time::Instant::now(),
+            9,
+            None,
+            true,
+            true,
+            true,
+            None,
         ));
         assert_eq!(sink.events().len(), 1);
         sink.set_enabled(false);

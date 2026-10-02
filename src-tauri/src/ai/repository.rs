@@ -3136,7 +3136,11 @@ impl AiRepository {
     /// 语义：同键同输入返回已有记录（`reused`）；同键不同输入拒绝并返回
     /// `IdempotencyConflict`。该记录必须在调用上游之前写入，进程崩溃或断电后
     /// 仍能按 `request_id` 找回同一个上游任务，从而不产生第二次付费提交。
-    pub fn record_remote_job(&self, key: &RemoteJobKey, upstream_task_id: Option<&str>) -> Result<RemoteJobRecord> {
+    pub fn record_remote_job(
+        &self,
+        key: &RemoteJobKey,
+        upstream_task_id: Option<&str>,
+    ) -> Result<RemoteJobRecord> {
         if key.request_id.trim().is_empty() || key.task_type.trim().is_empty() {
             return Err(AiRepositoryError::Integrity(
                 "幂等请求标识与任务类型不能为空".to_owned(),
@@ -3178,12 +3182,7 @@ impl AiRepository {
                         status = 'reused',
                         updated_at = ?2
                   WHERE request_id = ?3 AND task_type = ?4",
-                params![
-                    upstream_task_id,
-                    now,
-                    key.request_id,
-                    key.task_type
-                ],
+                params![upstream_task_id, now, key.request_id, key.task_type],
             )?;
             return Ok(RemoteJobRecord {
                 request_id: key.request_id.clone(),
@@ -3227,7 +3226,11 @@ impl AiRepository {
     }
 
     /// 按幂等键读取已落盘记录，供重启恢复使用。
-    pub fn remote_job_record(&self, request_id: &str, task_type: &str) -> Result<Option<RemoteJobRecord>> {
+    pub fn remote_job_record(
+        &self,
+        request_id: &str,
+        task_type: &str,
+    ) -> Result<Option<RemoteJobRecord>> {
         let connection = self.database.connection()?;
         let record = connection
             .query_row(
@@ -3275,7 +3278,8 @@ impl AiRepository {
         Ok(out)
     }
 
-    pub fn create_artifact(&self, input: NewAsrArtifact) -> Result<AsrArtifact> {        let source_hash = input.source_fingerprint.fingerprint()?;
+    pub fn create_artifact(&self, input: NewAsrArtifact) -> Result<AsrArtifact> {
+        let source_hash = input.source_fingerprint.fingerprint()?;
         let source_json = serde_json::to_string(&input.source_fingerprint)
             .map_err(|_| AiRepositoryError::Serialization("源指纹无法序列化".to_owned()))?;
         let now = Utc::now().to_rfc3339();
@@ -4705,7 +4709,9 @@ pub(crate) fn migrate_ai_v26(connection: &mut Connection) -> crate::database::Re
     ] {
         let exists: bool = transaction
             .query_row(
-                &format!("SELECT 1 FROM pragma_table_info('asr_artifacts') WHERE name = '{column}'"),
+                &format!(
+                    "SELECT 1 FROM pragma_table_info('asr_artifacts') WHERE name = '{column}'"
+                ),
                 [],
                 |_| Ok(()),
             )
@@ -5706,7 +5712,10 @@ mod remote_job_idempotency_tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("columns exist");
-        assert!(chunk.is_none() && normalization.is_none(), "旧行不得被回填新列");
+        assert!(
+            chunk.is_none() && normalization.is_none(),
+            "旧行不得被回填新列"
+        );
         drop(connection);
         // 缓存命中行为不变：同一源指纹与识别配置指纹仍命中该已发布产物。
         let hit = repository
