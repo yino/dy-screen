@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "visual-check",
+  "status": "fail",
+  "visualReview": "pending",
+  "artifact": {
+    "path": "/opt/yino/python/douyin/docs/diagrams/client-agent-flow.html",
+    "sha256": "fe4e5bac55eba8ec2d841f237e84cec02839a9d08c8326b422efd185bf00649a",
+    "bytes": 633647
+  },
+  "state": {
+    "detail": "read",
+    "motion": "still"
+  },
+  "chrome": {
+    "status": "available",
+    "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  },
+  "containment": {
+    "status": "fail",
+    "viewports": []
+  },
+  "captures": {
+    "status": "fail",
+    "screenshots": [],
+    "contactSheet": null
+  },
+  "sidecars": {
+    "receipt": "client-agent-flow.visual-check.json",
+    "contactSheet": "client-agent-flow.visual-check.html"
+  },
+  "error": "Chrome exited before visual-check completed (null)"
+}

@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "精彩分析（精彩提取）详细流程",
+    "output": "docs/diagrams/highlight-analysis-sequence.html",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [
+      1200,
+      800
+    ]
+  },
+  "participants": [
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "项目页",
+      "sublabel": "Tauri WebView"
+    },
+    {
+      "id": "cmd",
+      "type": "backend",
+      "label": "Tauri 命令",
+      "sublabel": "ai_start_highlight_analysis"
+    },
+    {
+      "id": "wf",
+      "type": "backend",
+      "label": "HighlightWorkflow",
+      "sublabel": "Rust 编排"
+    },
+    {
+      "id": "gate",
+      "type": "security",
+      "label": "本地校验",
+      "sublabel": "信任边界"
+    },
+    {
+      "id": "key",
+      "type": "security",
+      "label": "系统凭据库",
+      "sublabel": "Keychain"
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "SQLite 仓库",
+      "sublabel": "运行 · 批次 · 候选"
+    },
+    {
+      "id": "llm",
+      "type": "cloud",
+      "label": "阿里云百炼",
+      "sublabel": "compatible-mode"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 400,
+      "label": "门禁与准备"
+    },
+    {
+      "from": 400,
+      "to": 552,
+      "label": "候选发现 Agent（逐批）"
+    },
+    {
+      "from": 552,
+      "to": 700,
+      "label": "全局评分 Agent 与发布"
+    }
+  ],
+  "messages": [
+    {
+      "from": "ui",
+      "to": "cmd",
+      "y": 170,
+      "label": "点击开始（需勾选授权）",
+      "variant": "emphasis"
+    },
+    {
+      "from": "cmd",
+      "to": "wf",
+      "y": 206,
+      "label": "prepare(project_id, confirmed)",
+      "variant": "emphasis"
+    },
+    {
+      "from": "wf",
+      "to": "key",
+      "y": 242,
+      "label": "读取 API Key",
+      "variant": "default"
+    },
+    {
+      "from": "key",
+      "to": "wf",
+      "y": 278,
+      "label": "缺失 → Credential",
+      "variant": "return"
+    },
+    {
+      "from": "wf",
+      "to": "db",
+      "y": 314,
+      "label": "项目 completed + 读转写投影",
+      "variant": "default"
+    },
+    {
+      "from": "db",
+      "to": "wf",
+      "y": 350,
+      "label": "稳定句段 · 标签 · 阈值 70/80",
+      "variant": "return"
+    },
+    {
+      "from": "wf",
+      "to": "db",
+      "y": 386,
+      "label": "冻结模型 + 写运行与批次（指纹唯一）",
+      "variant": "emphasis"
+    },
+    {
+      "from": "wf",
+      "to": "llm",
+      "y": 422,
+      "label": "候选发现 Agent：≤6000 字符批次",
+      "variant": "emphasis"
+    },
+    {
+      "from": "llm",
+      "to": "wf",
+      "y": 458,
+      "label": "候选 JSON：六维分 + 句段 ID",
+      "variant": "return"
+    },
+    {
+      "from": "wf",
+      "to": "gate",
+      "y": 494,
+      "label": "本地校验：跨视频 / 越界 / 15–90 秒",
+      "variant": "security"
+    },
+    {
+      "from": "gate",
+      "to": "wf",
+      "y": 530,
+      "label": "通过入库，未通过丢弃",
+      "variant": "return"
+    },
+    {
+      "from": "wf",
+      "to": "db",
+      "y": 566,
+      "label": "批级状态落库；重试 1 次 / 连 3 批熔断",
+      "variant": "dashed"
+    },
+    {
+      "from": "wf",
+      "to": "llm",
+      "y": 602,
+      "label": "全局评分 Agent：只评分，不新增候选",
+      "variant": "emphasis"
+    },
+    {
+      "from": "llm",
+      "to": "wf",
+      "y": 638,
+      "label": "0–100 总分 + 理由 + 排序",
+      "variant": "return"
+    },
+    {
+      "from": "wf",
+      "to": "db",
+      "y": 674,
+      "label": "写终态：completed / partial + 错误码",
+      "variant": "emphasis"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "cmd",
+      "from": 164,
+      "to": 212,
+      "type": "backend"
+    },
+    {
+      "participant": "wf",
+      "from": 200,
+      "to": 682,
+      "type": "backend"
+    },
+    {
+      "participant": "key",
+      "from": 236,
+      "to": 284,
+      "type": "security"
+    },
+    {
+      "participant": "db",
+      "from": 308,
+      "to": 392,
+      "type": "database"
+    },
+    {
+      "participant": "llm",
+      "from": 416,
+      "to": 464,
+      "type": "cloud"
+    },
+    {
+      "participant": "gate",
+      "from": 488,
+      "to": 536,
+      "type": "security"
+    },
+    {
+      "participant": "db",
+      "from": 560,
+      "to": 572,
+      "type": "database"
+    },
+    {
+      "participant": "llm",
+      "from": 596,
+      "to": 644,
+      "type": "cloud"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两个 Agent，一次冻结",
+      "items": [
+        "候选发现按源视频分批调用，每批 ≤6000 字符、重叠 2 句",
+        "全局评分只接收已校验候选，不新增候选、不改时间与句段 ID",
+        "模型与地址在运行开始前解析一次并冻结，两阶段必须同模型",
+        "UI 通过 ai_get_highlight_progress 轮询读取运行终态与 Token 用量"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "本地校验是信任边界",
+      "items": [
+        "跨源视频、越界时间、伪造句段 ID、时长不在 15–90 秒一律丢弃",
+        "模型返回的文本被视为用户数据，不是可执行指令",
+        "候选通过校验前不会进入仓库，也不会参与评分"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "失败可续、结果可复现",
+      "items": [
+        "批级状态落库，同一 run_id 只跑一次，失败批次可单独重跑",
+        "运行指纹含调用路径指纹，同输入同模型直接复用已有运行",
+        "连续 3 批失败熔断；评分失败退回备用排序并标记 partial"
+      ]
+    }
+  ]
+}

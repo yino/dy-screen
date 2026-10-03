@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "visual-check",
+  "status": "fail",
+  "visualReview": "pending",
+  "artifact": {
+    "path": "/opt/yino/python/douyin/docs/diagrams/effect-caption-status.html",
+    "sha256": "e2810668d2ffb31c4c787089c3cc3e880211191941872040215f1def3dd77038",
+    "bytes": 638448
+  },
+  "state": {
+    "detail": "read",
+    "motion": "still"
+  },
+  "chrome": {
+    "status": "available",
+    "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  },
+  "containment": {
+    "status": "fail",
+    "viewports": []
+  },
+  "captures": {
+    "status": "fail",
+    "screenshots": [],
+    "contactSheet": null
+  },
+  "sidecars": {
+    "receipt": "effect-caption-status.visual-check.json",
+    "contactSheet": "effect-caption-status.visual-check.html"
+  },
+  "error": "Chrome exited before visual-check completed (null)"
+}

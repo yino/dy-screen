@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "两个 Agent 的内部契约：候选发现 → 全局评分",
+    "output": "docs/diagrams/highlight-two-agents-sequence.html",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1000, 800]
+  },
+  "participants": [
+    { "id": "wf", "type": "backend", "label": "HighlightWorkflow", "sublabel": "Rust 编排" },
+    { "id": "a1", "type": "cloud", "label": "候选发现 Agent", "sublabel": "逐批调用" },
+    { "id": "gate", "type": "security", "label": "本地校验与归一", "sublabel": "信任边界" },
+    { "id": "db", "type": "database", "label": "SQLite 仓库", "sublabel": "批次 · 候选" },
+    { "id": "a2", "type": "cloud", "label": "全局评分 Agent", "sublabel": "同一冻结模型" }
+  ],
+  "segments": [
+    { "from": 150, "to": 355, "label": "候选发现 Agent 契约" },
+    { "from": 355, "to": 555, "label": "全局评分 Agent 契约" },
+    { "from": 555, "to": 690, "label": "发布与终态" }
+  ],
+  "messages": [
+    { "from": "wf", "to": "a1", "y": 170, "label": "① 输入：task · tags · goal · skills[] · segments[]", "variant": "emphasis" },
+    { "from": "a1", "to": "wf", "y": 208, "label": "② 输出：candidates[] 结构化候选", "variant": "return" },
+    { "from": "wf", "to": "gate", "y": 246, "label": "③ 白名单 = 物理句段（不含只读上下文）", "variant": "security" },
+    { "from": "gate", "to": "wf", "y": 284, "label": "丢弃伪造 / 越界 / 时长不符，按六维均值排序", "variant": "return" },
+    { "from": "wf", "to": "db", "y": 322, "label": "④ 草稿快照入库 + token 累加，运行仍 running", "variant": "emphasis" },
+    { "from": "wf", "to": "a1", "y": 360, "label": "⑤ 重试：仅可重试错误，同批最多 2 次", "variant": "dashed" },
+    { "from": "wf", "to": "a2", "y": 398, "label": "⑥ 输入：已校验草稿原样回传", "variant": "emphasis" },
+    { "from": "a2", "to": "wf", "y": 436, "label": "⑦ 输出：scores[] 统一评分", "variant": "return" },
+    { "from": "wf", "to": "gate", "y": 474, "label": "⑧ 量纲归一；rank=0 或越界分直接丢弃", "variant": "security" },
+    { "from": "gate", "to": "wf", "y": 512, "label": "⑨ 漏项用发现阶段六维均值补分，排在最后", "variant": "return" },
+    { "from": "wf", "to": "db", "y": 550, "label": "⑩ 原子替换候选表；selected = totalScore ≥ excellent", "variant": "emphasis" },
+    { "from": "wf", "to": "db", "y": 588, "label": "⑪ 评分整体失败 → 备用排序 + 标 partial", "variant": "dashed" },
+    { "from": "wf", "to": "db", "y": 626, "label": "⑫ 运行终态：completed / partial + 错误码", "variant": "emphasis" }
+  ],
+  "activations": [
+    { "participant": "wf", "from": 164, "to": 634, "type": "backend" },
+    { "participant": "a1", "from": 164, "to": 214, "type": "cloud" },
+    { "participant": "gate", "from": 240, "to": 290, "type": "security" },
+    { "participant": "db", "from": 316, "to": 328, "type": "database" },
+    { "participant": "a1", "from": 354, "to": 366, "type": "cloud" },
+    { "participant": "a2", "from": 392, "to": 442, "type": "cloud" },
+    { "participant": "gate", "from": 468, "to": 518, "type": "security" },
+    { "participant": "db", "from": 544, "to": 556, "type": "database" },
+    { "participant": "db", "from": 582, "to": 594, "type": "database" },
+    { "participant": "db", "from": 620, "to": 632, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Agent 1 契约：候选发现", "items": ["输入：task · tags · goal · skills[{id,version,guidance}] · segments[{id,inputId,startMs,endMs,text,readOnlyContext}]", "输出（camelCase）：candidateKey · title · inputId · segmentIds[] · startMs · endMs · 六维分 · reason · matchedTags[]", "只读上下文仅进首块且 ≤1500 字符，物理候选白名单是 chunk.segmentIds，引用上下文句段直接判废"] },
+    { "dot": "emerald", "title": "Agent 2 契约：全局评分", "items": ["输入：已校验草稿原样回传（含 candidateKey、六维分、reason、matchedTags）", "输出：candidateKey · totalScore · 六维分 · rank · reason", "三道兜底：量纲归一 ×100/×10 → 过滤集合外 key 与非法分 → 漏项用发现阶段均值补分并排在最后", "评分整体失败退回发现分数排序，运行标记 partial"] },
+    { "dot": "violet", "title": "两次调用的共同底座", "items": ["同一冻结模型与地址 compatible-mode/v1，端点 path = chat/completions", "temperature 0 · thinking disabled · max_tokens 4096 · retries 0", "唯一连接键是模型自填的 candidateKey：客户端只查唯一性与集合成员，不重算不规范化", "每次调用一个脱敏终态事件，结构里没有能装 prompt 或 API Key 的字段"] }
+  ]
+}

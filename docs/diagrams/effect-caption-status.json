@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "特效字幕增强（HyperFrames）链路现状",
+    "output": "docs/diagrams/effect-caption-status.html",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "evidence",
+      "label": "适用性验证（仓库外沙箱）"
+    },
+    {
+      "id": "contract",
+      "label": "契约与数据模型"
+    },
+    {
+      "id": "generate",
+      "label": "组合生成"
+    },
+    {
+      "id": "gate",
+      "label": "白名单校验"
+    },
+    {
+      "id": "render",
+      "label": "受限渲染"
+    },
+    {
+      "id": "frames",
+      "label": "帧合成与导出"
+    },
+    {
+      "id": "decision",
+      "label": "渲染路径裁决",
+      "variant": "exception"
+    }
+  ],
+  "mainPath": [
+    "sandbox",
+    "contract",
+    "skill",
+    "whitelist",
+    "renderproc",
+    "frames"
+  ],
+  "nodes": [
+    {
+      "id": "sandbox",
+      "lane": "evidence",
+      "col": 0,
+      "type": "external",
+      "label": "沙箱验证",
+      "sublabel": "组 0 · 非产品代码",
+      "tag": "已完成",
+      "width": 92
+    },
+    {
+      "id": "gap07",
+      "lane": "evidence",
+      "col": 1,
+      "type": "security",
+      "label": "引擎脚本清单",
+      "sublabel": "0.7 未取得哈希",
+      "tag": "缺证据",
+      "width": 116
+    },
+    {
+      "id": "contract",
+      "lane": "contract",
+      "col": 1,
+      "type": "database",
+      "label": "契约与迁移",
+      "sublabel": "domain · repository",
+      "tag": "未实现",
+      "width": 116
+    },
+    {
+      "id": "skill",
+      "lane": "generate",
+      "col": 2,
+      "type": "cloud",
+      "label": "组合生成 Skill",
+      "sublabel": "模型产出 HTML/CSS",
+      "tag": "未实现",
+      "width": 116
+    },
+    {
+      "id": "whitelist",
+      "lane": "gate",
+      "col": 3,
+      "type": "security",
+      "label": "白名单校验",
+      "sublabel": "脚本 · 外链 · 文本",
+      "tag": "未实现",
+      "width": 116
+    },
+    {
+      "id": "renderproc",
+      "lane": "render",
+      "col": 4,
+      "type": "backend",
+      "label": "受限渲染子进程",
+      "sublabel": "隔离 · 限额 · 取消",
+      "tag": "未实现",
+      "width": 116
+    },
+    {
+      "id": "frames",
+      "lane": "frames",
+      "col": 5,
+      "type": "backend",
+      "label": "合成导出",
+      "sublabel": "clip_export.rs",
+      "tag": "未实现",
+      "width": 92
+    },
+    {
+      "id": "adjudicate",
+      "lane": "decision",
+      "col": 5,
+      "type": "backend",
+      "label": "渲染路径裁决",
+      "sublabel": "原生 vs 带视口",
+      "tag": "待 Lead 裁决",
+      "width": 92
+    }
+  ],
+  "edges": [
+    {
+      "from": "sandbox",
+      "to": "contract",
+      "label": "验证通过后进入实现",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 18
+    },
+    {
+      "from": "contract",
+      "to": "skill",
+      "label": "增强方式与字段",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 29
+    },
+    {
+      "from": "skill",
+      "to": "whitelist",
+      "label": "受限组合",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 29
+    },
+    {
+      "from": "whitelist",
+      "to": "renderproc",
+      "label": "过校验才启动渲染",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 29
+    },
+    {
+      "from": "renderproc",
+      "to": "frames",
+      "label": "RGBA 帧序列",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 29
+    },
+    {
+      "from": "sandbox",
+      "to": "gap07",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "from": "adjudicate",
+      "to": "frames",
+      "label": "裁决后才定出帧路径",
+      "role": "branch",
+      "variant": "dashed",
+      "labelDy": 18
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "现在就能说的事实",
+      "items": [
+        "产品代码 0 行：src · src-tauri/src · ui/src · scripts · tests 全量搜索 hyperframes 无命中",
+        "唯一跑过 HyperFrames 的代码在仓库外 /tmp/caption-sandbox2，重启即失",
+        "已完成部分只有沙箱验证 0.1–0.6 / 0.8 与 spec · design · tasks 文档"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "待裁决与硬缺口",
+      "items": [
+        "Q1 原生 png-sequence 1080×1920@30fps 为实时的 2.95–5.22 倍，不通过",
+        "替代方案 2：band-viewport 1080×400 + ffmpeg 合成约 0.85 倍，报告标注需 Lead 裁决",
+        "任务 0.7 未完成：真实引擎脚本清单与哈希缺失，组 4.7 完整性校验无法定稿"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "计划落点（tasks.md 明确）",
+      "items": [
+        "domain.rs 增强方式枚举 · repository.rs 迁移 27 · clip_export.rs 合成扩展",
+        "新增字幕组合 Skill、白名单校验器、受限渲染子进程与运行时资源清单",
+        "编排位置：智能成片在转场匹配之后新增表现形式增强阶段（任务 11.1）"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "切片智能体客户端：Agent 全流程",
+    "output": "docs/diagrams/client-agent-flow.html",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "shell",
+      "label": "客户端外壳"
+    },
+    {
+      "id": "monitor",
+      "label": "监看调度"
+    },
+    {
+      "id": "record",
+      "label": "录制"
+    },
+    {
+      "id": "asr",
+      "label": "云端识别"
+    },
+    {
+      "id": "ai",
+      "label": "精彩分析"
+    },
+    {
+      "id": "deliver",
+      "label": "出片"
+    }
+  ],
+  "phases": [
+    {
+      "id": "boot",
+      "label": "启动与鉴权",
+      "fromCol": 0,
+      "toCol": 0
+    },
+    {
+      "id": "watch",
+      "label": "监看与判定",
+      "fromCol": 1,
+      "toCol": 1,
+      "variant": "emphasis"
+    },
+    {
+      "id": "capture",
+      "label": "录制与识别",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "dashed"
+    },
+    {
+      "id": "produce",
+      "label": "分析与出片",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "boot",
+    "probe",
+    "record",
+    "transcribe",
+    "analyze",
+    "export"
+  ],
+  "nodes": [
+    {
+      "id": "boot",
+      "lane": "shell",
+      "col": 0,
+      "type": "backend",
+      "label": "启动与激活",
+      "sublabel": "单实例锁 · 激活 · 心跳",
+      "width": 92
+    },
+    {
+      "id": "probe",
+      "lane": "monitor",
+      "col": 1,
+      "type": "external",
+      "label": "直播间探测",
+      "sublabel": "原生请求 · 受限转浏览器",
+      "width": 120,
+      "tag": "退避至 30 分钟"
+    },
+    {
+      "id": "record",
+      "lane": "record",
+      "col": 2,
+      "type": "backend",
+      "label": "FFmpeg 分片录制",
+      "sublabel": "900s 分片 · 磁盘闸门",
+      "width": 120
+    },
+    {
+      "id": "transcribe",
+      "lane": "asr",
+      "col": 3,
+      "type": "cloud",
+      "label": "云端语音识别",
+      "sublabel": "files → 签名 → 提交",
+      "width": 120
+    },
+    {
+      "id": "analyze",
+      "lane": "ai",
+      "col": 4,
+      "type": "cloud",
+      "label": "LLM 精彩分析",
+      "sublabel": "chat/completions",
+      "width": 120
+    },
+    {
+      "id": "export",
+      "lane": "deliver",
+      "col": 5,
+      "type": "backend",
+      "label": "剪辑导出",
+      "sublabel": "字幕 · 转场 · MP4",
+      "width": 104
+    }
+  ],
+  "edges": [
+    {
+      "from": "boot",
+      "to": "probe",
+      "label": "开始监看",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "probe",
+      "to": "record",
+      "label": "判定开播",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 30
+    },
+    {
+      "from": "record",
+      "to": "transcribe",
+      "label": "分片音频",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "transcribe",
+      "to": "analyze",
+      "label": "带时间戳文本",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "analyze",
+      "to": "export",
+      "label": "精彩片段",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "三层边界，只有一层在执行",
+      "items": [
+        "L1 客户端（Tauri + Rust）是唯一实现体",
+        "L2 运营服务端本轮不新增端点",
+        "L3 阿里云百炼是唯一 AI 来源"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "探测与识别都默认直连",
+      "items": [
+        "原生请求失败时改用 WebView 验证通道，验证后重试探测",
+        "上传 → 签名临时 URL → 提交任务 → 轮询取结果",
+        "只有冻结的 engine_id 明确选择本地才启动 whisper.cpp"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "每一步都留可核对痕迹",
+      "items": [
+        "client_api 调用点：operation/path/durationMs/httpStatus/businessCode",
+        "监听诊断 JSONL：classification/markers/nextAction/nextRetryAt",
+        "云端与 LLM 调用诊断默认关闭、不落盘，结构上无法承载密钥"
+      ]
+    }
+  ]
+}
