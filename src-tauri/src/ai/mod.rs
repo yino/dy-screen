@@ -11,6 +11,7 @@ mod desktop_runtime;
 mod domain;
 mod effect_caption;
 mod effect_caption_composition;
+mod effect_caption_render;
 mod highlight;
 mod lifecycle;
 mod llm;
@@ -70,6 +71,14 @@ pub use effect_caption_composition::{
     BUNDLED_STYLESHEET, BuiltEffectCaption, CompositionRequest, EffectCaptionCompositionError,
     EffectCaptionCompositionProvider, EffectCaptionCompositionSkill,
     build_effect_caption_composition, composition_prompt, generate_effect_caption_composition,
+};
+pub use effect_caption_render::{
+    AlwaysIdleGate, BaseCapabilityGate, EffectCaptionRenderer, EffectCaptionRuntimeError,
+    PageScriptAttestation, ProcessExit, ProcessLimits, ProcessMemoryProbe, RenderInvocation,
+    RenderLimits, RenderOutcome, RenderScheduler, RendererRuntimeManifest, SubprocessRenderer,
+    SystemMemoryProbe, VerifiedRendererRuntime, assert_paths_within_roots,
+    build_restricted_command, cleanup_unpublished_frames, compute_tree_digest, supervise_process,
+    verify_browser, verify_page_script_attestation, verify_render_outcome, verify_renderer_runtime,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
