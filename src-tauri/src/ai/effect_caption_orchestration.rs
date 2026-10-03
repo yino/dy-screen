@@ -698,6 +698,77 @@ mod tests {
         assert_eq!(unchanged.project.name, "增强工程");
     }
 
+    /// 任务 3.9：白名单校验失败的组合不得写入工程（不产生生效的增强记录），
+    /// 也不得创建任何渲染缓存条目。
+    #[tokio::test]
+    async fn rejected_composition_never_becomes_a_project_effect_or_a_cache_entry() {
+        use crate::ai::effect_caption::{EffectCaptionLimits, validate_effect_caption};
+
+        struct ValidatingRunner;
+        #[async_trait]
+        impl EffectCaptionEnhancementRunner for ValidatingRunner {
+            async fn enhance(
+                &self,
+                _highlight: &EnhancementHighlight,
+                _cancellation: &CancellationToken,
+            ) -> Result<EnhancementProduct, EffectCaptionRuntimeError> {
+                // 真实实现同样先做白名单校验，再考虑启动渲染进程。
+                let invalid = "<div class=\"caption-root\"><script>alert(1)</script></div>";
+                match validate_effect_caption(invalid, &[], &EffectCaptionLimits::default()) {
+                    Ok(_) => Ok(EnhancementProduct {
+                        composition_version: "should-not-happen".to_owned(),
+                        composition_fingerprint: "should-not-happen".to_owned(),
+                        frames_dir: "/tmp/should-not-happen".to_owned(),
+                        emphasis_words: Vec::new(),
+                    }),
+                    Err(rejection) => Err(EffectCaptionRuntimeError::new(
+                        "effect_caption_rejected",
+                        format!("{:?}", rejection.code),
+                    )),
+                }
+            }
+        }
+
+        let repository = repository();
+        let project = repository
+            .create_project("校验失败工程", &profile())
+            .expect("create project");
+        let mut candidate = candidates();
+        candidate.truncate(1);
+        let highlights = enhancement_highlights(&candidate, &published(), "fp-1");
+        let summary = run_enhancement_stage(
+            &repository,
+            &ValidatingRunner,
+            &highlights,
+            project.id,
+            "fp-1",
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("阶段本身必须成功返回");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.applied, 0);
+
+        // 不得成为工程上的生效增强：要么没有记录，要么只能是 rejected。
+        if let Some(record) = repository
+            .active_enhancement_for_candidate(candidate[0].id)
+            .unwrap()
+        {
+            assert_eq!(record.status, Status::Rejected);
+            assert!(record.composition_version.is_none());
+            assert!(record.suppression_ranges.is_empty());
+        }
+        // 渲染缓存必须完全干净：没有尝试行，也没有 ready 帧。
+        assert_eq!(
+            repository.render_attempt_count().unwrap(),
+            0,
+            "校验失败不得创建渲染缓存条目"
+        );
+        // 组合版本也不可能被写进工程（草稿版本不变）。
+        let detail = repository.get_project(project.id).unwrap();
+        assert_eq!(detail.project.status, crate::ai::AiProjectStatus::Draft);
+    }
+
     use crate::ai::domain::RecognitionProfile;
 
     fn profile() -> RecognitionProfile {
