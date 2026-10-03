@@ -5146,6 +5146,58 @@ impl AiRepository {
             .ok_or(AiRepositoryError::NotFound("渲染尝试"))
     }
 
+    /// 删除某候选的全部渲染缓存条目，返回被删除条目的帧目录（任务 9.3）。
+    ///
+    /// 只删除渲染缓存行；工程、ASR 产物与已导出成片不在这些表与目录内，因此不受影响。
+    pub fn delete_render_attempts_for_candidate(&self, candidate_id: i64) -> Result<Vec<String>> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let directories = {
+            let mut statement = transaction.prepare(
+                "SELECT frames_dir FROM ai_effect_caption_renders WHERE candidate_id = ?1",
+            )?;
+            statement
+                .query_map([candidate_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        transaction.execute(
+            "DELETE FROM ai_effect_caption_renders WHERE candidate_id = ?1",
+            [candidate_id],
+        )?;
+        transaction.commit()?;
+        Ok(directories)
+    }
+
+    /// 删除指定时间之前创建且**未在渲染中**的缓存条目，返回被删除条目的帧目录。
+    pub fn prune_render_attempts_created_before(&self, cutoff: &str) -> Result<Vec<String>> {
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let directories = {
+            let mut statement = transaction.prepare(
+                "SELECT frames_dir FROM ai_effect_caption_renders WHERE created_at < ?1 AND status <> 'rendering'",
+            )?;
+            statement
+                .query_map([cutoff], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        transaction.execute(
+            "DELETE FROM ai_effect_caption_renders WHERE created_at < ?1 AND status <> 'rendering'",
+            [cutoff],
+        )?;
+        transaction.commit()?;
+        Ok(directories)
+    }
+
+    pub fn render_attempt_count(&self) -> Result<usize> {
+        let connection = self.database.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM ai_effect_caption_renders",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn get_render_attempt(
         &self,
         attempt_id: i64,

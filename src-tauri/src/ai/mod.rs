@@ -10,6 +10,7 @@ mod commands;
 mod desktop_runtime;
 mod domain;
 mod effect_caption;
+mod effect_caption_cache;
 mod effect_caption_composition;
 mod effect_caption_render;
 mod effect_caption_spec;
@@ -72,6 +73,9 @@ pub use effect_caption::{
     PublishedHighlightSegment, RENDERER_CONTRACT_ATTRIBUTES, TAG_ALLOWLIST, VOID_ELEMENTS,
     ValidatedEffectCaption, ValidatedEnhancement, validate_effect_caption,
     validate_enhancement_proposals,
+};
+pub use effect_caption_cache::{
+    RenderCacheOutcome, clear_render_cache, prune_render_cache, render_with_cache,
 };
 pub use effect_caption_composition::{
     BUNDLED_STYLESHEET, BuiltEffectCaption, CompositionRequest, EffectCaptionCompositionError,

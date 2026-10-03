@@ -68,6 +68,19 @@ pub struct VerifiedRendererRuntime {
     font_version: String,
 }
 
+#[cfg(test)]
+impl VerifiedRendererRuntime {
+    /// 测试专用：跳过随包清单校验，构造一个已校验运行时。
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            renderer_version: "0.8.96".to_owned(),
+            renderer_tree_sha256: "test-tree".to_owned(),
+            engine_script_sha256: "test-engine".to_owned(),
+            font_version: "test-fonts".to_owned(),
+        }
+    }
+}
+
 impl VerifiedRendererRuntime {
     pub fn renderer_version(&self) -> &str {
         &self.renderer_version
