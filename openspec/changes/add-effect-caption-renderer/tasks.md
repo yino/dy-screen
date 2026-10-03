@@ -117,9 +117,7 @@
 
 ## 11. 编排、降级与阶段语义
 
-- [ ] 11.1 在智能成片编排中于转场匹配之后新增表现形式增强阶段，验证基础草稿在增强完成前即可审阅与导出
-  - 已完成：`AiSmartStage::Enhancement` 落在 `Transition` 与 `Review` 之间（8 个阶段，含迁移 27 的 stage CHECK 扩展与落库行为测试）；`enhancement_stage_plan()` 明确 `blocking = false`；`assert_enhancement_stage_position()` 把「必须在转场之后、评审之前」变成可执行断言。
-  - **未勾选原因**：`SmartClippingWorkflow` 的调用点尚未接入（应在 `mark_smart_draft_review_ready` + `transition(... ReviewReady ...)` 之后以可选 runner 起后台任务；真实 runner 依赖随包渲染器，见组 10 阻塞项）。阶段语义与逐条降级已完成并有测试。
+- [x] 11.1 在智能成片编排中于转场匹配之后新增表现形式增强阶段，验证基础草稿在增强完成前即可审阅与导出（`AiSmartStage::Enhancement` 位于 `Transition` 与 `Review` 之间；`SmartClippingWorkflow::with_effect_caption_enhancement(runner)` 在**评审就绪之后**以非阻塞后台任务调用 `run_enhancement_for_batch`：登记阶段尝试、装载该批次入选高光与已发布句段、逐条执行增强；**端到端测试**验证评审就绪后增强阶段被登记并完成、每条入选高光都留下唯一最终增强方式，且草稿仍为 `review_ready`、导出状态仍为 `idle`。未注入 runner 时行为与注入前完全一致）
 - [x] 11.2 新增测试：增强阶段进行中用户可查看、编辑与导出基础草稿，增强结果就绪后不覆盖人工编辑（增强阶段 `blocking = false` 且只写 `ai_highlight_enhancements`：测试断言工程状态/名称与候选采用状态不变；旧代次结果经来源指纹判定只能落为历史建议，已生效结果的 `composition_version` 不被替换）
 - [x] 11.3 新增测试：单条高光渲染失败时该高光保留普通原视频与基础字幕、记录唯一最终增强方式与原因，其他高光与草稿状态不变（两条高光一条失败：`applied=1 / failed=1`、两条都被尝试、阶段本身成功返回；失败记录 `status=rejected` + `render_subprocess_failed` 且**抑制区间为空**（基础字幕保留）；无可用句段的高光记 `enhancement_no_published_segments` 且不调用渲染）
 - [x] 11.4 回归验证：合格与优秀阈值判定、候选采用决策与“必须由用户显式确认导出”的语义保持不变（新增测试断言增强阶段不改动工程状态与候选采用；同时全量回归 459 + 196 个测试全绿，覆盖阈值、候选采用与导出确认的既有语义）

@@ -26,9 +26,9 @@ use super::{
     AiSmartStageAttemptStatus, AiSmartWorkflow, AiSmartWorkflowBatch, AiSmartWorkflowDetail,
     AiSmartWorkflowEvent, AiSmartWorkflowMetric, AiSmartWorkflowMode, AiSmartWorkflowStatus,
     AiTranscriptProjection, AnalysisSegment, ClipTextCorrectionError, ClipTextCorrectionWorkflow,
-    HighlightWorkflow, LlmError, NewAiSmartCandidate, NewAiSmartCandidateSource,
-    NewAiSmartWorkflow, NewAiSmartWorkflowBatch, Result, SmartWorkflowConfiguration,
-    TrustedLocalFile,
+    EffectCaptionEnhancementRunner, EnhancementStageRequest, HighlightWorkflow, LlmError,
+    NewAiSmartCandidate, NewAiSmartCandidateSource, NewAiSmartWorkflow, NewAiSmartWorkflowBatch,
+    Result, SmartWorkflowConfiguration, TrustedLocalFile, run_enhancement_for_batch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1817,6 +1817,8 @@ pub struct SmartClippingWorkflow {
     gate: Arc<dyn SmartWorkflowGate>,
     publisher: Arc<dyn SmartWorkflowPublisher>,
     telemetry: Arc<dyn SmartWorkflowTelemetry>,
+    /// 表现形式增强执行者；未注入时增强阶段完全跳过（既有行为不变）。
+    enhancement: Option<Arc<dyn EffectCaptionEnhancementRunner>>,
     tasks: Arc<Mutex<HashMap<i64, SmartWorkflowTask>>>,
 }
 
@@ -1847,6 +1849,7 @@ impl SmartClippingWorkflow {
             gate,
             publisher: Arc::new(SilentSmartWorkflowPublisher),
             telemetry: Arc::new(SilentSmartWorkflowTelemetry),
+            enhancement: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1858,6 +1861,17 @@ impl SmartClippingWorkflow {
 
     pub fn with_telemetry(mut self, telemetry: Arc<dyn SmartWorkflowTelemetry>) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// 注入表现形式增强执行者（任务 11.1）。
+    ///
+    /// 未注入时增强阶段不会启动，智能成片的可观测行为与注入前完全一致。
+    pub fn with_effect_caption_enhancement(
+        mut self,
+        runner: Arc<dyn EffectCaptionEnhancementRunner>,
+    ) -> Self {
+        self.enhancement = Some(runner);
         self
     }
 
@@ -3236,6 +3250,40 @@ impl SmartClippingWorkflow {
             )
             .map_err(repository_error)?;
         self.publish_current(workflow_id, Some(batch.id));
+        // 基础草稿此刻已经可审阅、可导出；表现形式增强作为**非阻塞**后台阶段继续推进
+        // （任务 11.1 / 11.5）：它的失败与耗时都不影响首稿时效与草稿状态。
+        if let Some(runner) = self.enhancement.clone() {
+            let repository = self.repository.clone();
+            let workflows = self.workflows.clone();
+            // 必须重读批次：高光运行是在更早的阶段通过 attach_batch_project 挂上去的，
+            // 手里这份 batch 快照的 highlight_run_id 还是旧的。
+            let fresh_batch = self
+                .workflows
+                .get_batch(batch.id)
+                .map_err(repository_error)?;
+            let request = EnhancementStageRequest {
+                workflow_id,
+                batch_id: fresh_batch.id,
+                draft_generation: Some(draft.generation),
+                project_id: clip.project.id,
+                highlight_run_id: fresh_batch.highlight_run_id,
+                source_fingerprint: format!("{}:{}", draft.id, clip.project.version),
+            };
+            let cancellation = cancellation.child_token();
+            tokio::spawn(async move {
+                if let Err(error) = run_enhancement_for_batch(
+                    &repository,
+                    &workflows,
+                    runner.as_ref(),
+                    &request,
+                    &cancellation,
+                )
+                .await
+                {
+                    let _ = error;
+                }
+            });
+        }
         Ok(())
     }
 

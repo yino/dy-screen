@@ -5,11 +5,12 @@ use dy_screen_app_lib::ai::{
     AiPreflight, AiProjectService, AiProjectStatus, AiRepository, AiSmartBatchStatus,
     AiSmartClipSourceInput, AiSmartDraftOwnership, AiSmartStage, AiSmartStageAttemptStatus,
     AiSmartWorkflowMode, AiSmartWorkflowStatus, CandidateAgentOutput, CandidateAgentRequest,
-    ClipTextCorrectionWorkflow, CredentialStore, HighlightAgentProvider, HighlightCandidateDraft,
-    HighlightCandidateScore, HighlightWorkflow, LlmError, MemoryCredentialStore,
-    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAiSmartCandidate,
-    NewAiSmartCandidateSource, NewAiSmartWorkflow, NewAiSmartWorkflowBatch, NewAsrArtifact,
-    PreflightReport, ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest,
+    ClipTextCorrectionWorkflow, CredentialStore, EffectCaptionEnhancementRunner,
+    EffectCaptionRuntimeError, EnhancementHighlight, EnhancementProduct, HighlightAgentProvider,
+    HighlightCandidateDraft, HighlightCandidateScore, HighlightWorkflow, LlmError,
+    MemoryCredentialStore, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput,
+    NewAiSmartCandidate, NewAiSmartCandidateSource, NewAiSmartWorkflow, NewAiSmartWorkflowBatch,
+    NewAsrArtifact, PreflightReport, ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest,
     RecognitionProfile, SmartClippingWorkflow, SmartStageAttemptStart, SmartWorkflowConfiguration,
     SmartWorkflowGate, SmartWorkflowPublisher, SmartWorkflowRepository, SourceFingerprint,
     SubtitleCorrectionItem, SubtitleCorrectionOutput, SubtitleCorrectionProvider,
@@ -1081,6 +1082,184 @@ fn multi_source_draft_rejects_foreign_candidates_and_freezes_user_edits_and_expo
             )
             .is_err()
     );
+}
+
+/// 任务 11.1：转场匹配之后、评审就绪之后，表现形式增强作为非阻塞后台阶段推进；
+/// 基础草稿在增强完成前就已可审阅（workflow 状态与阶段不被增强影响）。
+#[tokio::test]
+async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("smart-source.mp4");
+    std::fs::write(&source, b"trusted fake video").unwrap();
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let repository = AiRepository::new(database.clone());
+    let controller = Arc::new(CompletingController {
+        repository: repository.clone(),
+        enqueue_count: AtomicUsize::new(0),
+        cancel_count: AtomicUsize::new(0),
+    });
+    let project_service = AiProjectService::new(
+        database.clone(),
+        Arc::new(SmartInspector),
+        Arc::new(SmartPreflight),
+    );
+    let credentials: Arc<dyn CredentialStore> = Arc::new(MemoryCredentialStore::new());
+    credentials.set("sk-test").unwrap();
+    let highlight = Arc::new(HighlightWorkflow::new(
+        repository.clone(),
+        Arc::new(SmartHighlightProvider),
+        credentials.clone(),
+    ));
+    let correction = ClipTextCorrectionWorkflow::new(
+        repository.clone(),
+        Arc::new(EchoCorrectionProvider),
+        credentials.clone(),
+    );
+    let assets = TransitionMaterialAssetService::new(
+        TransitionMaterialRepository::new(database.clone()),
+        TransitionMaterialCache::new(directory.path().join("transition-cache")).unwrap(),
+        CancellationToken::new(),
+        MaterialAssetRegistry::default(),
+    )
+    .unwrap();
+    let transition = TransitionMatchingWorkflow::new(
+        TransitionMaterialRepository::new(database.clone()),
+        repository.clone(),
+        Arc::new(EmptyTransitionProvider),
+        credentials,
+        assets,
+    );
+    let runner = Arc::new(RecordingEnhancementRunner::default());
+    let workflow = SmartClippingWorkflow::new(
+        database.clone(),
+        project_service.clone(),
+        controller.clone(),
+        highlight,
+        correction,
+        transition,
+        Arc::new(ReadyGate),
+    )
+    .with_effect_caption_enhancement(runner.clone());
+
+    let created = workflow
+        .create_local(
+            SmartWorkflowConfiguration {
+                name: "本地智能成片".to_owned(),
+                provider: "deepseek".to_owned(),
+                model_id: "deepseek-chat".to_owned(),
+                text_scope: "selected_clip_subtitles".to_owned(),
+                output_preference: "reviewable_compilation".to_owned(),
+            },
+            vec![TrustedLocalFile::new("trusted-grant", source)],
+            true,
+        )
+        .await
+        .unwrap();
+    let workflow_id = created.workflow.id;
+    let mut detail = None;
+    for _ in 0..200 {
+        let current = workflow.get(workflow_id).unwrap();
+        if matches!(
+            current.workflow.status,
+            AiSmartWorkflowStatus::ReviewReady | AiSmartWorkflowStatus::Failed
+        ) {
+            detail = Some(current);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let detail = detail.expect("智能任务应收敛到终态");
+    assert_eq!(
+        detail.workflow.status,
+        AiSmartWorkflowStatus::ReviewReady,
+        "{:?}",
+        detail.workflow.last_error_message
+    );
+
+    // 增强阶段是非阻塞后台任务：等待它登记阶段尝试即可，不影响上面的评审就绪结果。
+    let mut enhancement_attempt = None;
+    for _ in 0..200 {
+        let current = workflow.get(workflow_id).unwrap();
+        if let Some(attempt) = current
+            .attempts
+            .iter()
+            .find(|attempt| attempt.stage == AiSmartStage::Enhancement)
+        {
+            enhancement_attempt = Some(attempt.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let enhancement_attempt = enhancement_attempt.expect("增强阶段必须被登记");
+    assert_eq!(
+        enhancement_attempt.status,
+        AiSmartStageAttemptStatus::Completed,
+        "阶段本身必须完成：{:?}",
+        enhancement_attempt.last_error_message
+    );
+    // 评审就绪与草稿状态不被增强阶段改动。
+    let after = workflow.get(workflow_id).unwrap();
+    assert_eq!(after.workflow.status, AiSmartWorkflowStatus::ReviewReady);
+    assert_eq!(after.workflow.stage, AiSmartStage::Review);
+    assert_eq!(after.drafts[0].status.as_str(), "review_ready");
+    let clip = repository
+        .get_clip_project(after.drafts[0].clip_project_id)
+        .unwrap();
+    assert_eq!(clip.project.export_status.as_str(), "idle");
+
+    // 该批次的高光确实被逐条执行（runner 被调用，且留下了增强记录）。
+    let candidates = repository
+        .list_highlight_candidates(
+            repository
+                .latest_highlight_run_for_project(after.drafts[0].clip_project_id)
+                .unwrap()
+                .expect("高光运行")
+                .id,
+        )
+        .unwrap();
+    let selected: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| candidate.selected)
+        .collect();
+    assert!(!selected.is_empty(), "至少有一条入选高光");
+    assert!(
+        runner.calls.load(Ordering::SeqCst) >= selected.len(),
+        "每条入选高光都要尝试增强"
+    );
+    for candidate in &selected {
+        assert!(
+            repository
+                .active_enhancement_for_candidate(candidate.id)
+                .unwrap()
+                .is_some(),
+            "高光 {} 必须留下唯一最终增强方式",
+            candidate.id
+        );
+    }
+}
+
+/// 测试用增强执行者：记录调用次数并总是成功。
+#[derive(Default)]
+struct RecordingEnhancementRunner {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl EffectCaptionEnhancementRunner for RecordingEnhancementRunner {
+    async fn enhance(
+        &self,
+        highlight: &EnhancementHighlight,
+        _cancellation: &CancellationToken,
+    ) -> Result<EnhancementProduct, EffectCaptionRuntimeError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(EnhancementProduct {
+            composition_version: format!("composition-{}", highlight.candidate_id),
+            composition_fingerprint: format!("fingerprint-{}", highlight.candidate_id),
+            frames_dir: format!("/tmp/frames-{}", highlight.candidate_id),
+            emphasis_words: Vec::new(),
+        })
+    }
 }
 
 #[tokio::test]

@@ -269,6 +269,138 @@ fn base_enhancement_input(
     }
 }
 
+/// 一次批次级增强阶段的请求（任务 11.1 的调用点契约）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnhancementStageRequest {
+    pub workflow_id: i64,
+    pub batch_id: i64,
+    pub draft_generation: Option<u32>,
+    pub project_id: i64,
+    pub highlight_run_id: Option<i64>,
+    pub source_fingerprint: String,
+}
+
+/// 由工程已发布字幕构造已发布区间（隐藏句段不参与）。
+pub fn published_ranges_from_subtitles(
+    subtitles: &[super::domain::AiClipSubtitle],
+) -> Vec<PublishedSubtitleRange> {
+    let mut ranges: Vec<PublishedSubtitleRange> = subtitles
+        .iter()
+        .filter(|subtitle| !subtitle.hidden)
+        .map(|subtitle| PublishedSubtitleRange {
+            subtitle_id: subtitle.id,
+            stable_segment_id: subtitle.stable_segment_id.clone(),
+            start_ms: subtitle.project_start_ms,
+            end_ms: subtitle.project_end_ms,
+        })
+        .collect();
+    ranges.sort_by_key(|range| (range.start_ms, range.end_ms));
+    ranges
+}
+
+/// 批次级增强阶段：登记阶段尝试，装载该批次的高光与已发布句段，逐条执行增强。
+///
+/// 这是 `SmartClippingWorkflow` 在评审就绪后调用的入口。它**不修改**草稿状态：
+/// 阶段结果是 `ai_highlight_enhancements` 记录与阶段尝试行（任务 11.1 / 11.2）。
+pub async fn run_enhancement_for_batch(
+    repository: &AiRepository,
+    workflows: &super::smart_workflow::SmartWorkflowRepository,
+    runner: &dyn EffectCaptionEnhancementRunner,
+    request: &EnhancementStageRequest,
+    cancellation: &CancellationToken,
+) -> Result<EnhancementStageSummary, EffectCaptionRuntimeError> {
+    let attempt = workflows
+        .start_attempt(&super::smart_workflow::SmartStageAttemptStart {
+            workflow_id: request.workflow_id,
+            batch_id: Some(request.batch_id),
+            draft_generation: request.draft_generation,
+            stage: AiSmartStage::Enhancement,
+            input_fingerprint: request.source_fingerprint.clone(),
+        })
+        .map_err(|error| {
+            EffectCaptionRuntimeError::new("enhancement_stage_unavailable", error.to_string())
+        })?;
+    let started = std::time::Instant::now();
+    let prepared = (|| -> Result<Vec<EnhancementHighlight>, EffectCaptionRuntimeError> {
+        let candidates = match request.highlight_run_id {
+            Some(run_id) => repository
+                .list_highlight_candidates(run_id)
+                .map_err(|error| {
+                    EffectCaptionRuntimeError::new(
+                        "enhancement_stage_unavailable",
+                        error.to_string(),
+                    )
+                })?
+                .into_iter()
+                .filter(|candidate| candidate.selected)
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        let published = repository
+            .get_clip_project(request.project_id)
+            .map(|detail| published_ranges_from_subtitles(&detail.subtitles))
+            .map_err(|error| {
+                EffectCaptionRuntimeError::new("enhancement_stage_unavailable", error.to_string())
+            })?;
+        Ok(enhancement_highlights(
+            &candidates,
+            &published,
+            &request.source_fingerprint,
+        ))
+    })();
+    let highlights = match prepared {
+        Ok(highlights) => highlights,
+        Err(error) => {
+            let _ = workflows.finish_attempt(
+                attempt.id,
+                attempt.attempt_generation,
+                super::domain::AiSmartStageAttemptStatus::Failed,
+                None,
+                started.elapsed().as_millis() as u64,
+                Some((error.code, error.detail.as_str())),
+            );
+            return Err(error);
+        }
+    };
+    let summary = match run_enhancement_stage(
+        repository,
+        runner,
+        &highlights,
+        request.project_id,
+        &request.source_fingerprint,
+        cancellation,
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = workflows.finish_attempt(
+                attempt.id,
+                attempt.attempt_generation,
+                super::domain::AiSmartStageAttemptStatus::Failed,
+                None,
+                started.elapsed().as_millis() as u64,
+                Some((error.code, error.detail.as_str())),
+            );
+            return Err(error);
+        }
+    };
+    // 单条失败不影响阶段结果：阶段本身完成，失败明细在增强记录里。
+    workflows
+        .finish_attempt(
+            attempt.id,
+            attempt.attempt_generation,
+            super::domain::AiSmartStageAttemptStatus::Completed,
+            Some(("effect_caption_enhancement", request.batch_id)),
+            started.elapsed().as_millis() as u64,
+            None,
+        )
+        .map_err(|error| {
+            EffectCaptionRuntimeError::new("enhancement_stage_unavailable", error.to_string())
+        })?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -85,8 +85,9 @@ pub use effect_caption_composition::{
 };
 pub use effect_caption_orchestration::{
     EffectCaptionEnhancementRunner, EnhancementHighlight, EnhancementProduct, EnhancementStagePlan,
-    EnhancementStageSummary, assert_enhancement_stage_position, enhancement_highlights,
-    enhancement_stage_plan, run_enhancement_stage,
+    EnhancementStageRequest, EnhancementStageSummary, assert_enhancement_stage_position,
+    enhancement_highlights, enhancement_stage_plan, published_ranges_from_subtitles,
+    run_enhancement_for_batch, run_enhancement_stage,
 };
 pub use effect_caption_render::{
     AlwaysIdleGate, BaseCapabilityGate, DeterminismPolicy, EffectCaptionRenderer,
