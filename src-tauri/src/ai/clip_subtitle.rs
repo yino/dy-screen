@@ -13,7 +13,7 @@ use fontdue::layout::{
 use fontdue::{Font, FontSettings};
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::clip_export::{ClipExportFailure, failure};
+use super::clip_export::{ClipExportFailure, TextLayerRange, failure};
 use super::{AiClipSubtitle, AiClipSubtitleFrame, ClipOutputDimensions};
 
 static SUBTITLE_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +66,159 @@ struct PageUnit {
 #[derive(Debug, Clone)]
 struct SubtitlePage {
     units: Vec<PageUnit>,
+}
+
+/// 工程已发布字幕后在项目时间轴上的区间（人工编辑结果即输入）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedSubtitleRange {
+    pub subtitle_id: i64,
+    pub stable_segment_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// 特效字幕在某一时刻的可用状态：只有 `Available` 才抑制基础字幕。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectCaptionAvailability {
+    Available,
+    Removed,
+    RenderFailed,
+    Rejected,
+}
+
+/// 一条特效字幕的时间窗与其可用状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectCaptionWindow {
+    pub candidate_id: i64,
+    pub window: TextLayerRange,
+    pub availability: EffectCaptionAvailability,
+}
+
+/// 两层文字的规划结果：同一时间范围只允许出现在其中一侧。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextLayerPlan {
+    /// 基础字幕被隐藏的区间（这些区间由特效字幕占据）。
+    pub suppressed: Vec<TextLayerRange>,
+    /// 基础字幕仍然显示的区间。
+    pub visible: Vec<TextLayerRange>,
+    pub suppressed_subtitle_ids: Vec<i64>,
+}
+
+/// 由**工程已发布句段**推导特效字幕时间窗（任务 8.1）。
+///
+/// 这是抑制与叠加的唯一时间来源：函数签名里根本不存在"模型给出的时间戳"这一输入，
+/// 因此模型时间不可能进入抑制计算。未命中的句段 ID 不产生任何影响。
+pub fn derive_effect_window(
+    published: &[PublishedSubtitleRange],
+    segment_ids: &[String],
+) -> Option<TextLayerRange> {
+    let mut matched: Vec<&PublishedSubtitleRange> = published
+        .iter()
+        .filter(|range| segment_ids.iter().any(|id| id == &range.stable_segment_id))
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    matched.sort_by_key(|range| (range.start_ms, range.end_ms));
+    Some(TextLayerRange {
+        start_ms: matched
+            .first()
+            .map(|range| range.start_ms)
+            .unwrap_or_default(),
+        end_ms: matched.last().map(|range| range.end_ms).unwrap_or_default(),
+    })
+}
+
+fn ranges_overlap(left: TextLayerRange, right: TextLayerRange) -> bool {
+    left.start_ms < right.end_ms && right.start_ms < left.end_ms
+}
+
+/// 规划基础字幕与特效字幕（任务 8.1–8.4）。
+///
+/// - 只有 `Available` 的特效字幕会抑制基础字幕；被移除、渲染失败或被拒绝的特效字幕
+///   不抑制任何句段，基础字幕按原样恢复（任务 8.3）。
+/// - 输入永远是**当前**的已发布句段，因此用户在被抑制范围内新增或修改字幕时会自然重算（任务 8.2）。
+/// - 结果与分辨率无关，同一份计划同时供预览与导出使用（任务 8.4）。
+pub fn plan_text_layers(
+    published: &[PublishedSubtitleRange],
+    effects: &[EffectCaptionWindow],
+) -> Result<TextLayerPlan, ClipExportFailure> {
+    for range in published {
+        if range.end_ms <= range.start_ms {
+            return Err(failure(
+                "invalid_subtitle_range",
+                "已发布字幕的时间范围无效",
+            ));
+        }
+    }
+    let available: Vec<TextLayerRange> = effects
+        .iter()
+        .filter(|effect| effect.availability == EffectCaptionAvailability::Available)
+        .map(|effect| effect.window)
+        .collect();
+    for window in &available {
+        if window.end_ms <= window.start_ms {
+            return Err(failure("invalid_overlay_range", "特效字幕时间窗无效"));
+        }
+    }
+
+    let mut suppressed = Vec::new();
+    let mut visible = Vec::new();
+    let mut suppressed_subtitle_ids = Vec::new();
+    for range in published {
+        let owned = TextLayerRange {
+            start_ms: range.start_ms,
+            end_ms: range.end_ms,
+        };
+        if available
+            .iter()
+            .any(|window| ranges_overlap(*window, owned))
+        {
+            suppressed.push(owned);
+            suppressed_subtitle_ids.push(range.subtitle_id);
+        } else {
+            visible.push(owned);
+        }
+    }
+    // 自证：同一时间不允许同时出现在两侧（不出现两层文字）。
+    for left in &suppressed {
+        for right in &visible {
+            if ranges_overlap(*left, *right) {
+                return Err(failure(
+                    "dual_text_layers",
+                    "抑制结果同时包含与显示区间重叠的句段",
+                ));
+            }
+        }
+    }
+    Ok(TextLayerPlan {
+        suppressed,
+        visible,
+        suppressed_subtitle_ids,
+    })
+}
+
+/// 生成字幕显示帧，并**剔除**落在抑制区间内的帧（任务 8.3）。
+///
+/// 被剔除的时间范围由特效字幕层接管；不剔除会在同一时间出现两层文字。
+pub fn build_clip_subtitle_frames_with_suppression(
+    subtitles: &[AiClipSubtitle],
+    dimensions: ClipOutputDimensions,
+    total_duration_ms: u64,
+    suppressed: &[TextLayerRange],
+) -> Vec<AiClipSubtitleFrame> {
+    build_clip_subtitle_frames(subtitles, dimensions, total_duration_ms)
+        .into_iter()
+        .filter(|frame| {
+            let frame_range = TextLayerRange {
+                start_ms: frame.project_start_ms,
+                end_ms: frame.project_end_ms,
+            };
+            !suppressed
+                .iter()
+                .any(|range| ranges_overlap(*range, frame_range))
+        })
+        .collect()
 }
 
 /// 生成前端预览与导出共同使用的权威逐字显示计划。
@@ -676,6 +829,14 @@ mod tests {
     use std::io::BufReader;
 
     use super::*;
+    use crate::ai::{EffectCaptionOverlay, validate_single_text_layer};
+
+    fn canvas() -> ClipOutputDimensions {
+        ClipOutputDimensions {
+            width: 1080,
+            height: 1920,
+        }
+    }
 
     fn subtitle(id: &str, start_ms: u64, end_ms: u64, text: &str) -> AiClipSubtitle {
         AiClipSubtitle {
@@ -746,5 +907,220 @@ mod tests {
         );
         drop(assets);
         assert!(!root.exists());
+    }
+
+    // ---- 步骤 3 任务组 8：基础字幕抑制 ----
+
+    fn range(id: &str, subtitle_id: i64, start_ms: u64, end_ms: u64) -> PublishedSubtitleRange {
+        PublishedSubtitleRange {
+            subtitle_id,
+            stable_segment_id: id.to_owned(),
+            start_ms,
+            end_ms,
+        }
+    }
+
+    fn available(candidate_id: i64, start_ms: u64, end_ms: u64) -> EffectCaptionWindow {
+        EffectCaptionWindow {
+            candidate_id,
+            window: TextLayerRange { start_ms, end_ms },
+            availability: EffectCaptionAvailability::Available,
+        }
+    }
+
+    #[test]
+    fn effect_window_is_derived_only_from_published_segments() {
+        let published = vec![
+            range("seg-1", 1, 0, 1_000),
+            range("seg-2", 2, 1_000, 2_000),
+            range("seg-3", 3, 3_000, 4_000),
+        ];
+        // 只按句段 ID 推导：时间来自已发布句段，调用方无从传入模型时间。
+        assert_eq!(
+            derive_effect_window(&published, &["seg-2".to_owned()]),
+            Some(TextLayerRange {
+                start_ms: 1_000,
+                end_ms: 2_000
+            })
+        );
+        assert_eq!(
+            derive_effect_window(&published, &["seg-1".to_owned(), "seg-3".to_owned()]),
+            Some(TextLayerRange {
+                start_ms: 0,
+                end_ms: 4_000
+            })
+        );
+        assert_eq!(
+            derive_effect_window(&published, &["invented".to_owned()]),
+            None,
+            "未命中的句段不得产生时间窗"
+        );
+    }
+
+    #[test]
+    fn suppression_recomputes_after_manual_edit() {
+        let published = vec![range("seg-1", 1, 0, 1_000), range("seg-2", 2, 1_000, 2_000)];
+        let effects = vec![available(7, 0, 1_000)];
+        let plan = plan_text_layers(&published, &effects).unwrap();
+        assert_eq!(
+            plan.suppressed,
+            vec![TextLayerRange {
+                start_ms: 0,
+                end_ms: 1_000
+            }]
+        );
+        assert_eq!(
+            plan.visible,
+            vec![TextLayerRange {
+                start_ms: 1_000,
+                end_ms: 2_000
+            }]
+        );
+        assert_eq!(plan.suppressed_subtitle_ids, vec![1]);
+
+        // 用户在抑制范围内修改：把 seg-1 移出该窗口 → 基础字幕恢复显示。
+        let edited = vec![
+            range("seg-1", 1, 2_000, 3_000),
+            range("seg-2", 2, 1_000, 2_000),
+        ];
+        let plan = plan_text_layers(&edited, &effects).unwrap();
+        assert!(plan.suppressed.is_empty(), "移出窗口后不应再被抑制");
+        assert_eq!(plan.visible.len(), 2);
+
+        // 用户在抑制范围内新增字幕 → 新句段被抑制。
+        let extended = vec![
+            range("seg-2", 2, 1_000, 2_000),
+            range("seg-new", 9, 500, 900),
+        ];
+        let plan = plan_text_layers(&extended, &effects).unwrap();
+        assert_eq!(
+            plan.suppressed,
+            vec![TextLayerRange {
+                start_ms: 500,
+                end_ms: 900
+            }]
+        );
+        assert_eq!(plan.suppressed_subtitle_ids, vec![9]);
+        assert_eq!(
+            plan.visible,
+            vec![TextLayerRange {
+                start_ms: 1_000,
+                end_ms: 2_000
+            }]
+        );
+    }
+
+    #[test]
+    fn removed_or_failed_effect_restores_base_subtitles() {
+        let published = vec![range("seg-1", 1, 0, 1_000), range("seg-2", 2, 1_000, 2_000)];
+        for availability in [
+            EffectCaptionAvailability::Removed,
+            EffectCaptionAvailability::RenderFailed,
+            EffectCaptionAvailability::Rejected,
+        ] {
+            let effects = vec![EffectCaptionWindow {
+                candidate_id: 7,
+                window: TextLayerRange {
+                    start_ms: 0,
+                    end_ms: 1_000,
+                },
+                availability,
+            }];
+            let plan = plan_text_layers(&published, &effects).unwrap();
+            assert!(
+                plan.suppressed.is_empty(),
+                "{availability:?} 不得抑制基础字幕"
+            );
+            assert_eq!(plan.visible.len(), 2, "基础字幕必须完整恢复");
+            let subtitles = [
+                subtitle("seg-1", 0, 1_000, "第一句"),
+                subtitle("seg-2", 1_000, 2_000, "第二句"),
+            ];
+            let frames = build_clip_subtitle_frames_with_suppression(
+                &subtitles,
+                canvas(),
+                2_000,
+                &plan.suppressed,
+            );
+            assert!(
+                frames.iter().any(|frame| frame.project_start_ms < 1_000),
+                "恢复后第一句必须可见"
+            );
+        }
+    }
+
+    #[test]
+    fn available_effect_suppresses_base_text_and_never_double_layers() {
+        let published = vec![range("seg-1", 1, 0, 1_000), range("seg-2", 2, 1_000, 2_000)];
+        let effects = vec![available(7, 0, 1_000)];
+        let plan = plan_text_layers(&published, &effects).unwrap();
+        // 与导出计划交叉校验：可见区间与特效层不得重叠（不出现两层文字）。
+        let overlays = vec![EffectCaptionOverlay {
+            manifest_path: std::path::PathBuf::from("/tmp/effect.ffconcat"),
+            frames_dir: std::path::PathBuf::from("/tmp/effect-frames"),
+            start_ms: 0,
+            end_ms: 1_000,
+        }];
+        validate_single_text_layer(&plan.visible, &overlays).unwrap();
+
+        let subtitles = [
+            subtitle("seg-1", 0, 1_000, "第一句"),
+            subtitle("seg-2", 1_000, 2_000, "第二句"),
+        ];
+        let frames = build_clip_subtitle_frames_with_suppression(
+            &subtitles,
+            canvas(),
+            2_000,
+            &plan.suppressed,
+        );
+        assert!(
+            !frames.iter().any(|frame| frame.project_start_ms < 1_000),
+            "被抑制的第一句不得产生字幕帧，否则会与特效层叠加"
+        );
+        assert!(
+            frames.iter().any(|frame| frame.project_start_ms >= 1_000),
+            "未被抑制的第二句必须保留"
+        );
+    }
+
+    #[test]
+    fn same_suppression_plan_drives_preview_and_export() {
+        let published = vec![range("seg-1", 1, 0, 1_000), range("seg-2", 2, 1_000, 2_000)];
+        let effects = vec![available(7, 0, 1_000)];
+        let first = plan_text_layers(&published, &effects).unwrap();
+        let second = plan_text_layers(&published, &effects).unwrap();
+        assert_eq!(first, second, "同一输入必须得到同一抑制结果");
+
+        // 抑制结果与分辨率无关：预览与导出规格分别构建帧，抑制集合一致。
+        let subtitles = [
+            subtitle("seg-1", 0, 1_000, "第一句"),
+            subtitle("seg-2", 1_000, 2_000, "第二句"),
+        ];
+        let preview_dimensions = ClipOutputDimensions {
+            width: 540,
+            height: 960,
+        };
+        for specs in [canvas(), preview_dimensions] {
+            let frames = build_clip_subtitle_frames_with_suppression(
+                &subtitles,
+                specs,
+                2_000,
+                &first.suppressed,
+            );
+            assert!(
+                !frames.iter().any(|frame| frame.project_start_ms < 1_000),
+                "预览与导出必须使用同一抑制结果"
+            );
+            assert!(frames.iter().any(|frame| frame.project_start_ms >= 1_000));
+        }
+    }
+
+    #[test]
+    fn invalid_published_range_is_rejected() {
+        let published = vec![range("seg-bad", 1, 500, 500)];
+        assert_eq!(
+            plan_text_layers(&published, &[]).unwrap_err().code,
+            "invalid_subtitle_range"
+        );
     }
 }

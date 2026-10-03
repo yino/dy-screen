@@ -32,7 +32,9 @@ pub use clip_export::{
     verify_transparent_frame_sequence,
 };
 pub use clip_subtitle::{
-    ClipSubtitleAssets, build_clip_subtitle_frames, render_clip_subtitle_assets,
+    ClipSubtitleAssets, EffectCaptionAvailability, EffectCaptionWindow, PublishedSubtitleRange,
+    TextLayerPlan, build_clip_subtitle_frames, build_clip_subtitle_frames_with_suppression,
+    derive_effect_window, plan_text_layers, render_clip_subtitle_assets,
 };
 pub use clip_text_correction::{
     ActivationCorrectionGate, CLIP_TEXT_CORRECTION_PROMPT_VERSION, ClipCorrectionGate,
