@@ -13,7 +13,7 @@
 | 0 | 百炼能力探针 | `validate-dashscope-direct-capabilities` | **已完成（2026-09-30）**，结论见 §6 |
 | 1 | ASR 直连改造 | `wire-cloud-asr-upload-and-jobs` | ✅ 已满足：临时 token 可提交文件转写；音频上传须走三步直传流程（见 §6） |
 | 2 | Harness sidecar 与模型调用直连 | `add-model-gateway-and-harness-sidecar` | ✅ 已满足：临时 token 可完成 LLM 调用；仍需步骤 1 交付并可独立验收 |
-| 3 | 特效字幕 | `add-effect-caption-renderer` | 步骤 2 已交付；该 change 任务组 0 的沙盒适用性验证通过（**进入条件**，尚未开始） |
+| 3 | 特效字幕 | `add-effect-caption-renderer` | **65/77 已实现并提交**；剩 12 项为结构性阻塞（随包渲染器/浏览器/字体资产 6、Intel/Windows 真机 5、步骤 2 依赖 1），逐条证据见 `openspec/changes/add-effect-caption-renderer/evidence/completion-audit.md` |
 | 4 | 生成式动画 | `add-generative-video-animation` | ✅ 已满足：万相文生图与图生视频均实测 `SUCCEEDED`；仍需步骤 2 交付 |
 
 ### 已搁置

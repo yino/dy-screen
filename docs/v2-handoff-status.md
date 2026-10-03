@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | 1 | `wire-cloud-asr-upload-and-jobs` | **47/55**（余 8 项 = 三平台真机验收） |
 | 2 | `add-model-gateway-and-harness-sidecar` | 0/59（核心已落地，无可诚实勾选项） |
-| 3 | `add-effect-caption-renderer` | 7/77（**进入条件已通过**） |
+| 3 | `add-effect-caption-renderer` | 65/77（**可实现部分已全部完成**；剩 12 项结构性阻塞，见 [completion-audit.md](../openspec/changes/add-effect-caption-renderer/evidence/completion-audit.md)） |
 | 4 | `add-generative-video-animation` | 0/60（探针已确认万相可用） |
 
 ## 2. 已完成且经测试验证的实现（步骤 1）
