@@ -9,6 +9,7 @@ mod clip_text_correction;
 mod commands;
 mod desktop_runtime;
 mod domain;
+mod effect_caption;
 mod highlight;
 mod lifecycle;
 mod llm;
@@ -56,6 +57,11 @@ pub use domain::{
     NewAiSmartCandidate, NewAiSmartCandidateSource, NewAiSmartWorkflow, NewAiSmartWorkflowBatch,
     NewAsrArtifact, RecognitionProfile, RecoverySummary, RetrySmartWorkflowStageInput,
     SmartWorkflowConfiguration, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
+};
+pub use effect_caption::{
+    BUNDLED_FONT_FAMILIES, CSS_FUNCTION_ALLOWLIST, CSS_PROPERTY_ALLOWLIST, EffectCaptionLimits,
+    EffectCaptionRejection, GLOBAL_ATTRIBUTE_ALLOWLIST, RENDERER_CONTRACT_ATTRIBUTES,
+    TAG_ALLOWLIST, ValidatedEffectCaption, validate_effect_caption,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
