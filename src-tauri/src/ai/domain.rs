@@ -741,17 +741,20 @@ pub enum AiSmartStage {
     Draft,
     Correction,
     Transition,
+    /// 表现形式增强（特效字幕）：位于转场匹配之后、评审之前，且**不阻塞**基础草稿。
+    Enhancement,
     Review,
 }
 
 impl AiSmartStage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Preflight,
         Self::Asr,
         Self::Highlight,
         Self::Draft,
         Self::Correction,
         Self::Transition,
+        Self::Enhancement,
         Self::Review,
     ];
 
@@ -763,6 +766,7 @@ impl AiSmartStage {
             Self::Draft => "draft",
             Self::Correction => "correction",
             Self::Transition => "transition",
+            Self::Enhancement => "enhancement",
             Self::Review => "review",
         }
     }

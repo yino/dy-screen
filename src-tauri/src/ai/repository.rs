@@ -4439,7 +4439,8 @@ pub(crate) fn migrate_ai_v22(connection: &mut Connection) -> crate::database::Re
                     'paused', 'completed', 'cancelled', 'failed'
                 )),
                 stage TEXT NOT NULL CHECK(stage IN (
-                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition', 'review'
+                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition',
+                    'enhancement', 'review'
                 )),
                 generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
                 source_session_id INTEGER REFERENCES recording_sessions(id) ON DELETE RESTRICT,
@@ -4498,7 +4499,8 @@ pub(crate) fn migrate_ai_v22(connection: &mut Connection) -> crate::database::Re
                 batch_id INTEGER REFERENCES ai_smart_workflow_batches(id) ON DELETE CASCADE,
                 draft_generation INTEGER CHECK(draft_generation IS NULL OR draft_generation > 0),
                 stage TEXT NOT NULL CHECK(stage IN (
-                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition', 'review'
+                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition',
+                    'enhancement', 'review'
                 )),
                 input_fingerprint TEXT NOT NULL,
                 attempt_generation INTEGER NOT NULL CHECK(attempt_generation > 0),
@@ -4757,6 +4759,10 @@ pub(crate) fn migrate_ai_v26(connection: &mut Connection) -> crate::database::Re
 /// v27 增加高光表现形式增强记录与特效字幕渲染缓存（步骤 3 任务 1.2 / 任务组 9）。
 ///
 /// 迁移只建表、只加索引，不重写任何旧行，因此旧工程行为不变。
+///
+/// 说明：本版本号归属步骤 3（26=步骤 1、27=步骤 3、28=步骤 4），因此智能阶段
+/// 枚举新增 `enhancement` 所需的 CHECK 扩展也落在本迁移内 —— 新增阶段值属于步骤 3
+/// 的编排改动，不能占用步骤 4 的 28。
 pub(crate) fn migrate_ai_v27(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
         .query_row(
@@ -5488,7 +5494,8 @@ pub(crate) fn migrate_ai_v24(connection: &mut Connection) -> crate::database::Re
                     'paused', 'completed', 'cancelled', 'failed'
                 )),
                 stage TEXT NOT NULL CHECK(stage IN (
-                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition', 'review'
+                    'preflight', 'asr', 'highlight', 'draft', 'correction', 'transition',
+                    'enhancement', 'review'
                 )),
                 generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
                 source_session_id INTEGER REFERENCES recording_sessions(id) ON DELETE RESTRICT,
@@ -7300,5 +7307,53 @@ mod smart_migration_tests {
             changed.id, export_attempt.id,
             "版本变化必须创建新的渲染尝试"
         );
+    }
+
+    #[test]
+    fn migration_v27_allows_the_enhancement_smart_stage() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let connection = database.connection().expect("connection");
+        // 阶段 CHECK 必须包含增强阶段：否则智能成片在转场之后无法推进。
+        let (workflow_sql, attempt_sql): (String, String) = connection
+            .query_row(
+                "SELECT (SELECT sql FROM sqlite_master WHERE name = 'ai_smart_workflows'), (SELECT sql FROM sqlite_master WHERE name = 'ai_smart_stage_attempts')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("schema sql");
+        assert!(workflow_sql.contains("'enhancement'"), "{workflow_sql}");
+        assert!(attempt_sql.contains("'enhancement'"), "{attempt_sql}");
+
+        // 行为验证：真的能写入 enhancement 阶段的行。
+        let now = "2026-10-03T00:00:00Z";
+        connection
+            .execute(
+                r#"INSERT INTO ai_smart_workflows(
+                       name, mode, status, stage, generation, source_summary, provider,
+                       model_id, text_scope, configuration_fingerprint, created_at, updated_at
+                   ) VALUES('增强工作流', 'local', 'review_ready', 'enhancement', 1, '摘要',
+                       'deepseek', 'deepseek-chat', 'minimal', 'fingerprint', ?1, ?1)"#,
+                [now],
+            )
+            .expect("insert workflow with enhancement stage");
+        let workflow_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                r#"INSERT INTO ai_smart_stage_attempts(
+                       workflow_id, stage, input_fingerprint, attempt_generation, status,
+                       progress, created_at, updated_at
+                   ) VALUES(?1, 'enhancement', 'fingerprint', 1, 'completed', 100, ?2, ?2)"#,
+                params![workflow_id, now],
+            )
+            .expect("insert enhancement stage attempt");
+        let stage: String = connection
+            .query_row(
+                "SELECT stage FROM ai_smart_stage_attempts WHERE workflow_id = ?1",
+                [workflow_id],
+                |row| row.get(0),
+            )
+            .expect("read stage");
+        assert_eq!(stage, "enhancement");
     }
 }

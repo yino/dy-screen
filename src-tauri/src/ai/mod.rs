@@ -12,6 +12,7 @@ mod domain;
 mod effect_caption;
 mod effect_caption_cache;
 mod effect_caption_composition;
+mod effect_caption_orchestration;
 mod effect_caption_render;
 mod effect_caption_spec;
 mod highlight;
@@ -81,6 +82,11 @@ pub use effect_caption_composition::{
     BUNDLED_STYLESHEET, BuiltEffectCaption, CompositionRequest, EffectCaptionCompositionError,
     EffectCaptionCompositionProvider, EffectCaptionCompositionSkill,
     build_effect_caption_composition, composition_prompt, generate_effect_caption_composition,
+};
+pub use effect_caption_orchestration::{
+    EffectCaptionEnhancementRunner, EnhancementHighlight, EnhancementProduct, EnhancementStagePlan,
+    EnhancementStageSummary, assert_enhancement_stage_position, enhancement_highlights,
+    enhancement_stage_plan, run_enhancement_stage,
 };
 pub use effect_caption_render::{
     AlwaysIdleGate, BaseCapabilityGate, DeterminismPolicy, EffectCaptionRenderer,
