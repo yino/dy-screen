@@ -31,6 +31,8 @@ fn fixture_manifest(root: &Path, bundle_version: &str, contents: &[u8]) -> Runti
                 id: "media.ffmpeg".to_owned(),
                 version: "test".to_owned(),
                 required: true,
+                capability: Default::default(),
+                scripts: Vec::new(),
                 files: vec![RuntimeFile {
                     path: "bin/ffmpeg".to_owned(),
                     size_bytes: tool_size_bytes,
@@ -42,6 +44,8 @@ fn fixture_manifest(root: &Path, bundle_version: &str, contents: &[u8]) -> Runti
                 id: "media.ffprobe".to_owned(),
                 version: "test".to_owned(),
                 required: true,
+                capability: Default::default(),
+                scripts: Vec::new(),
                 files: vec![RuntimeFile {
                     path: "bin/ffprobe".to_owned(),
                     size_bytes: probe_size_bytes,

@@ -37,6 +37,25 @@ try {
     foreach ($decoder in @("h264", "hevc", "aac", "png")) {
         Assert-Matches $decoders ("^\s*[VAS]\S*\s+" + [Regex]::Escape($decoder) + "\s+") "FFmpeg 缺少 $decoder 解码器。"
     }
+    # RGBA/alpha PNG 解码校验（任务 10.3）：透明中间产物依赖它，缺失即发行校验失败。
+    $pixelFormats = Get-FfmpegCapabilities "-pix_fmts"
+    Assert-Matches $pixelFormats '^\s*\S*\s+rgba\s' "FFmpeg 缺少 rgba 像素格式，无法承载带 Alpha 的透明中间产物。"
+
+    $probeDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("dy-screen-alpha-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $probeDirectory | Out-Null
+    try {
+        $alphaPng = Join-Path $probeDirectory "alpha.png"
+        [System.IO.File]::WriteAllBytes($alphaPng, [Convert]::FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAACXBIWXMAAAABAAAAAQBPJcTWAAAAEklEQVR4nGP8z4AfsBCQHyYKABaIAR2G3je1AAAAAElFTkSuQmCC"))
+        $alphaJpg = Join-Path $probeDirectory "alpha.jpg"
+        & $Ffmpeg -hide_banner -v error -i $alphaPng -vf format=rgba -frames:v 1 -y $alphaJpg
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $alphaJpg -PathType Leaf)) {
+            throw "FFmpeg 无法解码带 Alpha 的 PNG（RGBA 路径不可用）。"
+        }
+    }
+    finally {
+        Remove-Item -Recurse -Force $probeDirectory -ErrorAction SilentlyContinue
+    }
+
     foreach ($demuxer in @("concat", "image2")) {
         Assert-Matches $demuxers ("^\s*D\s+" + [Regex]::Escape($demuxer) + "(?:\s|,)") "FFmpeg 缺少 $demuxer demuxer。"
     }

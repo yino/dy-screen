@@ -95,6 +95,19 @@ pub struct RuntimePlatformManifest {
     pub minimum_memory_bytes: u64,
 }
 
+/// 组件所属能力组（任务 10.2）。
+///
+/// 基础能力（录制、浏览、预览、封面、本地 ASR）只依赖 `Base` 组件；
+/// 增强能力（特效字幕渲染）依赖 `Enhancement` 组件。任一增强组件缺失或损坏
+/// MUST NOT 影响基础能力。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCapability {
+    #[default]
+    Base,
+    Enhancement,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeComponent {
@@ -102,6 +115,141 @@ pub struct RuntimeComponent {
     pub version: String,
     pub required: bool,
     pub files: Vec<RuntimeFile>,
+    /// 组件所属能力组；旧清单缺省视为基础能力。
+    #[serde(default)]
+    pub capability: RuntimeCapability,
+    /// 组件内以文本形式内联的可执行脚本条目（渲染器引擎脚本）。
+    ///
+    /// 引擎脚本内联在随包 JS 文件里、没有独立文件，因此必须以
+    /// （版本 + 字节数 + SHA-256 + 承载文件）四元组独立声明，供启动前校验。
+    #[serde(default)]
+    pub scripts: Vec<RuntimeScriptEntry>,
+}
+
+/// 组件内联脚本条目。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeScriptEntry {
+    pub id: String,
+    pub version: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    /// 承载该脚本的相对路径，必须在本组件的 `files` 中声明过。
+    pub host_file: String,
+}
+
+/// 增强能力的组件 ID（任务 10.1）。
+pub const RENDER_RUNTIME_COMPONENT: &str = "render.runtime";
+pub const RENDER_BROWSER_COMPONENT: &str = "render.browser";
+pub const RENDER_ENGINE_SCRIPT_COMPONENT: &str = "render.engine-script";
+pub const LOCKED_FONTS_COMPONENT: &str = "render.locked-fonts";
+pub const HARNESS_RUNTIME_COMPONENT: &str = "harness.runtime";
+
+/// 增强能力需要的全部组件。
+pub const ENHANCEMENT_COMPONENTS: &[&str] = &[
+    RENDER_RUNTIME_COMPONENT,
+    RENDER_BROWSER_COMPONENT,
+    RENDER_ENGINE_SCRIPT_COMPONENT,
+    LOCKED_FONTS_COMPONENT,
+    HARNESS_RUNTIME_COMPONENT,
+];
+
+/// 单个组件的诊断结果（可独立诊断，任务 10.1）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentDiagnostic {
+    pub id: String,
+    pub version: String,
+    pub capability: RuntimeCapability,
+    pub required: bool,
+    pub available: bool,
+    pub error_code: Option<String>,
+}
+
+/// 能力快照：基础能力与增强能力分别报告。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilitySnapshot {
+    pub base_available: bool,
+    pub enhancement_available: bool,
+    pub enhancement_error_code: Option<String>,
+    pub components: Vec<ComponentDiagnostic>,
+}
+
+/// 按清单校验已安装组件，并给出分能力组的状态（任务 10.1 / 10.2）。
+///
+/// `installed_root` 是运行资源根目录。基础能力只看 `Base` 组件，
+/// 增强能力只看 `Enhancement` 组件，两者互不影响。
+pub fn capability_snapshot(
+    manifest: &RuntimeManifest,
+    installed_root: &Path,
+) -> CapabilitySnapshot {
+    let mut components = Vec::with_capacity(manifest.components.len());
+    let mut base_available = true;
+    let mut enhancement_available = true;
+    let mut enhancement_error: Option<String> = None;
+    let mut enhancement_seen: Vec<&str> = Vec::new();
+    for component in &manifest.components {
+        let mut error_code: Option<String> = None;
+        for file in &component.files {
+            let path = installed_root.join(&file.path);
+            let verified = sha256_file(&path)
+                .map(|(size, sha256)| size == file.size_bytes && sha256 == file.sha256)
+                .unwrap_or(false);
+            if !verified {
+                error_code = Some("runtime_component_corrupt".to_owned());
+                break;
+            }
+        }
+        if error_code.is_none() && component.capability == RuntimeCapability::Enhancement {
+            enhancement_seen.push(component.id.as_str());
+            // 引擎脚本必须显式声明条目，否则增强能力不可用。
+            if component.id == RENDER_ENGINE_SCRIPT_COMPONENT && component.scripts.is_empty() {
+                error_code = Some("enhancement_engine_script_missing".to_owned());
+            }
+        }
+        let available = error_code.is_none();
+        match component.capability {
+            RuntimeCapability::Base => {
+                if component.required && !available {
+                    base_available = false;
+                }
+            }
+            RuntimeCapability::Enhancement => {
+                if !available {
+                    enhancement_available = false;
+                    enhancement_error.get_or_insert_with(|| {
+                        error_code
+                            .clone()
+                            .unwrap_or_else(|| "enhancement_component_unavailable".to_owned())
+                    });
+                }
+            }
+        }
+        components.push(ComponentDiagnostic {
+            id: component.id.clone(),
+            version: component.version.clone(),
+            capability: component.capability,
+            required: component.required,
+            available,
+            error_code,
+        });
+    }
+    let missing: Vec<&str> = ENHANCEMENT_COMPONENTS
+        .iter()
+        .copied()
+        .filter(|id| !enhancement_seen.contains(id))
+        .collect();
+    if !missing.is_empty() {
+        enhancement_available = false;
+        enhancement_error.get_or_insert_with(|| "enhancement_component_missing".to_owned());
+    }
+    CapabilitySnapshot {
+        base_available,
+        enhancement_available,
+        enhancement_error_code: enhancement_error,
+        components,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,12 +378,36 @@ impl RuntimeManifest {
                     "组件重复或为空".into(),
                 ));
             }
+            let declared: HashSet<&str> = component
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect();
             for file in &component.files {
                 validate_relative_path(&file.path)?;
                 validate_hash(&file.sha256)?;
                 if file.size_bytes == 0 || !paths.insert(file.path.as_str()) {
                     return Err(RuntimeResourceError::InvalidManifest(
                         "文件重复或大小为零".into(),
+                    ));
+                }
+            }
+            for script in &component.scripts {
+                if script.id.trim().is_empty() || script.version.trim().is_empty() {
+                    return Err(RuntimeResourceError::InvalidManifest(
+                        "内联脚本条目缺少 id 或版本".into(),
+                    ));
+                }
+                validate_hash(&script.sha256)?;
+                validate_relative_path(&script.host_file)?;
+                if script.size_bytes == 0 {
+                    return Err(RuntimeResourceError::InvalidManifest(
+                        "内联脚本条目大小为零".into(),
+                    ));
+                }
+                if !declared.contains(script.host_file.as_str()) {
+                    return Err(RuntimeResourceError::InvalidManifest(
+                        "内联脚本的承载文件未在组件中声明".into(),
                     ));
                 }
             }
@@ -902,6 +1074,8 @@ mod tests {
                 id: "media.ffmpeg".into(),
                 version: "1".into(),
                 required: true,
+                capability: RuntimeCapability::Base,
+                scripts: Vec::new(),
                 files: vec![RuntimeFile {
                     path: "bin/tool".into(),
                     size_bytes: 4,
@@ -1071,5 +1245,202 @@ mod tests {
             .install_directory(&linked, &manifest(actual.path()))
             .expect_err("源目录符号链接必须被拒绝");
         assert!(matches!(error, RuntimeResourceError::Install(_)));
+    }
+
+    /// 写入一个文件并返回其组件文件条目。
+    fn component_file(root: &Path, relative: &str, bytes: &[u8]) -> (RuntimeFile, PathBuf) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        let (size_bytes, sha256) = sha256_file(&path).unwrap();
+        (
+            RuntimeFile {
+                path: relative.into(),
+                size_bytes,
+                sha256,
+                executable: false,
+            },
+            path,
+        )
+    }
+
+    /// 基础组件 + 五个增强组件（含引擎脚本条目）的完整清单。
+    fn manifest_with_enhancement(root: &Path) -> RuntimeManifest {
+        let mut manifest = manifest(root);
+        let enhancement = |id: &str, relative: &str, bytes: &[u8]| {
+            let (file, _) = component_file(root, relative, bytes);
+            RuntimeComponent {
+                id: id.into(),
+                version: "0.8.96".into(),
+                required: false,
+                capability: RuntimeCapability::Enhancement,
+                scripts: Vec::new(),
+                files: vec![file],
+            }
+        };
+        manifest.components.push(enhancement(
+            RENDER_RUNTIME_COMPONENT,
+            "render/runtime/cli.js",
+            b"renderer",
+        ));
+        manifest.components.push(enhancement(
+            RENDER_BROWSER_COMPONENT,
+            "render/browser/chrome",
+            b"browser",
+        ));
+        let (engine_file, _) = component_file(root, "render/runtime/chunk.js", b"engine-host");
+        let (engine_size, engine_sha) = sha256_file(&root.join("render/runtime/chunk.js")).unwrap();
+        assert_eq!(engine_size, engine_file.size_bytes);
+        manifest.components.push(RuntimeComponent {
+            id: RENDER_ENGINE_SCRIPT_COMPONENT.into(),
+            version: "0.8.96".into(),
+            required: false,
+            capability: RuntimeCapability::Enhancement,
+            scripts: vec![RuntimeScriptEntry {
+                id: "engine-script".into(),
+                version: "0.8.96".into(),
+                size_bytes: 480_863,
+                sha256: engine_sha,
+                host_file: "render/runtime/chunk.js".into(),
+            }],
+            files: vec![engine_file],
+        });
+        manifest.components.push(enhancement(
+            LOCKED_FONTS_COMPONENT,
+            "render/fonts/caption-cjk.ttf",
+            b"font",
+        ));
+        manifest.components.push(enhancement(
+            HARNESS_RUNTIME_COMPONENT,
+            "harness/runtime.js",
+            b"harness",
+        ));
+        manifest
+    }
+
+    #[test]
+    fn enhancement_components_are_reported_independently() {
+        let directory = tempdir().unwrap();
+        let manifest = manifest_with_enhancement(directory.path());
+        manifest.validate().unwrap();
+        let snapshot = capability_snapshot(&manifest, directory.path());
+        assert!(snapshot.base_available);
+        assert!(snapshot.enhancement_available);
+        assert!(snapshot.enhancement_error_code.is_none());
+        // 每个增强组件都必须独立出现在诊断里。
+        for id in ENHANCEMENT_COMPONENTS {
+            let diagnostic = snapshot
+                .components
+                .iter()
+                .find(|component| component.id == *id)
+                .unwrap_or_else(|| panic!("缺少组件诊断 {id}"));
+            assert!(diagnostic.available, "组件 {id} 应当可用");
+            assert_eq!(diagnostic.capability, RuntimeCapability::Enhancement);
+            assert_eq!(diagnostic.version, "0.8.96");
+        }
+    }
+
+    #[test]
+    fn broken_enhancement_component_only_disables_enhancement() {
+        let directory = tempdir().unwrap();
+        let manifest = manifest_with_enhancement(directory.path());
+        // 损坏渲染浏览器：基础能力必须保持可用。
+        fs::write(directory.path().join("render/browser/chrome"), b"corrupted").unwrap();
+        let snapshot = capability_snapshot(&manifest, directory.path());
+        assert!(snapshot.base_available, "基础能力不得受增强组件影响");
+        assert!(!snapshot.enhancement_available);
+        assert_eq!(
+            snapshot.enhancement_error_code.as_deref(),
+            Some("runtime_component_corrupt")
+        );
+        let base = snapshot
+            .components
+            .iter()
+            .find(|component| component.id == "media.ffmpeg")
+            .unwrap();
+        assert!(base.available, "基础组件诊断必须仍为可用");
+        let browser = snapshot
+            .components
+            .iter()
+            .find(|component| component.id == RENDER_BROWSER_COMPONENT)
+            .unwrap();
+        assert!(!browser.available);
+        assert_eq!(
+            browser.error_code.as_deref(),
+            Some("runtime_component_corrupt")
+        );
+    }
+
+    #[test]
+    fn missing_enhancement_components_disable_only_enhancement() {
+        let directory = tempdir().unwrap();
+        // 只装基础组件的旧清单：增强能力不可用，基础能力照常。
+        let manifest = manifest(directory.path());
+        let snapshot = capability_snapshot(&manifest, directory.path());
+        assert!(snapshot.base_available);
+        assert!(!snapshot.enhancement_available);
+        assert_eq!(
+            snapshot.enhancement_error_code.as_deref(),
+            Some("enhancement_component_missing")
+        );
+    }
+
+    #[test]
+    fn engine_script_entry_must_be_declared_and_present() {
+        let directory = tempdir().unwrap();
+        let mut manifest = manifest_with_enhancement(directory.path());
+        // 去掉引擎脚本条目 → 增强能力不可用，基础能力不受影响。
+        for component in &mut manifest.components {
+            if component.id == RENDER_ENGINE_SCRIPT_COMPONENT {
+                component.scripts.clear();
+            }
+        }
+        let snapshot = capability_snapshot(&manifest, directory.path());
+        assert!(snapshot.base_available);
+        assert!(!snapshot.enhancement_available);
+        assert_eq!(
+            snapshot.enhancement_error_code.as_deref(),
+            Some("enhancement_engine_script_missing")
+        );
+
+        // 脚本条目的承载文件必须在本组件的 files 中声明。
+        let mut invalid = manifest_with_enhancement(directory.path());
+        for component in &mut invalid.components {
+            if component.id == RENDER_ENGINE_SCRIPT_COMPONENT {
+                component.scripts[0].host_file = "render/runtime/undeclared.js".into();
+            }
+        }
+        assert!(invalid.validate().is_err(), "未声明的承载文件必须被拒绝");
+
+        // 哈希非法、大小为 0 同样必须被拒绝。
+        let mut bad_hash = manifest_with_enhancement(directory.path());
+        for component in &mut bad_hash.components {
+            if component.id == RENDER_ENGINE_SCRIPT_COMPONENT {
+                component.scripts[0].sha256 = "not-a-hash".into();
+            }
+        }
+        assert!(bad_hash.validate().is_err());
+        let mut zero_size = manifest_with_enhancement(directory.path());
+        for component in &mut zero_size.components {
+            if component.id == RENDER_ENGINE_SCRIPT_COMPONENT {
+                component.scripts[0].size_bytes = 0;
+            }
+        }
+        assert!(zero_size.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_manifests_without_capability_default_to_base() {
+        // 旧清单没有 capability/scripts 字段：必须仍可解析，并归入基础能力。
+        let directory = tempdir().unwrap();
+        let manifest = manifest(directory.path());
+        manifest.validate().unwrap();
+        let json = serde_json::to_string(&manifest).unwrap();
+        let parsed = RuntimeManifest::from_json(&json).unwrap();
+        assert_eq!(parsed.components[0].capability, RuntimeCapability::Base);
+        assert!(parsed.components[0].scripts.is_empty());
+        let snapshot = capability_snapshot(&parsed, directory.path());
+        assert!(snapshot.base_available);
+        assert!(!snapshot.enhancement_available);
     }
 }

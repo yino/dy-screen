@@ -10,8 +10,8 @@ use std::process::{Command, ExitCode};
 use clap::{Parser, Subcommand, ValueEnum};
 use dy_screen::asr::{AsrBundleManifest, AsrFileIntegrityManifest, AsrPlatformManifest};
 use dy_screen::runtime_resources::{
-    RuntimeArchive, RuntimeComponent, RuntimeFile, RuntimeLicense, RuntimeManifest,
-    RuntimeManifestSignature, RuntimePlatformManifest, validate_base_url,
+    RuntimeArchive, RuntimeCapability, RuntimeComponent, RuntimeFile, RuntimeLicense,
+    RuntimeManifest, RuntimeManifestSignature, RuntimePlatformManifest, validate_base_url,
 };
 use sha2::{Digest, Sha256};
 
@@ -481,6 +481,8 @@ fn build_runtime_manifest(
             id: id.to_owned(),
             version: manifest.engine.version.clone(),
             required: true,
+            capability: RuntimeCapability::Base,
+            scripts: Vec::new(),
             files: vec![file_for(path)?],
         });
     }
@@ -512,6 +514,8 @@ fn build_runtime_manifest(
             id: id.to_owned(),
             version,
             required: true,
+            capability: RuntimeCapability::Base,
+            scripts: Vec::new(),
             files: vec![RuntimeFile {
                 path: path.clone(),
                 size_bytes,
@@ -525,6 +529,8 @@ fn build_runtime_manifest(
             id: format!("platform.library.{}", components.len()),
             version: manifest.engine.version.clone(),
             required: true,
+            capability: RuntimeCapability::Base,
+            scripts: Vec::new(),
             files: vec![file_for(library)?],
         });
     }
@@ -533,6 +539,8 @@ fn build_runtime_manifest(
             id: "platform.windows.vc-runtime".to_owned(),
             version: manifest.engine.version.clone(),
             required: platform.os == "windows",
+            capability: RuntimeCapability::Base,
+            scripts: Vec::new(),
             files: vec![file_for(runtime_file)?],
         });
     }
