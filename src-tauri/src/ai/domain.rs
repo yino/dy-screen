@@ -1491,3 +1491,75 @@ pub struct NewAiHighlightEnhancement {
     pub rejection_code: Option<String>,
     pub rejection_detail: Option<String>,
 }
+
+/// 渲染尝试状态（步骤 3 任务组 9）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiRenderAttemptStatus {
+    Rendering,
+    Ready,
+    Failed,
+}
+
+impl AiRenderAttemptStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Rendering => "rendering",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "rendering" => Ok(Self::Rendering),
+            "ready" => Ok(Self::Ready),
+            "failed" => Ok(Self::Failed),
+            _ => Err(AiRepositoryError::Integrity("渲染尝试状态无效".to_owned())),
+        }
+    }
+}
+
+/// 一次特效字幕渲染尝试。`cache_key` 相同即表示帧序列可以复用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiEffectCaptionRenderAttempt {
+    pub id: i64,
+    pub project_id: i64,
+    pub candidate_id: i64,
+    pub cache_key: String,
+    pub composition_version: String,
+    pub composition_fingerprint: String,
+    pub font_version: String,
+    pub browser_version: String,
+    pub renderer_version: String,
+    pub engine_script_version: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub frame_count: u64,
+    pub frames_dir: String,
+    pub status: AiRenderAttemptStatus,
+    pub failure_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 写入渲染尝试所需的字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAiEffectCaptionRenderAttempt {
+    pub project_id: i64,
+    pub candidate_id: i64,
+    pub cache_key: String,
+    pub composition_version: String,
+    pub composition_fingerprint: String,
+    pub font_version: String,
+    pub browser_version: String,
+    pub renderer_version: String,
+    pub engine_script_version: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub frames_dir: String,
+}

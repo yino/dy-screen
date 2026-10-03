@@ -73,12 +73,15 @@ pub use effect_caption_composition::{
     build_effect_caption_composition, composition_prompt, generate_effect_caption_composition,
 };
 pub use effect_caption_render::{
-    AlwaysIdleGate, BaseCapabilityGate, EffectCaptionRenderer, EffectCaptionRuntimeError,
-    PageScriptAttestation, ProcessExit, ProcessLimits, ProcessMemoryProbe, RenderInvocation,
-    RenderLimits, RenderOutcome, RenderScheduler, RendererRuntimeManifest, SubprocessRenderer,
+    AlwaysIdleGate, BaseCapabilityGate, DeterminismPolicy, EffectCaptionRenderer,
+    EffectCaptionRuntimeError, FontResource, FontResourceSet, FrameParity, PageScriptAttestation,
+    ProcessExit, ProcessLimits, ProcessMemoryProbe, RenderCacheKey, RenderInvocation, RenderLimits,
+    RenderOutcome, RenderScheduler, RenderVersionSet, RendererRuntimeManifest, SubprocessRenderer,
     SystemMemoryProbe, VerifiedRendererRuntime, assert_paths_within_roots,
-    build_restricted_command, cleanup_unpublished_frames, compute_tree_digest, supervise_process,
-    verify_browser, verify_page_script_attestation, verify_render_outcome, verify_renderer_runtime,
+    build_restricted_command, build_restricted_command_with_fonts, cleanup_unpublished_frames,
+    compare_frame_sequences, compute_tree_digest, digest_frame_sequence, supervise_process,
+    verify_browser, verify_font_resources, verify_page_script_attestation, verify_render_outcome,
+    verify_renderer_runtime,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,

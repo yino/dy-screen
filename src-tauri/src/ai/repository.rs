@@ -15,11 +15,12 @@ use crate::database::{Database, DatabaseError};
 use super::domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
     AiClipProjectSource, AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate,
-    AiClipTimelineUnit, AiClipTimelineUnitKind, AiEnhancementKind, AiEnhancementStatus,
-    AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk, AiHighlightEnhancement,
-    AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
-    AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AiSmartClipSourceInput,
-    AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AsrArtifact, NewAiHighlightChunk,
+    AiClipTimelineUnit, AiClipTimelineUnitKind, AiEffectCaptionRenderAttempt, AiEnhancementKind,
+    AiEnhancementStatus, AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk,
+    AiHighlightEnhancement, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus,
+    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
+    AiRenderAttemptStatus, AiSmartClipSourceInput, AiSmartDraft, AiSmartDraftOwnership,
+    AiSmartDraftStatus, AsrArtifact, NewAiEffectCaptionRenderAttempt, NewAiHighlightChunk,
     NewAiHighlightEnhancement, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact,
     RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
     TranscriptSegmentDraft,
@@ -4990,6 +4991,276 @@ impl AiRepository {
     }
 }
 
+/// 特效字幕渲染尝试（步骤 3 任务组 9 的持久化基础）。
+impl AiRepository {
+    /// 开始一次渲染尝试。
+    ///
+    /// 返回 `(尝试, 是否命中缓存)`：同一 `cache_key` 已存在且状态为 `ready` 时命中缓存，
+    /// 调用方应直接复用帧序列；否则把该行重置为 `rendering` 并返回。不同 `cache_key`
+    /// （任一版本字段变化）必然落到新行，因此"任一字段变化即创建新的渲染尝试"。
+    pub fn begin_render_attempt(
+        &self,
+        input: NewAiEffectCaptionRenderAttempt,
+    ) -> Result<(AiEffectCaptionRenderAttempt, bool)> {
+        if input.cache_key.trim().is_empty() {
+            return Err(AiRepositoryError::Integrity(
+                "渲染缓存键不能为空".to_owned(),
+            ));
+        }
+        if input.width == 0 || input.height == 0 || input.fps == 0 {
+            return Err(AiRepositoryError::Integrity("渲染规格无效".to_owned()));
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.database.connection()?;
+        // 命中缓存的判定必须发生在重置之前。
+        let previous_status: Option<String> = connection
+            .query_row(
+                "SELECT status FROM ai_effect_caption_renders WHERE cache_key = ?1",
+                [&input.cache_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let cached = previous_status.as_deref() == Some("ready");
+        connection.execute(
+            r#"
+            INSERT INTO ai_effect_caption_renders(
+                project_id, candidate_id, cache_key, composition_version, composition_fingerprint,
+                font_version, browser_version, renderer_version, engine_script_version,
+                width, height, fps, frame_count, frames_dir, status, failure_code, created_at, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, ?13, 'rendering', NULL, ?14, ?14)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                -- 命中缓存（已 ready 且已有帧）时保持 ready，交给调用方直接复用；
+                -- 仅在失败或未完成时复位为 rendering。
+                status = CASE
+                    WHEN ai_effect_caption_renders.status = 'ready'
+                         AND ai_effect_caption_renders.frame_count > 0
+                    THEN ai_effect_caption_renders.status
+                    ELSE 'rendering'
+                END,
+                failure_code = CASE
+                    WHEN ai_effect_caption_renders.status = 'ready'
+                         AND ai_effect_caption_renders.frame_count > 0
+                    THEN ai_effect_caption_renders.failure_code
+                    ELSE NULL
+                END,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                input.project_id,
+                input.candidate_id,
+                input.cache_key,
+                input.composition_version,
+                input.composition_fingerprint,
+                input.font_version,
+                input.browser_version,
+                input.renderer_version,
+                input.engine_script_version,
+                input.width as i64,
+                input.height as i64,
+                input.fps as i64,
+                input.frames_dir,
+                now,
+            ],
+        )?;
+        drop(connection);
+        let attempt = self
+            .find_render_attempt_by_key(&input.cache_key)?
+            .ok_or(AiRepositoryError::NotFound("渲染尝试"))?;
+        Ok((attempt, cached))
+    }
+
+    pub fn find_render_attempt_by_key(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<AiEffectCaptionRenderAttempt>> {
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                &format!("SELECT {RENDER_ATTEMPT_COLUMNS} FROM ai_effect_caption_renders WHERE cache_key = ?1"),
+                [cache_key],
+                map_render_attempt,
+            )
+            .optional()?;
+        row.map(parse_render_attempt).transpose()
+    }
+
+    pub fn find_ready_render_attempt(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<AiEffectCaptionRenderAttempt>> {
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                &format!("SELECT {RENDER_ATTEMPT_COLUMNS} FROM ai_effect_caption_renders WHERE cache_key = ?1 AND status = 'ready' AND frame_count > 0"),
+                [cache_key],
+                map_render_attempt,
+            )
+            .optional()?;
+        row.map(parse_render_attempt).transpose()
+    }
+
+    pub fn mark_render_attempt_ready(
+        &self,
+        attempt_id: i64,
+        frame_count: u64,
+    ) -> Result<AiEffectCaptionRenderAttempt> {
+        if frame_count == 0 {
+            return Err(AiRepositoryError::Integrity(
+                "渲染完成必须至少有一帧".to_owned(),
+            ));
+        }
+        let connection = self.database.connection()?;
+        let changed = connection.execute(
+            &format!(
+                "UPDATE ai_effect_caption_renders SET status = '{}', frame_count = ?1, failure_code = NULL, updated_at = ?2 WHERE id = ?3",
+                AiRenderAttemptStatus::Ready.as_str()
+            ),
+            params![frame_count as i64, Utc::now().to_rfc3339(), attempt_id],
+        )?;
+        if changed == 0 {
+            return Err(AiRepositoryError::NotFound("渲染尝试"));
+        }
+        drop(connection);
+        self.get_render_attempt(attempt_id)?
+            .ok_or(AiRepositoryError::NotFound("渲染尝试"))
+    }
+
+    pub fn mark_render_attempt_failed(
+        &self,
+        attempt_id: i64,
+        failure_code: &str,
+    ) -> Result<AiEffectCaptionRenderAttempt> {
+        if failure_code.trim().is_empty() {
+            return Err(AiRepositoryError::Integrity("失败原因不能为空".to_owned()));
+        }
+        let connection = self.database.connection()?;
+        connection.execute(
+            &format!(
+                "UPDATE ai_effect_caption_renders SET status = '{}', frame_count = 0, failure_code = ?1, updated_at = ?2 WHERE id = ?3",
+                AiRenderAttemptStatus::Failed.as_str()
+            ),
+            params![failure_code, Utc::now().to_rfc3339(), attempt_id],
+        )?;
+        drop(connection);
+        self.get_render_attempt(attempt_id)?
+            .ok_or(AiRepositoryError::NotFound("渲染尝试"))
+    }
+
+    pub fn get_render_attempt(
+        &self,
+        attempt_id: i64,
+    ) -> Result<Option<AiEffectCaptionRenderAttempt>> {
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                &format!(
+                    "SELECT {RENDER_ATTEMPT_COLUMNS} FROM ai_effect_caption_renders WHERE id = ?1"
+                ),
+                [attempt_id],
+                map_render_attempt,
+            )
+            .optional()?;
+        row.map(parse_render_attempt).transpose()
+    }
+}
+
+const RENDER_ATTEMPT_COLUMNS: &str = "id, project_id, candidate_id, cache_key, composition_version, composition_fingerprint, font_version, browser_version, renderer_version, engine_script_version, width, height, fps, frame_count, frames_dir, status, failure_code, created_at, updated_at";
+
+type RenderAttemptRow = (
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
+fn map_render_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<RenderAttemptRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+    ))
+}
+
+fn parse_render_attempt(row: RenderAttemptRow) -> Result<AiEffectCaptionRenderAttempt> {
+    let (
+        id,
+        project_id,
+        candidate_id,
+        cache_key,
+        composition_version,
+        composition_fingerprint,
+        font_version,
+        browser_version,
+        renderer_version,
+        engine_script_version,
+        width,
+        height,
+        fps,
+        frame_count,
+        frames_dir,
+        status,
+        failure_code,
+        created_at,
+        updated_at,
+    ) = row;
+    Ok(AiEffectCaptionRenderAttempt {
+        id,
+        project_id,
+        candidate_id,
+        cache_key,
+        composition_version,
+        composition_fingerprint,
+        font_version,
+        browser_version,
+        renderer_version,
+        engine_script_version,
+        width: u32::try_from(width)
+            .map_err(|_| AiRepositoryError::Integrity("渲染宽度无效".to_owned()))?,
+        height: u32::try_from(height)
+            .map_err(|_| AiRepositoryError::Integrity("渲染高度无效".to_owned()))?,
+        fps: u32::try_from(fps)
+            .map_err(|_| AiRepositoryError::Integrity("渲染帧率无效".to_owned()))?,
+        frame_count: u64::try_from(frame_count)
+            .map_err(|_| AiRepositoryError::Integrity("帧数无效".to_owned()))?,
+        frames_dir,
+        status: AiRenderAttemptStatus::parse(&status)?,
+        failure_code,
+        updated_at,
+        created_at,
+    })
+}
+
 const ENHANCEMENT_COLUMNS: &str = "id, project_id, candidate_id, highlight_run_id, generation, kind, status, start_ms, end_ms, emphasis_words_json, composition_version, composition_fingerprint, render_cache_key, source_fingerprint, suppression_ranges_json, rejection_code, rejection_detail, created_at, updated_at";
 
 type EnhancementRow = (
@@ -6728,5 +6999,148 @@ mod smart_migration_tests {
                 .record_enhancement(invalid_generation, "fp-1")
                 .is_err()
         );
+    }
+
+    // ---- 步骤 3 任务组 5/9：渲染尝试的缓存键复用 ----
+
+    fn render_attempt_input(
+        project_id: i64,
+        candidate_id: i64,
+        cache_key: &str,
+        frames_dir: &str,
+    ) -> NewAiEffectCaptionRenderAttempt {
+        NewAiEffectCaptionRenderAttempt {
+            project_id,
+            candidate_id,
+            cache_key: cache_key.to_owned(),
+            composition_version: "composition-v1".to_owned(),
+            composition_fingerprint: "composition-fp".to_owned(),
+            font_version: "caption-fonts-2026.10".to_owned(),
+            browser_version: "154.0.8037.58".to_owned(),
+            renderer_version: "0.8.96".to_owned(),
+            engine_script_version: "38592478aad3f515".to_owned(),
+            width: 1080,
+            height: 1920,
+            fps: 30,
+            frames_dir: frames_dir.to_owned(),
+        }
+    }
+
+    #[test]
+    fn render_attempt_is_reused_for_same_cache_key_and_recreated_for_new_key() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("渲染工程", &enhancement_test_profile())
+            .expect("create project");
+        let (first, cached) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                5,
+                "key-a",
+                "/tmp/frames-a",
+            ))
+            .expect("begin first");
+        assert!(!cached, "首次渲染不能算命中缓存");
+        assert_eq!(first.status, AiRenderAttemptStatus::Rendering);
+        let ready = repository
+            .mark_render_attempt_ready(first.id, 450)
+            .expect("mark ready");
+        assert_eq!(ready.status, AiRenderAttemptStatus::Ready);
+        assert_eq!(ready.frame_count, 450);
+
+        // 同一 cache_key：命中缓存并复用同一行。
+        let (second, cached) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                5,
+                "key-a",
+                "/tmp/frames-a",
+            ))
+            .expect("begin again");
+        assert!(cached, "相同缓存键必须命中缓存");
+        assert_eq!(second.id, first.id);
+
+        // 任一版本字段变化 → 新的缓存键 → 新的渲染尝试。
+        let mut changed = render_attempt_input(project.id, 5, "key-b", "/tmp/frames-b");
+        changed.browser_version = "155.0.0.0".to_owned();
+        let (third, cached) = repository
+            .begin_render_attempt(changed)
+            .expect("begin new key");
+        assert!(!cached);
+        assert_ne!(third.id, first.id);
+        assert_eq!(
+            repository
+                .find_ready_render_attempt("key-a")
+                .expect("query ready")
+                .map(|attempt| attempt.id),
+            Some(first.id)
+        );
+        assert!(
+            repository
+                .find_ready_render_attempt("key-b")
+                .expect("query ready")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_render_attempt_is_retried_on_the_same_key() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("渲染工程", &enhancement_test_profile())
+            .expect("create project");
+        let (attempt, _) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                6,
+                "key-c",
+                "/tmp/frames-c",
+            ))
+            .expect("begin");
+        let failed = repository
+            .mark_render_attempt_failed(attempt.id, "render_timeout")
+            .expect("mark failed");
+        assert_eq!(failed.status, AiRenderAttemptStatus::Failed);
+        assert_eq!(failed.failure_code.as_deref(), Some("render_timeout"));
+        assert_eq!(failed.frame_count, 0);
+        assert!(
+            repository
+                .find_ready_render_attempt("key-c")
+                .expect("query ready")
+                .is_none()
+        );
+
+        // 重试同一个键：复用同一行并把状态复位为 rendering，同时清掉上次失败原因。
+        let (retried, cached) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                6,
+                "key-c",
+                "/tmp/frames-c",
+            ))
+            .expect("retry");
+        assert!(!cached, "失败后的重试不算命中缓存");
+        assert_eq!(retried.id, attempt.id);
+        assert_eq!(retried.status, AiRenderAttemptStatus::Rendering);
+        assert!(retried.failure_code.is_none());
+    }
+
+    #[test]
+    fn render_attempt_rejects_invalid_spec_and_empty_key() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("渲染工程", &enhancement_test_profile())
+            .expect("create project");
+        let mut empty_key = render_attempt_input(project.id, 7, "  ", "/tmp/frames-d");
+        assert!(repository.begin_render_attempt(empty_key.clone()).is_err());
+        empty_key.cache_key = "key-d".to_owned();
+        empty_key.fps = 0;
+        assert!(repository.begin_render_attempt(empty_key).is_err());
     }
 }

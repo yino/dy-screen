@@ -469,6 +469,19 @@ pub fn build_restricted_command(
     invocation: &RenderInvocation,
     browser_path: &Path,
 ) -> Result<Command, EffectCaptionRuntimeError> {
+    build_restricted_command_with_fonts(program, invocation, browser_path, None)
+}
+
+/// 同上，但把随包字体目录显式交给渲染器（任务 5.1）。
+///
+/// 环境被清空，因此 `FONTCONFIG_PATH`、`XDG_DATA_DIRS` 等系统字体发现路径都不会被继承：
+/// 特效字幕的字形只能来自 `fonts`。
+pub fn build_restricted_command_with_fonts(
+    program: &Path,
+    invocation: &RenderInvocation,
+    browser_path: &Path,
+    fonts: Option<&FontResourceSet>,
+) -> Result<Command, EffectCaptionRuntimeError> {
     assert_paths_within_roots(invocation)?;
     let mut command = Command::new(program);
     command
@@ -500,6 +513,11 @@ pub fn build_restricted_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(fonts) = fonts {
+        command
+            .env("HYPERFRAMES_CAPTION_FONT_DIR", fonts.directory())
+            .env("HYPERFRAMES_CAPTION_FONT_FAMILY", fonts.family());
+    }
     Ok(command)
 }
 
@@ -643,6 +661,246 @@ impl EffectCaptionRenderer for SubprocessRenderer {
         }
         result
     }
+}
+
+/// 随包锁定字体资源（任务 5.1）。系统字体不得作为特效字幕的字形来源。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FontResource {
+    pub family: String,
+    pub version: String,
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+/// 通过校验的字体集合。只有 [`verify_font_resources`] 能构造它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontResourceSet {
+    family: String,
+    version: String,
+    directory: PathBuf,
+    count: usize,
+}
+
+impl FontResourceSet {
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+}
+
+/// 校验随包字体：家族必须是被样式表引用的锁定家族，版本与每个文件哈希都必须与清单一致。
+pub fn verify_font_resources(
+    resources: &[FontResource],
+    expected_version: &str,
+) -> Result<FontResourceSet, EffectCaptionRuntimeError> {
+    if resources.is_empty() {
+        return Err(EffectCaptionRuntimeError::new(
+            "caption_font_missing",
+            "没有随包锁定字体，禁止用系统字体渲染",
+        ));
+    }
+    let family = resources[0].family.clone();
+    for resource in resources {
+        if !super::effect_caption::BUNDLED_FONT_FAMILIES.contains(&resource.family.as_str()) {
+            return Err(EffectCaptionRuntimeError::new(
+                "caption_font_family_not_bundled",
+                "字体家族不是随包锁定家族",
+            ));
+        }
+        if resource.family != family {
+            return Err(EffectCaptionRuntimeError::new(
+                "caption_font_family_not_bundled",
+                "随包字体必须属于同一家族",
+            ));
+        }
+        if resource.version != expected_version {
+            return Err(EffectCaptionRuntimeError::new(
+                "caption_font_version_mismatch",
+                format!("字体版本不是清单固定的 {expected_version}"),
+            ));
+        }
+        let bytes = std::fs::read(&resource.path).map_err(|error| {
+            EffectCaptionRuntimeError::new("caption_font_missing", sanitize(&error))
+        })?;
+        let observed = hex::encode(Sha256::digest(&bytes));
+        if observed != resource.sha256 {
+            return Err(EffectCaptionRuntimeError::new(
+                "caption_font_hash_mismatch",
+                "字体文件哈希与清单不一致",
+            ));
+        }
+    }
+    let directory = resources[0]
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            EffectCaptionRuntimeError::new("caption_font_missing", "字体文件缺少所在目录")
+        })?;
+    Ok(FontResourceSet {
+        family,
+        version: expected_version.to_owned(),
+        directory,
+        count: resources.len(),
+    })
+}
+
+/// 渲染版本集合：任何一个字段变化都必须产生新的缓存键（任务 5.4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderVersionSet {
+    pub composition_version: String,
+    pub composition_fingerprint: String,
+    pub font_version: String,
+    pub browser_version: String,
+    pub renderer_version: String,
+    pub engine_script_version: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+/// 渲染缓存键。相同键表示可以复用已渲染的帧序列。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RenderCacheKey(String);
+
+impl RenderCacheKey {
+    pub fn new(versions: &RenderVersionSet) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(versions.composition_version.as_bytes());
+        hasher.update([0]);
+        hasher.update(versions.composition_fingerprint.as_bytes());
+        hasher.update([0]);
+        hasher.update(versions.font_version.as_bytes());
+        hasher.update([0]);
+        hasher.update(versions.browser_version.as_bytes());
+        hasher.update([0]);
+        hasher.update(versions.renderer_version.as_bytes());
+        hasher.update([0]);
+        hasher.update(versions.engine_script_version.as_bytes());
+        hasher.update([0]);
+        hasher.update(versions.width.to_le_bytes());
+        hasher.update(versions.height.to_le_bytes());
+        hasher.update(versions.fps.to_le_bytes());
+        Self(hex::encode(hasher.finalize()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// 帧序列一致性策略。设计决策四明确"逻辑确定性而非位精确"：允许极少量光栅差异。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeterminismPolicy {
+    pub max_mismatch_ratio: f64,
+}
+
+impl Default for DeterminismPolicy {
+    fn default() -> Self {
+        // 设计给出的实测上界：约 0.4–0.9% 的帧可能存在合成器光栅差异。
+        Self {
+            max_mismatch_ratio: 0.009,
+        }
+    }
+}
+
+/// 一次帧序列一致性比对的结果。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameParity {
+    pub total: u64,
+    pub mismatched: u64,
+    pub ratio: f64,
+}
+
+/// 计算帧序列的逐帧摘要：`(文件名, sha256)`，按文件名排序。
+pub fn digest_frame_sequence(
+    frames_dir: &Path,
+) -> Result<Vec<(String, String)>, EffectCaptionRuntimeError> {
+    let mut frames: Vec<(String, String)> = Vec::new();
+    let entries = std::fs::read_dir(frames_dir).map_err(|error| {
+        EffectCaptionRuntimeError::new("render_frames_missing", sanitize(&error))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            EffectCaptionRuntimeError::new("render_frames_missing", sanitize(&error))
+        })?;
+        let path = entry.path();
+        if !path.is_file()
+            || frame_index(&path.file_name().unwrap_or_default().to_string_lossy()).is_none()
+        {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|error| {
+            EffectCaptionRuntimeError::new("render_frames_missing", sanitize(&error))
+        })?;
+        frames.push((
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+            hex::encode(Sha256::digest(&bytes)),
+        ));
+    }
+    if frames.is_empty() {
+        return Err(EffectCaptionRuntimeError::new(
+            "render_frames_missing",
+            "没有可比的帧序列",
+        ));
+    }
+    frames.sort();
+    Ok(frames)
+}
+
+/// 比对两次渲染的帧序列（任务 5.2 / 5.5）。
+pub fn compare_frame_sequences(
+    first: &Path,
+    second: &Path,
+    policy: &DeterminismPolicy,
+) -> Result<FrameParity, EffectCaptionRuntimeError> {
+    let left = digest_frame_sequence(first)?;
+    let right = digest_frame_sequence(second)?;
+    if left.len() != right.len() {
+        return Err(EffectCaptionRuntimeError::new(
+            "render_frame_count_mismatch",
+            format!("两次渲染帧数不同：{} vs {}", left.len(), right.len()),
+        ));
+    }
+    let mismatched = left
+        .iter()
+        .zip(right.iter())
+        .filter(|(left, right)| left != right)
+        .count() as u64;
+    let total = left.len() as u64;
+    let ratio = if total == 0 {
+        0.0
+    } else {
+        mismatched as f64 / total as f64
+    };
+    if ratio > policy.max_mismatch_ratio {
+        return Err(EffectCaptionRuntimeError::new(
+            "render_nondeterministic",
+            format!("相同输入两次渲染不一致：{mismatched}/{total} 帧不同"),
+        ));
+    }
+    Ok(FrameParity {
+        total,
+        mismatched,
+        ratio,
+    })
 }
 
 /// 校验渲染产物：帧数、命名连续性与磁盘上限。
@@ -1313,5 +1571,220 @@ mod tests {
         assert!(!frames.exists(), "崩溃后必须清理未发布帧");
         assert!(published.exists(), "工程产物不得受影响");
         assert_eq!(renderer.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn font_resource(directory: &Path, bytes: &[u8]) -> FontResource {
+        let path = directory.join("caption-cjk.ttf");
+        std::fs::write(&path, bytes).expect("write font");
+        FontResource {
+            family: "hyperframes-caption-cjk".to_owned(),
+            version: "caption-fonts-2026.10".to_owned(),
+            path,
+            sha256: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    #[test]
+    fn font_resources_are_verified_and_system_families_rejected() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let resource = font_resource(directory.path(), b"font-bytes");
+        let verified =
+            verify_font_resources(std::slice::from_ref(&resource), "caption-fonts-2026.10")
+                .expect("字体应当通过校验");
+        assert_eq!(verified.family(), "hyperframes-caption-cjk");
+        assert_eq!(verified.version(), "caption-fonts-2026.10");
+        assert_eq!(verified.count(), 1);
+        assert_eq!(verified.directory(), directory.path());
+
+        // 版本不符
+        assert_eq!(
+            verify_font_resources(std::slice::from_ref(&resource), "caption-fonts-2025.01")
+                .unwrap_err()
+                .code,
+            "caption_font_version_mismatch"
+        );
+        // 系统字体家族
+        let mut system = resource.clone();
+        system.family = "PingFang SC".to_owned();
+        assert_eq!(
+            verify_font_resources(&[system], "caption-fonts-2026.10")
+                .unwrap_err()
+                .code,
+            "caption_font_family_not_bundled"
+        );
+        // 文件被篡改
+        let mut tampered = resource.clone();
+        tampered.sha256 = "0".repeat(64);
+        assert_eq!(
+            verify_font_resources(&[tampered], "caption-fonts-2026.10")
+                .unwrap_err()
+                .code,
+            "caption_font_hash_mismatch"
+        );
+        // 一个字体都没有
+        assert_eq!(
+            verify_font_resources(&[], "caption-fonts-2026.10")
+                .unwrap_err()
+                .code,
+            "caption_font_missing"
+        );
+    }
+
+    #[test]
+    fn render_environment_never_inherits_system_font_paths() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace = directory.path().join("work");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let fonts_dir = directory.path().join("fonts");
+        std::fs::create_dir_all(&fonts_dir).expect("fonts");
+        let resource = font_resource(&fonts_dir, b"font-bytes");
+        let fonts = verify_font_resources(&[resource], "caption-fonts-2026.10").expect("fonts");
+        let invocation = RenderInvocation {
+            composition_path: workspace.join("composition.html"),
+            workspace_dir: workspace.clone(),
+            frames_dir: workspace.join("frames"),
+            allowed_roots: vec![directory.path().to_path_buf()],
+            width: 1080,
+            height: 1920,
+            fps: 30,
+            duration_ms: 15_000,
+            limits: RenderLimits::default(),
+        };
+        let browser = directory.path().join("chrome");
+        let command = build_restricted_command_with_fonts(
+            Path::new("/usr/bin/node"),
+            &invocation,
+            &browser,
+            Some(&fonts),
+        )
+        .expect("command");
+        let envs: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().to_string())
+            .collect();
+        for system_font_env in [
+            "FONTCONFIG_PATH",
+            "FONTCONFIG_FILE",
+            "XDG_DATA_DIRS",
+            "XDG_DATA_HOME",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+        ] {
+            assert!(
+                !envs.contains(&system_font_env.to_owned()),
+                "不得继承系统字体发现路径 {system_font_env}"
+            );
+        }
+        let font_dir = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| key.to_string_lossy() == "HYPERFRAMES_CAPTION_FONT_DIR")
+            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().to_string()));
+        assert_eq!(
+            font_dir.as_deref(),
+            Some(fonts_dir.to_string_lossy().as_ref())
+        );
+    }
+
+    fn write_frames(directory: &Path, contents: &[&[u8]]) {
+        // 先清空：否则沿用上一次的帧会掩盖帧数/内容差异。
+        let _ = std::fs::remove_dir_all(directory);
+        std::fs::create_dir_all(directory).expect("frames dir");
+        for (index, bytes) in contents.iter().enumerate() {
+            std::fs::write(directory.join(format!("frame_{:06}.png", index + 1)), bytes)
+                .expect("write frame");
+        }
+    }
+
+    #[test]
+    fn frame_sequences_are_compared_against_the_determinism_policy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = directory.path().join("a");
+        let second = directory.path().join("b");
+        write_frames(&first, &[b"1", b"2", b"3"]);
+        write_frames(&second, &[b"1", b"2", b"3"]);
+        let parity = compare_frame_sequences(&first, &second, &DeterminismPolicy::default())
+            .expect("相同帧序列");
+        assert_eq!(parity.mismatched, 0);
+        assert_eq!(parity.ratio, 0.0);
+
+        // 3 帧里 1 帧不同（33%）远超允许比例 → 判定非确定性。
+        write_frames(&second, &[b"1", b"X", b"3"]);
+        let left = digest_frame_sequence(&first).expect("digest left");
+        let right = digest_frame_sequence(&second).expect("digest right");
+        assert_ne!(left, right, "重写后的帧序列必须不同：{left:?} vs {right:?}");
+        assert_eq!(
+            compare_frame_sequences(&first, &second, &DeterminismPolicy::default())
+                .unwrap_err()
+                .code,
+            "render_nondeterministic"
+        );
+
+        // 帧数不同 → 独立错误码。
+        write_frames(&second, &[b"1", b"2"]);
+        assert_eq!(
+            compare_frame_sequences(&first, &second, &DeterminismPolicy::default())
+                .unwrap_err()
+                .code,
+            "render_frame_count_mismatch"
+        );
+    }
+
+    #[test]
+    fn determinism_policy_allows_documented_raster_tolerance() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = directory.path().join("a");
+        let second = directory.path().join("b");
+        let identical: Vec<&[u8]> = vec![b"same"; 200];
+        write_frames(&first, &identical);
+        let mut tolerant = identical.clone();
+        tolerant[0] = b"diff";
+        write_frames(&second, &tolerant);
+        let parity = compare_frame_sequences(&first, &second, &DeterminismPolicy::default())
+            .expect("0.5% 差异在设计允许范围内");
+        assert_eq!(parity.total, 200);
+        assert_eq!(parity.mismatched, 1);
+        assert!(parity.ratio < 0.009);
+    }
+
+    #[test]
+    fn cache_key_changes_when_any_version_field_changes() {
+        let versions = RenderVersionSet {
+            composition_version: "composition-v1".to_owned(),
+            composition_fingerprint: "fingerprint".to_owned(),
+            font_version: "caption-fonts-2026.10".to_owned(),
+            browser_version: "154.0.8037.58".to_owned(),
+            renderer_version: "0.8.96".to_owned(),
+            engine_script_version: "38592478aad3f515".to_owned(),
+            width: 1080,
+            height: 1920,
+            fps: 30,
+        };
+        let base = RenderCacheKey::new(&versions);
+        assert_eq!(base.as_str().len(), 64);
+        assert_eq!(
+            base,
+            RenderCacheKey::new(&versions.clone()),
+            "相同输入必须稳定"
+        );
+        for mutate in [
+            |value: &mut RenderVersionSet| value.composition_version = "composition-v2".to_owned(),
+            |value: &mut RenderVersionSet| value.composition_fingerprint = "other".to_owned(),
+            |value: &mut RenderVersionSet| value.font_version = "caption-fonts-2026.11".to_owned(),
+            |value: &mut RenderVersionSet| value.browser_version = "155.0.0.0".to_owned(),
+            |value: &mut RenderVersionSet| value.renderer_version = "0.8.97".to_owned(),
+            |value: &mut RenderVersionSet| value.engine_script_version = "deadbeef".to_owned(),
+            |value: &mut RenderVersionSet| value.width = 720,
+            |value: &mut RenderVersionSet| value.height = 1280,
+            |value: &mut RenderVersionSet| value.fps = 60,
+        ] {
+            let mut changed = versions.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                base,
+                RenderCacheKey::new(&changed),
+                "任一版本字段变化都必须产生新的缓存键"
+            );
+        }
     }
 }
