@@ -23,6 +23,18 @@ pub const TAG_ALLOWLIST: &[&str] = &[
     "b", "i", "small", "u", "s", "ul", "ol", "li",
 ];
 
+/// 随包样式表暴露给组合的 class 集合（任务 2.2）。
+///
+/// 组合只能引用这里的 class：`class` 属性取值与 CSS 选择器里的 class 都必须落在集合内，
+/// 否则拒绝。新增样式必须先进入本表与 `BUNDLED_STYLESHEET`，不允许模型自带样式。
+pub const CLASS_ALLOWLIST: &[&str] = &[
+    "caption-root",
+    "caption-line",
+    "caption-word",
+    "caption-emphasis",
+    "caption-glow",
+];
+
 /// 允许出现的全局属性。渲染器契约属性单独列出，且取值受约束。
 pub const GLOBAL_ATTRIBUTE_ALLOWLIST: &[&str] = &["class", "style", "lang", "dir", "title"];
 
@@ -322,7 +334,7 @@ pub struct EffectCaptionRejection {
 }
 
 impl EffectCaptionRejection {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
@@ -656,6 +668,9 @@ fn validate_element_attributes(element: &ScannedElement) -> Result<(), EffectCap
         if lowered_name == "style" {
             validate_inline_css(value, element)?;
         }
+        if lowered_name == "class" {
+            validate_class_tokens(value, &format!("<{}> 的 class", element.name))?;
+        }
     }
     if element.name == "meta" {
         let keys: Vec<&str> = element
@@ -668,6 +683,46 @@ fn validate_element_attributes(element: &ScannedElement) -> Result<(), EffectCap
                 "effect_unsupported_attribute",
                 "meta 只允许 charset 属性",
             ));
+        }
+    }
+    Ok(())
+}
+
+/// 组合只能引用随包样式表里的 class（任务 2.2）。
+fn validate_class_tokens(value: &str, context: &str) -> Result<(), EffectCaptionRejection> {
+    for token in value.split_whitespace() {
+        if !CLASS_ALLOWLIST.contains(&token) {
+            return Err(EffectCaptionRejection::new(
+                "effect_class_not_bundled",
+                format!(
+                    "{context} 引用了随包样式之外的 class（第 {} 个）",
+                    token.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CSS 选择器里出现的 class 同样必须来自随包样式表。
+fn validate_selector_classes(selector_list: &str) -> Result<(), EffectCaptionRejection> {
+    for selector in selector_list.split(',') {
+        let mut rest = selector;
+        while let Some(index) = rest.find('.') {
+            let tail = &rest[index + 1..];
+            let name: String = tail
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .collect();
+            if !name.is_empty() && !CLASS_ALLOWLIST.contains(&name.as_str()) {
+                return Err(EffectCaptionRejection::new(
+                    "effect_class_not_bundled",
+                    format!("CSS 选择器引用了随包样式之外的 class {name}"),
+                ));
+            }
+            rest = &tail[name.len()..];
         }
     }
     Ok(())
@@ -1058,6 +1113,7 @@ fn validate_css(
                 "不支持 CSS 嵌套规则",
             ));
         }
+        validate_selector_classes(&prelude)?;
         let rule_longest = validate_declaration_block(block, allowed_texts, limits)?;
         longest = longest.max(rule_longest);
         if selector_targets_root(&prelude) {
@@ -1523,11 +1579,11 @@ mod tests {
     /// 最小合规组合：用于确认"接受路径"确实能通过。
     fn compliant() -> String {
         compose(
-            r#"<div class="stage"><span class="ch">这个价格真的绷不住了</span><span class="emph">，冲</span></div>"#,
+            r#"<div class="caption-root"><span class="caption-word">这个价格真的绷不住了</span><span class="caption-emphasis">，冲</span></div>"#,
             r#"
             html, body { margin:0; padding:0; background:transparent; }
-            .stage { position:absolute; left:0; right:0; bottom:230px; }
-            .ch { display:inline-block; animation: ch-in 240ms cubic-bezier(.2,.9,.3,1) both; }
+            .caption-root { position:absolute; left:0; right:0; bottom:230px; }
+            .caption-word { display:inline-block; animation: ch-in 240ms cubic-bezier(.2,.9,.3,1) both; }
             @keyframes ch-in { 0% { opacity:0; transform:translateY(38px) rotate(6deg); } 100% { opacity:1; transform:translateY(0); } }
             "#,
         )
@@ -1562,8 +1618,8 @@ mod tests {
     #[test]
     fn rejects_script_and_event_handler() {
         let script = compose(
-            r#"<div class="x"><script>alert(1)</script></div>"#,
-            ".x{opacity:1}",
+            r#"<div class="caption-line"><script>alert(1)</script></div>"#,
+            ".caption-line{opacity:1}",
         );
         assert_eq!(
             validate_effect_caption(&script, &corpus(), &LIMITS)
@@ -1573,8 +1629,8 @@ mod tests {
         );
 
         let handler = compose(
-            r#"<div class="x" onclick="run()">这个价格真的绷不住了</div>"#,
-            ".x{opacity:1}",
+            r#"<div class="caption-line" onclick="run()">这个价格真的绷不住了</div>"#,
+            ".caption-line{opacity:1}",
         );
         assert_eq!(
             validate_effect_caption(&handler, &corpus(), &LIMITS)
@@ -1587,8 +1643,8 @@ mod tests {
     #[test]
     fn rejects_external_reference() {
         let external = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{background-image:url(https://example.com/a.png)}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{background-image:url(https://example.com/a.png)}",
         );
         assert_eq!(
             validate_effect_caption(&external, &corpus(), &LIMITS)
@@ -1598,7 +1654,7 @@ mod tests {
         );
 
         let linked = compose(
-            r#"<div class="x" href="https://example.com">这个价格真的绷不住了</div>"#,
+            r#"<div class="caption-line" href="https://example.com">这个价格真的绷不住了</div>"#,
             "",
         );
         assert_eq!(
@@ -1613,8 +1669,8 @@ mod tests {
     fn rejects_engine_script_injection() {
         // 组合试图自带"引擎脚本"：即使名字像渲染器的，也必须拒绝，页面可执行内容只能来自随包渲染器。
         let injected = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{opacity:1}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{opacity:1}",
         )
         .replace(
             "<body>",
@@ -1631,7 +1687,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_css_capability() {
         let at_import = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
             "@import \"theme.css\";",
         );
         assert_eq!(
@@ -1642,8 +1698,8 @@ mod tests {
         );
 
         let media = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            "@media (prefers-color-scheme: dark) { .x { opacity: 1; } }",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            "@media (prefers-color-scheme: dark) { .caption-root { opacity: 1; } }",
         );
         assert_eq!(
             validate_effect_caption(&media, &corpus(), &LIMITS)
@@ -1653,8 +1709,8 @@ mod tests {
         );
 
         let unknown_property = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{behavior:url(#default#time2)}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{behavior:url(#default#time2)}",
         );
         assert_eq!(
             validate_effect_caption(&unknown_property, &corpus(), &LIMITS)
@@ -1667,8 +1723,8 @@ mod tests {
     #[test]
     fn rejects_limits_exceeded() {
         let long_animation = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{animation-duration:120s}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{animation-duration:120s}",
         );
         assert_eq!(
             validate_effect_caption(&long_animation, &corpus(), &LIMITS)
@@ -1683,7 +1739,7 @@ mod tests {
                 "<div>".repeat(30),
                 "</div>".repeat(30)
             ),
-            ".x{opacity:1}",
+            ".caption-line{opacity:1}",
         );
         assert_eq!(
             validate_effect_caption(&deep, &corpus(), &LIMITS)
@@ -1694,7 +1750,7 @@ mod tests {
 
         let too_many = compose(
             &format!("{}这个价格真的绷不住了", "<span></span>".repeat(600)),
-            ".x{opacity:1}",
+            ".caption-line{opacity:1}",
         );
         assert_eq!(
             validate_effect_caption(&too_many, &corpus(), &LIMITS)
@@ -1706,7 +1762,10 @@ mod tests {
 
     #[test]
     fn rejects_text_outside_published_corpus() {
-        let invented = compose(r#"<div class="x">恭喜发财红包拿来</div>"#, ".x{opacity:1}");
+        let invented = compose(
+            r#"<div class="caption-line">恭喜发财红包拿来</div>"#,
+            ".caption-line{opacity:1}",
+        );
         assert_eq!(
             validate_effect_caption(&invented, &corpus(), &LIMITS)
                 .unwrap_err()
@@ -1715,8 +1774,8 @@ mod tests {
         );
 
         let generated = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x::after{content:\"编造的字幕\"}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line::after{content:\"编造的字幕\"}",
         );
         assert_eq!(
             validate_effect_caption(&generated, &corpus(), &LIMITS)
@@ -1729,7 +1788,7 @@ mod tests {
     #[test]
     fn rejects_opaque_full_screen_background() {
         let opaque = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
             "html, body { background-color:#000000; }",
         );
         assert_eq!(
@@ -1740,8 +1799,8 @@ mod tests {
         );
 
         let inline = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{opacity:1}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{opacity:1}",
         )
         .replace("<body>", "<body style=\"background:#111\">");
         assert_eq!(
@@ -1755,8 +1814,8 @@ mod tests {
     #[test]
     fn rejects_nondeterministic_timing() {
         let random = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{transform:translateY(random(0px, 40px))}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{transform:translateY(random(0px, 40px))}",
         );
         assert_eq!(
             validate_effect_caption(&random, &corpus(), &LIMITS)
@@ -1766,8 +1825,8 @@ mod tests {
         );
 
         let scroll_driven = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{animation-timeline:scroll()}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{animation-timeline:scroll()}",
         );
         assert_eq!(
             validate_effect_caption(&scroll_driven, &corpus(), &LIMITS)
@@ -1780,8 +1839,8 @@ mod tests {
     #[test]
     fn rejects_build_configuration() {
         let build = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{opacity:1}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{opacity:1}",
         )
         .replace("<body>", "<body>\n<!-- npm install hyperframes -->");
         assert_eq!(
@@ -1794,7 +1853,10 @@ mod tests {
 
     #[test]
     fn rejects_malformed_markup() {
-        let unclosed = compose(r#"<div class="x">这个价格真的绷不住了"#, ".x{opacity:1}");
+        let unclosed = compose(
+            r#"<div class="caption-line">这个价格真的绷不住了"#,
+            ".caption-line{opacity:1}",
+        );
         assert_eq!(
             validate_effect_caption(&unclosed, &corpus(), &LIMITS)
                 .unwrap_err()
@@ -1821,7 +1883,10 @@ mod tests {
 
     #[test]
     fn rejection_detail_never_echoes_composition_text() {
-        let invented = compose(r#"<div class="x">恭喜发财红包拿来</div>"#, ".x{opacity:1}");
+        let invented = compose(
+            r#"<div class="caption-line">恭喜发财红包拿来</div>"#,
+            ".caption-line{opacity:1}",
+        );
         let rejection = validate_effect_caption(&invented, &corpus(), &LIMITS).unwrap_err();
         assert!(
             !rejection.detail.contains("恭喜发财"),
@@ -1829,8 +1894,8 @@ mod tests {
             rejection.detail
         );
         let external = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{background-image:url(https://example.com/a.png)}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{background-image:url(https://example.com/a.png)}",
         );
         let rejection = validate_effect_caption(&external, &corpus(), &LIMITS).unwrap_err();
         assert!(
@@ -1843,8 +1908,8 @@ mod tests {
     #[test]
     fn font_family_must_be_bundled() {
         let system_font = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{font-family:\"PingFang SC\", sans-serif}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{font-family:\"PingFang SC\", sans-serif}",
         );
         assert_eq!(
             validate_effect_caption(&system_font, &corpus(), &LIMITS)
@@ -1854,8 +1919,8 @@ mod tests {
         );
 
         let bundled = compose(
-            r#"<div class="x">这个价格真的绷不住了</div>"#,
-            ".x{font-family:\"hyperframes-caption-cjk\"}",
+            r#"<div class="caption-line">这个价格真的绷不住了</div>"#,
+            ".caption-line{font-family:\"hyperframes-caption-cjk\"}",
         );
         assert!(validate_effect_caption(&bundled, &corpus(), &LIMITS).is_ok());
     }

@@ -10,6 +10,7 @@ mod commands;
 mod desktop_runtime;
 mod domain;
 mod effect_caption;
+mod effect_caption_composition;
 mod highlight;
 mod lifecycle;
 mod llm;
@@ -64,6 +65,11 @@ pub use effect_caption::{
     PublishedHighlightSegment, RENDERER_CONTRACT_ATTRIBUTES, TAG_ALLOWLIST, VOID_ELEMENTS,
     ValidatedEffectCaption, ValidatedEnhancement, validate_effect_caption,
     validate_enhancement_proposals,
+};
+pub use effect_caption_composition::{
+    BUNDLED_STYLESHEET, BuiltEffectCaption, CompositionRequest, EffectCaptionCompositionError,
+    EffectCaptionCompositionProvider, EffectCaptionCompositionSkill,
+    build_effect_caption_composition, composition_prompt, generate_effect_caption_composition,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
