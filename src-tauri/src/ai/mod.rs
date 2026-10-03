@@ -24,9 +24,12 @@ mod smart_workflow;
 pub(crate) mod tauri_commands;
 
 pub use clip_export::{
-    ClipExportFailure, ClipExportPlan, ClipOutputDimensions, build_export_plan, execute_export,
-    probe_output_dimensions, select_clip_video_encoder, validate_export_sources,
-    validate_export_subtitles,
+    ClipExportFailure, ClipExportPlan, ClipOutputDimensions, EffectCaptionOverlay,
+    ExportResourceBaseline, ExportResourceSummary, TextLayerRange, TransparentFrameSummary,
+    build_export_plan, build_export_plan_with_overlays, check_export_resource_baseline,
+    cleanup_overlay_layers, execute_export, probe_output_dimensions, select_clip_video_encoder,
+    validate_export_sources, validate_export_subtitles, validate_single_text_layer,
+    verify_transparent_frame_sequence,
 };
 pub use clip_subtitle::{
     ClipSubtitleAssets, build_clip_subtitle_frames, render_clip_subtitle_assets,
