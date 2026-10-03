@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!-- 基线：现有固定样式逐字字幕（复刻 src-tauri/src/ai/clip_subtitle.rs 的观感：
+     单一白色填充 + 黑色描边 + 阴影，字号固定 64px（1080x1920 下 video_height*0.045 clamp 上限），
+     逐字出现（typewriter），无缩放、无位移、无颜色变化、无模糊。纯声明式 HTML/CSS，无脚本、无外部引用） -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>baseline</title>
+<style>
+  html,body { margin:0; padding:0; width:100%; height:100%; background:transparent; }
+  body { font-family:"PingFang SC","Hiragino Sans GB","Heiti SC",sans-serif; overflow:hidden; }
+
+  .stage { position:absolute; left:0; right:0; bottom:230px; display:flex; justify-content:center; }
+  .line {
+    font-size:64px; font-weight:700; letter-spacing:2px;
+    color:#ffffff;
+    -webkit-text-stroke:4px #000000;
+    paint-order:stroke fill;
+    text-shadow:5px 5px 0 rgba(0,0,0,.45);
+  }
+  .ch {
+    display:inline-block;
+    opacity:0;
+    animation: appear 6000ms linear both;
+  }
+  .ch:nth-child(1){animation-delay:0ms}   .ch:nth-child(2){animation-delay:200ms}
+  .ch:nth-child(3){animation-delay:400ms} .ch:nth-child(4){animation-delay:600ms}
+  .ch:nth-child(5){animation-delay:800ms} .ch:nth-child(6){animation-delay:1000ms}
+  .ch:nth-child(7){animation-delay:1200ms}.ch:nth-child(8){animation-delay:1400ms}
+  .ch:nth-child(9){animation-delay:1600ms}.ch:nth-child(10){animation-delay:1800ms}
+  .ch:nth-child(11){animation-delay:2000ms}
+  @keyframes appear { 0%{opacity:0} 0.001%{opacity:1} 100%{opacity:1} }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <div class="line">
+      <span class="ch">这</span><span class="ch">个</span><span class="ch">价</span><span class="ch">格</span>
+      <span class="ch">真</span><span class="ch">的</span><span class="ch">绷</span><span class="ch">不</span>
+      <span class="ch">住</span><span class="ch">了</span><span class="ch">，</span><span class="ch">冲</span>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,44 @@
+{
+  "page": "/tmp/page-sentence-io.html",
+  "browser": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "pageInlineScripts": [
+    {
+      "hasBootstrapAttr": true,
+      "bytes": 480863,
+      "sha256": "38592478aad3f515e33b69ecfc11898e338c28a54799bebcd933c18906decd06"
+    }
+  ],
+  "observed": {
+    "scripts": [
+      {
+        "src": null,
+        "type": null,
+        "hasBootstrapAttr": true,
+        "textLength": 480863,
+        "head": "\"use strict\";(()=>{var Bx=Object.create;",
+        "tail": "ContentLoaded\",Gb,{once:!0}):Gb();})();\n"
+      }
+    ],
+    "globals": {
+      "hyperframes": "object",
+      "timelines": "object",
+      "playerReady": true,
+      "renderReady": true,
+      "bootstrapped": true
+    },
+    "instrumentation": {
+      "hfIoTargets": "undefined",
+      "hfRootProps": "undefined",
+      "canvasGetContextWrapped": false
+    }
+  },
+  "expected": {
+    "runtimeBytes": 480863,
+    "runtimeSha256": "38592478aad3f515e33b69ecfc11898e338c28a54799bebcd933c18906decd06",
+    "audioFxBytes": 38874,
+    "audioFxSha256": "eec4e4349b87ee1542b88a32a4a5dd1428a2bc50fda7ad124c27083d126eb426",
+    "allowAudioFx": false
+  },
+  "ok": true,
+  "failures": []
+}
