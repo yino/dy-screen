@@ -7143,4 +7143,110 @@ mod smart_migration_tests {
         empty_key.fps = 0;
         assert!(repository.begin_render_attempt(empty_key).is_err());
     }
+
+    // ---- 步骤 3 任务组 6.4：预览的帧不得被导出复用 ----
+
+    #[test]
+    fn preview_frames_are_not_reused_by_export_and_version_change_forces_new_attempt() {
+        use crate::ai::effect_caption_render::RenderCacheKey;
+        use crate::ai::effect_caption_spec::{
+            CanvasSpec, HighlightRenderWindow, RenderPurpose, RenderSpec, plan_render_spec,
+        };
+
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("预览导出工程", &enhancement_test_profile())
+            .expect("create project");
+        let window = HighlightRenderWindow {
+            start_ms: 12_000,
+            end_ms: 27_000,
+        };
+        let preview = plan_render_spec(RenderPurpose::Preview, CanvasSpec::default(), window)
+            .expect("preview");
+        let export =
+            plan_render_spec(RenderPurpose::Export, CanvasSpec::default(), window).expect("export");
+        let key = |spec: &RenderSpec, composition: &str, font: &str| {
+            RenderCacheKey::new(&spec.version_set(
+                composition,
+                "composition-fingerprint",
+                font,
+                "154.0.8037.58",
+                "0.8.96",
+                "38592478aad3f515",
+            ))
+            .as_str()
+            .to_owned()
+        };
+
+        let preview_key = key(&preview, "composition-v1", "caption-fonts-2026.10");
+        let export_key = key(&export, "composition-v1", "caption-fonts-2026.10");
+        assert_ne!(preview_key, export_key, "预览与导出必须是不同的缓存键");
+
+        // 预览完成并置 ready。
+        let (attempt, _) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                11,
+                &preview_key,
+                "/tmp/preview",
+            ))
+            .expect("begin preview");
+        repository
+            .mark_render_attempt_ready(attempt.id, preview.frame_count)
+            .expect("preview ready");
+
+        // 导出：预览的 ready 不能命中导出的键，必须重新渲染。
+        assert!(
+            repository
+                .find_ready_render_attempt(&export_key)
+                .expect("query export key")
+                .is_none(),
+            "导出不得复用预览的帧"
+        );
+        let (export_attempt, cached) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                11,
+                &export_key,
+                "/tmp/export",
+            ))
+            .expect("begin export");
+        assert!(!cached);
+        repository
+            .mark_render_attempt_ready(export_attempt.id, export.frame_count)
+            .expect("export ready");
+        assert_eq!(
+            repository
+                .find_ready_render_attempt(&export_key)
+                .expect("query export key")
+                .map(|attempt| attempt.frame_count),
+            Some(export.frame_count)
+        );
+
+        // 字体版本变化（等价于文案/字体变化）：新键必须重新渲染，且不复用旧帧。
+        let changed_key = key(&export, "composition-v1", "caption-fonts-2026.11");
+        assert_ne!(changed_key, export_key);
+        assert!(
+            repository
+                .find_ready_render_attempt(&changed_key)
+                .expect("query changed key")
+                .is_none(),
+            "字体版本变化后不得复用旧帧"
+        );
+        let (changed, cached) = repository
+            .begin_render_attempt(render_attempt_input(
+                project.id,
+                11,
+                &changed_key,
+                "/tmp/export-2",
+            ))
+            .expect("begin changed");
+        assert!(!cached);
+        assert_ne!(
+            changed.id, export_attempt.id,
+            "版本变化必须创建新的渲染尝试"
+        );
+    }
 }

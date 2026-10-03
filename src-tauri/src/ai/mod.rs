@@ -12,6 +12,7 @@ mod domain;
 mod effect_caption;
 mod effect_caption_composition;
 mod effect_caption_render;
+mod effect_caption_spec;
 mod highlight;
 mod lifecycle;
 mod llm;
@@ -82,6 +83,10 @@ pub use effect_caption_render::{
     compare_frame_sequences, compute_tree_digest, digest_frame_sequence, supervise_process,
     verify_browser, verify_font_resources, verify_page_script_attestation, verify_render_outcome,
     verify_renderer_runtime,
+};
+pub use effect_caption_spec::{
+    CanvasSpec, HighlightRenderWindow, MAX_RENDER_FPS, PREVIEW_FPS_CAP, PREVIEW_SCALE_DIVISOR,
+    RenderPurpose, RenderSpec, assert_preview_export_consistent, plan_render_spec,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
