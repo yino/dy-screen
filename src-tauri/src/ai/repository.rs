@@ -15,12 +15,14 @@ use crate::database::{Database, DatabaseError};
 use super::domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
     AiClipProjectSource, AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate,
-    AiClipTimelineUnit, AiClipTimelineUnitKind, AiHighlightCandidate, AiHighlightCandidatePage,
-    AiHighlightChunk, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind,
-    AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
-    AiSmartClipSourceInput, AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AsrArtifact,
-    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
-    RecoverySummary, SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft,
+    AiClipTimelineUnit, AiClipTimelineUnitKind, AiEnhancementKind, AiEnhancementStatus,
+    AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk, AiHighlightEnhancement,
+    AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
+    AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus, AiSmartClipSourceInput,
+    AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AsrArtifact, NewAiHighlightChunk,
+    NewAiHighlightEnhancement, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact,
+    RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
+    TranscriptSegmentDraft,
 };
 
 use super::llm::{HighlightCandidateDraft, HighlightCandidateScore, LlmProviderSettings};
@@ -4751,6 +4753,340 @@ pub(crate) fn migrate_ai_v26(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v27 增加高光表现形式增强记录与特效字幕渲染缓存（步骤 3 任务 1.2 / 任务组 9）。
+///
+/// 迁移只建表、只加索引，不重写任何旧行，因此旧工程行为不变。
+pub(crate) fn migrate_ai_v27(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 27",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_highlight_enhancements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            highlight_run_id INTEGER,
+            generation INTEGER NOT NULL CHECK(generation >= 1),
+            kind TEXT NOT NULL CHECK(kind IN ('effect_caption', 'video_animation')),
+            status TEXT NOT NULL CHECK(status IN ('suggested', 'applied', 'rejected', 'superseded')),
+            start_ms INTEGER NOT NULL CHECK(start_ms >= 0),
+            end_ms INTEGER NOT NULL CHECK(end_ms > start_ms),
+            emphasis_words_json TEXT NOT NULL DEFAULT '[]',
+            composition_version TEXT,
+            composition_fingerprint TEXT,
+            render_cache_key TEXT,
+            source_fingerprint TEXT NOT NULL,
+            suppression_ranges_json TEXT NOT NULL DEFAULT '[]',
+            rejection_code TEXT,
+            rejection_detail TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(candidate_id, generation)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_highlight_enhancements_project
+            ON ai_highlight_enhancements(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_ai_highlight_enhancements_candidate
+            ON ai_highlight_enhancements(candidate_id, generation DESC);
+
+        CREATE TABLE IF NOT EXISTS ai_effect_caption_renders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            cache_key TEXT NOT NULL UNIQUE,
+            composition_version TEXT NOT NULL,
+            composition_fingerprint TEXT NOT NULL,
+            font_version TEXT NOT NULL,
+            browser_version TEXT NOT NULL,
+            renderer_version TEXT NOT NULL,
+            engine_script_version TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            fps INTEGER NOT NULL,
+            frame_count INTEGER NOT NULL,
+            frames_dir TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('rendering', 'ready', 'failed')),
+            failure_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_effect_caption_renders_candidate
+            ON ai_effect_caption_renders(candidate_id, width, height, fps, status);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(27, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 高光表现形式增强记录（步骤 3 任务 1.5：过期代次只能停在历史建议）。
+impl AiRepository {
+    /// 写入一条增强记录。
+    ///
+    /// `current_source_fingerprint` 是**当前**工程已发布内容的指纹。与建议携带的
+    /// `source_fingerprint` 不一致，说明该建议是用户编辑之前的旧代次：它只能以
+    /// `suggested` 落库，并且不得覆盖同一候选上已经 `applied` 的结果。
+    pub fn record_enhancement(
+        &self,
+        input: NewAiHighlightEnhancement,
+        current_source_fingerprint: &str,
+    ) -> Result<AiHighlightEnhancement> {
+        if input.generation < 1 {
+            return Err(AiRepositoryError::Integrity(
+                "增强代次必须从 1 开始".to_owned(),
+            ));
+        }
+        if input.end_ms <= input.start_ms {
+            return Err(AiRepositoryError::Integrity(
+                "增强区间必须满足 end_ms > start_ms".to_owned(),
+            ));
+        }
+        if input.source_fingerprint.trim().is_empty() {
+            return Err(AiRepositoryError::Integrity(
+                "增强来源指纹不能为空".to_owned(),
+            ));
+        }
+        let stale = input.source_fingerprint != current_source_fingerprint;
+        let (status, rejection_code, rejection_detail) = if stale {
+            (
+                AiEnhancementStatus::Suggested,
+                Some("enhancement_stale_generation".to_owned()),
+                Some("工程内容已被修改，该建议只保留为历史建议".to_owned()),
+            )
+        } else {
+            (
+                input.status,
+                input.rejection_code.clone(),
+                input.rejection_detail.clone(),
+            )
+        };
+        let emphasis_words_json = serde_json::to_string(&input.emphasis_words)
+            .map_err(|_| AiRepositoryError::Serialization("强调词无法序列化".to_owned()))?;
+        let suppression_ranges_json = serde_json::to_string(&input.suppression_ranges)
+            .map_err(|_| AiRepositoryError::Serialization("抑制区间无法序列化".to_owned()))?;
+        let now = Utc::now().to_rfc3339();
+        let connection = self.database.connection()?;
+        connection.execute(
+            r#"
+            INSERT INTO ai_highlight_enhancements(
+                project_id, candidate_id, highlight_run_id, generation, kind, status,
+                start_ms, end_ms, emphasis_words_json, composition_version,
+                composition_fingerprint, render_cache_key, source_fingerprint,
+                suppression_ranges_json, rejection_code, rejection_detail, created_at, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
+            ON CONFLICT(candidate_id, generation) DO UPDATE SET
+                status = excluded.status,
+                start_ms = excluded.start_ms,
+                end_ms = excluded.end_ms,
+                emphasis_words_json = excluded.emphasis_words_json,
+                composition_version = excluded.composition_version,
+                composition_fingerprint = excluded.composition_fingerprint,
+                render_cache_key = excluded.render_cache_key,
+                source_fingerprint = excluded.source_fingerprint,
+                suppression_ranges_json = excluded.suppression_ranges_json,
+                rejection_code = excluded.rejection_code,
+                rejection_detail = excluded.rejection_detail,
+                updated_at = excluded.updated_at
+            WHERE ai_highlight_enhancements.status <> 'applied'
+            "#,
+            params![
+                input.project_id,
+                input.candidate_id,
+                input.highlight_run_id,
+                input.generation,
+                input.kind.as_str(),
+                status.as_str(),
+                input.start_ms as i64,
+                input.end_ms as i64,
+                emphasis_words_json,
+                input.composition_version,
+                input.composition_fingerprint,
+                input.render_cache_key,
+                input.source_fingerprint,
+                suppression_ranges_json,
+                rejection_code,
+                rejection_detail,
+                now,
+            ],
+        )?;
+        drop(connection);
+        self.get_enhancement(input.candidate_id, input.generation)?
+            .ok_or(AiRepositoryError::NotFound("增强记录"))
+    }
+
+    pub fn get_enhancement(
+        &self,
+        candidate_id: i64,
+        generation: i64,
+    ) -> Result<Option<AiHighlightEnhancement>> {
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                &format!("SELECT {ENHANCEMENT_COLUMNS} FROM ai_highlight_enhancements WHERE candidate_id = ?1 AND generation = ?2"),
+                params![candidate_id, generation],
+                map_enhancement,
+            )
+            .optional()?;
+        row.map(parse_enhancement).transpose()
+    }
+
+    /// 候选当前生效的增强：优先返回 `applied`，否则返回最新代次。
+    pub fn active_enhancement_for_candidate(
+        &self,
+        candidate_id: i64,
+    ) -> Result<Option<AiHighlightEnhancement>> {
+        let connection = self.database.connection()?;
+        let row = connection
+            .query_row(
+                &format!(
+                    "SELECT {ENHANCEMENT_COLUMNS} FROM ai_highlight_enhancements WHERE candidate_id = ?1 ORDER BY (status = 'applied') DESC, generation DESC, id DESC LIMIT 1"
+                ),
+                [candidate_id],
+                map_enhancement,
+            )
+            .optional()?;
+        row.map(parse_enhancement).transpose()
+    }
+
+    /// 工程内所有已生效的增强（导出与基础字幕抑制的输入）。
+    pub fn applied_enhancements_for_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<AiHighlightEnhancement>> {
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {ENHANCEMENT_COLUMNS} FROM ai_highlight_enhancements WHERE project_id = ?1 AND status = 'applied' ORDER BY start_ms, id"
+        ))?;
+        let rows = statement
+            .query_map([project_id], map_enhancement)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().map(parse_enhancement).collect()
+    }
+
+    /// 把同一候选上更早代次的 `applied` 记录标记为 `superseded`（任务 1.5）。
+    pub fn supersede_older_enhancements(
+        &self,
+        candidate_id: i64,
+        generation: i64,
+    ) -> Result<usize> {
+        let connection = self.database.connection()?;
+        let changed = connection.execute(
+            "UPDATE ai_highlight_enhancements SET status = 'superseded', updated_at = ?1 WHERE candidate_id = ?2 AND generation < ?3 AND status = 'applied'",
+            params![Utc::now().to_rfc3339(), candidate_id, generation],
+        )?;
+        Ok(changed)
+    }
+}
+
+const ENHANCEMENT_COLUMNS: &str = "id, project_id, candidate_id, highlight_run_id, generation, kind, status, start_ms, end_ms, emphasis_words_json, composition_version, composition_fingerprint, render_cache_key, source_fingerprint, suppression_ranges_json, rejection_code, rejection_detail, created_at, updated_at";
+
+type EnhancementRow = (
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn map_enhancement(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnhancementRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+    ))
+}
+
+fn parse_enhancement(row: EnhancementRow) -> Result<AiHighlightEnhancement> {
+    let (
+        id,
+        project_id,
+        candidate_id,
+        highlight_run_id,
+        generation,
+        kind,
+        status,
+        start_ms,
+        end_ms,
+        emphasis_words_json,
+        composition_version,
+        composition_fingerprint,
+        render_cache_key,
+        source_fingerprint,
+        suppression_ranges_json,
+        rejection_code,
+        rejection_detail,
+        created_at,
+        updated_at,
+    ) = row;
+    Ok(AiHighlightEnhancement {
+        id,
+        project_id,
+        candidate_id,
+        highlight_run_id,
+        generation,
+        kind: AiEnhancementKind::parse(&kind)?,
+        status: AiEnhancementStatus::parse(&status)?,
+        start_ms: u64::try_from(start_ms)
+            .map_err(|_| AiRepositoryError::Integrity("增强起点无效".to_owned()))?,
+        end_ms: u64::try_from(end_ms)
+            .map_err(|_| AiRepositoryError::Integrity("增强终点无效".to_owned()))?,
+        emphasis_words: serde_json::from_str(&emphasis_words_json)
+            .map_err(|_| AiRepositoryError::Integrity("强调词快照损坏".to_owned()))?,
+        composition_version,
+        composition_fingerprint,
+        render_cache_key,
+        source_fingerprint,
+        suppression_ranges: serde_json::from_str(&suppression_ranges_json)
+            .map_err(|_| AiRepositoryError::Integrity("抑制区间快照损坏".to_owned()))?,
+        rejection_code,
+        rejection_detail,
+        created_at,
+        updated_at,
+    })
+}
+
 /// v25 为 ASR 产物记录实际 provider 和脱敏回退原因。
 pub(crate) fn migrate_ai_v25(connection: &mut Connection) -> crate::database::Result<()> {
     let applied = connection
@@ -6151,6 +6487,246 @@ mod smart_migration_tests {
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    // ---- 步骤 3 任务组 1：增强记录、迁移 27 与代次语义 ----
+
+    const ENHANCEMENT_TEST_PROFILE_JSON: &str = r#"{
+        "engineId": "dashscope-filetrans",
+        "engineVersion": "1",
+        "modelId": "qwen3-asr-flash-filetrans",
+        "modelVersion": "qwen3-asr-flash-filetrans",
+        "languageHint": "zh",
+        "vadModelId": "ggml-vad@1",
+        "vadThresholdMillis": 120,
+        "vadPaddingMs": 300,
+        "timestampPolicy": "segment",
+        "normalizationVersion": "OpenCC ver.1.4.1",
+        "hotwords": ["品牌名"]
+    }"#;
+
+    fn enhancement_test_profile() -> RecognitionProfile {
+        serde_json::from_str(ENHANCEMENT_TEST_PROFILE_JSON).expect("测试识别配置")
+    }
+
+    use crate::ai::domain::AiSuppressionRange;
+
+    fn enhancement(
+        project_id: i64,
+        candidate_id: i64,
+        generation: i64,
+        status: AiEnhancementStatus,
+        source_fingerprint: &str,
+    ) -> NewAiHighlightEnhancement {
+        NewAiHighlightEnhancement {
+            project_id,
+            candidate_id,
+            highlight_run_id: None,
+            generation,
+            kind: AiEnhancementKind::EffectCaption,
+            status,
+            start_ms: 0,
+            end_ms: 4_000,
+            emphasis_words: vec!["绷不住".to_owned()],
+            composition_version: Some(format!("composition-v{generation}")),
+            composition_fingerprint: Some(format!("composition-fp-{generation}")),
+            render_cache_key: None,
+            source_fingerprint: source_fingerprint.to_owned(),
+            suppression_ranges: vec![AiSuppressionRange {
+                start_ms: 0,
+                end_ms: 4_000,
+            }],
+            rejection_code: None,
+            rejection_detail: None,
+        }
+    }
+
+    #[test]
+    fn migration_v27_is_idempotent_and_keeps_existing_projects_unchanged() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("旧工程", &enhancement_test_profile())
+            .expect("create project");
+        // 再次迁移必须幂等，且不得改写既有工程。
+        database.migrate().expect("migrate again");
+        let unchanged = repository
+            .get_project_row(project.id)
+            .expect("project survives");
+        assert_eq!(unchanged.name, "旧工程");
+        assert_eq!(unchanged.status, AiProjectStatus::Draft);
+        let connection = database.connection().expect("connection");
+        for table in ["ai_highlight_enhancements", "ai_effect_caption_renders"] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |_| Ok(()),
+                )
+                .optional()
+                .expect("query sqlite_master")
+                .is_some();
+            assert!(exists, "迁移 27 必须建表 {table}");
+        }
+        let version: i64 = connection
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE version = 27",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version 27 recorded");
+        assert_eq!(version, 27);
+    }
+
+    #[test]
+    fn stale_enhancement_is_history_only_and_does_not_replace_applied() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("增强工程", &enhancement_test_profile())
+            .expect("create project");
+
+        let applied = repository
+            .record_enhancement(
+                enhancement(project.id, 42, 1, AiEnhancementStatus::Applied, "fp-1"),
+                "fp-1",
+            )
+            .expect("record applied");
+        assert_eq!(applied.status, AiEnhancementStatus::Applied);
+
+        // 用户改了工程：当前指纹变成 fp-2，而这条建议仍基于 fp-1。
+        let stale = repository
+            .record_enhancement(
+                enhancement(project.id, 42, 2, AiEnhancementStatus::Applied, "fp-1"),
+                "fp-2",
+            )
+            .expect("record stale");
+        assert_eq!(
+            stale.status,
+            AiEnhancementStatus::Suggested,
+            "过期代次只能是历史建议"
+        );
+        assert_eq!(
+            stale.rejection_code.as_deref(),
+            Some("enhancement_stale_generation")
+        );
+
+        let active = repository
+            .active_enhancement_for_candidate(42)
+            .expect("query active")
+            .expect("active exists");
+        assert_eq!(active.generation, 1, "人工编辑后的生效结果不得被旧代次替换");
+        assert_eq!(
+            active.composition_version.as_deref(),
+            Some("composition-v1")
+        );
+    }
+
+    #[test]
+    fn applied_enhancement_is_never_downgraded_by_a_later_write() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("增强工程", &enhancement_test_profile())
+            .expect("create project");
+        repository
+            .record_enhancement(
+                enhancement(project.id, 7, 1, AiEnhancementStatus::Applied, "fp-1"),
+                "fp-1",
+            )
+            .expect("record applied");
+        // 同一 (candidate, generation) 再写一条建议：不得覆盖已生效结果。
+        let written = repository
+            .record_enhancement(
+                enhancement(project.id, 7, 1, AiEnhancementStatus::Suggested, "fp-1"),
+                "fp-1",
+            )
+            .expect("record suggestion");
+        assert_eq!(written.status, AiEnhancementStatus::Applied);
+        assert_eq!(
+            written.updated_at, written.created_at,
+            "被拒的覆盖不得改动已生效行"
+        );
+    }
+
+    #[test]
+    fn supersede_marks_previous_generation_and_export_reads_only_applied() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("增强工程", &enhancement_test_profile())
+            .expect("create project");
+        repository
+            .record_enhancement(
+                enhancement(project.id, 9, 1, AiEnhancementStatus::Applied, "fp-1"),
+                "fp-1",
+            )
+            .expect("gen 1");
+        repository
+            .record_enhancement(
+                enhancement(project.id, 9, 2, AiEnhancementStatus::Applied, "fp-1"),
+                "fp-1",
+            )
+            .expect("gen 2");
+        // 两条 applied 都命中：导出按候选取最新，旧代次需要显式让位。
+        let changed = repository
+            .supersede_older_enhancements(9, 2)
+            .expect("supersede");
+        assert_eq!(changed, 1);
+        let applied = repository
+            .applied_enhancements_for_project(project.id)
+            .expect("applied list");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].generation, 2);
+        let superseded = repository
+            .get_enhancement(9, 1)
+            .expect("query gen 1")
+            .expect("gen 1 exists");
+        assert_eq!(superseded.status, AiEnhancementStatus::Superseded);
+    }
+
+    #[test]
+    fn enhancement_kind_and_status_parse_reject_unknown_values() {
+        assert!(matches!(
+            AiEnhancementKind::parse("effect_caption"),
+            Ok(AiEnhancementKind::EffectCaption)
+        ));
+        assert!(
+            AiEnhancementKind::parse("subtitle_karaoke").is_err(),
+            "未知增强方式必须被拒绝"
+        );
+        assert!(
+            AiEnhancementStatus::parse("pending").is_err(),
+            "未知增强状态必须被拒绝"
+        );
+    }
+
+    #[test]
+    fn enhancement_interval_and_generation_are_validated() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("增强工程", &enhancement_test_profile())
+            .expect("create project");
+        let mut invalid_generation =
+            enhancement(project.id, 1, 0, AiEnhancementStatus::Suggested, "fp-1");
+        assert!(
+            repository
+                .record_enhancement(invalid_generation.clone(), "fp-1")
+                .is_err()
+        );
+        invalid_generation.generation = 1;
+        invalid_generation.end_ms = invalid_generation.start_ms;
+        assert!(
+            repository
+                .record_enhancement(invalid_generation, "fp-1")
+                .is_err()
         );
     }
 }

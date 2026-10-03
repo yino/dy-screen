@@ -14,11 +14,11 @@
 
 ## 1. 增强方式契约与数据模型
 
-- [ ] 1.1 在 `src-tauri/src/ai/domain.rs` 新增增强方式枚举与 DTO（`effect_caption` 与保留的 `video_animation`），验证未知类型被拒绝
-- [ ] 1.2 在 `src-tauri/src/ai/repository.rs` 新增迁移（版本 27），增加增强方式、组合版本、渲染缓存键与抑制区间字段，验证在旧库快照上迁移成功且旧工程行为不变
-- [ ] 1.3 实现互斥校验：同一高光同时出现两种方式或未知类型时拒绝整条结果，并记录脱敏原因
-- [ ] 1.4 新增测试：模型给出虚构句段、越界时间或不存在的强调词时被拒绝，实际范围与文字回退为工程已发布内容
-- [ ] 1.5 验证人工编辑优先：用户修改工程后收到的旧代次增强结果只保存为历史建议，不覆盖人工编辑
+- [x] 1.1 在 `src-tauri/src/ai/domain.rs` 新增增强方式枚举与 DTO（`effect_caption` 与保留的 `video_animation`），验证未知类型被拒绝（`AiEnhancementKind::parse` 对未知取值报错，`AiEnhancementStatus`、`AiHighlightEnhancement`、`NewAiHighlightEnhancement`、`AiSuppressionRange` 已就位）
+- [x] 1.2 在 `src-tauri/src/ai/repository.rs` 新增迁移（版本 27），增加增强方式、组合版本、渲染缓存键与抑制区间字段，验证在旧库快照上迁移成功且旧工程行为不变（`ai_highlight_enhancements` + `ai_effect_caption_renders`；迁移幂等、只建表，旧工程行逐字段不变）
+- [x] 1.3 实现互斥校验：同一高光同时出现两种方式或未知类型时拒绝整条结果，并记录脱敏原因（`validate_enhancement_proposals`：`enhancement_kind_conflict` / `enhancement_kind_unknown` / `enhancement_kind_unsupported`；拒绝原因不含正文）
+- [x] 1.4 新增测试：模型给出虚构句段、越界时间或不存在的强调词时被拒绝，实际范围与文字回退为工程已发布内容（范围一律取自被引用已发布句段并合并相邻区间；强调词全部虚构即拒绝，部分虚构则丢弃并计数）
+- [x] 1.5 验证人工编辑优先：用户修改工程后收到的旧代次增强结果只保存为历史建议，不覆盖人工编辑（`record_enhancement` 对比当前来源指纹，过期即强制 `suggested` + `enhancement_stale_generation`；`ON CONFLICT ... WHERE status <> 'applied'` 保证已生效行不被降级；`supersede_older_enhancements` 处理代次让位）
 
 ## 2. 组合生成与 Skill
 

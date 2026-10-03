@@ -60,8 +60,10 @@ pub use domain::{
 };
 pub use effect_caption::{
     BUNDLED_FONT_FAMILIES, CSS_FUNCTION_ALLOWLIST, CSS_PROPERTY_ALLOWLIST, EffectCaptionLimits,
-    EffectCaptionRejection, GLOBAL_ATTRIBUTE_ALLOWLIST, RENDERER_CONTRACT_ATTRIBUTES,
-    TAG_ALLOWLIST, ValidatedEffectCaption, validate_effect_caption,
+    EffectCaptionRejection, GLOBAL_ATTRIBUTE_ALLOWLIST, ProposedEnhancement,
+    PublishedHighlightSegment, RENDERER_CONTRACT_ATTRIBUTES, TAG_ALLOWLIST, VOID_ELEMENTS,
+    ValidatedEffectCaption, ValidatedEnhancement, validate_effect_caption,
+    validate_enhancement_proposals,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
@@ -106,5 +108,5 @@ pub use smart_workflow::{
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
     migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23, migrate_ai_v24, migrate_ai_v25,
-    migrate_ai_v26,
+    migrate_ai_v26, migrate_ai_v27,
 };

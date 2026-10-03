@@ -1374,3 +1374,120 @@ pub struct RecoverySummary {
     #[serde(default)]
     pub awaiting_remote_reconcile: usize,
 }
+
+/// 高光表现形式增强的方式（步骤 3 任务 1.1）。
+///
+/// `video_animation` 在本 change 中只保留枚举位，不实现生成路径；未知取值必须被拒绝，
+/// 以免上游新增类型时被静默当成已知方式处理。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiEnhancementKind {
+    EffectCaption,
+    VideoAnimation,
+}
+
+impl AiEnhancementKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::EffectCaption => "effect_caption",
+            Self::VideoAnimation => "video_animation",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "effect_caption" => Ok(Self::EffectCaption),
+            "video_animation" => Ok(Self::VideoAnimation),
+            _ => Err(AiRepositoryError::Integrity("增强方式无效".to_owned())),
+        }
+    }
+}
+
+/// 增强结果的代次状态（步骤 3 任务 1.5）。
+///
+/// 用户修改工程后到达的旧代次结果只能停在 `suggested`，不得覆盖人工编辑。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiEnhancementStatus {
+    Suggested,
+    Applied,
+    Rejected,
+    Superseded,
+}
+
+impl AiEnhancementStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Suggested => "suggested",
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "suggested" => Ok(Self::Suggested),
+            "applied" => Ok(Self::Applied),
+            "rejected" => Ok(Self::Rejected),
+            "superseded" => Ok(Self::Superseded),
+            _ => Err(AiRepositoryError::Integrity("增强状态无效".to_owned())),
+        }
+    }
+}
+
+/// 被特效字幕命中的时间区间。区间 MUST 由工程已发布句段确定，不得采用模型给出的时间。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSuppressionRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// 一条高光的表现形式增强记录。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiHighlightEnhancement {
+    pub id: i64,
+    pub project_id: i64,
+    pub candidate_id: i64,
+    pub highlight_run_id: Option<i64>,
+    pub generation: i64,
+    pub kind: AiEnhancementKind,
+    pub status: AiEnhancementStatus,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub emphasis_words: Vec<String>,
+    pub composition_version: Option<String>,
+    pub composition_fingerprint: Option<String>,
+    pub render_cache_key: Option<String>,
+    /// 生成该建议时所依据的工程已发布内容指纹；与当前指纹不符即为过期代次。
+    pub source_fingerprint: String,
+    pub suppression_ranges: Vec<AiSuppressionRange>,
+    pub rejection_code: Option<String>,
+    pub rejection_detail: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 写入增强记录所需的字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAiHighlightEnhancement {
+    pub project_id: i64,
+    pub candidate_id: i64,
+    pub highlight_run_id: Option<i64>,
+    pub generation: i64,
+    pub kind: AiEnhancementKind,
+    pub status: AiEnhancementStatus,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub emphasis_words: Vec<String>,
+    pub composition_version: Option<String>,
+    pub composition_fingerprint: Option<String>,
+    pub render_cache_key: Option<String>,
+    pub source_fingerprint: String,
+    pub suppression_ranges: Vec<AiSuppressionRange>,
+    pub rejection_code: Option<String>,
+    pub rejection_detail: Option<String>,
+}

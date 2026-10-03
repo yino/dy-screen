@@ -15,6 +15,8 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::domain::{AiEnhancementKind, AiSuppressionRange};
+
 /// 允许出现的标签。`meta` 只允许 `charset`，`style` 的正文按 CSS 规则单独校验。
 pub const TAG_ALLOWLIST: &[&str] = &[
     "html", "head", "meta", "title", "style", "body", "div", "span", "p", "br", "strong", "em",
@@ -1334,6 +1336,159 @@ fn parse_time_ms(value: &str) -> Option<u64> {
     None
 }
 
+/// 工程已发布的一条句段（把模型建议回退到已发布内容的唯一依据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedHighlightSegment {
+    pub stable_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+/// 模型给出的一条增强建议（尚未校验）。
+///
+/// `kind` 刻意保留为原始字符串：未知类型必须在这里被拒绝，而不是被解析成默认值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedEnhancement {
+    pub kind: String,
+    pub segment_ids: Vec<String>,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub emphasis_words: Vec<String>,
+}
+
+/// 校验通过的增强建议：时间范围与抑制区间一律来自工程已发布句段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatedEnhancement {
+    pub kind: AiEnhancementKind,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub emphasis_words: Vec<String>,
+    pub dropped_emphasis_words: usize,
+    pub suppression_ranges: Vec<AiSuppressionRange>,
+}
+
+/// 校验一批增强建议（任务 1.3 互斥 + 任务 1.4 回退到已发布内容）。
+///
+/// 规则：
+/// 1. 未知增强方式 → 拒绝整条结果；
+/// 2. 同一高光同时出现两种方式 → 拒绝整条结果；
+/// 3. `video_animation` 在本 change 内没有生成路径 → 明确拒绝，而不是静默忽略；
+/// 4. 虚构句段 ID 与越界时间 → 丢弃模型给出的范围（不据此拒绝），回退为被引用句段的已发布范围；
+/// 5. 引用不到任何已发布句段 → 拒绝该条建议；
+/// 6. 强调词只要有一个不存在于已发布文本 → 拒绝该条建议；部分不存在则丢弃并计数。
+pub fn validate_enhancement_proposals(
+    proposals: &[ProposedEnhancement],
+    published: &[PublishedHighlightSegment],
+) -> Result<Vec<ValidatedEnhancement>, EffectCaptionRejection> {
+    if proposals.is_empty() {
+        return Err(EffectCaptionRejection::new(
+            "enhancement_proposals_empty",
+            "没有可校验的增强建议",
+        ));
+    }
+    let mut kinds: Vec<AiEnhancementKind> = Vec::new();
+    for proposal in proposals {
+        let kind = AiEnhancementKind::parse(&proposal.kind).map_err(|_| {
+            EffectCaptionRejection::new("enhancement_kind_unknown", "增强建议包含未知的方式取值")
+        })?;
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    if kinds.len() > 1 {
+        return Err(EffectCaptionRejection::new(
+            "enhancement_kind_conflict",
+            "同一高光同时出现两种表现形式增强方式",
+        ));
+    }
+    let kind = kinds[0];
+    if kind == AiEnhancementKind::VideoAnimation {
+        return Err(EffectCaptionRejection::new(
+            "enhancement_kind_unsupported",
+            "生成式动画在本轮没有生成路径，不得作为增强结果发布",
+        ));
+    }
+
+    let mut validated = Vec::with_capacity(proposals.len());
+    for (index, proposal) in proposals.iter().enumerate() {
+        let ordinal = index + 1;
+        let referenced: Vec<&PublishedHighlightSegment> = published
+            .iter()
+            .filter(|segment| {
+                proposal
+                    .segment_ids
+                    .iter()
+                    .any(|id| id == &segment.stable_id)
+            })
+            .collect();
+        if referenced.is_empty() {
+            return Err(EffectCaptionRejection::new(
+                "enhancement_range_unpublished",
+                format!("第 {ordinal} 条建议没有引用任何已发布句段"),
+            ));
+        }
+        let published_text = referenced
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        let mut emphasis_words = Vec::new();
+        let mut dropped = 0_usize;
+        for word in &proposal.emphasis_words {
+            if word.is_empty() {
+                continue;
+            }
+            if published_text.contains(word.as_str()) {
+                if !emphasis_words.contains(word) {
+                    emphasis_words.push(word.clone());
+                }
+            } else {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 && emphasis_words.is_empty() {
+            return Err(EffectCaptionRejection::new(
+                "enhancement_emphasis_unpublished",
+                format!("第 {ordinal} 条建议的强调词全部不在已发布文本内"),
+            ));
+        }
+
+        let mut ranges: Vec<AiSuppressionRange> = referenced
+            .iter()
+            .map(|segment| AiSuppressionRange {
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+            })
+            .collect();
+        ranges.sort_by_key(|range| (range.start_ms, range.end_ms));
+        let mut merged: Vec<AiSuppressionRange> = Vec::new();
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if range.start_ms <= last.end_ms => {
+                    last.end_ms = last.end_ms.max(range.end_ms);
+                }
+                _ => merged.push(range),
+            }
+        }
+        let start_ms = merged
+            .first()
+            .map(|range| range.start_ms)
+            .unwrap_or_default();
+        let end_ms = merged.last().map(|range| range.end_ms).unwrap_or_default();
+        validated.push(ValidatedEnhancement {
+            kind,
+            start_ms,
+            end_ms,
+            emphasis_words,
+            dropped_emphasis_words: dropped,
+            suppression_ranges: merged,
+        });
+    }
+    Ok(validated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1703,5 +1858,172 @@ mod tests {
             ".x{font-family:\"hyperframes-caption-cjk\"}",
         );
         assert!(validate_effect_caption(&bundled, &corpus(), &LIMITS).is_ok());
+    }
+
+    fn published() -> Vec<PublishedHighlightSegment> {
+        vec![
+            PublishedHighlightSegment {
+                stable_id: "seg-1".to_owned(),
+                start_ms: 0,
+                end_ms: 1_200,
+                text: "这个价格真的绷不住了".to_owned(),
+            },
+            PublishedHighlightSegment {
+                stable_id: "seg-2".to_owned(),
+                start_ms: 1_200,
+                end_ms: 1_800,
+                text: "，冲".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn enhancement_proposal_falls_back_to_published_range_and_text() {
+        // 模型给出虚构句段 ID 与越界时间：范围必须回退为已发布句段。
+        let proposals = vec![ProposedEnhancement {
+            kind: "effect_caption".to_owned(),
+            segment_ids: vec!["seg-1".to_owned(), "invented-9".to_owned()],
+            start_ms: 900_000,
+            end_ms: 1_200_000,
+            emphasis_words: vec!["绷不住".to_owned(), "编造的强调词".to_owned()],
+        }];
+        let validated = validate_enhancement_proposals(&proposals, &published()).expect("应当通过");
+        assert_eq!(validated.len(), 1);
+        let item = &validated[0];
+        assert_eq!(item.kind, AiEnhancementKind::EffectCaption);
+        assert_eq!(item.start_ms, 0, "范围必须来自已发布句段");
+        assert_eq!(item.end_ms, 1_200);
+        assert_eq!(item.emphasis_words, vec!["绷不住".to_owned()]);
+        assert_eq!(item.dropped_emphasis_words, 1, "虚构强调词必须被丢弃并计数");
+        assert_eq!(
+            item.suppression_ranges,
+            vec![AiSuppressionRange {
+                start_ms: 0,
+                end_ms: 1_200
+            }]
+        );
+    }
+
+    #[test]
+    fn enhancement_adjacent_published_segments_merge_into_one_range() {
+        let proposals = vec![ProposedEnhancement {
+            kind: "effect_caption".to_owned(),
+            segment_ids: vec!["seg-1".to_owned(), "seg-2".to_owned()],
+            start_ms: 0,
+            end_ms: 1_800,
+            emphasis_words: Vec::new(),
+        }];
+        let validated = validate_enhancement_proposals(&proposals, &published()).unwrap();
+        assert_eq!(
+            validated[0].suppression_ranges,
+            vec![AiSuppressionRange {
+                start_ms: 0,
+                end_ms: 1_800
+            }]
+        );
+        assert_eq!(validated[0].end_ms, 1_800);
+    }
+
+    #[test]
+    fn enhancement_rejects_unpublished_references_and_words() {
+        let no_segment = vec![ProposedEnhancement {
+            kind: "effect_caption".to_owned(),
+            segment_ids: vec!["invented-1".to_owned()],
+            start_ms: 0,
+            end_ms: 1_000,
+            emphasis_words: Vec::new(),
+        }];
+        assert_eq!(
+            validate_enhancement_proposals(&no_segment, &published())
+                .unwrap_err()
+                .code,
+            "enhancement_range_unpublished"
+        );
+
+        let only_invented_words = vec![ProposedEnhancement {
+            kind: "effect_caption".to_owned(),
+            segment_ids: vec!["seg-1".to_owned()],
+            start_ms: 0,
+            end_ms: 1_200,
+            emphasis_words: vec!["不存在的强调词".to_owned()],
+        }];
+        assert_eq!(
+            validate_enhancement_proposals(&only_invented_words, &published())
+                .unwrap_err()
+                .code,
+            "enhancement_emphasis_unpublished"
+        );
+    }
+
+    #[test]
+    fn enhancement_kinds_are_mutually_exclusive_and_unknown_rejected() {
+        let conflicting = vec![
+            ProposedEnhancement {
+                kind: "effect_caption".to_owned(),
+                segment_ids: vec!["seg-1".to_owned()],
+                start_ms: 0,
+                end_ms: 1_200,
+                emphasis_words: Vec::new(),
+            },
+            ProposedEnhancement {
+                kind: "video_animation".to_owned(),
+                segment_ids: vec!["seg-2".to_owned()],
+                start_ms: 1_200,
+                end_ms: 1_800,
+                emphasis_words: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            validate_enhancement_proposals(&conflicting, &published())
+                .unwrap_err()
+                .code,
+            "enhancement_kind_conflict"
+        );
+
+        let unknown = vec![ProposedEnhancement {
+            kind: "subtitle_karaoke".to_owned(),
+            segment_ids: vec!["seg-1".to_owned()],
+            start_ms: 0,
+            end_ms: 1_200,
+            emphasis_words: Vec::new(),
+        }];
+        assert_eq!(
+            validate_enhancement_proposals(&unknown, &published())
+                .unwrap_err()
+                .code,
+            "enhancement_kind_unknown"
+        );
+
+        let reserved = vec![ProposedEnhancement {
+            kind: "video_animation".to_owned(),
+            segment_ids: vec!["seg-1".to_owned()],
+            start_ms: 0,
+            end_ms: 1_200,
+            emphasis_words: Vec::new(),
+        }];
+        assert_eq!(
+            validate_enhancement_proposals(&reserved, &published())
+                .unwrap_err()
+                .code,
+            "enhancement_kind_unsupported"
+        );
+    }
+
+    #[test]
+    fn enhancement_rejection_detail_never_echoes_words() {
+        let only_invented_words = vec![ProposedEnhancement {
+            kind: "effect_caption".to_owned(),
+            segment_ids: vec!["seg-1".to_owned()],
+            start_ms: 0,
+            end_ms: 1_200,
+            emphasis_words: vec!["保密强调词标记".to_owned()],
+        }];
+        let rejection =
+            validate_enhancement_proposals(&only_invented_words, &published()).unwrap_err();
+        assert!(
+            !rejection.detail.contains("保密强调词标记"),
+            "拒绝原因不得回显强调词：{}",
+            rejection.detail
+        );
     }
 }
