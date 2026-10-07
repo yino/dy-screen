@@ -139,8 +139,8 @@ pub struct HarnessProfile {
 
 /// 读取并校验随包 Profile（任务 3.1 的校验侧）。
 pub fn load_harness_profile(path: &Path) -> Result<HarnessProfile, SkillLoadError> {
-    let bytes = std::fs::read(path)
-        .map_err(|_| SkillLoadError::MissingDirectory("随包 Profile 不可读"))?;
+    let bytes =
+        std::fs::read(path).map_err(|_| SkillLoadError::MissingDirectory("随包 Profile 不可读"))?;
     let profile: HarnessProfile = serde_json::from_slice(&bytes)
         .map_err(|_| SkillLoadError::InvalidDefinition("Profile 结构非法或含未知字段"))?;
     validate_profile(&profile)?;
@@ -155,13 +155,17 @@ fn validate_profile(profile: &HarnessProfile) -> Result<(), SkillLoadError> {
     if !(parts.clone().count() == 3
         && parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())))
     {
-        return Err(SkillLoadError::InvalidVersion("Profile 版本必须是 x.y.z 数字三段"));
+        return Err(SkillLoadError::InvalidVersion(
+            "Profile 版本必须是 x.y.z 数字三段",
+        ));
     }
     if profile.protocol_version != HARNESS_PROTOCOL_VERSION {
         return Err(SkillLoadError::InvalidDefinition("Profile 协议版本不匹配"));
     }
     if profile.skills.is_empty() {
-        return Err(SkillLoadError::InvalidDefinition("Profile 未注册任何 Skill"));
+        return Err(SkillLoadError::InvalidDefinition(
+            "Profile 未注册任何 Skill",
+        ));
     }
     for tool in &profile.tools {
         if !ALLOWED_PROFILE_TOOLS.contains(&tool.as_str()) {
@@ -332,7 +336,10 @@ mod tests {
         let skills = load_bundled_skills(&harness_source_dir().join("skills")).unwrap();
         let skill_ids: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
         for skill in &profile.skills {
-            assert!(skill_ids.contains(&skill.as_str()), "Profile 引用了未随包 Skill {skill}");
+            assert!(
+                skill_ids.contains(&skill.as_str()),
+                "Profile 引用了未随包 Skill {skill}"
+            );
         }
     }
 
@@ -350,5 +357,4 @@ mod tests {
             "skill_definition_invalid"
         );
     }
-
 }

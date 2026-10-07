@@ -436,6 +436,37 @@ mod tests {
     /// 只返回固定结果、不触网的测试执行器。
     struct EchoToolExecutor;
 
+    /// 返回 `model.generate_text` 真实结果形状（text + tokenUsage）的假执行器。
+    struct ModelTextEchoExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for ModelTextEchoExecutor {
+        async fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
+            if tool != "model.generate_text" {
+                return Err(HarnessError::ToolDenied("未知工具"));
+            }
+            let prompt = params.get("prompt").cloned().unwrap_or(Value::Null);
+            Ok(serde_json::json!({
+                "text": format!("模型看到：{prompt}"),
+                "tokenUsage": 7,
+            }))
+        }
+    }
+
+    /// 定位本机 node（零依赖 Harness 的运行底座，发布锁 22 LTS、本机 v26 验证协议）。
+    fn node_path() -> PathBuf {
+        for candidate in [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ] {
+            if std::path::Path::new(candidate).exists() {
+                return PathBuf::from(candidate);
+            }
+        }
+        panic!("找不到 node 可执行文件，无法运行真实 Harness 集成测试");
+    }
+
     #[async_trait]
     impl ToolExecutor for EchoToolExecutor {
         async fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
@@ -680,5 +711,89 @@ write({"jsonrpc": "2.0", "id": req["id"], "result": {
         let parsed: JsonRpcRequest = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(parsed.id, 7);
         assert_eq!(parsed.method, "run_skill");
+    }
+
+    /// 决策十七：用**真实 Node Harness 程序**跑 effect-caption-compose skill 工具循环，
+    /// 证明随包程序能承载新分支（不再是假 Python 脚本）。
+    #[tokio::test]
+    async fn real_node_harness_runs_the_compose_skill_tool_loop() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let main_js = manifest.join("../harness/main.mjs");
+        let profile = manifest.join("../resources/harness-source/profile.json");
+        let skills_dir = manifest.join("../harness/skills");
+        assert!(main_js.is_file(), "Harness 主程序必须存在");
+        assert!(profile.is_file(), "随包 Profile 必须存在");
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut sidecar = HarnessSidecar::spawn(
+            node_path(),
+            vec![
+                main_js.to_string_lossy().into_owned(),
+                "--profile".to_owned(),
+                profile.to_string_lossy().into_owned(),
+                "--skills-dir".to_owned(),
+                skills_dir.to_string_lossy().into_owned(),
+            ],
+            directory.path().to_path_buf(),
+            HarnessLimits::default(),
+        )
+        .await
+        .expect("spawn node harness");
+        let allowlist = ToolAllowlist::new(["model.generate_text"]);
+        let result = sidecar
+            .request(
+                "run_skill",
+                serde_json::json!({
+                    "skill": "effect-caption-compose",
+                    "input": { "prompt": "写一个组合" }
+                }),
+                &ModelTextEchoExecutor,
+                &allowlist,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("skill 工具循环必须成功");
+        assert_eq!(result["result"]["text"], "模型看到：\"写一个组合\"");
+        assert_eq!(result["result"]["tokenUsage"], 7);
+        assert_eq!(result["steps"].as_array().map(|steps| steps.len()), Some(1));
+        sidecar.shutdown().await;
+    }
+
+    /// 真实 Harness：skill 请求了白名单之外的工具时，Rust 侧拒绝且不执行。
+    #[tokio::test]
+    async fn real_node_harness_rejects_non_allowlisted_tool() {
+        // 用一个会请求 media.generate 的 skill 场景不好构造，这里改为：
+        // 白名单为空 + effect-caption-compose 请求 model.generate_text → 被拒。
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let main_js = manifest.join("../harness/main.mjs");
+        let profile = manifest.join("../resources/harness-source/profile.json");
+        let skills_dir = manifest.join("../harness/skills");
+        let directory = tempfile::tempdir().unwrap();
+        let mut sidecar = HarnessSidecar::spawn(
+            node_path(),
+            vec![
+                main_js.to_string_lossy().into_owned(),
+                "--profile".to_owned(),
+                profile.to_string_lossy().into_owned(),
+                "--skills-dir".to_owned(),
+                skills_dir.to_string_lossy().into_owned(),
+            ],
+            directory.path().to_path_buf(),
+            HarnessLimits::default(),
+        )
+        .await
+        .expect("spawn");
+        let denied = sidecar
+            .request(
+                "run_skill",
+                serde_json::json!({ "skill": "effect-caption-compose", "input": { "prompt": "x" } }),
+                &ModelTextEchoExecutor,
+                &ToolAllowlist::deny_all(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), "harness_tool_denied");
+        sidecar.shutdown().await;
     }
 }

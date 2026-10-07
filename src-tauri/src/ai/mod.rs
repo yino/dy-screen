@@ -31,9 +31,8 @@ mod smart_workflow;
 pub(crate) mod tauri_commands;
 
 pub use bundled_skills::{
-    ALLOWED_PROFILE_TOOLS, BundledSkill, HarnessProfile, SkillLoadError,
-    bundled_skills_directory, load_bundled_skills, load_harness_profile, skill_snapshot,
-    skills_fingerprint,
+    ALLOWED_PROFILE_TOOLS, BundledSkill, HarnessProfile, SkillLoadError, bundled_skills_directory,
+    load_bundled_skills, load_harness_profile, skill_snapshot, skills_fingerprint,
 };
 pub use clip_export::{
     ClipExportFailure, ClipExportPlan, ClipOutputDimensions, EffectCaptionOverlay,
@@ -150,7 +149,9 @@ pub use media_generation::{
     MediaGenerationTool, MediaQuota, MediaTaskStatus, MediaUpstream, StubMediaUpstream,
 };
 pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime, TokenStatus};
-pub use model_tool::{ModelGenerateTextRequest, ModelTextTool, UnifiedCallPointCompositionProvider};
+pub use model_tool::{
+    ModelGenerateTextRequest, ModelTextTool, UnifiedCallPointCompositionProvider,
+};
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
 };
