@@ -1946,6 +1946,8 @@ pub fn run() {
             ai_diagnose_environment,
             ai_get_llm_settings,
             ai_get_model_status,
+            ai_set_llm_diagnostics,
+            ai_get_llm_diagnostics,
             ai_reparse_model_config,
             ai_save_llm_settings,
             ai_clear_llm_key,

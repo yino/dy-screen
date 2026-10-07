@@ -48,7 +48,7 @@ pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiModelStatusView,
     AiProjectDetailView, AiProjectInputView, AiRuntimeComponentDiagnostic,
-    AiRuntimeResourceDiagnostic, AiSessionImportView, AiTrustedFileGrant,
+    AiRuntimeResourceDiagnostic, AiSessionImportView, AiTrustedFileGrant, LlmCallDiagnosticsView,
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
@@ -118,16 +118,18 @@ pub use llm::{
     CandidateAgentOutput, CandidateAgentRequest, CredentialError, CredentialStore,
     DEEPSEEK_BASE_URL, DEFAULT_EXCELLENT_SCORE, DEFAULT_MODEL_ID, DEFAULT_QUALIFIED_SCORE,
     DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider, FrozenModelCall,
-    HighlightAgentProvider, HighlightCandidateDraft, HighlightCandidateScore, LlmError,
-    LlmProviderSettings, LlmTokenLease, LlmTokenSource, MODEL_RESOLUTION_INTERVAL_MS,
-    MemoryCredentialStore, ModelCallHandle, ModelCallPath, ModelCallResolver, ModelCallSnapshot,
-    ModelResolutionInputs, PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput,
-    RankingAgentRequest, ResolutionSource, RigDeepSeekProvider, SubtitleCorrectionItem,
-    SubtitleCorrectionOutput, SubtitleCorrectionProvider, SubtitleCorrectionRequest,
-    SystemCredentialStore, TOKEN_SAFETY_MARGIN_SECONDS, TransitionAgentCandidate,
-    TransitionAgentMatch, TransitionAgentOutput, TransitionAgentProvider, TransitionAgentRequest,
-    TransitionAgentScore, TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token,
-    resolve_model_call_with_heartbeat,
+    HighlightAgentProvider, HighlightCandidateDraft, HighlightCandidateScore,
+    LLM_CALL_DIAGNOSTIC_CAPACITY, LlmCallDiagnostic, LlmError, LlmProviderSettings, LlmTokenLease,
+    LlmTokenSource, MODEL_RESOLUTION_INTERVAL_MS, MemoryCredentialStore, ModelCallHandle,
+    ModelCallPath, ModelCallResolver, ModelCallSnapshot, ModelResolutionInputs, PROMPT_VERSION,
+    ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest, ResolutionSource,
+    RigDeepSeekProvider, SubtitleCorrectionItem, SubtitleCorrectionOutput,
+    SubtitleCorrectionProvider, SubtitleCorrectionRequest, SystemCredentialStore,
+    TOKEN_SAFETY_MARGIN_SECONDS, TransitionAgentCandidate, TransitionAgentMatch,
+    TransitionAgentOutput, TransitionAgentProvider, TransitionAgentRequest, TransitionAgentScore,
+    TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token, llm_call_diagnostics_enabled,
+    llm_call_diagnostics_snapshot, resolve_model_call_with_heartbeat,
+    set_llm_call_diagnostics_enabled,
 };
 pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime, TokenStatus};
 pub use processor::{

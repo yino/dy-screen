@@ -15,8 +15,8 @@ use super::{
     AiSessionImportView, AiSessionOption, AiSmartReplaySessionCursor, AiSmartReplaySessionPage,
     AiSmartWorkflow, AiSmartWorkflowDetail, AiTranscriptProjection, AiTrustedFileGrant,
     AuthorizeSmartWorkflowInput, CreateLiveSmartWorkflowInput, CreateLocalSmartWorkflowInput,
-    CreateReplaySmartWorkflowInput, LlmProviderSettings, ProviderDiagnostic,
-    RetrySmartWorkflowStageInput, SmartClippingWorkflow, SmartWorkflowError,
+    CreateReplaySmartWorkflowInput, LlmCallDiagnosticsView, LlmProviderSettings,
+    ProviderDiagnostic, RetrySmartWorkflowStageInput, SmartClippingWorkflow, SmartWorkflowError,
 };
 
 pub struct AiDesktopState {
@@ -493,6 +493,22 @@ pub(crate) fn ai_get_llm_settings(
 ) -> Result<LlmProviderSettings, AiCommandError> {
     let key_configured = state.commands.llm_key_configured()?;
     state.commands.get_llm_provider_settings(key_configured)
+}
+
+#[tauri::command]
+pub(crate) fn ai_set_llm_diagnostics(
+    enabled: bool,
+    state: State<'_, AiDesktopState>,
+) -> Result<(), AiCommandError> {
+    state.commands.set_llm_call_diagnostics(enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_llm_diagnostics(
+    state: State<'_, AiDesktopState>,
+) -> Result<LlmCallDiagnosticsView, AiCommandError> {
+    Ok(state.commands.llm_call_diagnostics())
 }
 
 #[tauri::command]

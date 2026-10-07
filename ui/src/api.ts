@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AiEnvironmentDiagnostic,
   AiModelStatus,
+  LlmCallDiagnostics,
   AiClipProjectDetail,
   AiExportResult,
   AiImportBatch,
@@ -217,6 +218,8 @@ const tauriApi: ClientApi = {
   getAiLlmSettings: () => invoke<LlmProviderSettings>("ai_get_llm_settings"),
   getAiModelStatus: () => invoke<AiModelStatus>("ai_get_model_status"),
   reparseAiModelConfig: () => invoke<AiModelStatus>("ai_reparse_model_config"),
+  setLlmDiagnostics: (enabled) => invoke<void>("ai_set_llm_diagnostics", { enabled }),
+  getLlmDiagnostics: () => invoke<LlmCallDiagnostics>("ai_get_llm_diagnostics"),
   saveAiLlmSettings: (settings, apiKey) =>
     invoke<LlmProviderSettings>("ai_save_llm_settings", { settings, apiKey: apiKey ?? null }),
   clearAiLlmKey: () => invoke<void>("ai_clear_llm_key"),

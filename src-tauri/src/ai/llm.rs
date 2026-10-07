@@ -2,6 +2,8 @@
 //!
 //! 本模块刻意不暴露 API Key，也不把 Rig 类型传播到 repository 或 Tauri DTO。
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -713,6 +715,51 @@ fn llm_call_diagnostics_slot() -> &'static RwLock<SharedLlmCallDiagnosticSink> {
 /// 注入进程级 LLM 调用诊断接收端。
 ///
 /// 供测试断言脱敏边界，也供后续诊断面板在启动时接管；不注入时保持 stderr 默认。
+/// 进程级调用点诊断环形缓冲的容量上限。
+pub const LLM_CALL_DIAGNOSTIC_CAPACITY: usize = 256;
+
+struct LlmCallDiagnosticsBuffer {
+    enabled: AtomicBool,
+    events: RwLock<VecDeque<LlmCallDiagnostic>>,
+}
+
+static LLM_CALL_DIAGNOSTIC_BUFFER: OnceLock<LlmCallDiagnosticsBuffer> = OnceLock::new();
+
+fn llm_call_diagnostics_buffer() -> &'static LlmCallDiagnosticsBuffer {
+    LLM_CALL_DIAGNOSTIC_BUFFER.get_or_init(|| LlmCallDiagnosticsBuffer {
+        enabled: AtomicBool::new(false),
+        events: RwLock::new(VecDeque::new()),
+    })
+}
+
+/// 显式开关：默认关闭（任务 4.6）。
+///
+/// 只有开启后，`emit_llm_call_diagnostic` 才会把事件写入环形缓冲；
+/// 关闭既不清空历史，也不阻止后续开启时继续累积（用于跨问题排查）。
+pub fn set_llm_call_diagnostics_enabled(enabled: bool) {
+    llm_call_diagnostics_buffer()
+        .enabled
+        .store(enabled, Ordering::SeqCst);
+}
+
+/// 当前开关状态。
+pub fn llm_call_diagnostics_enabled() -> bool {
+    llm_call_diagnostics_buffer().enabled.load(Ordering::SeqCst)
+}
+
+/// 返回最近 `limit` 条脱敏事件，最新的在前。
+///
+/// 事件结构本身不含 token、提示词或 ASR 正文（见 `LlmCallDiagnostic` 的字段约束），
+/// 因此这份快照可以安全地展示在诊断面板里。
+pub fn llm_call_diagnostics_snapshot(limit: usize) -> Vec<LlmCallDiagnostic> {
+    let buffer = llm_call_diagnostics_buffer();
+    let events = buffer.events.read();
+    match events {
+        Ok(events) => events.iter().rev().take(limit).cloned().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn set_llm_call_diagnostics_sink(sink: SharedLlmCallDiagnosticSink) {
     if let Ok(mut slot) = llm_call_diagnostics_slot().write() {
         *slot = sink;
@@ -732,7 +779,23 @@ fn llm_call_diagnostics_sink() -> SharedLlmCallDiagnosticSink {
 
 /// 发射一个 LLM 调用诊断事件。
 fn emit_llm_call_diagnostic(event: LlmCallDiagnostic) {
-    llm_call_diagnostics_sink().emit(event);
+    llm_call_diagnostics_sink().emit(event.clone());
+    record_llm_call_diagnostic(event);
+}
+
+/// 只写环形缓冲（不经由进程级 sink），便于缓冲测试隔离"落缓冲"与"落日志"。
+///
+/// 显式开关默认关闭：开启后才落环形缓冲，供 UI 面板（默认不展示）读取。
+fn record_llm_call_diagnostic(event: LlmCallDiagnostic) {
+    let buffer = llm_call_diagnostics_buffer();
+    if buffer.enabled.load(Ordering::SeqCst)
+        && let Ok(mut events) = buffer.events.write()
+    {
+        if events.len() >= LLM_CALL_DIAGNOSTIC_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
 }
 
 /// 把一次 LLM 调用结果转成脱敏事件。
@@ -1722,6 +1785,97 @@ mod model_call_snapshot_tests {
         assert_eq!(frozen.fingerprint_input(), same_stage.fingerprint_input());
         // 指纹必须携带路径标识，使切换路径后不复用旧结果。
         assert!(frozen.fingerprint_input().starts_with("cloud_direct|"));
+    }
+}
+
+#[cfg(test)]
+mod llm_call_diagnostics_buffer_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    // 缓冲是进程级全局：本模块的测试必须串行执行，并各自重置开关，
+    // 避免并行测试互相污染（与 `llm_call_diagnostic_tests` 同样的约束）。
+    static BUFFER_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        BUFFER_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn diagnostic_event(model_id: &str) -> LlmCallDiagnostic {
+        LlmCallDiagnostic {
+            stage: "llm",
+            path: "compatible-mode/v1/chat/completions",
+            model_id: model_id.to_owned(),
+            duration_ms: 42,
+            token_usage: Some(100),
+            error_category: None,
+        }
+    }
+
+    /// 显式开关：构造时默认关闭（`AtomicBool::new(false)`），
+    /// 只在开启后捕获；关闭既不清空历史，也不阻止后续开启继续累积。
+    #[test]
+    fn diagnostics_capture_only_when_enabled() {
+        let _guard = lock();
+        set_llm_call_diagnostics_enabled(false);
+        assert!(!llm_call_diagnostics_enabled());
+        record_llm_call_diagnostic(diagnostic_event("qwen-plus"));
+        assert!(
+            llm_call_diagnostics_snapshot(100).is_empty(),
+            "关闭时不得写入环形缓冲"
+        );
+        set_llm_call_diagnostics_enabled(true);
+        assert!(llm_call_diagnostics_enabled());
+        record_llm_call_diagnostic(diagnostic_event("qwen-plus"));
+        assert_eq!(llm_call_diagnostics_snapshot(100).len(), 1);
+        set_llm_call_diagnostics_enabled(false);
+    }
+
+    #[test]
+    fn diagnostics_ring_buffer_keeps_the_latest_and_never_exceeds_capacity() {
+        let _guard = lock();
+        set_llm_call_diagnostics_enabled(true);
+        // 清空历史：直接关掉再开不影响历史，因此这里不依赖历史，只验证容量。
+        for index in 0..(LLM_CALL_DIAGNOSTIC_CAPACITY + 10) {
+            record_llm_call_diagnostic(diagnostic_event(&format!("model-{index}")));
+        }
+        let snapshot = llm_call_diagnostics_snapshot(10_000);
+        assert_eq!(
+            snapshot.len(),
+            LLM_CALL_DIAGNOSTIC_CAPACITY,
+            "环形缓冲不得超过容量"
+        );
+        assert_eq!(
+            snapshot.first().map(|event| event.model_id.as_str()),
+            Some(format!("model-{}", LLM_CALL_DIAGNOSTIC_CAPACITY + 9).as_str()),
+            "最新事件在前"
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|event| !event.model_id.starts_with("model-0")),
+            "最旧的事件必须被淘汰"
+        );
+        set_llm_call_diagnostics_enabled(false);
+    }
+
+    #[test]
+    fn diagnostics_snapshot_never_carries_tokens_prompts_or_asr_text() {
+        let _guard = lock();
+        set_llm_call_diagnostics_enabled(true);
+        record_llm_call_diagnostic(diagnostic_event("qwen-plus"));
+        let snapshot = llm_call_diagnostics_snapshot(10);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        for forbidden in ["st-lt-v1", "sk-", "这个价格", "prompt", "authorization"] {
+            assert!(
+                !json.contains(forbidden),
+                "诊断快照泄漏了「{forbidden}」：{json}"
+            );
+        }
+        set_llm_call_diagnostics_enabled(false);
     }
 }
 

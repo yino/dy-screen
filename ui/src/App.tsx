@@ -49,6 +49,7 @@ import type {
   Dashboard,
   EnvironmentStatus,
   AiModelStatus,
+  LlmCallDiagnostics,
   LlmProviderSettings,
   MonitorStatus,
   PreviewSnapshot,
@@ -1755,6 +1756,8 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
   const [modelStatus, setModelStatus] = useState<AiModelStatus | null>(null);
   const [llmMessage, setLlmMessage] = useState<string | null>(null);
   const [llmBusy, setLlmBusy] = useState<"save" | "diagnose" | "clear" | "reparse" | null>(null);
+  const [llmDiagnostics, setLlmDiagnostics] = useState<LlmCallDiagnostics | null>(null);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const ordinaryDirty = !sameAppSettings(form, baseline);
   // 模型标识由统一调用点解析，界面不再可编辑；可保存的只有策略字段（超时与阈值）。
   const providerDirty = Boolean(llm && llmBaseline && !sameLlmProviderSettings(llm, llmBaseline));
@@ -1770,6 +1773,9 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
     void api.getAiModelStatus?.()
       .then((status) => setModelStatus(status))
       .catch(() => setModelStatus(null));
+    void api.getLlmDiagnostics?.()
+      .then((loaded) => setLlmDiagnostics(loaded))
+      .catch(() => setLlmDiagnostics(null));
     void api.getAiLlmSettings?.()
       .then((loaded) => {
         setLlm(loaded);
@@ -1867,6 +1873,20 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
       setLlmMessage(`已重新解析：${status.modelId}（${modelSourceLabel(status.modelSource)}）`);
     } catch (error) {
       setLlmMessage(errorMessage(error, "无法重新解析模型配置"));
+    } finally {
+      setLlmBusy(null);
+    }
+  };
+
+  const toggleLlmDiagnostics = async (enabled: boolean) => {
+    if (!api.setLlmDiagnostics || !api.getLlmDiagnostics) return;
+    setLlmBusy("diagnose");
+    try {
+      await api.setLlmDiagnostics(enabled);
+      setLlmDiagnostics(await api.getLlmDiagnostics());
+      if (enabled) setDiagnosticsOpen(true);
+    } catch (error) {
+      setLlmMessage(errorMessage(error, "无法切换调用点诊断"));
     } finally {
       setLlmBusy(null);
     }
@@ -2039,6 +2059,34 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
                 )}
               </div>
               <p className="settings-help settings-help-last">测试只发送固定诊断提示；分析时仅发送规范化转写与标签，不发送视频、音频、本地路径或 Cookie。</p>
+              <details open={diagnosticsOpen} className="llm-diagnostics">
+                <summary>调用点诊断（默认关闭，仅含脱敏字段）</summary>
+                <label className="inline-toggle">
+                  <input
+                    type="checkbox"
+                    checked={llmDiagnostics?.enabled ?? false}
+                    onChange={(event) => void toggleLlmDiagnostics(event.target.checked)}
+                    aria-label="调用点诊断开关"
+                  />
+                  开启后记录最近 {llmDiagnostics?.capacity ?? 0} 次模型调用的脱敏事件
+                </label>
+                {llmDiagnostics?.enabled && (
+                  <ul className="llm-diagnostics-list">
+                    {llmDiagnostics.events.length === 0
+                      ? <li className="muted-copy">暂无调用事件</li>
+                      : llmDiagnostics.events.map((event, index) => (
+                          <li key={index}>
+                            <b>{event.modelId}</b>
+                            {" · "}{event.stage}
+                            {" · "}{event.path}
+                            {" · "}{event.durationMs}ms
+                            {event.tokenUsage != null ? ` · ${event.tokenUsage} tokens` : ""}
+                            {event.errorCategory ? ` · 错误 ${event.errorCategory}` : " · 成功"}
+                          </li>
+                        ))}
+                  </ul>
+                )}
+              </details>
             </section>
           )}
         </div>

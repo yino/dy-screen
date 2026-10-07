@@ -240,6 +240,7 @@ function smartWorkflowDetail(
 }
 
 function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi {
+  let llmDiagnosticsEnabled = false;
   return {
     getActivationState: vi.fn().mockResolvedValue(activeActivation),
     activateClient: vi.fn().mockResolvedValue(activeActivation),
@@ -381,6 +382,16 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       callPath: "cloud_direct",
       nonProductionConfig: false,
     }),
+    setLlmDiagnostics: vi.fn().mockImplementation(async (enabled) => {
+      llmDiagnosticsEnabled = enabled;
+    }),
+    getLlmDiagnostics: vi.fn().mockImplementation(async () => ({
+      enabled: llmDiagnosticsEnabled,
+      capacity: 256,
+      events: llmDiagnosticsEnabled
+        ? [{ stage: "llm", path: "compatible-mode/v1/chat/completions", modelId: "qwen-plus", durationMs: 42, tokenUsage: 100, errorCategory: null }]
+        : [],
+    })),
     reparseAiModelConfig: vi.fn().mockResolvedValue({
       modelId: "qwen-max",
       modelSource: "local_override",
@@ -2581,3 +2592,25 @@ describe("App", () => {
     await waitFor(() => expect(api.releaseVideoThumbnailBatch).toHaveBeenCalledWith("cover-failed"));
   });
 });
+
+  it("调用点诊断默认关闭，开启后展示脱敏事件并调用后端开关", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+
+    // 默认关闭：面板不显示任何事件。
+    const toggle = await screen.findByLabelText("调用点诊断开关");
+    expect(toggle).not.toBeChecked();
+    expect(screen.queryByText(/暂无调用事件/)).toBeNull();
+
+    await user.click(toggle);
+    expect(api.setLlmDiagnostics).toHaveBeenCalledWith(true);
+    // 事件列表里出现模型名（与顶部"当前模型"重名，因此按列表容器断言）。
+    const list = await screen.findByRole("list");
+    await waitFor(() => expect(list.textContent).toContain("qwen-plus"));
+    expect(api.getLlmDiagnostics).toHaveBeenCalled();
+    // 事件只含脱敏字段（模型、阶段、耗时、用量、错误分类），绝不出现 token/提示词。
+    expect(list.textContent).not.toContain("st-lt-v1");
+    expect(list.textContent).not.toContain("sk-");
+  });

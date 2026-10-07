@@ -658,6 +658,23 @@ export interface TokenStatus {
   expiresInSeconds: number | null;
 }
 
+/** 一条脱敏的 LLM 调用诊断事件。 */
+export interface LlmCallDiagnostic {
+  stage: string;
+  path: string;
+  modelId: string;
+  durationMs: number;
+  tokenUsage: number | null;
+  errorCategory: string | null;
+}
+
+/** 调用点诊断面板视图。 */
+export interface LlmCallDiagnostics {
+  enabled: boolean;
+  capacity: number;
+  events: LlmCallDiagnostic[];
+}
+
 /** 设置页的「当前模型与可用性」视图。 */
 export interface AiModelStatus {
   modelId: string;
@@ -1131,6 +1148,8 @@ export interface ClientApi {
   getAiLlmSettings?(): Promise<LlmProviderSettings>;
   getAiModelStatus?(): Promise<AiModelStatus>;
   reparseAiModelConfig?(): Promise<AiModelStatus>;
+  setLlmDiagnostics?(enabled: boolean): Promise<void>;
+  getLlmDiagnostics?(): Promise<LlmCallDiagnostics>;
   saveAiLlmSettings?(settings: LlmProviderSettings, apiKey?: string): Promise<LlmProviderSettings>;
   clearAiLlmKey?(): Promise<void>;
   diagnoseAiLlmProvider?(): Promise<ProviderDiagnostic>;

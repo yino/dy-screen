@@ -46,7 +46,7 @@
 - [x] 4.3 验证原子提交与并发冲突处理不变：任一批次失败或版本冲突时全部工程字幕保持不变（`later_batch_failure_keeps_all_subtitles_and_project_version_unchanged` 在迁移后仍通过；新增门禁测试同时断言门禁不通过时字幕逐条不变）
 - [x] 4.4 新增测试：账号未开通或纠错额度耗尽（依据 heartbeat 响应）时停止运行、保留字幕不变并显示可区分的授权或额度原因（工作流级测试 `authorization_and_quota_gates_stop_the_run_before_any_batch`：未开通→`NotActivated`、额度耗尽→`QuotaExhausted`，两者可区分且**不发起任何付费调用**、字幕保持不变；另新增 `credential_failure_stops_the_run_and_keeps_subtitles_unchanged` 覆盖短期 token 授权失败路径。**事实更正**：未开通由 heartbeat 派生的激活状态判定；**额度耗尽只能由上游业务错误码判定**——客户端没有额度本地权威来源，不能由 heartbeat 推断，代码中已有明确注释，此前的措辞过度归因于 heartbeat）
 - [x] 4.5 验证 WebView 不接触短期 token 与上游原始响应，审计只保存实际模型、prompt 版本、指纹、计数、实际用量（若上游返回）、耗时与脱敏错误分类（token 只在 Rust 侧 `ModelCallHandle` 内流转；审计测试断言运行记录只含实际模型 `qwen-plus`、prompt 版本与状态且**不含 token**；诊断标签只输出 provider 与剩余有效期）
-- [ ] 4.6 实现统一调用点诊断（内存环形缓冲 + 显式开关 + UI 面板默认关闭），验证不含短期 token、完整提示词与 ASR 正文
+- [x] 4.6 实现统一调用点诊断（内存环形缓冲 + 显式开关 + UI 面板默认关闭），验证不含短期 token、完整提示词与 ASR 正文（`LlmCallDiagnosticsBuffer` 可实例化环形缓冲：默认关闭、容量 256、只存 `LlmCallDiagnostic` 脱敏字段；Tauri 命令 `ai_set_llm_diagnostics` / `ai_get_llm_diagnostics`；设置页 `<details>` 面板默认收起，开关开启后展示最近事件；测试覆盖开关/容量淘汰/快照不含 token、提示词与 ASR 正文，UI 测试断言默认关闭、开启后展示且不出现 `st-lt-v1`/`sk-`）
 
 ## 5. 转换转场匹配链路
 

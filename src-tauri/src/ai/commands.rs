@@ -208,6 +208,15 @@ pub struct AiModelStatusView {
     pub non_production_config: bool,
 }
 
+/// 调用点诊断面板视图（任务 4.6）：显式开关 + 脱敏事件快照。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmCallDiagnosticsView {
+    pub enabled: bool,
+    pub capacity: usize,
+    pub events: Vec<crate::ai::LlmCallDiagnostic>,
+}
+
 #[derive(Clone)]
 pub struct AiCommandService {
     project_service: AiProjectService,
@@ -334,6 +343,20 @@ impl AiCommandService {
             "生产构建不提供立即重新解析入口",
             false,
         ))
+    }
+
+    /// 打开/关闭调用点诊断（显式开关，默认关闭）。
+    pub fn set_llm_call_diagnostics(&self, enabled: bool) {
+        crate::ai::set_llm_call_diagnostics_enabled(enabled);
+    }
+
+    /// 读取调用点诊断（脱敏快照；不含 token / 提示词 / ASR 正文）。
+    pub fn llm_call_diagnostics(&self) -> LlmCallDiagnosticsView {
+        LlmCallDiagnosticsView {
+            enabled: crate::ai::llm_call_diagnostics_enabled(),
+            capacity: crate::ai::LLM_CALL_DIAGNOSTIC_CAPACITY,
+            events: crate::ai::llm_call_diagnostics_snapshot(100),
+        }
     }
 
     pub fn list_projects(&self) -> Result<Vec<AiProject>, AiCommandError> {
