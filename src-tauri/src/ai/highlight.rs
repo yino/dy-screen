@@ -1181,6 +1181,82 @@ mod tests {
         input.id
     }
 
+    /// 任务 10.2：发往模型的请求体只含最小文本（转写、标签、目标与 Skill 说明），
+    /// 不含本地路径、媒体文件名、URL、签名地址或视频/音频内容。
+    #[test]
+    fn prompts_carry_only_minimal_text_and_never_paths_urls_or_media() {
+        let chunk = AnalysisChunk {
+            ordinal: 0,
+            input_id: 7,
+            segment_ids: vec!["s0".to_owned()],
+            context_segment_ids: Vec::new(),
+            segments: vec![AnalysisSegment {
+                stable_id: "s0".to_owned(),
+                input_id: 7,
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "这个价格真的绷不住了".to_owned(),
+            }],
+        };
+        let skills = select_skills(&["generic_hook".to_owned()]);
+        let candidate_prompt =
+            build_candidate_prompt(&chunk, &["带货".to_owned()], &skills, Some("突出价格"));
+        let ranking_prompt = build_ranking_prompt(
+            &[HighlightCandidateDraft {
+                candidate_key: "c1".to_owned(),
+                input_id: 7,
+                segment_ids: vec!["s0".to_owned()],
+                start_ms: 0,
+                end_ms: 5_000,
+                title: "候选".to_owned(),
+                hook_score: 0.5,
+                information_score: 0.5,
+                emotion_score: 0.5,
+                tag_relevance_score: 0.5,
+                completeness_score: 1.0,
+                shareability_score: 0.5,
+                reason: "理由".to_owned(),
+                matched_tags: vec!["带货".to_owned()],
+            }],
+            &["带货".to_owned()],
+            Some("突出价格"),
+        );
+        // 候选发现需要转写文本；全局评分只需要候选摘要，因此**不**携带原始转写（更小发送面）。
+        assert!(
+            candidate_prompt.contains("这个价格真的绷不住了"),
+            "候选发现必须包含转写文本"
+        );
+        assert!(
+            !ranking_prompt.contains("这个价格真的绷不住了"),
+            "全局评分不得重复发送原始转写"
+        );
+        assert!(ranking_prompt.contains("候选"), "全局评分必须包含候选摘要");
+        for (name, prompt) in [("候选发现", candidate_prompt), ("全局评分", ranking_prompt)]
+        {
+            for forbidden in [
+                "/tmp/",
+                "/Users/",
+                ".mp4",
+                ".mov",
+                ".m4a",
+                ".wav",
+                "http://",
+                "https://",
+                "?sign=",
+                "Expires=",
+                "signature=",
+                "Cookie",
+                "Authorization",
+                "Bearer ",
+            ] {
+                assert!(
+                    !prompt.contains(forbidden),
+                    "{name} 提示词不得包含「{forbidden}」：{prompt}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn skill_selection_is_deterministic_and_unknown_labels_are_data_only() {
         let skills = select_skills(&[

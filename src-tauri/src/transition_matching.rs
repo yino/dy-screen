@@ -1158,6 +1158,28 @@ mod tests {
         assert!(after.manually_locked, "人工锁定标记必须保持");
     }
 
+    /// 任务 10.2：转场匹配/评分的提示词只含素材的公开描述字段，
+    /// 不含下载地址、签名地址或本地路径（`prompt_material` 是唯一的组装入口）。
+    #[test]
+    fn transition_prompt_material_omits_urls_paths_and_signatures() {
+        let mut value = material("known", "反应镜头", &["reaction"], 1);
+        // 素材目录从服务端同步，地址字段可能很长：提示词里只允许公开描述。
+        value.video_url = "https://cdn.example.com/a.mp4?sign=secret&Expires=123".to_owned();
+        value.sha256 = "a".repeat(64);
+        let prompt_material = prompt_material(value);
+        let encoded = serde_json::to_string(&[&prompt_material]).unwrap();
+        assert!(encoded.contains("known"), "必须保留素材键");
+        assert!(encoded.contains("反应镜头"), "必须保留公开标题");
+        for forbidden in [
+            "http://", "https://", "?sign=", "Expires=", "/tmp/", "/Users/", "sha256",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "素材提示词不得包含「{forbidden}」：{encoded}"
+            );
+        }
+    }
+
     #[test]
     fn context_is_bounded_and_recall_is_deterministic() {
         let materials = vec![

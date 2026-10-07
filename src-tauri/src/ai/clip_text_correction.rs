@@ -970,6 +970,35 @@ mod tests {
         }
     }
 
+    /// 任务 10.2：纠错请求体只包含输入文本数组，不含路径、URL 或媒体内容。
+    #[test]
+    fn correction_prompt_only_carries_the_text_array() {
+        let texts = vec!["第一句原文", "第二句原文"];
+        let payload = serde_json::to_string(&texts).unwrap();
+        let prompt = format!(
+            "纠正以下 ASR 文本数组。只修正错别字、同音错词、明显识别错误和标点；保持原意、语气、专名、数字、条目数量和顺序，不润色、不改写、不合并或拆分。corrections 必须为与输入等长的 index + text 数组，index 从 0 连续递增。输入文本数组：{payload}"
+        );
+        // 提示词里只允许出现文本数组这一份用户内容。
+        assert!(prompt.ends_with(&payload));
+        assert!(prompt.contains("第一句原文"));
+        for forbidden in [
+            "/tmp/",
+            "/Users/",
+            ".mp4",
+            ".m4a",
+            "http://",
+            "https://",
+            "?sign=",
+            "Authorization",
+            "Bearer ",
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "纠错提示词不得包含「{forbidden}」：{prompt}"
+            );
+        }
+    }
+
     #[test]
     fn batches_preserve_complete_subtitle_order() {
         let batches = batch_targets(

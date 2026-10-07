@@ -5,6 +5,7 @@ pub mod error;
 mod flight;
 pub mod manager;
 pub mod model;
+pub mod privacy;
 pub mod profile_resolver;
 pub mod recorder;
 pub mod resolver;
