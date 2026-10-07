@@ -16,14 +16,18 @@
 | 短期 token 取用：`LlmTokenSource` + `acquire_llm_token`（余量不足**重取一次**，仍不足则授权失败；来源报错直接上抛） | 三个 token 测试 + `token_diagnostic_never_contains_the_token_body` |
 | 删除未使用的 `MAX_AGENT_TURNS` 及其 re-export | `grep MAX_AGENT_TURNS` 仅剩任务描述 |
 | 解析器输入显式化：`ModelResolutionInputs`（解析器自身不读环境变量，避免并发测试污染） | `ModelResolutionInputs::from_non_production_environment` 是唯一读环境处 |
+| **真实 token 来源** `ActivationLlmTokenSource`：走既有激活凭据 + `GET client/ai/llm-ak`，**复用 `AiApi` 内部缓存**（与云 ASR 同一份） | `model_call.rs`；错误分类测试 `token_api_errors_map_to_distinguishable_categories` |
+| **端到端运行时** `ModelCallRuntime`：bootstrap 冷启动、`snapshot()`、`next_resolution_at_ms()`、`freeze_for_run()`、`on_heartbeat()`、`acquire_token()` | `ai/model_call.rs` 7 个测试（含两实例互不污染、来源报错不重取） |
+| **心跳边界接线**：`app.rs` 在 `HeartbeatOutcome::Active` 时调用 `on_heartbeat` 并发出 `model-call-event`（只含公开字段：modelId/source/changed/nextResolutionAtMs） | `app.rs` `spawn_activation_lifecycle` |
+| **启动降级**：模型调用点 bootstrap 失败**不阻断应用启动**，降级到构建期默认设置并只记录固定分类 | `app.rs`；日志 `bootstrap_fallback` / `bootstrap_fallback_persist_failed` |
 
-**验证**：`cargo test --all-targets` 474 passed（默认构建）；`--features non-prod-model-config --lib` 223 passed；
-根工作区 196 passed；两种配置 `clippy -D warnings` 与 `fmt` 干净；`openspec validate --all --strict` 32/32。
+**验证（最近一次全量）**：`cargo test --all-targets` 481 passed（默认构建）；
+`--features non-prod-model-config --lib` 230 passed；根工作区 196 passed；
+两种配置 `clippy -D warnings` 与 `fmt` 干净；`openspec validate --all --strict` 32/32。
 
 ## 待办（按建议顺序）
 
-1. **真实 token 来源**：实现 `LlmTokenSource` 的生产实现，复用 `AiApi::ai_llm_ak`（与云 ASR 共享 `AiLlmAkCache`，同一 scope）；
-   把 `ModelCallResolver` 挂到应用装配处（心跳响应到达时调用 `apply_heartbeat`）。
+1. ~~真实 token 来源与心跳接线~~ **已完成**（见上表）。
 2. **迁移文本纠错链路**（任务 4.1–4.5）：`SubtitleCorrectionProvider` 改为取"冻结快照 + 短期 token"，
    不再收用户 `api_key`；以既有测试作为等价性断言。
 3. **迁移转场匹配链路**（5.1–5.5）→ **迁移精彩分析链路**（6.1–6.6），按风险从低到高。
@@ -35,5 +39,6 @@
 ## 已知遗留
 
 - `MAX_AGENT_TURNS` 已删除，但"Rust 侧整次调用的**预算上限**"尚未实现（任务 3.7 因此未勾选）。
-- 短期 token 目前仍只被云 ASR 使用；三条 LLM 链路仍在收用户 `api_key`（迁移尚未开始）。
+- 三条 LLM 链路仍在收用户 `api_key`（迁移尚未开始）；`ModelCallRuntime` 已在装配处就绪，等待被三条链路消费。
+- `model-call-event` 已发出但设置页尚未消费（任务 9.2）。
 - 设置表尚未新增"模型来源/解析时间戳"字段（9.4 未做，涉及迁移号决策）。

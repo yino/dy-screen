@@ -1,0 +1,357 @@
+//! 统一模型调用点：短期 token 取用与模型配置的运行期持有者。
+//!
+//! 口径见 `add-model-gateway-and-harness-sidecar/design.md`「决策四 / 决策十」：
+//!
+//! - 短期 token **与云 ASR 共享同一份缓存**（`AiApi::ai_llm_ak` 内部的 `AiLlmAkCache`），
+//!   本模块不新建第二套缓存，只做"取一个仍有余量的租约"这件事；
+//! - 模型配置在**心跳响应到达时**重新解析，运行开始前冻结，运行期间不漂移；
+//! - 解析器与 token 来源都不读环境变量、不使用可变全局：环境变量只在
+//!   `ModelResolutionInputs::from_non_production_environment`（非生产 feature）读一次。
+
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+
+use crate::activation::ActivationService;
+use crate::api::ApiError;
+
+use super::llm::{
+    FrozenModelCall, LlmError, LlmTokenLease, LlmTokenSource, ModelCallResolver, ModelCallSnapshot,
+    ModelResolutionInputs, acquire_llm_token,
+};
+use super::repository::AiRepository;
+
+/// 生产环境的短期 token 来源：走既有激活凭据与 `GET client/ai/llm-ak`。
+///
+/// 它刻意不缓存、不落盘：缓存由 `AiApi` 内部负责，token 只在内存中流转。
+#[derive(Clone)]
+pub struct ActivationLlmTokenSource {
+    activation: ActivationService,
+}
+
+impl ActivationLlmTokenSource {
+    pub fn new(activation: ActivationService) -> Self {
+        Self { activation }
+    }
+}
+
+/// 把服务端错误映射为可区分的模型调用错误分类：
+/// 授权/激活类 → `Credential`（需重新激活）；传输/超时 → `Temporary`（可重试）；其余 → `Provider`。
+fn map_token_api_error(error: &ApiError) -> LlmError {
+    match error {
+        ApiError::Transport | ApiError::Timeout => LlmError::Temporary,
+        ApiError::Configuration | ApiError::InvalidResponse => LlmError::Provider,
+        ApiError::Business { .. } | ApiError::Context { .. } => {
+            // 复用激活模块的撤销判定，避免两处对错误码的理解分叉。
+            if crate::activation::api_error_is_revocation(error) {
+                LlmError::Credential
+            } else {
+                match error.code() {
+                    // 未开通/未授权类业务码同样按凭据处理，让界面显示可区分的授权原因。
+                    Some(1002..=1006 | 2002..=2004) => LlmError::Credential,
+                    _ => LlmError::Provider,
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl LlmTokenSource for ActivationLlmTokenSource {
+    async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
+        let (device_id, activate_code) =
+            self.activation.credentials().ok_or(LlmError::Credential)?;
+        let response = self
+            .activation
+            .api()
+            .ai_llm_ak(&device_id, &activate_code)
+            .await
+            .map_err(|error| map_token_api_error(&error))?;
+        Ok(LlmTokenLease {
+            token: response.ak,
+            expire_at: response.expire_at,
+            provider: response.provider,
+        })
+    }
+}
+
+/// 运行期持有的模型调用点。
+///
+/// 所有模块都经它取"冻结快照 + 短期 token"，因此"改一处即改全部模型"成立：
+/// 三条链路不再各自读设置、各自决定地址或模型。
+pub struct ModelCallRuntime {
+    repository: AiRepository,
+    tokens: Arc<dyn LlmTokenSource>,
+    resolver: RwLock<ModelCallResolver>,
+}
+
+impl ModelCallRuntime {
+    /// 启动时解析一次（冷启动立即可用，不等第一次心跳）。
+    pub fn bootstrap(
+        repository: AiRepository,
+        tokens: Arc<dyn LlmTokenSource>,
+        now_ms: i64,
+    ) -> Result<Self, LlmError> {
+        let settings = repository.get_llm_provider_settings(true)?;
+        let inputs = ModelResolutionInputs::from_non_production_environment();
+        let resolver = ModelCallResolver::bootstrap(&settings, &inputs, now_ms)?;
+        Ok(Self {
+            repository,
+            tokens,
+            resolver: RwLock::new(resolver),
+        })
+    }
+
+    /// 当前生效快照（设置页展示"当前模型 + 解析来源 + 下次解析时间"用）。
+    pub fn snapshot(&self) -> Result<ModelCallSnapshot, LlmError> {
+        Ok(self
+            .resolver
+            .read()
+            .map_err(|_| LlmError::Temporary)?
+            .current()
+            .clone())
+    }
+
+    /// 下次心跳边界解析时间。
+    pub fn next_resolution_at_ms(&self) -> Result<i64, LlmError> {
+        Ok(self
+            .resolver
+            .read()
+            .map_err(|_| LlmError::Temporary)?
+            .next_resolution_at_ms())
+    }
+
+    /// 运行开始前冻结；进行中的运行不受后续配置切换影响。
+    pub fn freeze_for_run(&self) -> Result<FrozenModelCall, LlmError> {
+        Ok(self
+            .resolver
+            .read()
+            .map_err(|_| LlmError::Temporary)?
+            .freeze_for_run())
+    }
+
+    /// 心跳响应到达时重新解析；返回模型/地址是否变化（变化即相关缓存与指纹失效）。
+    pub fn on_heartbeat(&self, now_ms: i64) -> Result<bool, LlmError> {
+        let settings = self.repository.get_llm_provider_settings(true)?;
+        let inputs = ModelResolutionInputs::from_non_production_environment();
+        let mut resolver = self.resolver.write().map_err(|_| LlmError::Temporary)?;
+        resolver.apply_heartbeat(&settings, &inputs, now_ms)
+    }
+
+    /// 取一个仍有余量的短期 token（余量不足时重取一次）。
+    pub async fn acquire_token(&self, now_ms: i64) -> Result<LlmTokenLease, LlmError> {
+        acquire_llm_token(self.tokens.as_ref(), now_ms).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::activation::api_error_is_revocation;
+    use crate::api::ApiError;
+    use crate::database::Database;
+
+    fn repository() -> AiRepository {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        AiRepository::new(database)
+    }
+
+    enum Reply {
+        Lease(LlmTokenLease),
+        Temporary,
+    }
+
+    struct ScriptedSource {
+        replies: Vec<Reply>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmTokenSource for ScriptedSource {
+        async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.replies.get(index) {
+                Some(Reply::Lease(lease)) => Ok(lease.clone()),
+                Some(Reply::Temporary) | None => Err(LlmError::Temporary),
+            }
+        }
+    }
+
+    fn lease(expire_at: i64) -> LlmTokenLease {
+        LlmTokenLease {
+            token: "st-lt-v1.shared".to_owned(),
+            expire_at,
+            provider: "ALI".to_owned(),
+        }
+    }
+
+    #[test]
+    fn runtime_bootstraps_from_persisted_settings_and_exposes_resolution_time() {
+        let runtime = ModelCallRuntime::bootstrap(
+            repository(),
+            Arc::new(ScriptedSource {
+                replies: Vec::new(),
+                calls: AtomicUsize::new(0),
+            }),
+            1_000,
+        )
+        .expect("冷启动必须成功");
+        let snapshot = runtime.snapshot().unwrap();
+        // 全新库的默认取值即构建期默认模型。
+        assert_eq!(snapshot.model_id, "qwen-plus");
+        assert_eq!(runtime.next_resolution_at_ms().unwrap(), 1_000 + 90_000);
+    }
+
+    #[test]
+    fn heartbeat_boundary_refresh_updates_snapshot_and_reports_change() {
+        let repository = repository();
+        let runtime = ModelCallRuntime::bootstrap(
+            repository.clone(),
+            Arc::new(ScriptedSource {
+                replies: Vec::new(),
+                calls: AtomicUsize::new(0),
+            }),
+            0,
+        )
+        .unwrap();
+        let frozen = runtime.freeze_for_run().unwrap();
+        assert_eq!(frozen.model_id(), "qwen-plus");
+
+        // 用户改设置（模型标识）→ 下一次心跳边界才生效。
+        let mut settings = repository.get_llm_provider_settings(true).unwrap();
+        settings.model_id = "qwen-max".to_owned();
+        repository.save_llm_provider_settings(&settings).unwrap();
+        assert_eq!(
+            runtime.snapshot().unwrap().model_id,
+            "qwen-plus",
+            "心跳边界之前不得生效"
+        );
+        assert!(runtime.on_heartbeat(90_000).unwrap(), "模型变化必须上报");
+        assert_eq!(runtime.snapshot().unwrap().model_id, "qwen-max");
+        // 已冻结的运行不受影响。
+        assert_eq!(frozen.model_id(), "qwen-plus");
+
+        // 同一模型再次心跳 → 不报告变化。
+        assert!(!runtime.on_heartbeat(180_000).unwrap());
+    }
+
+    #[tokio::test]
+    async fn runtime_shares_the_token_lease_and_retries_once_when_expiring() {
+        let source = Arc::new(ScriptedSource {
+            replies: vec![Reply::Lease(lease(1_010)), Reply::Lease(lease(1_900))],
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = ModelCallRuntime::bootstrap(repository(), source.clone(), 0).unwrap();
+        let acquired = runtime.acquire_token(1_000).await.expect("重取后必须成功");
+        assert_eq!(acquired.provider, "ALI");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+        // 诊断标签不得含 token 本体。
+        assert!(!acquired.diagnostic_label(1_000).contains("st-lt-v1"));
+    }
+
+    #[tokio::test]
+    async fn runtime_surfaces_credential_failure_when_tokens_never_have_margin() {
+        let source = Arc::new(ScriptedSource {
+            replies: vec![Reply::Lease(lease(1_000)), Reply::Lease(lease(1_000))],
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = ModelCallRuntime::bootstrap(repository(), source.clone(), 0).unwrap();
+        let error = runtime.acquire_token(1_000).await.unwrap_err();
+        assert_eq!(error.category_str(), "credential");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2, "只重取一次");
+    }
+
+    #[tokio::test]
+    async fn runtime_propagates_a_token_source_failure_without_retrying() {
+        let source = Arc::new(ScriptedSource {
+            replies: vec![Reply::Temporary],
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = ModelCallRuntime::bootstrap(repository(), source.clone(), 0).unwrap();
+        let error = runtime.acquire_token(1_000).await.unwrap_err();
+        assert_eq!(error.category_str(), "temporary");
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            1,
+            "来源本身报错时必须直接上抛，不做无意义重取"
+        );
+    }
+
+    #[test]
+    fn token_api_errors_map_to_distinguishable_categories() {
+        assert_eq!(
+            map_token_api_error(&ApiError::Transport).category_str(),
+            "temporary"
+        );
+        assert_eq!(
+            map_token_api_error(&ApiError::Timeout).category_str(),
+            "temporary"
+        );
+        assert_eq!(
+            map_token_api_error(&ApiError::InvalidResponse).category_str(),
+            "provider"
+        );
+        // 未开通/撤销类业务码 → 凭据类，界面可显示"需重新激活/未开通"。
+        assert_eq!(
+            map_token_api_error(&ApiError::Business {
+                code: 1003,
+                message: "未开通".to_owned(),
+            })
+            .category_str(),
+            "credential"
+        );
+        assert_eq!(
+            map_token_api_error(&ApiError::Business {
+                code: 500,
+                message: "内部错误".to_owned(),
+            })
+            .category_str(),
+            "provider"
+        );
+        // 撤销与未授权判定必须与激活模块同源。
+        let revoked = ApiError::Business {
+            code: 1002,
+            message: "revoked".to_owned(),
+        };
+        assert!(api_error_is_revocation(&revoked));
+        assert_eq!(map_token_api_error(&revoked).category_str(), "credential");
+    }
+
+    #[test]
+    fn two_runtimes_do_not_share_mutable_state() {
+        // 并发运行必须互不影响：解析结果存在各自的运行时实例里，没有可变全局。
+        let first = ModelCallRuntime::bootstrap(
+            repository(),
+            Arc::new(ScriptedSource {
+                replies: Vec::new(),
+                calls: AtomicUsize::new(0),
+            }),
+            0,
+        )
+        .unwrap();
+        let second_repository = repository();
+        let mut settings = second_repository.get_llm_provider_settings(true).unwrap();
+        settings.model_id = "qwen-turbo".to_owned();
+        second_repository
+            .save_llm_provider_settings(&settings)
+            .unwrap();
+        let second = ModelCallRuntime::bootstrap(
+            second_repository,
+            Arc::new(ScriptedSource {
+                replies: Vec::new(),
+                calls: AtomicUsize::new(0),
+            }),
+            0,
+        )
+        .unwrap();
+        assert_eq!(first.snapshot().unwrap().model_id, "qwen-plus");
+        assert_eq!(second.snapshot().unwrap().model_id, "qwen-turbo");
+        assert_ne!(
+            first.freeze_for_run().unwrap().fingerprint_input(),
+            second.freeze_for_run().unwrap().fingerprint_input()
+        );
+    }
+}

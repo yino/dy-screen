@@ -19,6 +19,7 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::activation::{ActivationService, ActivationStateView, HeartbeatOutcome, TelemetryQueue};
 use crate::ai::tauri_commands::*;
+use crate::ai::{ActivationLlmTokenSource, ModelCallRuntime};
 use crate::ai::{
     AiClipExportStatus, AiCommandService, AiJobEvent, AiJobPublisher, AiProjectService,
     AiRepository, AiSmartWorkflowEvent, AiSmartWorkflowMetric, ClipExportBridge, ClipExportFailure,
@@ -344,6 +345,7 @@ fn spawn_activation_lifecycle(
     supervisor: Supervisor,
     ai_runtime: Arc<LocalAsrRuntime>,
     telemetry: TelemetryQueue,
+    model_call: Arc<ModelCallRuntime>,
 ) {
     if activation.is_active() {
         telemetry.track(
@@ -408,6 +410,24 @@ fn spawn_activation_lifecycle(
             }
             let outcome = activation.heartbeat_once().await;
             supervisor.set_server_recording_limit(activation.max_screen_limit());
+            // 模型配置只在心跳周期边界重新解析（任务 11.5）：进行中的运行已冻结，不受影响。
+            if matches!(outcome, HeartbeatOutcome::Active)
+                && let Ok(changed) = model_call.on_heartbeat(chrono::Utc::now().timestamp_millis())
+                && let Ok(snapshot) = model_call.snapshot()
+            {
+                // 事件只带公开配置值；短期 token 与地址细节都不进入事件。
+                let _ = app.emit(
+                    "model-call-event",
+                    serde_json::json!({
+                        "modelId": snapshot.model_id,
+                        "source": snapshot.source.as_str(),
+                        "changed": changed,
+                        "nextResolutionAtMs": model_call
+                            .next_resolution_at_ms()
+                            .unwrap_or_default(),
+                    }),
+                );
+            }
             let view = activation.state();
             let _ = app.emit("activation-event", &view);
             wait = match outcome {
@@ -2180,12 +2200,55 @@ pub fn run() {
                 activation.clone(),
                 app.state::<RuntimeResourceState>().inner().clone(),
             );
+            // 模型调用点：解析失败**不得**阻断应用启动（录制、浏览、预览与本地 ASR
+            // 都不依赖它）。失败时降级到构建期默认设置，并只记录脱敏分类。
+            let model_call = match ModelCallRuntime::bootstrap(
+                AiRepository::new(database.clone()),
+                Arc::new(ActivationLlmTokenSource::new(activation.clone())),
+                chrono::Utc::now().timestamp_millis(),
+            ) {
+                Ok(runtime) => Arc::new(runtime),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "component": "model_call",
+                            "event": "bootstrap_fallback",
+                            "category": error.category_str(),
+                        })
+                    );
+                    let fallback_repository = AiRepository::new(database.clone());
+                    // 只记录固定分类，不输出任何错误正文（可能含数据内容）。
+                    if fallback_repository
+                        .save_llm_provider_settings(&crate::ai::LlmProviderSettings::default())
+                        .is_err()
+                    {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "component": "model_call",
+                                "event": "bootstrap_fallback_persist_failed",
+                                "category": "repository",
+                            })
+                        );
+                    }
+                    Arc::new(
+                        ModelCallRuntime::bootstrap(
+                            fallback_repository,
+                            Arc::new(ActivationLlmTokenSource::new(activation.clone())),
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .map_err(std::io::Error::other)?,
+                    )
+                }
+            };
             spawn_activation_lifecycle(
                 app.handle().clone(),
                 activation.clone(),
                 supervisor.clone(),
                 ai_components.runtime.clone(),
                 telemetry.clone(),
+                model_call,
             );
 
             app.manage(AppState {

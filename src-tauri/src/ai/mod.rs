@@ -18,6 +18,7 @@ mod effect_caption_spec;
 mod highlight;
 mod lifecycle;
 mod llm;
+mod model_call;
 mod processor;
 mod projection;
 mod repository;
@@ -128,6 +129,7 @@ pub use llm::{
     TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token,
     resolve_model_call_with_heartbeat,
 };
+pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime};
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
 };
