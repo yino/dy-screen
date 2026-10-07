@@ -31,7 +31,8 @@ mod smart_workflow;
 pub(crate) mod tauri_commands;
 
 pub use bundled_skills::{
-    BundledSkill, SkillLoadError, bundled_skills_directory, load_bundled_skills, skill_snapshot,
+    ALLOWED_PROFILE_TOOLS, BundledSkill, HarnessProfile, SkillLoadError,
+    bundled_skills_directory, load_bundled_skills, load_harness_profile, skill_snapshot,
     skills_fingerprint,
 };
 pub use clip_export::{

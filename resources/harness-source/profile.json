@@ -1,0 +1,18 @@
+{
+  "id": "dy-screen-desktop",
+  "version": "1.0.0",
+  "protocolVersion": "1",
+  "skills": [
+    "generic-hook",
+    "ecommerce-conversion",
+    "comedy-payoff",
+    "knowledge-density",
+    "story-emotion",
+    "transition-match",
+    "transition-score"
+  ],
+  "tools": [
+    "model.generate_text",
+    "media.generate"
+  ]
+}

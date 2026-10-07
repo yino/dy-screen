@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::harness::HARNESS_PROTOCOL_VERSION;
+
 /// 一个随包 Skill 定义（与 `HighlightSkill` 常量等价，但可序列化、可从文件加载）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -117,6 +119,58 @@ pub fn skills_fingerprint(skills: &[BundledSkill]) -> String {
     let joined = ids.join(",");
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(joined.as_bytes()))
+}
+
+/// Profile 里允许注册的受控工具（决策三：不存在 shell、任意文件编辑、浏览器浏览或任意网络访问）。
+pub const ALLOWED_PROFILE_TOOLS: &[&str] = &["model.generate_text", "media.generate"];
+
+/// 应用专用随包 Profile：只注册模型路由（受控工具）与 Skill。
+///
+/// `deny_unknown_fields` 拒绝任何未声明的字段，防止 Profile 夹带额外工具或权限。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessProfile {
+    pub id: String,
+    pub version: String,
+    pub protocol_version: String,
+    pub skills: Vec<String>,
+    pub tools: Vec<String>,
+}
+
+/// 读取并校验随包 Profile（任务 3.1 的校验侧）。
+pub fn load_harness_profile(path: &Path) -> Result<HarnessProfile, SkillLoadError> {
+    let bytes = std::fs::read(path)
+        .map_err(|_| SkillLoadError::MissingDirectory("随包 Profile 不可读"))?;
+    let profile: HarnessProfile = serde_json::from_slice(&bytes)
+        .map_err(|_| SkillLoadError::InvalidDefinition("Profile 结构非法或含未知字段"))?;
+    validate_profile(&profile)?;
+    Ok(profile)
+}
+
+fn validate_profile(profile: &HarnessProfile) -> Result<(), SkillLoadError> {
+    if profile.id.trim().is_empty() {
+        return Err(SkillLoadError::InvalidDefinition("Profile id 为空"));
+    }
+    let mut parts = profile.version.split('.');
+    if !(parts.clone().count() == 3
+        && parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())))
+    {
+        return Err(SkillLoadError::InvalidVersion("Profile 版本必须是 x.y.z 数字三段"));
+    }
+    if profile.protocol_version != HARNESS_PROTOCOL_VERSION {
+        return Err(SkillLoadError::InvalidDefinition("Profile 协议版本不匹配"));
+    }
+    if profile.skills.is_empty() {
+        return Err(SkillLoadError::InvalidDefinition("Profile 未注册任何 Skill"));
+    }
+    for tool in &profile.tools {
+        if !ALLOWED_PROFILE_TOOLS.contains(&tool.as_str()) {
+            return Err(SkillLoadError::InvalidDefinition(
+                "Profile 注册了白名单之外的工具",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 由一组随包 Skill 恢复常量式 `HighlightSkill` 的等价信息（供既有链路引用）。
@@ -230,4 +284,71 @@ mod tests {
             "skill_directory_missing"
         );
     }
+
+    fn harness_source_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../resources/harness-source")
+    }
+
+    #[test]
+    fn bundled_skills_match_the_five_highlight_constants() {
+        let skills = load_bundled_skills(&harness_source_dir().join("skills")).unwrap();
+        assert_eq!(skills.len(), 7, "5 个精彩 Skill + 2 个转场阶段 Skill");
+        let ids: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
+        for expected in [
+            "generic-hook",
+            "ecommerce-conversion",
+            "comedy-payoff",
+            "knowledge-density",
+            "story-emotion",
+            "transition-match",
+            "transition-score",
+        ] {
+            assert!(ids.contains(&expected), "缺少随包 Skill {expected}");
+        }
+        // 5 个精彩 Skill 与 Rust 常量一致。
+        let highlight = |id: &str| skills.iter().find(|skill| skill.id == id).unwrap();
+        assert_eq!(highlight("generic-hook").version, "1.0.0");
+        assert_eq!(
+            highlight("ecommerce-conversion").labels,
+            vec!["带货".to_owned(), "电商".to_owned(), "商品".to_owned()]
+        );
+        assert_eq!(
+            highlight("comedy-payoff").weights,
+            [1.4, 0.7, 1.5, 1.0, 1.1, 1.4]
+        );
+    }
+
+    #[test]
+    fn bundled_profile_registers_only_allowlisted_tools_and_declared_skills() {
+        let profile = load_harness_profile(&harness_source_dir().join("profile.json")).unwrap();
+        assert_eq!(profile.id, "dy-screen-desktop");
+        assert_eq!(profile.protocol_version, HARNESS_PROTOCOL_VERSION);
+        for tool in &profile.tools {
+            assert!(
+                ALLOWED_PROFILE_TOOLS.contains(&tool.as_str()),
+                "Profile 不得注册白名单外的工具：{tool}"
+            );
+        }
+        let skills = load_bundled_skills(&harness_source_dir().join("skills")).unwrap();
+        let skill_ids: Vec<&str> = skills.iter().map(|skill| skill.id.as_str()).collect();
+        for skill in &profile.skills {
+            assert!(skill_ids.contains(&skill.as_str()), "Profile 引用了未随包 Skill {skill}");
+        }
+    }
+
+    #[test]
+    fn profile_rejects_non_allowlisted_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        std::fs::write(
+            &path,
+            r#"{"id":"x","version":"1.0.0","protocolVersion":"1","skills":["a"],"tools":["shell.exec"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_harness_profile(&path).unwrap_err().code(),
+            "skill_definition_invalid"
+        );
+    }
+
 }
