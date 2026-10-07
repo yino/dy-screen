@@ -1,7 +1,8 @@
 use dy_screen_app_lib::ai::{
     CredentialError, CredentialStore, DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider,
-    HighlightAgentProvider, LlmProviderSettings, MemoryCredentialStore, SubtitleCorrectionOutput,
-    TransitionAgentOutput, TransitionScoreOutput,
+    FrozenModelCall, HighlightAgentProvider, LlmProviderSettings, LlmTokenLease,
+    MemoryCredentialStore, ModelCallHandle, SubtitleCorrectionOutput, TransitionAgentOutput,
+    TransitionScoreOutput,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -89,12 +90,26 @@ fn provider_output_schemas_use_response_metadata_for_token_usage() {
 #[tokio::test]
 async fn fake_provider_diagnosis_is_deterministic_and_receives_no_project_text() {
     let provider = FakeHighlightProvider::default();
-    let settings = LlmProviderSettings::default();
+    // 迁移后 provider 只接受统一调用点给出的句柄（冻结模型 + 短期 token）。
     let result = provider
-        .diagnose(&settings, "sk-test-secret", CancellationToken::new())
+        .diagnose(&test_handle(), CancellationToken::new())
         .await
         .unwrap();
     assert!(result.ok);
     assert_eq!(result.category, "ok");
     assert_eq!(*provider.diagnostic_calls.lock().unwrap(), 1);
+}
+
+/// 构造一个测试用句柄：模型为构建期默认，凭据为形如短期 token 的字符串。
+fn test_handle() -> ModelCallHandle {
+    let settings = LlmProviderSettings::default();
+    let frozen = FrozenModelCall::resolve(&settings).expect("冻结快照");
+    ModelCallHandle {
+        frozen,
+        token: LlmTokenLease {
+            token: "st-lt-v1.test".to_owned(),
+            expire_at: chrono::Utc::now().timestamp() + 3_600,
+            provider: "ALI".to_owned(),
+        },
+    }
 }

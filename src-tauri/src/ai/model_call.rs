@@ -130,6 +130,23 @@ impl ModelCallRuntime {
             .freeze_for_run())
     }
 
+    /// 按**运行记录**里的模型冻结（续跑/恢复用）。
+    ///
+    /// 同一运行 MUST 复用产出它时的模型：即使设置已切换，续跑也不得漂移，
+    /// 否则运行指纹与实际调用不一致、历史结果无法对账。
+    pub fn freeze_with_model(&self, model_id: &str) -> Result<FrozenModelCall, LlmError> {
+        let mut snapshot = self
+            .resolver
+            .read()
+            .map_err(|_| LlmError::Temporary)?
+            .current()
+            .clone();
+        if !model_id.trim().is_empty() {
+            snapshot.model_id = model_id.trim().to_owned();
+        }
+        Ok(FrozenModelCall::from_snapshot(snapshot))
+    }
+
     /// 心跳响应到达时重新解析；返回模型/地址是否变化（变化即相关缓存与指纹失效）。
     pub fn on_heartbeat(&self, now_ms: i64) -> Result<bool, LlmError> {
         let settings = self.repository.get_llm_provider_settings(true)?;

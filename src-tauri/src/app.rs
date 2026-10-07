@@ -2096,7 +2096,7 @@ pub fn run() {
             let highlight_workflow = Arc::new(HighlightWorkflow::new(
                 AiRepository::new(database.clone()),
                 Arc::new(RigDeepSeekProvider),
-                credential_store.clone(),
+                model_call.clone(),
             ));
             let ai_commands = AiCommandService::new(
                 ai_project_service.clone(),

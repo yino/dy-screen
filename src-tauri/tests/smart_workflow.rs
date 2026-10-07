@@ -414,8 +414,7 @@ struct SmartHighlightProvider;
 impl HighlightAgentProvider for SmartHighlightProvider {
     async fn diagnose(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         _cancellation: CancellationToken,
     ) -> Result<ProviderDiagnostic, LlmError> {
         Ok(ProviderDiagnostic {
@@ -427,8 +426,7 @@ impl HighlightAgentProvider for SmartHighlightProvider {
 
     async fn discover_candidates(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         request: CandidateAgentRequest,
         _cancellation: CancellationToken,
     ) -> Result<CandidateAgentOutput, LlmError> {
@@ -463,8 +461,7 @@ impl HighlightAgentProvider for SmartHighlightProvider {
 
     async fn rank_candidates(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         request: RankingAgentRequest,
         _cancellation: CancellationToken,
     ) -> Result<RankingAgentOutput, LlmError> {
@@ -1133,7 +1130,7 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
     let highlight = Arc::new(HighlightWorkflow::new(
         repository.clone(),
         Arc::new(SmartHighlightProvider),
-        credentials.clone(),
+        test_model_call(&database),
     ));
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
@@ -1309,7 +1306,7 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
     let highlight = Arc::new(HighlightWorkflow::new(
         repository.clone(),
         Arc::new(SmartHighlightProvider),
-        credentials.clone(),
+        test_model_call(&database),
     ));
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
@@ -1526,7 +1523,7 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
     let highlight = Arc::new(HighlightWorkflow::new(
         repository.clone(),
         Arc::new(SmartHighlightProvider),
-        credentials.clone(),
+        test_model_call(&database),
     ));
     let correction_provider = Arc::new(FailOnceCorrectionProvider::default());
     let correction = ClipTextCorrectionWorkflow::new(
@@ -1806,7 +1803,7 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
     let highlight = Arc::new(HighlightWorkflow::new(
         repository.clone(),
         Arc::new(SmartHighlightProvider),
-        credentials.clone(),
+        test_model_call(&database),
     ));
     let correction_provider = Arc::new(FailOnceCorrectionProvider::default());
     let correction = ClipTextCorrectionWorkflow::new(
@@ -1995,7 +1992,7 @@ async fn run_live_workflow_end_to_end() {
     let highlight = Arc::new(HighlightWorkflow::new(
         repository.clone(),
         Arc::new(SmartHighlightProvider),
-        credentials.clone(),
+        test_model_call(&database),
     ));
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),

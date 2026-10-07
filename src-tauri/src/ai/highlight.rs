@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     AiHighlightCandidate, AiHighlightRun, AiHighlightRunStatus, AiRepository,
-    CandidateAgentRequest, CredentialStore, HighlightAgentProvider, HighlightCandidateDraft,
+    CandidateAgentRequest, HighlightAgentProvider, HighlightCandidateDraft,
     HighlightCandidateScore, LlmError, NewAiHighlightChunk, NewAiHighlightRun, ProviderDiagnostic,
     RankingAgentRequest,
 };
@@ -204,19 +204,20 @@ pub fn analysis_fingerprint(
 pub struct HighlightWorkflow {
     repository: AiRepository,
     provider: Arc<dyn HighlightAgentProvider>,
-    credentials: Arc<dyn CredentialStore>,
+    /// 统一调用点：模型与短期 token 都从这里取，链路自身不持有凭据。
+    model_call: Arc<crate::ai::ModelCallRuntime>,
 }
 
 impl HighlightWorkflow {
     pub fn new(
         repository: AiRepository,
         provider: Arc<dyn HighlightAgentProvider>,
-        credentials: Arc<dyn CredentialStore>,
+        model_call: Arc<crate::ai::ModelCallRuntime>,
     ) -> Self {
         Self {
             repository,
             provider,
-            credentials,
+            model_call,
         }
     }
 
@@ -239,10 +240,6 @@ impl HighlightWorkflow {
                 "必须确认将规范化转写发送给 DeepSeek".to_owned(),
             ));
         }
-        self.credentials
-            .get()
-            .map_err(|_| LlmError::Credential)?
-            .ok_or(LlmError::Credential)?;
         let settings = self.repository.get_llm_provider_settings(true)?;
         let detail = self.repository.get_project(project_id)?;
         let projection = super::AiTranscriptProjection::load(&self.repository, project_id)
@@ -289,9 +286,8 @@ impl HighlightWorkflow {
             .cloned()
             .chain(segments.iter().cloned())
             .collect::<Vec<_>>();
-        // 经统一调用点解析本次运行的冻结快照，并把其指纹纳入运行指纹与审计。
-        // 一次运行只解析一次并冻结：本运行的候选发现与全局评分必须使用同一模型。
-        let frozen_call = crate::ai::llm::FrozenModelCall::resolve(&settings)?;
+        // 经统一调用点冻结本次运行：解析只发生一次，候选发现与全局评分共用同一模型。
+        let frozen_call = self.model_call.freeze_for_run()?;
         let call_fingerprint = frozen_call.fingerprint_input();
         let fingerprint = analysis_fingerprint(
             project_id,
@@ -299,7 +295,7 @@ impl HighlightWorkflow {
             &tags,
             AnalysisFingerprintConfig {
                 skills: &skills,
-                model_id: &settings.model_id,
+                model_id: frozen_call.model_id(),
                 prompt_version: &settings.prompt_version,
                 goal: detail.project.analysis_goal.as_deref(),
                 qualified_score: settings.qualified_score,
@@ -373,12 +369,8 @@ impl HighlightWorkflow {
         if matches!(run.status, AiHighlightRunStatus::Completed) {
             return Ok(run);
         }
-        let key = self
-            .credentials
-            .get()
-            .map_err(|_| LlmError::Credential)?
-            .ok_or(LlmError::Credential)?;
-        let settings = self.repository.get_llm_provider_settings(true)?;
+        // 续跑/恢复：按运行记录里的模型冻结，设置之后的变化不影响本次运行。
+        let frozen_call = self.model_call.freeze_with_model(&run.model_id)?;
         let segments = load_segments(&self.repository, run.project_id)?;
         let segments_by_id = segments
             .into_iter()
@@ -443,16 +435,24 @@ impl HighlightWorkflow {
             for attempt in 0..MAX_CHUNK_ATTEMPTS {
                 self.repository
                     .mark_highlight_chunk_running(run.id, chunk_row.id)?;
+                let chunk_cancellation = cancellation.child_token();
                 match self
-                    .provider
-                    .discover_candidates(
-                        &settings,
-                        &key,
-                        CandidateAgentRequest {
-                            prompt: prompt.clone(),
-                        },
-                        cancellation.child_token(),
-                    )
+                    .call_highlight_with_refresh(&frozen_call, {
+                        let prompt = prompt.clone();
+                        move |handle| {
+                            let prompt = prompt.clone();
+                            let cancellation = chunk_cancellation.clone();
+                            async move {
+                                self.provider
+                                    .discover_candidates(
+                                        &handle,
+                                        CandidateAgentRequest { prompt },
+                                        cancellation,
+                                    )
+                                    .await
+                            }
+                        }
+                    })
                     .await
                 {
                     Ok(response) => {
@@ -486,6 +486,7 @@ impl HighlightWorkflow {
                 if matches!(error, LlmError::Cancelled) {
                     return Err(error);
                 }
+                let authorization_failed = matches!(error, LlmError::Credential);
                 self.repository.fail_highlight_chunk(
                     run.id,
                     chunk_row.id,
@@ -493,6 +494,21 @@ impl HighlightWorkflow {
                     &error.to_string(),
                 )?;
                 consecutive_chunk_failures += 1;
+                if authorization_failed {
+                    // 授权不可用时立即停止：继续跑只会产生更多失败且毫无价值，
+                    // 并且必须给出**可区分**的原因，而不是落成通用批次失败（任务 6.5）。
+                    return self
+                        .repository
+                        .update_highlight_run_status(
+                            run.id,
+                            AiHighlightRunStatus::Failed,
+                            Some((
+                                "highlight_authorization_failed",
+                                "AI 授权不可用，请重新激活后重试",
+                            )),
+                        )
+                        .map_err(LlmError::from);
+                }
             }
         }
 
@@ -541,16 +557,20 @@ impl HighlightWorkflow {
             &run.tags_snapshot,
             run.analysis_goal.as_deref(),
         );
+        let ranking_cancellation = cancellation.child_token();
         let ranked = self
-            .provider
-            .rank_candidates(
-                &settings,
-                &key,
-                RankingAgentRequest {
-                    prompt: ranking_prompt,
-                },
-                cancellation.child_token(),
-            )
+            .call_highlight_with_refresh(&frozen_call, {
+                let ranking_prompt = ranking_prompt.clone();
+                move |handle| {
+                    let prompt = ranking_prompt.clone();
+                    let cancellation = ranking_cancellation.clone();
+                    async move {
+                        self.provider
+                            .rank_candidates(&handle, RankingAgentRequest { prompt }, cancellation)
+                            .await
+                    }
+                }
+            })
             .await;
         let candidate_keys = ranking_drafts
             .iter()
@@ -650,13 +670,48 @@ impl HighlightWorkflow {
         &self,
         cancellation: CancellationToken,
     ) -> Result<ProviderDiagnostic, LlmError> {
-        let key = self
-            .credentials
-            .get()
-            .map_err(|_| LlmError::Credential)?
-            .ok_or(LlmError::Credential)?;
-        let settings = self.repository.get_llm_provider_settings(true)?;
-        self.provider.diagnose(&settings, &key, cancellation).await
+        let frozen = self.model_call.freeze_for_run()?;
+        self.call_highlight_with_refresh(&frozen, |handle| {
+            let cancellation = cancellation.clone();
+            async move { self.provider.diagnose(&handle, cancellation).await }
+        })
+        .await
+    }
+
+    /// 取当前可用的模型调用句柄（模型来自运行内冻结快照）。
+    async fn current_handle(
+        &self,
+        frozen: &crate::ai::FrozenModelCall,
+    ) -> Result<crate::ai::ModelCallHandle, LlmError> {
+        let token = self
+            .model_call
+            .acquire_token(chrono::Utc::now().timestamp())
+            .await?;
+        Ok(crate::ai::ModelCallHandle {
+            frozen: frozen.clone(),
+            token,
+        })
+    }
+
+    /// 调用一次 Agent；凭据类失败重取一次 token 并重试，其余失败直接上抛。
+    async fn call_highlight_with_refresh<T, F, Fut>(
+        &self,
+        frozen: &crate::ai::FrozenModelCall,
+        call: F,
+    ) -> Result<T, LlmError>
+    where
+        F: Fn(crate::ai::ModelCallHandle) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, LlmError>>,
+    {
+        let handle = self.current_handle(frozen).await?;
+        match call(handle).await {
+            Ok(value) => Ok(value),
+            Err(LlmError::Credential) => {
+                let refreshed = self.current_handle(frozen).await?;
+                call(refreshed).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn candidates(&self, run_id: i64) -> Result<Vec<AiHighlightCandidate>, LlmError> {
@@ -973,13 +1028,42 @@ impl WorkflowCancellation for CancellationToken {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
+    /// 测试用固定短期 token 来源：不触网、有效期充足。
+    struct FixedTokenSource;
+
+    #[async_trait]
+    impl crate::ai::LlmTokenSource for FixedTokenSource {
+        async fn fetch(&self) -> std::result::Result<crate::ai::LlmTokenLease, LlmError> {
+            Ok(crate::ai::LlmTokenLease {
+                token: "st-lt-v1.test".to_owned(),
+                expire_at: chrono::Utc::now().timestamp() + 3_600,
+                provider: "ALI".to_owned(),
+            })
+        }
+    }
+
+    /// 从既有仓库派生调用点（测试中数据库可能已被移入仓库）。
+    fn test_model_call_from_repository(
+        repository: &AiRepository,
+    ) -> Arc<crate::ai::ModelCallRuntime> {
+        Arc::new(
+            crate::ai::ModelCallRuntime::bootstrap(
+                repository.clone(),
+                Arc::new(FixedTokenSource),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .expect("测试用模型调用点必须可构造"),
+        )
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::ai::{
-        AiArtifactStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus, MemoryCredentialStore,
-        NewAiProjectInput, NewAsrArtifact, RecognitionProfile, SourceFingerprint,
-        TranscriptSegmentDraft,
+        AiArtifactStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus, NewAiProjectInput,
+        NewAsrArtifact, RecognitionProfile, SourceFingerprint, TranscriptSegmentDraft,
     };
     use crate::database::Database;
 
@@ -992,8 +1076,7 @@ mod tests {
     impl HighlightAgentProvider for FirstChunkTimesOut {
         async fn diagnose(
             &self,
-            _settings: &super::super::LlmProviderSettings,
-            _api_key: &str,
+            _call: &crate::ai::ModelCallHandle,
             _cancellation: CancellationToken,
         ) -> Result<ProviderDiagnostic, LlmError> {
             unreachable!()
@@ -1001,8 +1084,7 @@ mod tests {
 
         async fn discover_candidates(
             &self,
-            _settings: &super::super::LlmProviderSettings,
-            _api_key: &str,
+            _call: &crate::ai::ModelCallHandle,
             _request: CandidateAgentRequest,
             _cancellation: CancellationToken,
         ) -> Result<super::super::CandidateAgentOutput, LlmError> {
@@ -1019,8 +1101,7 @@ mod tests {
 
         async fn rank_candidates(
             &self,
-            _settings: &super::super::LlmProviderSettings,
-            _api_key: &str,
+            _call: &crate::ai::ModelCallHandle,
             _request: RankingAgentRequest,
             _cancellation: CancellationToken,
         ) -> Result<super::super::RankingAgentOutput, LlmError> {
@@ -1276,6 +1357,261 @@ mod tests {
         assert!((fallback[0].completeness_score - 85.0).abs() < 0.001);
     }
 
+    /// 记录每次 Agent 调用收到的（阶段, 模型, token）的替身。
+    #[derive(Default)]
+    struct RecordingHighlightProvider {
+        seen: std::sync::Mutex<Vec<(&'static str, String, String)>>,
+        credential_failures: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HighlightAgentProvider for RecordingHighlightProvider {
+        async fn diagnose(
+            &self,
+            _call: &crate::ai::ModelCallHandle,
+            _cancellation: CancellationToken,
+        ) -> Result<ProviderDiagnostic, LlmError> {
+            unreachable!()
+        }
+
+        async fn discover_candidates(
+            &self,
+            call: &crate::ai::ModelCallHandle,
+            _request: CandidateAgentRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<super::super::CandidateAgentOutput, LlmError> {
+            self.seen.lock().unwrap().push((
+                "discover",
+                call.model_id().to_owned(),
+                call.token.token.clone(),
+            ));
+            if self.credential_failures.load(Ordering::SeqCst) > 0 {
+                let remaining = self.credential_failures.load(Ordering::SeqCst);
+                self.credential_failures
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(LlmError::Credential);
+            }
+            Ok(super::super::CandidateAgentOutput {
+                candidates: Vec::new(),
+                token_usage: 3,
+            })
+        }
+
+        async fn rank_candidates(
+            &self,
+            call: &crate::ai::ModelCallHandle,
+            _request: RankingAgentRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<super::super::RankingAgentOutput, LlmError> {
+            self.seen.lock().unwrap().push((
+                "rank",
+                call.model_id().to_owned(),
+                call.token.token.clone(),
+            ));
+            Ok(super::super::RankingAgentOutput {
+                scores: Vec::new(),
+                token_usage: 1,
+            })
+        }
+    }
+
+    /// 依次发放不同 token 的来源。
+    struct RotatingTokenSource {
+        issued: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::LlmTokenSource for RotatingTokenSource {
+        async fn fetch(&self) -> Result<crate::ai::LlmTokenLease, LlmError> {
+            let index = self.issued.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ai::LlmTokenLease {
+                token: format!("st-lt-v1.lease-{index}"),
+                expire_at: chrono::Utc::now().timestamp() + 3_600,
+                provider: "ALI".to_owned(),
+            })
+        }
+    }
+
+    struct RejectingTokenSource;
+
+    #[async_trait::async_trait]
+    impl crate::ai::LlmTokenSource for RejectingTokenSource {
+        async fn fetch(&self) -> Result<crate::ai::LlmTokenLease, LlmError> {
+            Err(LlmError::Credential)
+        }
+    }
+
+    fn model_call_with(
+        repository: &AiRepository,
+        source: Arc<dyn crate::ai::LlmTokenSource>,
+    ) -> Arc<crate::ai::ModelCallRuntime> {
+        Arc::new(
+            crate::ai::ModelCallRuntime::bootstrap(
+                repository.clone(),
+                source,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// 建一个可运行精彩分析的工程（两个已完成输入）。
+    fn analyzable_project() -> (AiRepository, i64) {
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("统一调用点精彩", &test_profile())
+            .unwrap();
+        let input_ids = [
+            add_completed_input(&repository, project.id, 0),
+            add_completed_input(&repository, project.id, 1),
+        ];
+        repository.freeze_project(project.id).unwrap();
+        repository
+            .transition_project(project.id, AiProjectStatus::Running)
+            .unwrap();
+        for input_id in input_ids {
+            repository
+                .transition_input(input_id, AiInputStatus::Validating, None)
+                .unwrap();
+            repository
+                .transition_input(input_id, AiInputStatus::Completed, None)
+                .unwrap();
+        }
+        repository.recompute_project_progress(project.id).unwrap();
+        (repository, project.id)
+    }
+
+    #[tokio::test]
+    async fn candidate_discovery_and_ranking_share_one_frozen_model() {
+        let (repository, project_id) = analyzable_project();
+        let provider = Arc::new(RecordingHighlightProvider::default());
+        let workflow = HighlightWorkflow::new(
+            repository.clone(),
+            provider.clone(),
+            model_call_with(
+                &repository,
+                Arc::new(RotatingTokenSource {
+                    issued: AtomicUsize::new(0),
+                }),
+            ),
+        );
+        let run = workflow.prepare(project_id, true).unwrap();
+        workflow
+            .execute(run.id, CancellationToken::new())
+            .await
+            .unwrap();
+        let seen = provider.seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "必须真的调用了 Agent");
+        // 任务 6.1：候选发现与全局评分必须使用同一冻结模型。
+        let models: std::collections::BTreeSet<&str> =
+            seen.iter().map(|(_, model, _)| model.as_str()).collect();
+        assert_eq!(models.len(), 1, "两阶段模型必须一致：{models:?}");
+        assert_eq!(models.iter().next().copied(), Some("qwen-plus"));
+        // 凭据来自统一调用点的短期 token。
+        for (_, _, token) in &seen {
+            assert!(token.starts_with("st-lt-v1."), "必须用短期 token：{token}");
+        }
+        // 运行记录记录实际模型与统一调用点指纹。
+        let run_row = repository.get_highlight_run(run.id).unwrap();
+        assert_eq!(run_row.model_id, "qwen-plus");
+    }
+
+    #[tokio::test]
+    async fn resume_uses_the_model_recorded_in_the_run_not_the_new_settings() {
+        let (repository, project_id) = analyzable_project();
+        let provider = Arc::new(RecordingHighlightProvider::default());
+        let workflow = HighlightWorkflow::new(
+            repository.clone(),
+            provider.clone(),
+            model_call_with(
+                &repository,
+                Arc::new(RotatingTokenSource {
+                    issued: AtomicUsize::new(0),
+                }),
+            ),
+        );
+        let run = workflow.prepare(project_id, true).unwrap();
+        assert_eq!(run.model_id, "qwen-plus");
+        // 运行开始后用户改了设置：续跑必须仍用运行记录里的模型，不得漂移。
+        let mut settings = repository.get_llm_provider_settings(true).unwrap();
+        settings.model_id = "qwen-max".to_owned();
+        repository.save_llm_provider_settings(&settings).unwrap();
+        workflow
+            .execute(run.id, CancellationToken::new())
+            .await
+            .unwrap();
+        let seen = provider.seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|(_, model, _)| model == "qwen-plus"),
+            "续跑不得因设置变化而漂移：{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_failure_is_distinguishable_and_refreshes_the_token_once() {
+        let (repository, project_id) = analyzable_project();
+        let provider = Arc::new(RecordingHighlightProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+            credential_failures: AtomicUsize::new(1),
+        });
+        let workflow = HighlightWorkflow::new(
+            repository.clone(),
+            provider.clone(),
+            model_call_with(
+                &repository,
+                Arc::new(RotatingTokenSource {
+                    issued: AtomicUsize::new(0),
+                }),
+            ),
+        );
+        let run = workflow.prepare(project_id, true).unwrap();
+        // 第一次凭据失败 → 重取一次 token 后成功，运行不失败。
+        workflow
+            .execute(run.id, CancellationToken::new())
+            .await
+            .expect("重取 token 后必须成功");
+        let seen = provider.seen.lock().unwrap().clone();
+        assert!(seen.len() >= 2, "必须重试过一次：{seen:?}");
+        assert_ne!(
+            seen[0].2, seen[1].2,
+            "重试必须使用重取后的新 token：{seen:?}"
+        );
+
+        // 来源完全拒绝时：错误必须可区分为凭据类，而不是网络类。
+        let (repository, project_id) = analyzable_project();
+        let rejecting_provider = Arc::new(RecordingHighlightProvider::default());
+        let workflow = HighlightWorkflow::new(
+            repository.clone(),
+            rejecting_provider.clone(),
+            model_call_with(&repository, Arc::new(RejectingTokenSource)),
+        );
+        let run = workflow.prepare(project_id, true).unwrap();
+        // 该链路的既有语义是"失败落库后返回运行记录"，因此断言落在记录上：
+        // 必须给出**可区分**的授权原因，且不得描述成 Provider 网络故障（任务 6.5）。
+        let finished = workflow
+            .execute(run.id, CancellationToken::new())
+            .await
+            .expect("失败必须反映在运行记录里");
+        assert_eq!(finished.status, AiHighlightRunStatus::Failed);
+        assert_eq!(
+            finished.last_error_code.as_deref(),
+            Some("highlight_authorization_failed")
+        );
+        let message = finished.last_error_message.unwrap_or_default();
+        assert!(!message.contains("网络"), "不得描述为网络故障：{message}");
+        assert!(
+            !message.contains("Provider"),
+            "不得描述为 Provider 故障：{message}"
+        );
+        // 授权不可用时一个付费调用都不该发出。
+        assert!(
+            rejecting_provider.seen.lock().unwrap().is_empty(),
+            "授权不可用时不得发起 Agent 调用"
+        );
+    }
+
     #[tokio::test]
     async fn chunk_timeout_is_persisted_and_does_not_discard_later_batches() {
         let database = Database::open_in_memory().unwrap();
@@ -1301,11 +1637,12 @@ mod tests {
                 .unwrap();
         }
         repository.recompute_project_progress(project.id).unwrap();
-        let credentials = MemoryCredentialStore::new();
-        credentials.set("test-key").unwrap();
         let provider = Arc::new(FirstChunkTimesOut::default());
-        let workflow =
-            HighlightWorkflow::new(repository.clone(), provider.clone(), Arc::new(credentials));
+        let workflow = HighlightWorkflow::new(
+            repository.clone(),
+            provider.clone(),
+            test_model_call_from_repository(&repository),
+        );
 
         let run = workflow.prepare(project.id, true).unwrap();
         assert_eq!(run.estimated_batches, 2);

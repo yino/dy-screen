@@ -7,9 +7,9 @@ use dy_screen::asr::{AsrError, EngineResult, FrozenMediaSource, MediaInspection,
 use dy_screen_app_lib::ai::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
     AiEnvironmentDiagnostic, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus,
-    AiJobController, AiPreflight, AiProjectService, AiProjectStatus, AiRepository, CredentialStore,
-    FakeHighlightProvider, HighlightWorkflow, MemoryCredentialStore, NewAiHighlightRun,
-    NewAiProjectInput, PreflightReport, RecognitionProfile, SourceFingerprint,
+    AiJobController, AiPreflight, AiProjectService, AiProjectStatus, AiRepository,
+    FakeHighlightProvider, HighlightWorkflow, NewAiHighlightRun, NewAiProjectInput,
+    PreflightReport, RecognitionProfile, SourceFingerprint,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
@@ -401,12 +401,10 @@ fn highlight_resume_from_sync_tauri_command_thread_does_not_require_a_tokio_reac
             user_authorized: true,
         })
         .unwrap();
-    let credentials = MemoryCredentialStore::new();
-    credentials.set("test-key").unwrap();
     let commands = commands.with_highlight_workflow(Arc::new(HighlightWorkflow::new(
         repository.clone(),
         Arc::new(FakeHighlightProvider::default()),
-        Arc::new(credentials),
+        test_model_call(&repository),
     )));
 
     let resumed = commands.resume_highlight_analysis(run.id).unwrap();
@@ -448,4 +446,33 @@ impl ReadyControllerProfile {
             chunk_strategy: None,
         }
     }
+}
+
+/// 测试用固定短期 token 来源。
+struct FixedTokenSource;
+
+#[async_trait::async_trait]
+impl dy_screen_app_lib::ai::LlmTokenSource for FixedTokenSource {
+    async fn fetch(
+        &self,
+    ) -> Result<dy_screen_app_lib::ai::LlmTokenLease, dy_screen_app_lib::ai::LlmError> {
+        Ok(dy_screen_app_lib::ai::LlmTokenLease {
+            token: "st-lt-v1.test".to_owned(),
+            expire_at: chrono::Utc::now().timestamp() + 3_600,
+            provider: "ALI".to_owned(),
+        })
+    }
+}
+
+fn test_model_call(
+    repository: &dy_screen_app_lib::ai::AiRepository,
+) -> std::sync::Arc<dy_screen_app_lib::ai::ModelCallRuntime> {
+    std::sync::Arc::new(
+        dy_screen_app_lib::ai::ModelCallRuntime::bootstrap(
+            repository.clone(),
+            std::sync::Arc::new(FixedTokenSource),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect("测试用模型调用点必须可构造"),
+    )
 }

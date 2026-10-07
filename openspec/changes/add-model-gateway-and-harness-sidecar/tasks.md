@@ -58,12 +58,12 @@
 
 ## 6. 转换精彩分析链路
 
-- [ ] 6.1 把候选发现与全局评分两个阶段改为经统一调用点取同一冻结模型，验证两阶段使用同一冻结模型且运行指纹记录实际模型
-- [ ] 6.2 以既有测试作为等价性断言，验证分块策略、候选校验、评分归一化、阈值语义与电路熔断行为不变
-- [ ] 6.3 验证持久化与恢复不变：运行 ID、冻结 Skills 快照、分析指纹与阶段尝试代次语义保持不变
-- [ ] 6.4 验证已授权的智能成片自动启动路径仍校验任务授权、激活、模型、文本发送范围与批次代次
-- [ ] 6.5 新增测试：短期 token 过期或额度耗尽时停止运行并显示可区分原因，不把结果描述为 Provider 网络错误
-- [ ] 6.6 验证精彩分析结果结构、稳定句段 ID 引用与来源区间不受转换影响
+- [x] 6.1 把候选发现与全局评分两个阶段改为经统一调用点取同一冻结模型，验证两阶段使用同一冻结模型且运行指纹记录实际模型（`HighlightAgentProvider` 三个方法改收 `&ModelCallHandle`；运行开始 `freeze_for_run` 一次，候选发现与全局评分共用；测试 `candidate_discovery_and_ranking_share_one_frozen_model` 断言两阶段模型集合只有一个 `qwen-plus`、凭据是短期 token、运行记录 `model_id` 为实际冻结模型）
+- [x] 6.2 以既有测试作为等价性断言，验证分块策略、候选校验、评分归一化、阈值语义与电路熔断行为不变（`chunks_keep_source_file_boundaries_and_overlap`、`chunk_timeout_is_persisted_and_does_not_discard_later_batches`、`analysis_fingerprint_changes_when_result_policy_changes`、`top_scores_keep_reference_candidates_below_threshold`、`provider_score_scales_are_normalized_to_percentages`、`legacy_fractional_drafts_are_normalized_before_fallback_ranking`、`skill_selection_is_deterministic_and_unknown_labels_are_data_only` 全部通过）
+- [x] 6.3 验证持久化与恢复不变：运行 ID、冻结 Skills 快照、分析指纹与阶段尝试代次语义保持不变（运行 ID/`skills_snapshot`/`analysis_fingerprint` 字段与算法未改；**新增** `ModelCallRuntime::freeze_with_model` 让续跑按运行记录里的模型冻结，测试 `resume_uses_the_model_recorded_in_the_run_not_the_new_settings` 证明改设置后续跑不漂移）
+- [x] 6.4 验证已授权的智能成片自动启动路径仍校验任务授权、激活、模型、文本发送范围与批次代次（智能成片端到端测试保持通过：`create_local` 仍要求 `authorization_confirmed`，`prepare` 的授权确认文案与门禁未改，批次代次语义未触碰；迁移只替换了凭据来源）
+- [x] 6.5 新增测试：短期 token 过期或额度耗尽时停止运行并显示可区分原因，不把结果描述为 Provider 网络错误（新增 `credential_failure_is_distinguishable_and_refreshes_the_token_once`：首次凭据失败重取一次 token 后成功；来源完全拒绝时运行以 `Failed` 落库且 `last_error_code = highlight_authorization_failed`、文案不含“网络/Provider”，并且**一个付费调用都不发出**）
+- [x] 6.6 验证精彩分析结果结构、稳定句段 ID 引用与来源区间不受转换影响（`AiHighlightCandidate`/`AiHighlightRun` 结构与 `segment_ids`/来源区间字段未改；候选校验与稳定 ID 引用的既有测试全部通过）
 
 ## 7. 媒体生成受控工具
 
