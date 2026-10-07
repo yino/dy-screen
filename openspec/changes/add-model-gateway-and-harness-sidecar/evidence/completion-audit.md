@@ -87,3 +87,25 @@ tarball）、随包 Profile 与 Skill 文件、以及据此产生的三架构哈
   每一项的"缺什么"已在第二节列出，未做任何虚假勾选。
 - 资产就位后可直接解锁：1.x（清单已就绪）、3.x（加载器/注入防护已就绪）、11.x（CI 扩展是既有 workflow 的增量）、
   2.6/8.x（监管与门禁已就绪，只差真实运行时实测）。
+
+
+## 六、Harness 运行时资产落地更新（2026-10-07 二轮）
+
+原第二节 A/B/C 中的「随包资产缺失」已大幅收窄。落地内容：
+
+| 原阻塞项 | 现状 |
+| --- | --- |
+| 3.1 随包 Profile | ✅ `resources/harness-source/profile.json` + `HarnessProfile` 加载器（工具白名单校验） |
+| 3.4 五个精彩 Skill + 两个转场阶段纳入随包 | ✅ 7 个 `.skill.json`（转场 match/score 定义了 Skill 身份） |
+| 真实 Harness 程序 | ✅ `harness/main.mjs`（零 npm 依赖）+ 真实 Node 进程端到端工具循环 |
+| Node 22 LTS 运行时 | ✅ 锁 v22.22.2 + 三平台 SHA256 + 构建脚本 + 本机 arm64 端到端 |
+| 接入 Runtime Resource Pack | ✅ 清单生成器 + 接入文档 + 组件类型（1.2 已就绪）；三平台 bundle 打包+签名留 CI |
+| 步骤 3 任务 2.4（组合生成直连） | ✅ `UnifiedCallPointCompositionProvider` + `model.generate_text` 工具 |
+
+**剩余阻塞（真机/发布流程，逐条留证）**：
+- 11.1 / 11.2 / 11.3：Intel / Windows 真机侧 sidecar 验收（脚本已写好，留 CI 执行）
+- 1.3 / 1.4 / 11.11：三平台 bundle 重打包 + 哈希 + 签名 + 发布校验（生成器就绪，留 CI）
+- 2.6 / 11.8：8 GB 资源实测（需真实运行时 + 真机）
+- 3.2 / 3.3：真实 Harness 运行 Profile 被拒、忽略用户目录同名配置的**真机**测试（加载器就绪）
+- 8.x：取消 / 资源限制 / 迟到结果的编排接线（部分依赖真实运行时）
+- 真实 Wanx 提交 / 轮询 / 下载：留给步骤 4（add-generative-video-animation）
