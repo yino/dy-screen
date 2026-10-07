@@ -1,0 +1,14 @@
+{
+  "id": "effect-caption-compose",
+  "version": "1.0.0",
+  "tools": ["model.generate_text"],
+  "steps": [
+    {
+      "tool": "model.generate_text",
+      "params": {
+        "prompt": "${input.prompt}",
+        "maxTokens": "${input.maxTokens}"
+      }
+    }
+  ]
+}
