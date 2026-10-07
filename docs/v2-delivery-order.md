@@ -12,8 +12,8 @@
 | --- | --- | --- | --- |
 | 0 | 百炼能力探针 | `validate-dashscope-direct-capabilities` | **已完成（2026-09-30）**，结论见 §6 |
 | 1 | ASR 直连改造 | `wire-cloud-asr-upload-and-jobs` | ✅ 已满足：临时 token 可提交文件转写；音频上传须走三步直传流程（见 §6） |
-| 2 | Harness sidecar 与模型调用直连 | `add-model-gateway-and-harness-sidecar` | ✅ 已满足：临时 token 可完成 LLM 调用；仍需步骤 1 交付并可独立验收 |
-| 3 | 特效字幕 | `add-effect-caption-renderer` | **65/77 已实现并提交**；剩 12 项为结构性阻塞（随包渲染器/浏览器/字体资产 6、Intel/Windows 真机 5、步骤 2 依赖 1），逐条证据见 `openspec/changes/add-effect-caption-renderer/evidence/completion-audit.md` |
+| 2 | Harness sidecar 与模型调用直连 | `add-model-gateway-and-harness-sidecar` | **分片交付（2026-10-07 定案）**：S1 统一调用点（token 共享 + 运行级冻结 + 心跳解析 + 非生产配置编译期隔离）+ 三条链路迁移 → 解锁步骤 3 的 2.4；S2 sidecar 与 Profile/Skill；S3 媒体生成契约与发行验收。三平台验收改走 CI（`macos-15-intel` / `windows-2022`），不再等真机 |
+| 3 | 特效字幕 | `add-effect-caption-renderer` | **65/77 已实现并提交**；剩 12 项（随包渲染器/浏览器/字体资产 6、待接入 CI 的跨平台验收 4（10.5/12.4 与 12.2/12.3，已按 2026-10-07 定案改判为 CI 可执行）、步骤 2 依赖 2.4、双设备一致性 5.3），逐条证据见 `openspec/changes/add-effect-caption-renderer/evidence/completion-audit.md` |
 | 4 | 生成式动画 | `add-generative-video-animation` | ✅ 已满足：万相文生图与图生视频均实测 `SUCCEEDED`；仍需步骤 2 交付 |
 
 ### 已搁置
