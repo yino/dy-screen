@@ -371,6 +371,26 @@ function createApi(streamers: Streamer[] = [], videos: Video[] = []): ClientApi 
       updatedAt: "2026-07-27T00:00:00Z",
     }),
     saveAiLlmSettings: vi.fn().mockImplementation(async (settings) => settings),
+    getAiModelStatus: vi.fn().mockResolvedValue({
+      modelId: "qwen-plus",
+      modelSource: "build_default",
+      resolvedAt: "2026-10-07T00:00:00Z",
+      nextResolutionAt: "2026-10-07T00:01:30Z",
+      token: { cached: false, provider: null, expiresInSeconds: null },
+      keyConfigured: true,
+      callPath: "cloud_direct",
+      nonProductionConfig: false,
+    }),
+    reparseAiModelConfig: vi.fn().mockResolvedValue({
+      modelId: "qwen-max",
+      modelSource: "local_override",
+      resolvedAt: "2026-10-07T00:02:00Z",
+      nextResolutionAt: "2026-10-07T00:03:30Z",
+      token: { cached: false, provider: null, expiresInSeconds: null },
+      keyConfigured: true,
+      callPath: "cloud_direct",
+      nonProductionConfig: true,
+    }),
     clearAiLlmKey: vi.fn().mockResolvedValue(undefined),
     diagnoseAiLlmProvider: vi.fn().mockResolvedValue({ ok: true, category: "ready", message: "连接可用" }),
     requestAiInputPreview: vi.fn().mockRejectedValue("测试未配置 AI 视频预览"),
@@ -816,7 +836,7 @@ describe("App", () => {
     render(<App api={createApi()} />);
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
-    await screen.findByRole("heading", { name: "精彩与剪辑 Agent" });
+    await screen.findByRole("heading", { name: "当前模型与可用性" });
 
     const primaryColumn = screen.getByTestId("settings-column-primary");
     const secondaryColumn = screen.getByTestId("settings-column-secondary");
@@ -828,7 +848,7 @@ describe("App", () => {
     expect(within(secondaryColumn).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
       "运行环境",
       "客户端授权",
-      "精彩与剪辑 Agent",
+      "当前模型与可用性",
     ]);
   });
 
@@ -907,32 +927,77 @@ describe("App", () => {
     expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
   });
 
-  it("Provider 卡片保存会同步底部保存栏状态", async () => {
+  it("模型策略卡片保存会同步底部保存栏状态", async () => {
     const user = userEvent.setup();
     const api = createApi();
     render(<App api={api} />);
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
-    const modelId = await screen.findByLabelText("模型 ID");
+    const threshold = await screen.findByLabelText("合格片段阈值");
     const ordinarySave = screen.getByRole("button", { name: "保存设置" });
     expect(ordinarySave).toBeDisabled();
 
-    await user.clear(modelId);
-    await user.type(modelId, "deepseek-reasoner");
+    await user.clear(threshold);
+    await user.type(threshold, "60");
     expect(ordinarySave).toBeEnabled();
     expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("有未保存的更改");
-    await user.click(screen.getByRole("button", { name: "保存 Provider" }));
-    expect(api.saveAiLlmSettings).toHaveBeenCalledWith(expect.objectContaining({ modelId: "deepseek-reasoner" }), undefined);
+    await user.click(screen.getByRole("button", { name: "保存模型策略" }));
+    expect(api.saveAiLlmSettings).toHaveBeenCalledWith(expect.objectContaining({ qualifiedScore: 60 }), undefined);
     expect(api.saveSettings).not.toHaveBeenCalled();
     await waitFor(() => expect(ordinarySave).toBeDisabled());
     expect(screen.getByRole("status", { name: "设置保存状态" })).toHaveTextContent("所有更改均已保存");
 
     await user.click(screen.getByRole("button", { name: "测试连接" }));
     expect(api.diagnoseAiLlmProvider).toHaveBeenCalledTimes(1);
-    await user.click(screen.getByRole("button", { name: "清除 Key" }));
+    await user.click(screen.getByRole("button", { name: "清除旧 Key" }));
     expect(api.clearAiLlmKey).toHaveBeenCalledTimes(1);
     expect(api.saveSettings).not.toHaveBeenCalled();
     expect(ordinarySave).toBeDisabled();
+  });
+
+  it("设置页展示当前模型与解析来源，且不再提供 API Key 输入", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    expect(await screen.findByLabelText("当前模型")).toHaveTextContent("qwen-plus");
+    // 任务 9.1 / 9.6：设置页不再有凭据输入框，也不回填任何 Key 内容。
+    expect(screen.queryByLabelText(/API Key/)).toBeNull();
+    expect(screen.queryByLabelText("模型 ID")).toBeNull();
+    expect(api.getAiModelStatus).toHaveBeenCalled();
+  });
+
+  it("生产构建不显示「立即重新解析」入口", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    await screen.findByLabelText("当前模型");
+    // 默认 mock 的 nonProductionConfig = false → 不显示入口。
+    expect(screen.queryByRole("button", { name: "立即重新解析" })).toBeNull();
+  });
+
+  it("非生产构建显示「立即重新解析」并可触发", async () => {
+    const user = userEvent.setup();
+    const devApi = createApi();
+    devApi.getAiModelStatus = vi.fn().mockResolvedValue({
+      modelId: "qwen-plus",
+      modelSource: "build_default",
+      resolvedAt: "2026-10-07T00:00:00Z",
+      nextResolutionAt: "2026-10-07T00:01:30Z",
+      token: { cached: true, provider: "ALI", expiresInSeconds: 900 },
+      keyConfigured: false,
+      callPath: "cloud_direct",
+      nonProductionConfig: true,
+    });
+    render(<App api={devApi} />);
+    await user.click(await screen.findByRole("button", { name: "设置" }));
+    const reparse = await screen.findByRole("button", { name: "立即重新解析" });
+    await user.click(reparse);
+    expect(devApi.reparseAiModelConfig).toHaveBeenCalledTimes(1);
+    // 解析结果回填到界面（来源文案可读）。
+    expect(await screen.findByLabelText("当前模型")).toHaveTextContent("qwen-max");
   });
 
   it("底部保存设置可以单独保存 Provider 转场阈值", async () => {
@@ -1014,7 +1079,7 @@ describe("App", () => {
 
     await user.click(await screen.findByRole("button", { name: "设置" }));
     const threshold = await screen.findByLabelText("转场自动应用阈值");
-    const saveProvider = screen.getByRole("button", { name: "保存 Provider" });
+    const saveProvider = screen.getByRole("button", { name: "保存模型策略" });
 
     await user.clear(threshold);
     await user.type(threshold, "11");

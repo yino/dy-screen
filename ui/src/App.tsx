@@ -48,6 +48,7 @@ import type {
   CreateStreamerInput,
   Dashboard,
   EnvironmentStatus,
+  AiModelStatus,
   LlmProviderSettings,
   MonitorStatus,
   PreviewSnapshot,
@@ -1703,6 +1704,22 @@ function sameAppSettings(left: AppSettings, right: AppSettings): boolean {
     && left.autostartEnabled === right.autostartEnabled;
 }
 
+/** 解析来源的界面文案：让"为什么这次用了这个模型"一眼可读。 */
+function modelSourceLabel(source: string | null): string {
+  switch (source) {
+    case "build_default":
+      return "构建期默认";
+    case "heartbeat":
+      return "心跳边界解析";
+    case "local_override":
+      return "本机设置";
+    case "run_override":
+      return "单次运行覆盖";
+    default:
+      return "未知来源";
+  }
+}
+
 function sameLlmProviderSettings(left: LlmProviderSettings, right: LlmProviderSettings): boolean {
   return left.provider === right.provider
     && left.modelId === right.modelId
@@ -1735,15 +1752,12 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
   const [saveState, setSaveState] = useState<SettingsSaveState>("idle");
   const [llm, setLlm] = useState<LlmProviderSettings | null>(null);
   const [llmBaseline, setLlmBaseline] = useState<LlmProviderSettings | null>(null);
-  const [apiKey, setApiKey] = useState("");
+  const [modelStatus, setModelStatus] = useState<AiModelStatus | null>(null);
   const [llmMessage, setLlmMessage] = useState<string | null>(null);
-  const [llmBusy, setLlmBusy] = useState<"save" | "diagnose" | "clear" | null>(null);
+  const [llmBusy, setLlmBusy] = useState<"save" | "diagnose" | "clear" | "reparse" | null>(null);
   const ordinaryDirty = !sameAppSettings(form, baseline);
-  const providerDirty = Boolean(
-    llm
-      && llmBaseline
-      && (!sameLlmProviderSettings(llm, llmBaseline) || apiKey.trim()),
-  );
+  // 模型标识由统一调用点解析，界面不再可编辑；可保存的只有策略字段（超时与阈值）。
+  const providerDirty = Boolean(llm && llmBaseline && !sameLlmProviderSettings(llm, llmBaseline));
   const dirty = ordinaryDirty || providerDirty;
   const ordinaryDirtyRef = useRef(ordinaryDirty);
   ordinaryDirtyRef.current = ordinaryDirty;
@@ -1753,6 +1767,9 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
     if (!ordinaryDirtyRef.current) setForm(settings);
   }, [settings]);
   useEffect(() => {
+    void api.getAiModelStatus?.()
+      .then((status) => setModelStatus(status))
+      .catch(() => setModelStatus(null));
     void api.getAiLlmSettings?.()
       .then((loaded) => {
         setLlm(loaded);
@@ -1775,11 +1792,6 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
     if (saveState !== "saving") setSaveState("idle");
   };
 
-  const updateApiKey = (value: string) => {
-    setApiKey(value);
-    setLlmMessage(null);
-    if (saveState !== "saving") setSaveState("idle");
-  };
 
   const persistLlm = async (): Promise<boolean> => {
     if (!llm || !api.saveAiLlmSettings || llmBusy !== null) return false;
@@ -1793,14 +1805,13 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
     }
     setLlmBusy("save");
     try {
-      const saved = await api.saveAiLlmSettings(llm, apiKey.trim() || undefined);
+      const saved = await api.saveAiLlmSettings(llm, undefined);
       setLlm(saved);
       setLlmBaseline(saved);
-      setApiKey("");
-      setLlmMessage("DeepSeek 设置已保存，Key 只存入系统凭据库");
+      setLlmMessage("阈值与超时已保存；模型由客户端直连百炼解析，界面不管理凭据");
       return true;
     } catch (error) {
-      setLlmMessage(errorMessage(error, "无法保存 DeepSeek 设置"));
+      setLlmMessage(errorMessage(error, "无法保存模型策略设置"));
       return false;
     } finally {
       setLlmBusy(null);
@@ -1841,7 +1852,21 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
       const result = await api.diagnoseAiLlmProvider();
       setLlmMessage(result.ok ? `连接成功：${result.message}` : `连接失败：${result.message}`);
     } catch (error) {
-      setLlmMessage(errorMessage(error, "无法测试 DeepSeek 连接"));
+      setLlmMessage(errorMessage(error, "无法测试模型连接"));
+    } finally {
+      setLlmBusy(null);
+    }
+  };
+
+  const reparseModelConfig = async () => {
+    if (!modelStatus?.nonProductionConfig || !api.reparseAiModelConfig || llmBusy !== null) return;
+    setLlmBusy("reparse");
+    try {
+      const status = await api.reparseAiModelConfig();
+      setModelStatus(status);
+      setLlmMessage(`已重新解析：${status.modelId}（${modelSourceLabel(status.modelSource)}）`);
+    } catch (error) {
+      setLlmMessage(errorMessage(error, "无法重新解析模型配置"));
     } finally {
       setLlmBusy(null);
     }
@@ -1854,10 +1879,9 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
       await api.clearAiLlmKey();
       setLlm((current) => current ? { ...current, keyConfigured: false } : current);
       setLlmBaseline((current) => current ? { ...current, keyConfigured: false } : current);
-      setApiKey("");
-      setLlmMessage("Key 已从系统凭据库清除");
+      setLlmMessage("旧的 DeepSeek Key 已从系统凭据库清除");
     } catch (error) {
-      setLlmMessage(errorMessage(error, "无法清除 DeepSeek Key"));
+      setLlmMessage(errorMessage(error, "无法清除旧的 DeepSeek Key"));
     } finally {
       setLlmBusy(null);
     }
@@ -1963,11 +1987,33 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
           {llm && (
             <section className="panel settings-card provider-settings-card">
               <div className="panel-header">
-                <div><p className="section-kicker">DEEPSEEK</p><h2>精彩与剪辑 Agent</h2></div>
+                <div><p className="section-kicker">MODEL</p><h2>当前模型与可用性</h2></div>
                 <Sparkles size={21} />
               </div>
-              <label htmlFor="settings-llm-model">模型 ID<input id="settings-llm-model" value={llm.modelId} onChange={(event) => updateLlm({ modelId: event.target.value })} /></label>
-              <label htmlFor="settings-llm-key">API Key（留空表示不替换）<input id="settings-llm-key" type="password" autoComplete="off" value={apiKey} onChange={(event) => updateApiKey(event.target.value)} placeholder={llm.keyConfigured ? "已配置系统凭据" : "sk-..."} /></label>
+              <div className="access-session-summary">
+                <span aria-label="当前模型"><b>{modelStatus?.modelId ?? llm.modelId}</b></span>
+                <small>
+                  解析来源 {modelSourceLabel(modelStatus?.modelSource ?? llm.modelSource ?? null)}
+                  {" · "}调用路径 {modelStatus?.callPath ?? "cloud_direct"}
+                  {" · "}上次解析 {formatDate(modelStatus?.resolvedAt ?? llm.resolvedAt ?? null)}
+                  {" · "}下次解析 {formatDate(modelStatus?.nextResolutionAt ?? llm.nextResolutionAt ?? null)}
+                </small>
+                <small>
+                  短期 token{" "}
+                  {modelStatus?.token.cached
+                    ? `已就绪（${modelStatus.token.provider ?? "未知来源"}，剩余约 ${Math.max(0, modelStatus.token.expiresInSeconds ?? 0)} 秒）`
+                    : "尚未缓存，将在下一次调用时获取"}
+                </small>
+                <small>
+                  {activation?.active
+                    ? "客户端授权正常；账号未开通时会在运行时给出可区分原因，额度耗尽由上游错误判定（本地没有额度权威来源）"
+                    : "客户端尚未激活，AI 链路不可用；录制、浏览、预览与本地识别不受影响"}
+                </small>
+              </div>
+              <p className="settings-help">
+                模型调用由客户端持短期 token 直连百炼，界面不再要求输入上游 API Key；配置切换最长一个心跳周期（90 秒）生效，
+                进行中的运行使用开始前冻结的模型。
+              </p>
               <label htmlFor="settings-llm-timeout">请求超时（毫秒）<input id="settings-llm-timeout" type="number" min="1000" max="120000" value={llm.timeoutMs} onChange={(event) => updateLlm({ timeoutMs: Number(event.target.value) })} /></label>
               <div className="form-grid">
                 <label htmlFor="settings-qualified-score">合格片段阈值<input id="settings-qualified-score" aria-label="合格片段阈值" type="number" min="0" max="100" value={llm.qualifiedScore} onChange={(event) => updateLlm({ qualifiedScore: Number(event.target.value) })} /></label>
@@ -1976,12 +2022,21 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
               <p className="settings-help">达到合格阈值的片段会显示在精彩候选；达到优秀阈值的片段会在首次分析完成时自动选中。每次精彩分析会冻结当时的阈值。</p>
               <label htmlFor="settings-transition-auto-score">转场自动应用阈值（0–10 分）<input id="settings-transition-auto-score" aria-label="转场自动应用阈值" type="number" min="0" max="10" step="1" value={llm.transitionAutoApplyScore} onChange={(event) => updateLlm({ transitionAutoApplyScore: Number(event.target.value) })} /></label>
               <p className="settings-help">一键 Agent 会先匹配场景、再独立评分；总分达到该阈值才自动应用。每次运行会冻结当时的阈值，默认 8 分。</p>
-              <div className="llm-key-status">{llm.keyConfigured ? "已配置系统凭据，界面不会读取 Key" : "尚未配置 Key"}</div>
+              <div className="llm-key-status">
+                {llm.keyConfigured
+                  ? "旧的 DeepSeek Key 仍保存在系统凭据库中，但已不再被任何链路使用（可在下方清除）"
+                  : "未保存旧的上游 Key（当前版本不需要）"}
+              </div>
               {llmMessage && <p className="form-error provider-message" role="status" aria-live="polite">{llmMessage}</p>}
               <div className="settings-inline-actions">
-                <button type="button" className="secondary-button compact" disabled={!providerDirty || llmBusy !== null || saveState === "saving"} onClick={() => void saveLlm()}>{llmBusy === "save" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{llmBusy === "save" ? "正在保存" : "保存 Provider"}</button>
-                <button type="button" className="secondary-button compact" disabled={!llm.keyConfigured || llmBusy !== null} onClick={() => void diagnoseLlm()}>{llmBusy === "diagnose" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}{llmBusy === "diagnose" ? "正在测试" : "测试连接"}</button>
-                <button type="button" className="ghost-button compact" disabled={!llm.keyConfigured || llmBusy !== null} onClick={() => void clearLlmKey()}>{llmBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{llmBusy === "clear" ? "正在清除" : "清除 Key"}</button>
+                <button type="button" className="secondary-button compact" disabled={!providerDirty || llmBusy !== null || saveState === "saving"} onClick={() => void saveLlm()}>{llmBusy === "save" ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{llmBusy === "save" ? "正在保存" : "保存模型策略"}</button>
+                <button type="button" className="secondary-button compact" disabled={llmBusy !== null} onClick={() => void diagnoseLlm()}>{llmBusy === "diagnose" ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}{llmBusy === "diagnose" ? "正在测试" : "测试连接"}</button>
+                {modelStatus?.nonProductionConfig && (
+                  <button type="button" className="ghost-button compact" disabled={llmBusy !== null} onClick={() => void reparseModelConfig()}>{llmBusy === "reparse" ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{llmBusy === "reparse" ? "正在解析" : "立即重新解析"}</button>
+                )}
+                {llm.keyConfigured && (
+                  <button type="button" className="ghost-button compact" disabled={llmBusy !== null} onClick={() => void clearLlmKey()}>{llmBusy === "clear" ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{llmBusy === "clear" ? "正在清除" : "清除旧 Key"}</button>
+                )}
               </div>
               <p className="settings-help settings-help-last">测试只发送固定诊断提示；分析时仅发送规范化转写与标签，不发送视频、音频、本地路径或 Cookie。</p>
             </section>

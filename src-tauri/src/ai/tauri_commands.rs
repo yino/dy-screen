@@ -503,6 +503,13 @@ pub(crate) fn ai_get_model_status(
 }
 
 #[tauri::command]
+pub(crate) fn ai_reparse_model_config(
+    state: State<'_, AiDesktopState>,
+) -> Result<AiModelStatusView, AiCommandError> {
+    state.commands.reparse_model_config()
+}
+
+#[tauri::command]
 pub(crate) fn ai_save_llm_settings(
     settings: LlmProviderSettings,
     api_key: Option<String>,

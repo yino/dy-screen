@@ -634,15 +634,41 @@ export interface AiSmartReplaySessionPage {
 }
 
 export interface LlmProviderSettings {
-  provider: "deepseek";
+  /** 兼容列：调用路径由统一调用点决定，界面不再依赖该字段。 */
+  provider: string;
   modelId: string;
   timeoutMs: number;
   promptVersion: string;
   qualifiedScore: number;
   excellentScore: number;
   transitionAutoApplyScore: number;
+  /** 旧上游凭据是否仍存在（保留但不再使用）。 */
   keyConfigured: boolean;
   updatedAt: string | null;
+  /** 当前取值的解析来源（build_default / heartbeat / local_override / run_override）。 */
+  modelSource?: string | null;
+  resolvedAt?: string | null;
+  nextResolutionAt?: string | null;
+}
+
+/** 短期 token 的只读状态：不含 token 本体。 */
+export interface TokenStatus {
+  cached: boolean;
+  provider: string | null;
+  expiresInSeconds: number | null;
+}
+
+/** 设置页的「当前模型与可用性」视图。 */
+export interface AiModelStatus {
+  modelId: string;
+  modelSource: string | null;
+  resolvedAt: string | null;
+  nextResolutionAt: string | null;
+  token: TokenStatus;
+  keyConfigured: boolean;
+  callPath: string;
+  /** 是否非生产构建；界面据此决定是否显示「立即重新解析」。 */
+  nonProductionConfig: boolean;
 }
 
 export type AiHighlightRunStatus = "pending" | "running" | "candidates" | "ranking" | "completed" | "partial" | "cancelled" | "failed";
@@ -1103,6 +1129,8 @@ export interface ClientApi {
   exportAiJson(projectId: number): Promise<AiExportResult>;
   diagnoseAiEnvironment(): Promise<AiEnvironmentDiagnostic>;
   getAiLlmSettings?(): Promise<LlmProviderSettings>;
+  getAiModelStatus?(): Promise<AiModelStatus>;
+  reparseAiModelConfig?(): Promise<AiModelStatus>;
   saveAiLlmSettings?(settings: LlmProviderSettings, apiKey?: string): Promise<LlmProviderSettings>;
   clearAiLlmKey?(): Promise<void>;
   diagnoseAiLlmProvider?(): Promise<ProviderDiagnostic>;

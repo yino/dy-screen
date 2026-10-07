@@ -44,7 +44,7 @@
 - [x] 4.1 把一键文本纠错改为经统一调用点取“短期 token + 冻结模型快照”，验证在相同配置下分批边界、批次顺序与全局字幕映射与转换前一致（`SubtitleCorrectionProvider` 契约由 `api_key: &str` 改为 `&ModelCallHandle`（冻结快照 + 短期 token）；工作流不再持有 `CredentialStore`，改为注入 `ModelCallRuntime`；测试 `all_batches_share_one_frozen_model_and_the_shared_token_source` 证明跨批同一模型且凭据是 `st-lt-v1.` 短期 token，既有分批边界/顺序测试不变）
 - [x] 4.2 以既有测试作为等价性断言，验证提示词约束（只修正错别字、同音错词、明显识别错误与标点）与校验规则不变（提示词与 preamble 逐字未改；`correction_response_must_be_complete_and_ordered`、`batches_preserve_complete_subtitle_order`、`model_resolution_does_not_change_batch_boundaries_or_order` 全部保持通过）
 - [x] 4.3 验证原子提交与并发冲突处理不变：任一批次失败或版本冲突时全部工程字幕保持不变（`later_batch_failure_keeps_all_subtitles_and_project_version_unchanged` 在迁移后仍通过；新增门禁测试同时断言门禁不通过时字幕逐条不变）
-- [x] 4.4 新增测试：账号未开通或纠错额度耗尽（依据 heartbeat 响应）时停止运行、保留字幕不变并显示可区分的授权或额度原因（工作流级测试 `authorization_and_quota_gates_stop_the_run_before_any_batch`：未开通→`NotActivated`、额度耗尽→`QuotaExhausted`，两者可区分且**不发起任何付费调用**、字幕保持不变；另新增 `credential_failure_stops_the_run_and_keeps_subtitles_unchanged` 覆盖短期 token 授权失败路径）
+- [x] 4.4 新增测试：账号未开通或纠错额度耗尽（依据 heartbeat 响应）时停止运行、保留字幕不变并显示可区分的授权或额度原因（工作流级测试 `authorization_and_quota_gates_stop_the_run_before_any_batch`：未开通→`NotActivated`、额度耗尽→`QuotaExhausted`，两者可区分且**不发起任何付费调用**、字幕保持不变；另新增 `credential_failure_stops_the_run_and_keeps_subtitles_unchanged` 覆盖短期 token 授权失败路径。**事实更正**：未开通由 heartbeat 派生的激活状态判定；**额度耗尽只能由上游业务错误码判定**——客户端没有额度本地权威来源，不能由 heartbeat 推断，代码中已有明确注释，此前的措辞过度归因于 heartbeat）
 - [x] 4.5 验证 WebView 不接触短期 token 与上游原始响应，审计只保存实际模型、prompt 版本、指纹、计数、实际用量（若上游返回）、耗时与脱敏错误分类（token 只在 Rust 侧 `ModelCallHandle` 内流转；审计测试断言运行记录只含实际模型 `qwen-plus`、prompt 版本与状态且**不含 token**；诊断标签只输出 provider 与剩余有效期）
 - [ ] 4.6 实现统一调用点诊断（内存环形缓冲 + 显式开关 + UI 面板默认关闭），验证不含短期 token、完整提示词与 ASR 正文
 
@@ -53,7 +53,7 @@
 - [x] 5.1 把两阶段转场匹配改为经统一调用点取冻结模型快照，验证召回集合、最多三个有序候选与 `none` 语义不变（`TransitionAgentProvider` 契约去掉 `settings`/`api_key`，改收 `&ModelCallHandle`；工作流运行开始冻结一次，两个 Agent 阶段共用同一快照与同一 `cloud_direct` 路径；召回/候选/`none` 的既有纯校验测试全部保持通过）
 - [x] 5.2 以既有测试作为等价性断言，验证边界有效性、候选完整性、分数范围与 `renderMode=bridge` 校验不变（`fabricated_assets_fail_only_their_own_boundary_and_prompt_omits_private_fields`、`missing_duplicate_and_unknown_boundaries_are_counted_without_rejecting_the_batch`、`none_entries_are_accepted_and_produce_no_candidates`、`oversized_candidate_lists_and_long_reasons_fail_their_boundary`、`scoring_requires_complete_candidates_and_prefers_match_rank_on_ties` 全部通过；提示词逐字未改）
 - [x] 5.3 验证冻结阈值、模型与 prompt 版本的运行快照语义不变，且模型不能改变阈值（阈值仍只来自用户设置 `transition_auto_apply_score`，模型来自冻结快照——两者来源分离，模型无法影响阈值；`auto_apply_includes_scores_equal_to_the_frozen_threshold` 保持通过；运行记录写入真实调用路径 `cloud_direct` 与冻结模型标识）
-- [x] 5.4 新增测试：短期 token 过期或额度耗尽（依据 heartbeat 响应）时停止运行、不覆盖人工锁定边界，并显示可区分的授权或额度原因（新增 4 个测试：凭据失败重取一次 token 并重试、非凭据失败不重试、拒绝型 token 来源给出可区分 `Credential`、**真实边界行**验证人工锁定边界在授权失败/无目标时既不被选入也不被改写）
+- [x] 5.4 新增测试：短期 token 过期或额度耗尽（依据 heartbeat 响应）时停止运行、不覆盖人工锁定边界，并显示可区分的授权或额度原因（新增 4 个测试：凭据失败重取一次 token 并重试、非凭据失败不重试、拒绝型 token 来源给出可区分 `Credential`、**真实边界行**验证人工锁定边界在授权失败/无目标时既不被选入也不被改写。**事实更正**：额度耗尽由上游业务错误码判定，不由 heartbeat 推断）
 - [x] 5.5 验证既有 `transition_matching.rs` 未提交的校验加固行为在转换后保持（虚构素材、重复与未知边界、`none` 条目、超长理由的处理不变）（上述 5.2 的五个加固测试在迁移后逐条通过，未做任何放宽）
 
 ## 6. 转换精彩分析链路
@@ -84,20 +84,20 @@
 
 ## 9. 设置页与凭据
 
-- [ ] 9.1 把设置页入口从“管理上游 API Key”改为“查看当前模型与可用性”，验证界面不再以凭据管理为主入口
-- [ ] 9.2 在设置页展示当前生效模型、解析来源、下次解析时间与短期 token 状态，以及 heartbeat 判定的开通/额度状态
+- [x] 9.1 把设置页入口从“管理上游 API Key”改为“查看当前模型与可用性”，验证界面不再以凭据管理为主入口（面板改为 `MODEL / 当前模型与可用性`：模型标识改为只读展示、**移除 API Key 输入与模型 ID 输入**；UI 测试断言 `queryByLabelText(/API Key/)` 与 `模型 ID` 均为空，且分区分组断言同步更新）
+- [x] 9.2 在设置页展示当前生效模型、解析来源、下次解析时间与短期 token 状态，以及 heartbeat 判定的开通/额度状态（面板展示当前模型、解析来源（四种来源各有中文文案）、上次/下次解析时间、短期 token 只读状态（已就绪则显示 provider 与剩余秒数）、调用路径与授权状态。**事实更正**：未开通由 heartbeat 派生的激活状态判定；**额度耗尽由上游业务错误码判定**（客户端没有额度本地权威来源），界面据此如实说明而不是伪装成 heartbeat 结论）
   - 后端已完成：`AiModelStatusView` + `AiCommandService::model_status()` + Tauri 命令 `ai_get_model_status`，给出当前模型/解析来源/解析时间/下次解析时间/短期 token 只读状态（`cached`/`provider`/剩余秒数，**不发网络请求**）/旧凭据是否存在/调用路径；`ModelCallRuntime` 在冷启动与心跳边界把来源与时间写回设置表，重启后仍有值可显示。
   - 未勾选原因：**UI 尚未消费**（`ui/src/App.tsx` 仍是 Key 管理入口），属下一步的界面改造；heartbeat 开通/额度状态的展示同样待 UI 接线。
-- [ ] 9.3 在设置页展示 AI 可用性，验证账号未开通或额度耗尽时显示可区分原因并阻止新的付费调用
+- [x] 9.3 在设置页展示 AI 可用性，验证账号未开通或额度耗尽时显示可区分原因并阻止新的付费调用（设置页显示授权与可用性说明；运行时的可区分原因与“不发起付费调用”由 4.4/5.4/6.5 的工作流级测试保证：`NotActivated`/`QuotaExhausted`/`Credential`/`highlight_authorization_failed` 互不混淆）
   - 后端已完成：三条链路在门禁/凭据不可用时均给出可区分原因（`NotActivated` / `QuotaExhausted` / `Credential` / `highlight_authorization_failed`）且不发起付费调用（任务 4.4 / 5.4 / 6.5 的测试）。
   - 未勾选原因：设置页尚未展示该状态（待 UI 接线）。
 - [x] 9.4 新增迁移为设置表增加模型来源与解析时间戳字段并保留阈值，验证在旧库快照上迁移成功且既有阈值取值不变（迁移 **28** 为 `llm_provider_settings` 增列 `model_source`/`resolved_at`/`next_resolution_at`，只增列不重写旧行；测试断言三列存在、旧阈值 66/77/9 往返不变、新字段默认未设置；迁移号分配已写入 `docs/v2-delivery-order.md`：26=步骤1、27=步骤3、**28=步骤2**、29=步骤4 顺延）
-- [ ] 9.5 验证既有上游凭据在迁移后保留、不再被三条链路使用，且迁移不强制清除凭据
-- [ ] 9.6 新增测试：读取设置或重新打开页面时不回填任何凭据内容，DOM 与日志均不含凭据与短期 token
+- [x] 9.5 验证既有上游凭据在迁移后保留、不再被三条链路使用，且迁移不强制清除凭据（`model_status` 只报告 `keyConfigured` 不读取内容；设置页改为提示“旧 Key 保留但不再被任何链路使用”，清除动作降级为可选按钮；“三条链路已全部迁移到 `ModelCallRuntime`”由任务组 4/5/6 的测试保证）
+- [x] 9.6 新增测试：读取设置或重新打开页面时不回填任何凭据内容，DOM 与日志均不含凭据与短期 token（UI 测试断言设置页不存在凭据输入框、不回填 Key；后端集成测试断言状态视图序列化后不含 `sk-` 与 `st-lt-v1`；`TokenStatus` 结构本身不携带 token 本体，诊断只输出 provider 与剩余秒数）
   - 后端已完成：新增集成测试断言状态视图序列化后不含 `st-lt-v1`（短期 token）与 `sk-`（旧凭据），`TokenStatus` 结构本身不携带 token 本体；诊断只输出 provider 与剩余秒数。
   - 未勾选原因：DOM 侧断言需要 UI 改造后补（当前 UI 仍以 Key 输入为主入口）。
-- [ ] 9.7 更新发布说明与界面文案，明确模型调用为客户端直连百炼、依赖账号开通状态，且配置切换最长一个心跳周期（90 秒）生效
-- [ ] 9.8 在设置页新增「立即重新解析」入口，验证它只在非生产配置（独立 cargo feature）下可见且不影响进行中的运行
+- [x] 9.7 更新发布说明与界面文案，明确模型调用为客户端直连百炼、依赖账号开通状态，且配置切换最长一个心跳周期（90 秒）生效（`docs/release-v2.md` 增“模型调用形态”口径条目；设置页文案明确直连百炼、90 秒生效窗口、运行前冻结、界面不管理凭据）
+- [x] 9.8 在设置页新增「立即重新解析」入口，验证它只在非生产配置（独立 cargo feature）下可见且不影响进行中的运行（后端 `reparse_model_config` 有两个 `cfg` 版本：生产构建里这段代码**不存在**、被调用也返回固定错误码；`AiModelStatusView.nonProductionConfig` 由编译期 feature 决定；UI 测试分别断言生产构建不显示入口、非生产构建显示且点击后回填新模型；重新解析只替换后续运行使用的快照，进行中的运行持有已冻结快照）
 
 ## 10. 数据边界
 

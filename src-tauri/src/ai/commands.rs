@@ -203,6 +203,9 @@ pub struct AiModelStatusView {
     pub key_configured: bool,
     /// 调用路径，当前恒为 `cloud_direct`。
     pub call_path: String,
+    /// 是否为非生产构建（`non-prod-model-config` feature）。
+    /// 界面据此决定是否显示"立即重新解析"入口。
+    pub non_production_config: bool,
 }
 
 #[derive(Clone)]
@@ -299,7 +302,38 @@ impl AiCommandService {
             token,
             key_configured,
             call_path: crate::ai::ModelCallPath::CloudDirect.as_str().to_owned(),
+            non_production_config: cfg!(feature = "non-prod-model-config"),
         })
+    }
+
+    /// "立即重新解析"入口（任务 9.8）：**只在非生产构建里存在**。
+    ///
+    /// 两个 cfg 分支各自定义一次函数体：生产构建里这段代码根本不存在，
+    /// 而不是被一个运行期开关挡住。
+    #[cfg(feature = "non-prod-model-config")]
+    pub fn reparse_model_config(&self) -> Result<AiModelStatusView, AiCommandError> {
+        let Some(model_call) = self.model_call.as_ref() else {
+            return Err(AiCommandError::new(
+                "model_config_unavailable",
+                "统一调用点尚未就绪",
+                false,
+            ));
+        };
+        model_call
+            .on_heartbeat(chrono::Utc::now().timestamp_millis())
+            .map_err(|error| {
+                AiCommandError::new("model_config_unavailable", error.category_str(), true)
+            })?;
+        self.model_status()
+    }
+
+    #[cfg(not(feature = "non-prod-model-config"))]
+    pub fn reparse_model_config(&self) -> Result<AiModelStatusView, AiCommandError> {
+        Err(AiCommandError::new(
+            "model_config_not_available",
+            "生产构建不提供立即重新解析入口",
+            false,
+        ))
     }
 
     pub fn list_projects(&self) -> Result<Vec<AiProject>, AiCommandError> {
