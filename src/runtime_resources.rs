@@ -144,6 +144,8 @@ pub const RENDER_BROWSER_COMPONENT: &str = "render.browser";
 pub const RENDER_ENGINE_SCRIPT_COMPONENT: &str = "render.engine-script";
 pub const LOCKED_FONTS_COMPONENT: &str = "render.locked-fonts";
 pub const HARNESS_RUNTIME_COMPONENT: &str = "harness.runtime";
+pub const HARNESS_PROFILE_COMPONENT: &str = "harness.profile";
+pub const HARNESS_SKILL_COMPONENT: &str = "harness.skill";
 
 /// 增强能力需要的全部组件。
 pub const ENHANCEMENT_COMPONENTS: &[&str] = &[
@@ -152,6 +154,8 @@ pub const ENHANCEMENT_COMPONENTS: &[&str] = &[
     RENDER_ENGINE_SCRIPT_COMPONENT,
     LOCKED_FONTS_COMPONENT,
     HARNESS_RUNTIME_COMPONENT,
+    HARNESS_PROFILE_COMPONENT,
+    HARNESS_SKILL_COMPONENT,
 ];
 
 /// 单个组件的诊断结果（可独立诊断，任务 10.1）。
@@ -1315,6 +1319,16 @@ mod tests {
             "harness/runtime.js",
             b"harness",
         ));
+        manifest.components.push(enhancement(
+            HARNESS_PROFILE_COMPONENT,
+            "harness/profile.yaml",
+            b"profile",
+        ));
+        manifest.components.push(enhancement(
+            HARNESS_SKILL_COMPONENT,
+            "harness/skills/generic-hook.skill.json",
+            b"skill",
+        ));
         manifest
     }
 
@@ -1427,6 +1441,45 @@ mod tests {
             }
         }
         assert!(zero_size.validate().is_err());
+    }
+
+    /// 任务 1.2（步骤 2）：Harness 运行时、Profile 与 Skill 组件类型可独立诊断，
+    /// 缺失时增强能力不可用，且不误伤基础能力。
+    #[test]
+    fn harness_components_are_registered_and_independently_diagnosable() {
+        for id in [
+            HARNESS_RUNTIME_COMPONENT,
+            HARNESS_PROFILE_COMPONENT,
+            HARNESS_SKILL_COMPONENT,
+        ] {
+            assert!(
+                ENHANCEMENT_COMPONENTS.contains(&id),
+                "{id} 必须登记进增强组件集合"
+            );
+        }
+        let directory = tempdir().unwrap();
+        let full = manifest_with_enhancement(directory.path());
+        let snapshot = capability_snapshot(&full, directory.path());
+        for id in [
+            HARNESS_RUNTIME_COMPONENT,
+            HARNESS_PROFILE_COMPONENT,
+            HARNESS_SKILL_COMPONENT,
+        ] {
+            let diagnostic = snapshot
+                .components
+                .iter()
+                .find(|component| component.id == id)
+                .unwrap_or_else(|| panic!("缺少组件诊断 {id}"));
+            assert!(diagnostic.available, "{id} 应当可用");
+            assert_eq!(diagnostic.capability, RuntimeCapability::Enhancement);
+        }
+        assert!(snapshot.enhancement_available);
+
+        // 只含基础组件的旧清单：缺失 Harness 组件使增强不可用、基础照常。
+        let base = manifest(directory.path());
+        let base_snapshot = capability_snapshot(&base, directory.path());
+        assert!(base_snapshot.base_available);
+        assert!(!base_snapshot.enhancement_available);
     }
 
     #[test]

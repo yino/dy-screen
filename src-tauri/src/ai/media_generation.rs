@@ -8,8 +8,8 @@
 //! 决策十一：额度口径写进冻结配置——以 heartbeat 的开通/额度结论为总上限，本地再冻结
 //! 任务级上限（每次运行最多 4 张图、最多 5 秒视频、单次金额按模型单价折算上限）。
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

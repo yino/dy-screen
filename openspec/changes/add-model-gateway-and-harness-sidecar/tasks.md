@@ -14,8 +14,8 @@
 
 ## 1. 决策记录与运行资源扩展
 
-- [ ] 1.1 在本 change 的 `design.md` 中保留对两条已归档非目标决策的推翻记录（原决策、出处、理由、替代方案、代价），验证评审可据此追溯变更依据
-- [ ] 1.2 在运行资源清单中新增 Harness 运行时、Profile 与 Skill 组件类型，验证清单校验接受新类型并仍拒绝未声明组件
+- [x] 1.1 在本 change 的 `design.md` 中保留对两条已归档非目标决策的推翻记录（原决策、出处、理由、替代方案、代价），验证评审可据此追溯变更依据（`design.md`「决策零」完整覆盖：两条被推翻决策均点名出处（两个归档 change 目录）、推翻理由三条、替代方案两条、代价一条）
+- [x] 1.2 在运行资源清单中新增 Harness 运行时、Profile 与 Skill 组件类型，验证清单校验接受新类型并仍拒绝未声明组件（新增 `HARNESS_PROFILE_COMPONENT = harness.profile` 与 `HARNESS_SKILL_COMPONENT = harness.skill` 常量并登记进 `ENHANCEMENT_COMPONENTS`；`harness.runtime` 此前已在；测试断言三组件独立诊断、缺失时增强不可用且不误伤基础能力）
 - [ ] 1.3 把新组件加入发布校验的必需组件列表，验证缺失时构建失败；并验证 macOS arm64、macOS Intel x86_64 与 Windows x64 三个架构各自的产物都通过哈希与架构校验
 - [ ] 1.4 验证 staging 与完整性校验覆盖新组件的哈希、架构与相对路径，且符号链接被拒绝
 
