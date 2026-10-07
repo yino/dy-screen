@@ -20,6 +20,7 @@ mod harness;
 mod highlight;
 mod lifecycle;
 mod llm;
+mod media_generation;
 mod model_call;
 mod processor;
 mod projection;
@@ -141,6 +142,10 @@ pub use llm::{
     TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token, llm_call_diagnostics_enabled,
     llm_call_diagnostics_snapshot, resolve_model_call_with_heartbeat,
     set_llm_call_diagnostics_enabled,
+};
+pub use media_generation::{
+    MediaGenerationError, MediaGenerationKind, MediaGenerationRequest, MediaGenerationResult,
+    MediaGenerationTool, MediaQuota, MediaTaskStatus, MediaUpstream, StubMediaUpstream,
 };
 pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime, TokenStatus};
 pub use processor::{

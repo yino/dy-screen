@@ -79,3 +79,16 @@
 - 任务组 3 的 3.1–3.4（随包 Profile/Skill 资产本体）——3.5/3.6 已在本机完成
 - 任务组 8（取消/资源上限/迟到结果）部分依赖真实运行时的资源特征
 - 三平台协议与恢复验收（11.x）依赖 Node 22 LTS 三架构资产 + CI 扩展
+
+
+## S3 进度（媒体生成受控工具）
+
+已完成（资产无关）：
+- `ai/media_generation.rs`：结构化请求（deny_unknown_fields）、`MediaGenerationTool`（实现 `ToolExecutor`）、
+  `MediaQuota`（4 图 / 5 秒 / 400 分，单价折算并累计）、`MediaRunBudget`（累计预留）、
+  `StubMediaUpstream`（不触网、返回确定性 stub 任务 ID）、最大尝试次数校验
+- 7 个测试覆盖 7.1–7.7：结构互斥/时间范围/未知字段拒绝/额度（张数/秒数/金额/累计）/最大尝试/结果只含 taskId+status/桩不产生付费调用
+
+待办（阻塞项）：
+- 11.x 三平台协议与恢复验收：需扩展 CI（macos-15-intel / windows-2022）+ 真实 Harness 资产
+- 真实 Wanx 提交/轮询/下载：留给步骤 4（add-generative-video-animation）

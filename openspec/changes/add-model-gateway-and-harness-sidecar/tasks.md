@@ -67,13 +67,13 @@
 
 ## 7. 媒体生成受控工具
 
-- [ ] 7.1 实现图片与视频生成的结构化业务工具接口，验证返回值只包含业务任务 ID 与状态
-- [ ] 7.2 新增测试：请求包含任意 URL、本地路径、Provider 原始参数或滤镜与命令行片段时被拒绝且不产生付费调用
-- [ ] 7.3 实现 Rust 侧对时间范围、互斥类型与最大尝试次数的校验，验证非法请求被拒绝并记录脱敏原因
-- [ ] 7.4 新增测试：本地门禁（任务级动画数量、累计秒数与金额上限）拒绝时客户端停止提交，验证超限请求不会发出
-- [ ] 7.5 验证工具契约中不存在短期 token 与任意下载地址，且 Harness 无法绕过 Rust 直接调用生成接口
-- [ ] 7.6 只交付结构化契约 + Rust 侧门禁 + 桩实现，真实上游提交/轮询/下载留给 `add-generative-video-animation`，验证本 change 验收期间不产生付费调用
-- [ ] 7.7 把额度口径写进冻结配置：以 heartbeat 开通/额度结论为总上限，本地任务级上限为每次运行最多 4 张图、最多 5 秒视频、单次金额按模型单价折算上限，验证超限即不提交
+- [x] 7.1 实现图片与视频生成的结构化业务工具接口，验证返回值只包含业务任务 ID 与状态（`MediaGenerationTool`（实现 `ToolExecutor`）经 sidecar `tool.invoke` 暴露；`MediaGenerationResult` 只有 `taskId` + `status`，测试断言序列化不含 token/url/download/ak）
+- [x] 7.2 新增测试：请求包含任意 URL、本地路径、Provider 原始参数或滤镜与命令行片段时被拒绝且不产生付费调用（`MediaGenerationRequest` 带 `deny_unknown_fields`，`url`/`localPath`/`filter`/`cmdline` 等字段结构上不存在；四个样本逐一断言反序列化失败）
+- [x] 7.3 实现 Rust 侧对时间范围、互斥类型与最大尝试次数的校验，验证非法请求被拒绝并记录脱敏原因（`validate_request_shape`：图片/视频互斥、图片 1..=16 张、视频 1..=30000ms、提示词非空；`max_attempts` 计数超限即拒；错误码稳定且不含提示词正文）
+- [x] 7.4 新增测试：本地门禁（任务级动画数量、累计秒数与金额上限）拒绝时客户端停止提交，验证超限请求不会发出（`MediaRunBudget::try_reserve` 累计预留：图片张数、视频秒数、金额三者分别有可区分错误码；超限请求在 `submit` 之前被拒，桩提交计数不变）
+- [x] 7.5 验证工具契约中不存在短期 token 与任意下载地址，且 Harness 无法绕过 Rust 直接调用生成接口（**结构性成立**：`MediaUpstream` 是 Rust 侧 trait，sidecar 只能经 `tool.invoke → ToolExecutor::execute` 到达；`MediaGenerationResult` 不含 token/下载地址；token 只存在于统一调用点内存中）
+- [x] 7.6 只交付结构化契约 + Rust 侧门禁 + 桩实现，真实上游提交/轮询/下载留给 `add-generative-video-animation`，验证本 change 验收期间不产生付费调用（`StubMediaUpstream` 不触网、只返回确定性 `stub-*` 任务 ID；测试断言提交只递增本地计数）
+- [x] 7.7 把额度口径写进冻结配置：以 heartbeat 开通/额度结论为总上限，本地任务级上限为每次运行最多 4 张图、最多 5 秒视频、单次金额按模型单价折算上限，验证超限即不提交（`MediaQuota::default()` = 4 张图/5 秒视频/400 分金额上限，单价 20 分每图、50 分每秒视频；金额按单价折算并累计，超限测试通过）
 
 ## 8. 取消、资源限制与迟到结果
 
