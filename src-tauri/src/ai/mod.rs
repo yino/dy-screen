@@ -120,7 +120,7 @@ pub use llm::{
     DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider, FrozenModelCall,
     HighlightAgentProvider, HighlightCandidateDraft, HighlightCandidateScore, LlmError,
     LlmProviderSettings, LlmTokenLease, LlmTokenSource, MODEL_RESOLUTION_INTERVAL_MS,
-    MemoryCredentialStore, ModelCallHandle, ModelCallResolver, ModelCallSnapshot,
+    MemoryCredentialStore, ModelCallHandle, ModelCallPath, ModelCallResolver, ModelCallSnapshot,
     ModelResolutionInputs, PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput,
     RankingAgentRequest, ResolutionSource, RigDeepSeekProvider, SubtitleCorrectionItem,
     SubtitleCorrectionOutput, SubtitleCorrectionProvider, SubtitleCorrectionRequest,

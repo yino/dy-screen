@@ -9,9 +9,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::ai::{
-    AiRepository, CredentialStore, LlmError, LlmProviderSettings, TransitionAgentMatch,
-    TransitionAgentOutput, TransitionAgentProvider, TransitionAgentRequest, TransitionAgentScore,
-    TransitionScoreOutput, TransitionScoreRequest,
+    AiRepository, LlmError, TransitionAgentMatch, TransitionAgentOutput, TransitionAgentProvider,
+    TransitionAgentRequest, TransitionAgentScore, TransitionScoreOutput, TransitionScoreRequest,
 };
 use crate::clip_workflow::{
     ClipWorkflowProgress, ClipWorkflowPublisher, SilentClipWorkflowPublisher,
@@ -102,7 +101,8 @@ pub struct TransitionMatchingWorkflow {
     repository: TransitionMaterialRepository,
     ai_repository: AiRepository,
     provider: Arc<dyn TransitionAgentProvider>,
-    credentials: Arc<dyn CredentialStore>,
+    /// 统一调用点：模型与短期 token 都从这里取，链路自身不持有凭据。
+    model_call: Arc<crate::ai::ModelCallRuntime>,
     assets: TransitionMaterialAssetService,
     publisher: Arc<dyn ClipWorkflowPublisher>,
 }
@@ -112,14 +112,14 @@ impl TransitionMatchingWorkflow {
         repository: TransitionMaterialRepository,
         ai_repository: AiRepository,
         provider: Arc<dyn TransitionAgentProvider>,
-        credentials: Arc<dyn CredentialStore>,
+        model_call: Arc<crate::ai::ModelCallRuntime>,
         assets: TransitionMaterialAssetService,
     ) -> Self {
         Self {
             repository,
             ai_repository,
             provider,
-            credentials,
+            model_call,
             assets,
             publisher: Arc::new(SilentClipWorkflowPublisher),
         }
@@ -142,7 +142,16 @@ impl TransitionMatchingWorkflow {
             .map_err(|_| TransitionMatchingError::Repository)?
             .project
             .version;
-        let (settings, api_key) = self.provider_context()?;
+        // 统一调用点：运行开始前冻结模型（两个 Agent 阶段共用同一模型）；
+        // 阈值仍来自用户设置——模型无法改变阈值（任务 5.3）。
+        let settings = self
+            .ai_repository
+            .get_llm_provider_settings(true)
+            .map_err(|_| TransitionMatchingError::Repository)?;
+        let frozen = self
+            .model_call
+            .freeze_for_run()
+            .map_err(Self::map_llm_error)?;
         let threshold = settings.transition_auto_apply_score;
         let boundaries = self.repository.reconcile_boundaries(clip_project_id)?;
         let targets = boundaries
@@ -193,8 +202,8 @@ impl TransitionMatchingWorkflow {
         let run_id = self.repository.begin_match_run(
             clip_project_id,
             project_version,
-            "deepseek",
-            &settings.model_id,
+            crate::ai::ModelCallPath::CloudDirect.as_str(),
+            frozen.model_id(),
             TRANSITION_MATCH_PROMPT_VERSION,
             TRANSITION_SCORE_PROMPT_VERSION,
             threshold,
@@ -235,15 +244,24 @@ impl TransitionMatchingWorkflow {
                 )
             };
             let output = match self
-                .provider
-                .match_transitions(
-                    &settings,
-                    &api_key,
-                    TransitionAgentRequest { prompt },
+                .call_with_token_refresh(
+                    &frozen,
+                    |handle| {
+                        let prompt = prompt.clone();
+                        let cancellation = cancellation.clone();
+                        async move {
+                            self.provider
+                                .match_transitions(
+                                    &handle,
+                                    TransitionAgentRequest { prompt },
+                                    cancellation,
+                                )
+                                .await
+                        }
+                    },
                     cancellation.clone(),
                 )
                 .await
-                .map_err(TransitionMatchingError::from)
             {
                 Ok(output) => output,
                 Err(error) => {
@@ -342,17 +360,24 @@ impl TransitionMatchingWorkflow {
                 "逐个评价输入中的全部候选。每个候选都必须返回 0 到 10 的 totalScore、sceneScore、continuityScore、rhythmScore、materialScore 和不超过 {MAX_REASON_CHARS} 个字符的 reason；必须完整覆盖候选集合，不得新增、删除或替换素材。输入：{score_payload}"
             );
             let score_output = match self
-                .provider
-                .score_transitions(
-                    &settings,
-                    &api_key,
-                    TransitionScoreRequest {
-                        prompt: score_prompt,
+                .call_with_token_refresh(
+                    &frozen,
+                    |handle| {
+                        let prompt = score_prompt.clone();
+                        let cancellation = cancellation.clone();
+                        async move {
+                            self.provider
+                                .score_transitions(
+                                    &handle,
+                                    TransitionScoreRequest { prompt },
+                                    cancellation,
+                                )
+                                .await
+                        }
                     },
                     cancellation.clone(),
                 )
                 .await
-                .map_err(TransitionMatchingError::from)
             {
                 Ok(output) => output,
                 Err(error) => {
@@ -514,18 +539,51 @@ impl TransitionMatchingWorkflow {
         })
     }
 
-    fn provider_context(&self) -> Result<(LlmProviderSettings, String)> {
-        let api_key = self
-            .credentials
-            .get()
-            .map_err(|_| TransitionMatchingError::Credential)?
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(TransitionMatchingError::Credential)?;
-        let settings = self
-            .ai_repository
-            .get_llm_provider_settings(true)
-            .map_err(|_| TransitionMatchingError::Repository)?;
-        Ok((settings, api_key))
+    /// 把统一调用点的错误映射为可区分的转场错误。
+    fn map_llm_error(error: LlmError) -> TransitionMatchingError {
+        match error {
+            LlmError::Credential => TransitionMatchingError::Credential,
+            other => TransitionMatchingError::Llm(other),
+        }
+    }
+
+    /// 取当前可用的模型调用句柄（模型来自运行内冻结快照）。
+    async fn current_handle(
+        &self,
+        frozen: &crate::ai::FrozenModelCall,
+    ) -> Result<crate::ai::ModelCallHandle> {
+        let token = self
+            .model_call
+            .acquire_token(chrono::Utc::now().timestamp())
+            .await
+            .map_err(Self::map_llm_error)?;
+        Ok(crate::ai::ModelCallHandle {
+            frozen: frozen.clone(),
+            token,
+        })
+    }
+
+    /// 调用一次 Provider；凭据类失败时重取一次 token 并重试当前调用。
+    async fn call_with_token_refresh<T, F, Fut>(
+        &self,
+        frozen: &crate::ai::FrozenModelCall,
+        call: F,
+        cancellation: CancellationToken,
+    ) -> Result<T>
+    where
+        F: Fn(crate::ai::ModelCallHandle) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, LlmError>>,
+    {
+        let _ = cancellation;
+        let handle = self.current_handle(frozen).await?;
+        match call(handle).await {
+            Ok(value) => Ok(value),
+            Err(LlmError::Credential) => {
+                let refreshed = self.current_handle(frozen).await?;
+                call(refreshed).await.map_err(Self::map_llm_error)
+            }
+            Err(error) => Err(Self::map_llm_error(error)),
+        }
     }
 
     fn publish(
@@ -977,6 +1035,9 @@ fn score_meets_threshold(score: f64, threshold: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transition_assets::{MaterialAssetRegistry, TransitionMaterialCache};
+    use async_trait::async_trait;
+    use rusqlite::params;
 
     fn material(key: &str, title: &str, tags: &[&str], sort_order: i64) -> TransitionMaterial {
         TransitionMaterial {
@@ -1001,6 +1062,100 @@ mod tests {
             sort_order,
             is_current: true,
         }
+    }
+
+    /// 建一个含两个片段的工程，reconcile 后得到 1 个边界。
+    fn project_with_two_segments() -> crate::database::Database {
+        let database = crate::database::Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let connection = database.connection().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO ai_clip_projects(
+                       id, highlight_run_id, name, version, export_status, export_progress,
+                       created_at, updated_at
+                   ) VALUES(1, 1, '转场锁定测试', 1, 'idle', 0, ?1, ?1)"#,
+                ["2026-08-08T00:00:00Z"],
+            )
+            .unwrap();
+        // candidate_id 在工程内唯一，因此两个片段使用不同候选。
+        for (id, position, candidate, start, end) in [
+            (11_i64, 0_i64, 1_i64, 0_i64, 5_000_i64),
+            (12, 1, 2, 5_000, 10_000),
+        ] {
+            connection
+                .execute(
+                    r#"INSERT INTO ai_clip_segments(
+                           id, clip_project_id, candidate_id, input_id, position, title,
+                           source_start_ms, source_end_ms, created_at, updated_at
+                       ) VALUES(?1, 1, ?2, 1, ?3, '片段', ?4, ?5, ?6, ?6)"#,
+                    params![id, candidate, position, start, end, "2026-08-08T00:00:00Z"],
+                )
+                .unwrap();
+        }
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        drop(connection);
+        database
+    }
+
+    #[tokio::test]
+    async fn authorization_failure_never_overwrites_a_manually_locked_boundary() {
+        let database = project_with_two_segments();
+        let material_repository = TransitionMaterialRepository::new(database.clone());
+        let boundaries = material_repository.reconcile_boundaries(1).unwrap();
+        assert_eq!(boundaries.len(), 1, "两个片段之间应有一个边界");
+        let locked = material_repository
+            .set_boundary_lock(boundaries[0].id, true)
+            .unwrap();
+        assert!(locked.manually_locked, "边界必须被人工锁定");
+
+        let directory = tempfile::tempdir().unwrap();
+        let model_call = Arc::new(
+            crate::ai::ModelCallRuntime::bootstrap(
+                AiRepository::new(database.clone()),
+                Arc::new(RejectingTokenSource),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap(),
+        );
+        let assets = TransitionMaterialAssetService::new(
+            TransitionMaterialRepository::new(database.clone()),
+            TransitionMaterialCache::new(directory.path().join("transition-cache")).unwrap(),
+            CancellationToken::new(),
+            MaterialAssetRegistry::default(),
+        )
+        .unwrap();
+        let workflow = TransitionMatchingWorkflow::new(
+            TransitionMaterialRepository::new(database.clone()),
+            AiRepository::new(database.clone()),
+            Arc::new(NoopTransitionProvider),
+            model_call,
+            assets,
+        );
+        // 只有被人工锁定的边界 → 没有可匹配目标；无论如何都不得改动锁定边界。
+        let error = workflow
+            .match_boundaries(1, None, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TransitionMatchingError::NoBoundaries | TransitionMatchingError::Credential
+            ),
+            "锁定边界不得进入匹配目标：{error:?}"
+        );
+        let after = material_repository.boundary(locked.id).unwrap();
+        assert_eq!(
+            after.asset_key, None,
+            "授权失败/无目标时不得为锁定边界写入素材"
+        );
+        assert_eq!(after.selection_source, locked.selection_source);
+        assert!(after.manually_locked, "人工锁定标记必须保持");
     }
 
     #[test]
@@ -1227,6 +1382,199 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("invented"))
         );
+    }
+
+    // ---- 统一调用点迁移后的新语义（任务 5.1 / 5.3 / 5.4）----
+
+    /// 依次发放不同 token 的来源，用于证明"重取"确实发生。
+    struct RotatingTokenSource {
+        issued: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::ai::LlmTokenSource for RotatingTokenSource {
+        async fn fetch(&self) -> std::result::Result<crate::ai::LlmTokenLease, LlmError> {
+            let index = self
+                .issued
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::ai::LlmTokenLease {
+                token: format!("st-lt-v1.lease-{index}"),
+                expire_at: chrono::Utc::now().timestamp() + 3_600,
+                provider: "ALI".to_owned(),
+            })
+        }
+    }
+
+    /// 总是拒绝的来源，用于授权失败路径。
+    struct RejectingTokenSource;
+
+    #[async_trait]
+    impl crate::ai::LlmTokenSource for RejectingTokenSource {
+        async fn fetch(&self) -> std::result::Result<crate::ai::LlmTokenLease, LlmError> {
+            Err(LlmError::Credential)
+        }
+    }
+
+    struct NoopTransitionProvider;
+
+    #[async_trait]
+    impl TransitionAgentProvider for NoopTransitionProvider {
+        async fn match_transitions(
+            &self,
+            _call: &crate::ai::ModelCallHandle,
+            _request: TransitionAgentRequest,
+            _cancellation: CancellationToken,
+        ) -> std::result::Result<TransitionAgentOutput, LlmError> {
+            Ok(TransitionAgentOutput {
+                matches: Vec::new(),
+                token_usage: 0,
+            })
+        }
+
+        async fn score_transitions(
+            &self,
+            _call: &crate::ai::ModelCallHandle,
+            _request: TransitionScoreRequest,
+            _cancellation: CancellationToken,
+        ) -> std::result::Result<TransitionScoreOutput, LlmError> {
+            Ok(TransitionScoreOutput {
+                scores: Vec::new(),
+                token_usage: 0,
+            })
+        }
+    }
+
+    fn test_workflow(
+        token_source: Arc<dyn crate::ai::LlmTokenSource>,
+    ) -> (TransitionMatchingWorkflow, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = crate::database::Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let model_call = Arc::new(
+            crate::ai::ModelCallRuntime::bootstrap(
+                AiRepository::new(database.clone()),
+                token_source,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap(),
+        );
+        let assets = TransitionMaterialAssetService::new(
+            TransitionMaterialRepository::new(database.clone()),
+            TransitionMaterialCache::new(directory.path().join("transition-cache")).unwrap(),
+            CancellationToken::new(),
+            MaterialAssetRegistry::default(),
+        )
+        .unwrap();
+        let workflow = TransitionMatchingWorkflow::new(
+            TransitionMaterialRepository::new(database.clone()),
+            AiRepository::new(database),
+            Arc::new(NoopTransitionProvider),
+            model_call,
+            assets,
+        );
+        (workflow, directory)
+    }
+
+    #[test]
+    fn credential_errors_are_distinguishable_from_provider_errors() {
+        assert!(matches!(
+            TransitionMatchingWorkflow::map_llm_error(LlmError::Credential),
+            TransitionMatchingError::Credential
+        ));
+        assert!(matches!(
+            TransitionMatchingWorkflow::map_llm_error(LlmError::Temporary),
+            TransitionMatchingError::Llm(LlmError::Temporary)
+        ));
+        assert!(matches!(
+            TransitionMatchingWorkflow::map_llm_error(LlmError::Provider),
+            TransitionMatchingError::Llm(LlmError::Provider)
+        ));
+        // 授权原因不得被描述成 Provider 网络错误。
+        assert_ne!(
+            TransitionMatchingError::Credential.to_string(),
+            TransitionMatchingError::Llm(LlmError::Temporary).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_failure_refreshes_the_token_once_and_retries_the_call() {
+        let (workflow, _directory) = test_workflow(Arc::new(RotatingTokenSource {
+            issued: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let frozen = workflow.model_call.freeze_for_run().unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome: std::result::Result<(), TransitionMatchingError> = workflow
+            .call_with_token_refresh(
+                &frozen,
+                |handle| {
+                    let seen = &seen;
+                    let calls = &calls;
+                    async move {
+                        seen.lock().unwrap().push(handle.token.token.clone());
+                        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            return Err(LlmError::Credential);
+                        }
+                        Ok(())
+                    }
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        outcome.expect("重取 token 后必须成功");
+        let tokens = seen.lock().unwrap().clone();
+        assert_eq!(tokens.len(), 2, "凭据失败必须重取一次并重试");
+        assert_ne!(tokens[0], tokens[1], "重试必须使用重取后的新 token");
+        // 两个 Agent 阶段共用同一冻结模型：模型来自快照而不是各阶段现读设置。
+        assert_eq!(frozen.model_id(), "qwen-plus");
+    }
+
+    #[tokio::test]
+    async fn non_credential_failures_are_not_retried() {
+        let (workflow, _directory) = test_workflow(Arc::new(RotatingTokenSource {
+            issued: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let frozen = workflow.model_call.freeze_for_run().unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let outcome: std::result::Result<(), TransitionMatchingError> = workflow
+            .call_with_token_refresh(
+                &frozen,
+                |_handle| {
+                    let calls = &calls;
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(LlmError::Temporary)
+                    }
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            outcome.unwrap_err(),
+            TransitionMatchingError::Llm(LlmError::Temporary)
+        ));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "非凭据失败不得重试，避免把限流/网络错误掩盖成重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_token_source_surfaces_a_distinguishable_credential_error() {
+        let (workflow, _directory) = test_workflow(Arc::new(RejectingTokenSource));
+        let frozen = workflow.model_call.freeze_for_run().unwrap();
+        let outcome: std::result::Result<(), TransitionMatchingError> = workflow
+            .call_with_token_refresh(
+                &frozen,
+                |_handle| async move { Ok(()) },
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(
+            outcome.unwrap_err(),
+            TransitionMatchingError::Credential
+        ));
     }
 
     #[test]

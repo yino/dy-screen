@@ -2114,7 +2114,7 @@ pub fn run() {
                 TransitionMaterialRepository::new(database.clone()),
                 AiRepository::new(database.clone()),
                 Arc::new(RigDeepSeekProvider),
-                credential_store.clone(),
+                model_call.clone(),
                 transition_assets.clone(),
             )
             .with_publisher(clip_workflow_publisher.clone());

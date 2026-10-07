@@ -50,11 +50,11 @@
 
 ## 5. 转换转场匹配链路
 
-- [ ] 5.1 把两阶段转场匹配改为经统一调用点取冻结模型快照，验证召回集合、最多三个有序候选与 `none` 语义不变
-- [ ] 5.2 以既有测试作为等价性断言，验证边界有效性、候选完整性、分数范围与 `renderMode=bridge` 校验不变
-- [ ] 5.3 验证冻结阈值、模型与 prompt 版本的运行快照语义不变，且模型不能改变阈值
-- [ ] 5.4 新增测试：短期 token 过期或额度耗尽（依据 heartbeat 响应）时停止运行、不覆盖人工锁定边界，并显示可区分的授权或额度原因
-- [ ] 5.5 验证既有 `transition_matching.rs` 未提交的校验加固行为在转换后保持（虚构素材、重复与未知边界、`none` 条目、超长理由的处理不变）
+- [x] 5.1 把两阶段转场匹配改为经统一调用点取冻结模型快照，验证召回集合、最多三个有序候选与 `none` 语义不变（`TransitionAgentProvider` 契约去掉 `settings`/`api_key`，改收 `&ModelCallHandle`；工作流运行开始冻结一次，两个 Agent 阶段共用同一快照与同一 `cloud_direct` 路径；召回/候选/`none` 的既有纯校验测试全部保持通过）
+- [x] 5.2 以既有测试作为等价性断言，验证边界有效性、候选完整性、分数范围与 `renderMode=bridge` 校验不变（`fabricated_assets_fail_only_their_own_boundary_and_prompt_omits_private_fields`、`missing_duplicate_and_unknown_boundaries_are_counted_without_rejecting_the_batch`、`none_entries_are_accepted_and_produce_no_candidates`、`oversized_candidate_lists_and_long_reasons_fail_their_boundary`、`scoring_requires_complete_candidates_and_prefers_match_rank_on_ties` 全部通过；提示词逐字未改）
+- [x] 5.3 验证冻结阈值、模型与 prompt 版本的运行快照语义不变，且模型不能改变阈值（阈值仍只来自用户设置 `transition_auto_apply_score`，模型来自冻结快照——两者来源分离，模型无法影响阈值；`auto_apply_includes_scores_equal_to_the_frozen_threshold` 保持通过；运行记录写入真实调用路径 `cloud_direct` 与冻结模型标识）
+- [x] 5.4 新增测试：短期 token 过期或额度耗尽（依据 heartbeat 响应）时停止运行、不覆盖人工锁定边界，并显示可区分的授权或额度原因（新增 4 个测试：凭据失败重取一次 token 并重试、非凭据失败不重试、拒绝型 token 来源给出可区分 `Credential`、**真实边界行**验证人工锁定边界在授权失败/无目标时既不被选入也不被改写）
+- [x] 5.5 验证既有 `transition_matching.rs` 未提交的校验加固行为在转换后保持（虚构素材、重复与未知边界、`none` 条目、超长理由的处理不变）（上述 5.2 的五个加固测试在迁移后逐条通过，未做任何放宽）
 
 ## 6. 转换精彩分析链路
 

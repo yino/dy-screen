@@ -1183,18 +1183,17 @@ pub trait HighlightAgentProvider: Send + Sync {
 
 #[async_trait]
 pub trait TransitionAgentProvider: Send + Sync {
+    /// 迁移后只接受统一调用点给出的句柄（冻结模型 + 短期 token）。
     async fn match_transitions(
         &self,
-        settings: &LlmProviderSettings,
-        api_key: &str,
+        call: &ModelCallHandle,
         request: TransitionAgentRequest,
         cancellation: CancellationToken,
     ) -> Result<TransitionAgentOutput, LlmError>;
 
     async fn score_transitions(
         &self,
-        settings: &LlmProviderSettings,
-        api_key: &str,
+        call: &ModelCallHandle,
         request: TransitionScoreRequest,
         cancellation: CancellationToken,
     ) -> Result<TransitionScoreOutput, LlmError>;
@@ -1320,14 +1319,12 @@ impl HighlightAgentProvider for RigDeepSeekProvider {
 impl TransitionAgentProvider for RigDeepSeekProvider {
     async fn match_transitions(
         &self,
-        settings: &LlmProviderSettings,
-        api_key: &str,
+        call: &ModelCallHandle,
         request: TransitionAgentRequest,
         cancellation: CancellationToken,
     ) -> Result<TransitionAgentOutput, LlmError> {
-        self.extract_with_preamble(
-            settings,
-            api_key,
+        self.extract_with_handle(
+            call,
             &request.prompt,
             "你是受限的只读视频转场匹配 Agent。只能从输入候选中选择，不调用工具、不访问网络或文件，不生成渲染参数，只输出结构化结果。",
             cancellation,
@@ -1337,14 +1334,12 @@ impl TransitionAgentProvider for RigDeepSeekProvider {
 
     async fn score_transitions(
         &self,
-        settings: &LlmProviderSettings,
-        api_key: &str,
+        call: &ModelCallHandle,
         request: TransitionScoreRequest,
         cancellation: CancellationToken,
     ) -> Result<TransitionScoreOutput, LlmError> {
-        self.extract_with_preamble(
-            settings,
-            api_key,
+        self.extract_with_handle(
+            call,
             &request.prompt,
             "你是受限的只读视频转场评分 Agent。只能评价输入中已经匹配的候选，不调用工具、不访问网络或文件，不生成渲染参数，只输出结构化评分。",
             cancellation,

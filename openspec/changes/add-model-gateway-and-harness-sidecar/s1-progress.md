@@ -19,6 +19,7 @@
 | **真实 token 来源** `ActivationLlmTokenSource`：走既有激活凭据 + `GET client/ai/llm-ak`，**复用 `AiApi` 内部缓存**（与云 ASR 同一份） | `model_call.rs`；错误分类测试 `token_api_errors_map_to_distinguishable_categories` |
 | **端到端运行时** `ModelCallRuntime`：bootstrap 冷启动、`snapshot()`、`next_resolution_at_ms()`、`freeze_for_run()`、`on_heartbeat()`、`acquire_token()` | `ai/model_call.rs` 7 个测试（含两实例互不污染、来源报错不重取） |
 | **心跳边界接线**：`app.rs` 在 `HeartbeatOutcome::Active` 时调用 `on_heartbeat` 并发出 `model-call-event`（只含公开字段：modelId/source/changed/nextResolutionAtMs） | `app.rs` `spawn_activation_lifecycle` |
+| **转场匹配链路迁移完成**：`TransitionAgentProvider` 收 `&ModelCallHandle`；两阶段共用冻结快照；运行记录记 `cloud_direct` + 冻结模型；凭据失败重取一次重试；新增 5 个测试（含真实边界行的人工锁定保护） | `transition_matching.rs`；`tests/smart_workflow.rs` 5 处构造点迁移 |
 | **文本纠错链路迁移完成**：`SubtitleCorrectionProvider` 收 `&ModelCallHandle`；工作流注入 `ModelCallRuntime`；每批取 token + 凭据失败重取一次重试本批；门禁前置；`Credential`/`NotActivated`/`QuotaExhausted` 三者可区分 | `clip_text_correction.rs` 新增 6 个测试；`tests/smart_workflow.rs` 5 处构造点迁移 |
 | **启动降级**：模型调用点 bootstrap 失败**不阻断应用启动**，降级到构建期默认设置并只记录固定分类 | `app.rs`；日志 `bootstrap_fallback` / `bootstrap_fallback_persist_failed` |
 
@@ -32,7 +33,9 @@
 2. ~~迁移文本纠错链路（任务 4.1–4.5）~~ **已完成**：provider 契约改为 `&ModelCallHandle`；
    每批从统一调用点取 token（中途凭据失败重取一次并重试本批）；门禁在任何付费调用前拦下；
    审计不含 token。既有测试即等价性断言，另有 6 个新测试。
-3. **迁移转场匹配链路**（5.1–5.5）→ **迁移精彩分析链路**（6.1–6.6），按风险从低到高。
+3. ~~迁移转场匹配链路（5.1–5.5）~~ **已完成**：provider 契约改收 `&ModelCallHandle`；两阶段共用一份冻结快照；
+   运行记录改记真实调用路径 `cloud_direct` 与冻结模型；凭据失败重取一次并重试；人工锁定边界在失败路径下不被改写。
+   **下一步：迁移精彩分析链路（6.1–6.6）**，影响面最大（候选发现与全局评分必须同模型）。
 4. **设置页与迁移**（9.1–9.8）：主入口改为"查看当前模型与可用性"；迁移为设置表增加模型来源与解析时间戳字段
    （**注意迁移号**：27 已被步骤 3 占用，28 原计划归步骤 4 —— 实施前需先定号并在 `docs/v2-delivery-order.md` 同步）。
 5. **数据边界**（10.1–10.3）与 **调用点诊断**（4.6：内存环形缓冲 + 显式开关 + UI 面板默认关闭）。
@@ -41,6 +44,6 @@
 ## 已知遗留
 
 - `MAX_AGENT_TURNS` 已删除，但"Rust 侧整次调用的**预算上限**"尚未实现（任务 3.7 因此未勾选）。
-- 转场匹配与精彩分析仍收用户 `api_key`（`SubtitleCorrectionProvider` 已迁移，`HighlightAgentProvider` 与转场 provider 尚未迁移）。
+- 精彩分析仍收用户 `api_key`（`SubtitleCorrectionProvider` 与 `TransitionAgentProvider` 已迁移，`HighlightAgentProvider` 尚未迁移）。
 - `model-call-event` 已发出但设置页尚未消费（任务 9.2）。
 - 设置表尚未新增"模型来源/解析时间戳"字段（9.4 未做，涉及迁移号决策）。

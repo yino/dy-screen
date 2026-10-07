@@ -558,8 +558,7 @@ struct EmptyTransitionProvider;
 impl TransitionAgentProvider for EmptyTransitionProvider {
     async fn match_transitions(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         _request: TransitionAgentRequest,
         _cancellation: CancellationToken,
     ) -> Result<TransitionAgentOutput, LlmError> {
@@ -571,8 +570,7 @@ impl TransitionAgentProvider for EmptyTransitionProvider {
 
     async fn score_transitions(
         &self,
-        _settings: &dy_screen_app_lib::ai::LlmProviderSettings,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         _request: TransitionScoreRequest,
         _cancellation: CancellationToken,
     ) -> Result<TransitionScoreOutput, LlmError> {
@@ -1153,7 +1151,7 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
         TransitionMaterialRepository::new(database.clone()),
         repository.clone(),
         Arc::new(EmptyTransitionProvider),
-        credentials,
+        test_model_call(&database),
         assets,
     );
     let runner = Arc::new(RecordingEnhancementRunner::default());
@@ -1329,7 +1327,7 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         TransitionMaterialRepository::new(database.clone()),
         repository.clone(),
         Arc::new(EmptyTransitionProvider),
-        credentials,
+        test_model_call(&database),
         assets,
     );
     let events = Arc::new(EventCollector::default());
@@ -1547,7 +1545,7 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
         TransitionMaterialRepository::new(database.clone()),
         repository.clone(),
         Arc::new(EmptyTransitionProvider),
-        credentials,
+        test_model_call(&database),
         assets,
     );
     let workflow = SmartClippingWorkflow::new(
@@ -1827,7 +1825,7 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
         TransitionMaterialRepository::new(database.clone()),
         repository.clone(),
         Arc::new(EmptyTransitionProvider),
-        credentials,
+        test_model_call(&database),
         assets,
     );
     let workflow = SmartClippingWorkflow::new(
@@ -2015,7 +2013,7 @@ async fn run_live_workflow_end_to_end() {
         TransitionMaterialRepository::new(database.clone()),
         repository.clone(),
         Arc::new(EmptyTransitionProvider),
-        credentials,
+        test_model_call(&database),
         assets,
     );
     let workflow = SmartClippingWorkflow::new(
