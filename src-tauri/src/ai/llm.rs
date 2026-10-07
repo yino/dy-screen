@@ -11,7 +11,12 @@ use std::time::Duration;
 use std::process::Command;
 
 use async_trait::async_trait;
-use rig_core::{client::CompletionClient, extractor::ExtractionError, providers::deepseek};
+use rig_core::{
+    client::CompletionClient,
+    completion::{AssistantContent, CompletionError, CompletionModel},
+    extractor::ExtractionError,
+    providers::deepseek,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1582,6 +1587,152 @@ impl RigDeepSeekProvider {
                 Ok(response.data)
             }
         }
+    }
+}
+
+/// 一次非结构化文本补全的结果（决策十五 `model.generate_text` 的底层产物）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextCompletion {
+    pub text: String,
+    pub token_usage: Option<u64>,
+}
+
+/// 文本补全的注入缝：生产实现直连百炼，测试用假实现，避免真实网络。
+#[async_trait]
+pub trait TextCompleter: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn complete(
+        &self,
+        frozen: &FrozenModelCall,
+        token: &str,
+        prompt: &str,
+        preamble: &str,
+        max_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<TextCompletion, LlmError>;
+}
+
+/// 生产实现：rig 非结构化 completion，与 `extract_with_handle` 同一条调用点
+/// （冻结快照决定地址与模型，token 只用于鉴权，不进入提示词或日志）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RigTextCompleter;
+
+#[async_trait]
+impl TextCompleter for RigTextCompleter {
+    async fn complete(
+        &self,
+        frozen: &FrozenModelCall,
+        token: &str,
+        prompt: &str,
+        preamble: &str,
+        max_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<TextCompletion, LlmError> {
+        let snapshot = frozen.snapshot_ref();
+        let started = std::time::Instant::now();
+        if validate_key(token).is_err() {
+            let error = LlmError::Credential;
+            emit_llm_call_diagnostic(llm_call_diagnostic(snapshot, started, None, Some(&error)));
+            return Err(error);
+        }
+        let client = match deepseek::Client::builder()
+            .api_key(token)
+            .base_url(&snapshot.base_url)
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => {
+                let error = LlmError::Provider;
+                emit_llm_call_diagnostic(llm_call_diagnostic(
+                    snapshot,
+                    started,
+                    None,
+                    Some(&error),
+                ));
+                return Err(error);
+            }
+        };
+        let full_prompt = if preamble.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("{preamble}\n\n{prompt}")
+        };
+        let model = client.completion_model(&snapshot.model_id);
+        let request = model.completion_request(full_prompt).max_tokens(max_tokens);
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                let error = LlmError::Cancelled;
+                emit_llm_call_diagnostic(llm_call_diagnostic(
+                    snapshot,
+                    started,
+                    None,
+                    Some(&error),
+                ));
+                Err(error)
+            }
+            result = tokio::time::timeout(Duration::from_millis(snapshot.timeout_ms), request.send()) => {
+                match result {
+                    Ok(Ok(response)) => {
+                        let text = match response.choice.first() {
+                            AssistantContent::Text(text) => text.text,
+                            _ => {
+                                let error = LlmError::InvalidResponse;
+                                emit_llm_call_diagnostic(llm_call_diagnostic(
+                                    snapshot,
+                                    started,
+                                    None,
+                                    Some(&error),
+                                ));
+                                return Err(error);
+                            }
+                        };
+                        let token_usage = if response.usage.total_tokens > 0 {
+                            response.usage.total_tokens
+                        } else {
+                            response.usage.input_tokens.saturating_add(response.usage.output_tokens)
+                        };
+                        emit_llm_call_diagnostic(llm_call_diagnostic(
+                            snapshot,
+                            started,
+                            Some(token_usage),
+                            None,
+                        ));
+                        Ok(TextCompletion { text, token_usage: Some(token_usage) })
+                    }
+                    Ok(Err(error)) => {
+                        let mapped = map_completion_error(error);
+                        emit_llm_call_diagnostic(llm_call_diagnostic(
+                            snapshot,
+                            started,
+                            None,
+                            Some(&mapped),
+                        ));
+                        Err(mapped)
+                    }
+                    Err(_) => {
+                        let error = LlmError::Temporary;
+                        emit_llm_call_diagnostic(llm_call_diagnostic(
+                            snapshot,
+                            started,
+                            None,
+                            Some(&error),
+                        ));
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn map_completion_error(error: CompletionError) -> LlmError {
+    match error
+        .provider_response_status()
+        .map(|status| status.as_u16())
+    {
+        Some(401 | 403) => LlmError::Credential,
+        Some(408 | 409 | 425 | 429) | Some(500..=599) => LlmError::Temporary,
+        _ => LlmError::Provider,
     }
 }
 

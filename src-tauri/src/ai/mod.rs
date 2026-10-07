@@ -22,6 +22,7 @@ mod lifecycle;
 mod llm;
 mod media_generation;
 mod model_call;
+mod model_tool;
 mod processor;
 mod projection;
 mod repository;
@@ -135,12 +136,12 @@ pub use llm::{
     LlmTokenSource, MODEL_RESOLUTION_INTERVAL_MS, MemoryCredentialStore, ModelCallHandle,
     ModelCallPath, ModelCallResolver, ModelCallSnapshot, ModelResolutionInputs, PROMPT_VERSION,
     ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest, ResolutionSource,
-    RigDeepSeekProvider, SubtitleCorrectionItem, SubtitleCorrectionOutput,
+    RigDeepSeekProvider, RigTextCompleter, SubtitleCorrectionItem, SubtitleCorrectionOutput,
     SubtitleCorrectionProvider, SubtitleCorrectionRequest, SystemCredentialStore,
-    TOKEN_SAFETY_MARGIN_SECONDS, TransitionAgentCandidate, TransitionAgentMatch,
-    TransitionAgentOutput, TransitionAgentProvider, TransitionAgentRequest, TransitionAgentScore,
-    TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token, llm_call_diagnostics_enabled,
-    llm_call_diagnostics_snapshot, resolve_model_call_with_heartbeat,
+    TOKEN_SAFETY_MARGIN_SECONDS, TextCompleter, TextCompletion, TransitionAgentCandidate,
+    TransitionAgentMatch, TransitionAgentOutput, TransitionAgentProvider, TransitionAgentRequest,
+    TransitionAgentScore, TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token,
+    llm_call_diagnostics_enabled, llm_call_diagnostics_snapshot, resolve_model_call_with_heartbeat,
     set_llm_call_diagnostics_enabled,
 };
 pub use media_generation::{
@@ -148,6 +149,7 @@ pub use media_generation::{
     MediaGenerationTool, MediaQuota, MediaTaskStatus, MediaUpstream, StubMediaUpstream,
 };
 pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime, TokenStatus};
+pub use model_tool::UnifiedCallPointCompositionProvider;
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
 };
