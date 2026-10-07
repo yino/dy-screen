@@ -237,8 +237,8 @@ impl ModelCallRuntime {
     }
 
     /// 取一个仍有余量的短期 token（余量不足时重取一次）。
-    pub async fn acquire_token(&self, now_ms: i64) -> Result<LlmTokenLease, LlmError> {
-        acquire_llm_token(self.tokens.as_ref(), now_ms).await
+    pub async fn acquire_token(&self, now_unix_seconds: i64) -> Result<LlmTokenLease, LlmError> {
+        acquire_llm_token(self.tokens.as_ref(), now_unix_seconds).await
     }
 }
 

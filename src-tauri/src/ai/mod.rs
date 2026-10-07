@@ -149,7 +149,7 @@ pub use media_generation::{
     MediaGenerationTool, MediaQuota, MediaTaskStatus, MediaUpstream, StubMediaUpstream,
 };
 pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime, TokenStatus};
-pub use model_tool::UnifiedCallPointCompositionProvider;
+pub use model_tool::{ModelGenerateTextRequest, ModelTextTool, UnifiedCallPointCompositionProvider};
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
 };

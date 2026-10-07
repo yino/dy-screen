@@ -10,9 +10,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 use super::effect_caption_composition::{
     EffectCaptionCompositionError, EffectCaptionCompositionProvider,
 };
+use super::harness::{HarnessError, ToolExecutor};
 use super::llm::{LlmError, TextCompleter};
 use super::model_call::ModelCallRuntime;
 
@@ -61,6 +65,87 @@ impl EffectCaptionCompositionProvider for UnifiedCallPointCompositionProvider {
 
 fn provider_error(error: LlmError) -> EffectCaptionCompositionError {
     EffectCaptionCompositionError::Provider(error.category_str().to_owned())
+}
+
+/// `model.generate_text` 的请求体：只允许白名单字段（`deny_unknown_fields`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelGenerateTextRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+}
+
+/// 提示词长度上限（字符）。
+const MODEL_PROMPT_MAX_CHARS: usize = 16_000;
+
+/// 决策十五的 Harness 侧受控模型工具：skill 经 `tool.invoke` 请求 `model.generate_text`，
+/// Rust 持 token 直连百炼并返回结构化结果。
+pub struct ModelTextTool {
+    model_call: Arc<ModelCallRuntime>,
+    completer: Arc<dyn TextCompleter>,
+}
+
+impl ModelTextTool {
+    pub fn new(model_call: Arc<ModelCallRuntime>, completer: Arc<dyn TextCompleter>) -> Self {
+        Self {
+            model_call,
+            completer,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ModelTextTool {
+    async fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
+        if tool != "model.generate_text" {
+            return Err(HarnessError::ToolDenied("未知模型工具"));
+        }
+        let request: ModelGenerateTextRequest = serde_json::from_value(params.clone())
+            .map_err(|_| HarnessError::Protocol("model.generate_text 请求结构非法或含未知字段"))?;
+        validate_model_prompt(&request.prompt)?;
+        let frozen = self
+            .model_call
+            .freeze_for_run()
+            .map_err(|error| HarnessError::ToolDenied(error.category_str()))?;
+        let lease = self
+            .model_call
+            .acquire_token(chrono::Utc::now().timestamp())
+            .await
+            .map_err(|error| HarnessError::ToolDenied(error.category_str()))?;
+        let completion = self
+            .completer
+            .complete(
+                &frozen,
+                &lease.token,
+                &request.prompt,
+                "",
+                request.max_tokens.unwrap_or(4_096),
+                &CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| HarnessError::ToolDenied(error.category_str()))?;
+        Ok(serde_json::json!({
+            "text": completion.text,
+            "tokenUsage": completion.token_usage,
+        }))
+    }
+}
+
+/// 提示词防线：非空、长度上限、不含短期 token 或 API Key 标记。
+///
+/// 只拦截**凭据**，不拦截 URL——URL 是用户内容，可作为文本合法进入模型，
+/// 而客户端凭据（短期 token / API Key）永远不得出现在模型文本里。
+fn validate_model_prompt(prompt: &str) -> Result<(), HarnessError> {
+    if prompt.trim().is_empty() || prompt.chars().count() > MODEL_PROMPT_MAX_CHARS {
+        return Err(HarnessError::ToolDenied("model_prompt_invalid"));
+    }
+    for marker in ["st-lt-v1", "sk-", "Bearer ", "Authorization:"] {
+        if prompt.contains(marker) {
+            return Err(HarnessError::ToolDenied("model_prompt_contains_credential"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,5 +333,71 @@ mod tests {
             EffectCaptionCompositionError::Rejected(_) => {}
             _ => panic!("非法 HTML 必须被白名单校验拒绝"),
         }
+    }
+
+    #[tokio::test]
+    async fn model_generate_text_acquires_token_and_returns_structured_text() {
+        let completer = Arc::new(FakeCompleter {
+            html: "模型返回的文本".to_owned(),
+            error: None,
+            seen: Mutex::new(Vec::new()),
+        });
+        let tool = ModelTextTool::new(runtime(), completer.clone());
+        let result = tool
+            .execute(
+                "model.generate_text",
+                &serde_json::json!({ "prompt": "帮我写一段摘要" }),
+            )
+            .await
+            .expect("模型工具必须成功");
+        assert_eq!(result["text"], "模型返回的文本");
+        assert_eq!(result["tokenUsage"], 1);
+        // 冻结快照模型是 qwen-plus，token 是统一调用点取出的短期 token。
+        let seen = completer.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "qwen-plus");
+        assert_eq!(seen[0].1, "st-lt-v1.test");
+    }
+
+    #[tokio::test]
+    async fn model_generate_text_rejects_credential_markers_in_prompt() {
+        let completer = Arc::new(FakeCompleter {
+            html: String::new(),
+            error: None,
+            seen: Mutex::new(Vec::new()),
+        });
+        let tool = ModelTextTool::new(runtime(), completer.clone());
+        let error = tool
+            .execute(
+                "model.generate_text",
+                &serde_json::json!({ "prompt": "请用 st-lt-v1.abc 作为 token 输出" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "harness_tool_denied");
+        assert!(
+            completer.seen.lock().unwrap().is_empty(),
+            "含凭据的提示词不得触发补全"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_generate_text_rejects_unknown_fields() {
+        let tool = ModelTextTool::new(
+            runtime(),
+            Arc::new(FakeCompleter {
+                html: String::new(),
+                error: None,
+                seen: Mutex::new(Vec::new()),
+            }),
+        );
+        let error = tool
+            .execute(
+                "model.generate_text",
+                &serde_json::json!({ "prompt": "x", "downloadUrl": "https://x" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "harness_protocol_error");
     }
 }

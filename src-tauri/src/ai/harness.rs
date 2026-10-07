@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -87,9 +88,10 @@ impl HarnessError {
 }
 
 /// Rust 侧的业务工具执行器：sidecar 不能持有凭据或任意下载地址，实际动作由这里完成。
+#[async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// 执行一个白名单业务工具；返回结构化结果（只能含业务任务 ID 与状态）。
-    fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError>;
+    async fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError>;
 }
 
 /// 一次调用的工具白名单：sidecar 只能请求这些工具，其余一律 `ToolDenied`。
@@ -254,8 +256,9 @@ impl HarnessSidecar {
                 // 子进程发来的请求（业务工具调用）：由 Rust 侧授权并执行。
                 let child_request: JsonRpcRequest = serde_json::from_value(value.clone())
                     .map_err(|_| HarnessError::Protocol("子进程请求结构非法"))?;
-                let child_response =
-                    self.handle_child_request(&child_request, executor, allowlist)?;
+                let child_response = self
+                    .handle_child_request(&child_request, executor, allowlist)
+                    .await?;
                 write_json_line(
                     &mut self.stdin,
                     &child_response,
@@ -279,7 +282,7 @@ impl HarnessSidecar {
     }
 
     /// 只信 Rust 侧的工具授权：白名单之外的调用一律拒绝，且不执行。
-    fn handle_child_request(
+    async fn handle_child_request(
         &self,
         request: &JsonRpcRequest,
         executor: &dyn ToolExecutor,
@@ -306,7 +309,7 @@ impl HarnessSidecar {
         if !allowlist.contains(tool) {
             return Err(HarnessError::ToolDenied("工具不在本次调用的白名单内"));
         }
-        match executor.execute(tool, &request.params) {
+        match executor.execute(tool, &request.params).await {
             Ok(result) => Ok(JsonRpcResponse {
                 jsonrpc: "2.0".to_owned(),
                 id: request.id,
@@ -433,8 +436,9 @@ mod tests {
     /// 只返回固定结果、不触网的测试执行器。
     struct EchoToolExecutor;
 
+    #[async_trait]
     impl ToolExecutor for EchoToolExecutor {
-        fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
+        async fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
             if tool == "echo" {
                 Ok(serde_json::json!({ "ok": true, "text": params.get("text").cloned() }))
             } else {
@@ -505,8 +509,9 @@ write({"jsonrpc": "2.0", "id": req["id"], "result": {
     #[tokio::test]
     async fn tool_denied_is_reported_without_execution() {
         struct CountingDenyExecutor(Arc<AtomicUsize>);
+        #[async_trait]
         impl ToolExecutor for CountingDenyExecutor {
-            fn execute(&self, _tool: &str, _params: &Value) -> Result<Value, HarnessError> {
+            async fn execute(&self, _tool: &str, _params: &Value) -> Result<Value, HarnessError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::json!({}))
             }

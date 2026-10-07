@@ -11,6 +11,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -250,8 +251,9 @@ impl<U: MediaUpstream> MediaGenerationTool<U> {
     }
 }
 
+#[async_trait]
 impl<U: MediaUpstream> ToolExecutor for MediaGenerationTool<U> {
-    fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
+    async fn execute(&self, tool: &str, params: &Value) -> Result<Value, HarnessError> {
         if tool != "media.generate" {
             return Err(HarnessError::ToolDenied("未知媒体工具"));
         }
@@ -351,14 +353,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn successful_generation_returns_only_task_id_and_status() {
+    #[tokio::test]
+    async fn successful_generation_returns_only_task_id_and_status() {
         let tool = make_tool();
         let result = tool
             .execute(
                 "media.generate",
                 &serde_json::to_value(image_request(1)).unwrap(),
             )
+            .await
             .expect("生成必须成功");
         let result: MediaGenerationResult = serde_json::from_value(result).unwrap();
         assert!(result.task_id.starts_with("stub-image-"));
@@ -370,8 +373,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn quota_is_enforced_before_any_submission() {
+    #[tokio::test]
+    async fn quota_is_enforced_before_any_submission() {
         // 图片张数超限（一次 5 张 > 4）。
         let t = make_tool();
         let error = t
@@ -379,6 +382,7 @@ mod tests {
                 "media.generate",
                 &serde_json::to_value(image_request(5)).unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(error.code(), "harness_tool_denied");
         // 累计额度：先 2 张 + 再 3 张 = 5 张 > 4，第二次被拒。
@@ -387,12 +391,14 @@ mod tests {
             "media.generate",
             &serde_json::to_value(image_request(2)).unwrap(),
         )
+        .await
         .unwrap();
         let error = tool
             .execute(
                 "media.generate",
                 &serde_json::to_value(image_request(3)).unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(error.code(), "harness_tool_denied");
 
@@ -403,12 +409,13 @@ mod tests {
                 "media.generate",
                 &serde_json::to_value(video_request(6_000)).unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(error.code(), "harness_tool_denied");
     }
 
-    #[test]
-    fn amount_quota_is_enforced() {
+    #[tokio::test]
+    async fn amount_quota_is_enforced() {
         // 金额上限 400 分；5 秒视频 = 250 分，再来 4 张图 = 80 分，共 330 分 OK；
         // 再加 5 秒视频 = 250 分 → 580 > 400 被拒。
         let upstream = StubMediaUpstream::default();
@@ -417,46 +424,52 @@ mod tests {
             "media.generate",
             &serde_json::to_value(video_request(5_000)).unwrap(),
         )
+        .await
         .unwrap();
         tool.execute(
             "media.generate",
             &serde_json::to_value(image_request(4)).unwrap(),
         )
+        .await
         .unwrap();
         let error = tool
             .execute(
                 "media.generate",
                 &serde_json::to_value(video_request(5_000)).unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(error.code(), "harness_tool_denied");
     }
 
-    #[test]
-    fn max_attempts_are_enforced() {
+    #[tokio::test]
+    async fn max_attempts_are_enforced() {
         let upstream = StubMediaUpstream::default();
         let tool = MediaGenerationTool::new(upstream, MediaQuota::default()).with_max_attempts(2);
         tool.execute(
             "media.generate",
             &serde_json::to_value(image_request(1)).unwrap(),
         )
+        .await
         .unwrap();
         tool.execute(
             "media.generate",
             &serde_json::to_value(image_request(1)).unwrap(),
         )
+        .await
         .unwrap();
         let error = tool
             .execute(
                 "media.generate",
                 &serde_json::to_value(image_request(1)).unwrap(),
             )
+            .await
             .unwrap_err();
         assert_eq!(error.code(), "harness_tool_denied");
     }
 
-    #[test]
-    fn stub_upstream_produces_no_paid_calls() {
+    #[tokio::test]
+    async fn stub_upstream_produces_no_paid_calls() {
         // 桩实现只返回确定性任务 ID：`submit` 的调用计数只在真正提交时 +1，
         // 且 task_id 不含任何上游/下载信息。
         let upstream = StubMediaUpstream::default();
@@ -466,6 +479,7 @@ mod tests {
             "media.generate",
             &serde_json::to_value(image_request(1)).unwrap(),
         )
+        .await
         .unwrap();
         assert_eq!(
             tool.upstream.submissions.load(Ordering::SeqCst),
