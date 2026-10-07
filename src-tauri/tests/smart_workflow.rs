@@ -19,6 +19,32 @@ use dy_screen_app_lib::ai::{
     TrustedLocalFile,
 };
 use dy_screen_app_lib::ai::{AiEnvironmentCheckView, AiSmartWorkflowEvent};
+use dy_screen_app_lib::ai::{LlmTokenLease, LlmTokenSource, ModelCallHandle, ModelCallRuntime};
+
+/// 测试用固定短期 token 来源：不触网、有效期充足。
+struct FixedTokenSource;
+
+#[async_trait::async_trait]
+impl LlmTokenSource for FixedTokenSource {
+    async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
+        Ok(LlmTokenLease {
+            token: "st-lt-v1.test".to_owned(),
+            expire_at: chrono::Utc::now().timestamp() + 3_600,
+            provider: "ALI".to_owned(),
+        })
+    }
+}
+
+fn test_model_call(database: &Database) -> std::sync::Arc<ModelCallRuntime> {
+    std::sync::Arc::new(
+        ModelCallRuntime::bootstrap(
+            AiRepository::new(database.clone()),
+            std::sync::Arc::new(FixedTokenSource),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect("测试用模型调用点必须可构造"),
+    )
+}
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
 use dy_screen_app_lib::transition_assets::{
@@ -474,7 +500,7 @@ struct EchoCorrectionProvider;
 impl SubtitleCorrectionProvider for EchoCorrectionProvider {
     async fn correct_subtitles(
         &self,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         request: SubtitleCorrectionRequest,
         _cancellation: CancellationToken,
     ) -> Result<SubtitleCorrectionOutput, LlmError> {
@@ -503,7 +529,7 @@ struct FailOnceCorrectionProvider {
 impl SubtitleCorrectionProvider for FailOnceCorrectionProvider {
     async fn correct_subtitles(
         &self,
-        _api_key: &str,
+        _call: &ModelCallHandle,
         request: SubtitleCorrectionRequest,
         _cancellation: CancellationToken,
     ) -> Result<SubtitleCorrectionOutput, LlmError> {
@@ -1114,7 +1140,7 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
         Arc::new(EchoCorrectionProvider),
-        credentials.clone(),
+        test_model_call(&database),
     );
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
@@ -1290,7 +1316,7 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
         Arc::new(EchoCorrectionProvider),
-        credentials.clone(),
+        test_model_call(&database),
     );
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
@@ -1508,7 +1534,7 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
         correction_provider.clone(),
-        credentials.clone(),
+        test_model_call(&database),
     );
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
@@ -1788,7 +1814,7 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
         correction_provider.clone(),
-        credentials.clone(),
+        test_model_call(&database),
     );
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
@@ -1976,7 +2002,7 @@ async fn run_live_workflow_end_to_end() {
     let correction = ClipTextCorrectionWorkflow::new(
         repository.clone(),
         Arc::new(EchoCorrectionProvider),
-        credentials.clone(),
+        test_model_call(&database),
     );
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),

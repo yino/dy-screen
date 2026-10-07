@@ -13,8 +13,8 @@ use crate::clip_workflow::{
 
 use super::{
     AiRepository, AiRepositoryError, ClipTextCorrectionSummary, ClipTextCorrectionTarget,
-    ClipTextCorrectionUpdate, CredentialStore, LlmError, SubtitleCorrectionOutput,
-    SubtitleCorrectionProvider, SubtitleCorrectionRequest,
+    ClipTextCorrectionUpdate, LlmError, SubtitleCorrectionOutput, SubtitleCorrectionProvider,
+    SubtitleCorrectionRequest,
 };
 
 pub const CLIP_TEXT_CORRECTION_PROMPT_VERSION: &str = "clip-text-correction-v1";
@@ -24,7 +24,7 @@ const MAX_BATCH_CHARS: usize = 6_000;
 pub enum ClipTextCorrectionError {
     #[error("当前工程没有可一键纠错的字幕")]
     NoEligibleSubtitles,
-    #[error("DeepSeek Key 尚未配置")]
+    #[error("AI 授权不可用，请重新激活后重试")]
     Credential,
     #[error("当前账号未开通 AI 服务，请开通后重试")]
     NotActivated,
@@ -132,7 +132,8 @@ pub fn evaluate_correction_gate(
 pub struct ClipTextCorrectionWorkflow {
     repository: AiRepository,
     provider: Arc<dyn SubtitleCorrectionProvider>,
-    credentials: Arc<dyn CredentialStore>,
+    /// 统一调用点：模型与短期 token 都从这里取，链路自身不再持有任何凭据。
+    model_call: Arc<crate::ai::ModelCallRuntime>,
     publisher: Arc<dyn ClipWorkflowPublisher>,
     gate: Arc<dyn ClipCorrectionGate>,
 }
@@ -141,14 +142,73 @@ impl ClipTextCorrectionWorkflow {
     pub fn new(
         repository: AiRepository,
         provider: Arc<dyn SubtitleCorrectionProvider>,
-        credentials: Arc<dyn CredentialStore>,
+        model_call: Arc<crate::ai::ModelCallRuntime>,
     ) -> Self {
         Self {
             repository,
             provider,
-            credentials,
+            model_call,
             publisher: Arc::new(SilentClipWorkflowPublisher),
             gate: Arc::new(PermissiveCorrectionGate),
+        }
+    }
+
+    /// 把统一调用点的错误映射为可区分的纠错错误：凭据类必须与额度/网络类分开。
+    fn map_llm_error(error: LlmError) -> ClipTextCorrectionError {
+        match error {
+            LlmError::Credential => ClipTextCorrectionError::Credential,
+            other => ClipTextCorrectionError::Llm(other),
+        }
+    }
+
+    /// 取当前可用的模型调用句柄：模型来自运行内冻结快照，凭据来自统一调用点。
+    async fn current_handle(
+        &self,
+        frozen: &crate::ai::FrozenModelCall,
+    ) -> std::result::Result<crate::ai::ModelCallHandle, ClipTextCorrectionError> {
+        let token = self
+            .model_call
+            .acquire_token(chrono::Utc::now().timestamp())
+            .await
+            .map_err(Self::map_llm_error)?;
+        Ok(crate::ai::ModelCallHandle {
+            frozen: frozen.clone(),
+            token,
+        })
+    }
+
+    /// 调用一次 Provider；若原因是**短期 token 不可用**，重取一次并重试当前批次。
+    ///
+    /// 只对凭据类失败重试：其它失败（限流、结构非法、网络）由上层按既有语义处理，
+    /// 不得因为"重试"把真实错误吞掉。
+    async fn call_provider_with_token_refresh(
+        &self,
+        frozen: &crate::ai::FrozenModelCall,
+        prompt: String,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<SubtitleCorrectionOutput, ClipTextCorrectionError> {
+        let handle = self.current_handle(frozen).await?;
+        let request = SubtitleCorrectionRequest {
+            prompt: prompt.clone(),
+        };
+        match self
+            .provider
+            .correct_subtitles(&handle, request, cancellation.clone())
+            .await
+        {
+            Ok(output) => Ok(output),
+            Err(LlmError::Credential) => {
+                let refreshed = self.current_handle(frozen).await?;
+                self.provider
+                    .correct_subtitles(
+                        &refreshed,
+                        SubtitleCorrectionRequest { prompt },
+                        cancellation,
+                    )
+                    .await
+                    .map_err(Self::map_llm_error)
+            }
+            Err(error) => Err(Self::map_llm_error(error)),
         }
     }
 
@@ -217,21 +277,15 @@ impl ClipTextCorrectionWorkflow {
         if plan.targets.is_empty() {
             return Err(ClipTextCorrectionError::NoEligibleSubtitles);
         }
-        let settings = self.repository.get_llm_provider_settings(true)?;
-        // 统一调用点：运行开始前解析一次并冻结，本运行的全部批次共用同一模型。
-        let frozen_call = crate::ai::llm::FrozenModelCall::resolve(&settings)?;
-        let api_key = self
-            .credentials
-            .get()
-            .map_err(|_| ClipTextCorrectionError::Credential)?
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ClipTextCorrectionError::Credential)?;
+        // 统一调用点：运行开始前**冻结模型**，本运行全部批次共用同一模型；
+        // 短期 token 改为**每批取用**，长运行中途过期时调用点会重取一次（决策六）。
+        let frozen = self.model_call.freeze_for_run()?;
         let batches = batch_targets(&plan.targets, MAX_BATCH_CHARS);
         let fingerprint = correction_fingerprint(&plan.targets);
         let run_id = self.repository.begin_clip_text_correction_run(
             clip_project_id,
             plan.project_version,
-            frozen_call.model_id(),
+            frozen.model_id(),
             CLIP_TEXT_CORRECTION_PROMPT_VERSION,
             &fingerprint,
             plan.targets.len(),
@@ -277,17 +331,8 @@ impl ClipTextCorrectionWorkflow {
                 "纠正以下 ASR 文本数组。只修正错别字、同音错词、明显识别错误和标点；保持原意、语气、专名、数字、条目数量和顺序，不润色、不改写、不合并或拆分。corrections 必须为与输入等长的 index + text 数组，index 从 0 连续递增。输入文本数组：{payload}"
             );
             let output = match self
-                .provider
-                .correct_subtitles(
-                    &api_key,
-                    SubtitleCorrectionRequest {
-                        prompt,
-                        frozen: frozen_call.clone(),
-                    },
-                    cancellation.clone(),
-                )
+                .call_provider_with_token_refresh(&frozen, prompt, cancellation.clone())
                 .await
-                .map_err(ClipTextCorrectionError::from)
             {
                 Ok(output) => output,
                 Err(error) => {
@@ -543,6 +588,352 @@ mod tests {
     use crate::ai::SubtitleCorrectionItem;
     use crate::database::Database;
 
+    /// 测试用固定短期 token 来源：不触网、有效期充足。
+    struct FixedTokenSource;
+
+    #[async_trait]
+    impl crate::ai::LlmTokenSource for FixedTokenSource {
+        async fn fetch(&self) -> std::result::Result<crate::ai::LlmTokenLease, LlmError> {
+            Ok(crate::ai::LlmTokenLease {
+                token: "st-lt-v1.test".to_owned(),
+                expire_at: chrono::Utc::now().timestamp() + 3_600,
+                provider: "ALI".to_owned(),
+            })
+        }
+    }
+
+    fn test_model_call(database: &Database) -> Arc<crate::ai::ModelCallRuntime> {
+        Arc::new(
+            crate::ai::ModelCallRuntime::bootstrap(
+                AiRepository::new(database.clone()),
+                Arc::new(FixedTokenSource),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .expect("测试用模型调用点必须可构造"),
+        )
+    }
+
+    /// 建一个含 `subtitle_count` 条 500 字字幕的工程，返回数据库。
+    ///
+    /// 500 字 × 13 条 = 3 批（MAX_BATCH_CHARS 上限内），用于验证"跨批同一模型"。
+    fn project_with_subtitles(subtitle_count: i64) -> Database {
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        let connection = database.connection().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO ai_clip_projects(
+                       id, highlight_run_id, name, version, export_status, export_progress,
+                       created_at, updated_at
+                   ) VALUES(1, 1, '统一调用点测试', 1, 'idle', 0, ?1, ?1)"#,
+                ["2026-08-08T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO ai_clip_segments(
+                       id, clip_project_id, candidate_id, input_id, position, title,
+                       source_start_ms, source_end_ms, created_at, updated_at
+                   ) VALUES(11, 1, 1, 1, 0, '测试片段', 0, 13000, ?1, ?1)"#,
+                ["2026-08-08T00:00:00Z"],
+            )
+            .unwrap();
+        for index in 0_i64..subtitle_count {
+            let text = "字".repeat(500);
+            connection
+                .execute(
+                    r#"INSERT INTO ai_clip_subtitles(
+                           clip_project_id, clip_segment_id, input_id, stable_segment_id,
+                           source_start_ms, source_end_ms, original_text, text, hidden,
+                           created_at, updated_at
+                       ) VALUES(1, 11, 1, ?1, ?2, ?3, ?4, ?4, 0, ?5, ?5)"#,
+                    params![
+                        format!("segment-{index}"),
+                        index * 1000,
+                        (index + 1) * 1000,
+                        text,
+                        "2026-08-08T00:00:00Z"
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        drop(connection);
+        database
+    }
+
+    /// 记录每次调用收到的句柄（模型 + token）的替身，可选地在前 N 次返回指定错误。
+    #[derive(Default)]
+    struct RecordingCorrectionProvider {
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+        credential_failures: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SubtitleCorrectionProvider for RecordingCorrectionProvider {
+        async fn correct_subtitles(
+            &self,
+            call: &crate::ai::ModelCallHandle,
+            request: SubtitleCorrectionRequest,
+            _cancellation: CancellationToken,
+        ) -> std::result::Result<SubtitleCorrectionOutput, LlmError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((call.model_id().to_owned(), call.token.token.clone()));
+            if self.credential_failures.load(Ordering::SeqCst) > 0 {
+                let remaining = self.credential_failures.load(Ordering::SeqCst);
+                self.credential_failures
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(LlmError::Credential);
+            }
+            let texts: Vec<String> =
+                serde_json::from_str(request.prompt.split("输入文本数组：").nth(1).unwrap())
+                    .unwrap();
+            Ok(SubtitleCorrectionOutput {
+                corrections: texts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| SubtitleCorrectionItem {
+                        index: index as u32,
+                        text,
+                    })
+                    .collect(),
+                token_usage: 1,
+            })
+        }
+    }
+
+    /// 依次返回不同 token 的来源，用于证明"重取"确实发生。
+    struct RotatingTokenSource {
+        issued: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::ai::LlmTokenSource for RotatingTokenSource {
+        async fn fetch(&self) -> std::result::Result<crate::ai::LlmTokenLease, LlmError> {
+            let index = self.issued.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ai::LlmTokenLease {
+                token: format!("st-lt-v1.lease-{index}"),
+                expire_at: chrono::Utc::now().timestamp() + 3_600,
+                provider: "ALI".to_owned(),
+            })
+        }
+    }
+
+    fn rotating_model_call(database: &Database) -> Arc<crate::ai::ModelCallRuntime> {
+        Arc::new(
+            crate::ai::ModelCallRuntime::bootstrap(
+                AiRepository::new(database.clone()),
+                Arc::new(RotatingTokenSource {
+                    issued: AtomicUsize::new(0),
+                }),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn all_batches_share_one_frozen_model_and_the_shared_token_source() {
+        let database = project_with_subtitles(13);
+        let provider = Arc::new(RecordingCorrectionProvider::default());
+        let workflow = ClipTextCorrectionWorkflow::new(
+            AiRepository::new(database.clone()),
+            provider.clone(),
+            rotating_model_call(&database),
+        );
+        let summary = workflow
+            .correct_project(1, 1, CancellationToken::new())
+            .await
+            .expect("纠错必须成功");
+        assert!(
+            summary.total_batches >= 2,
+            "必须真的跨多批：{}",
+            summary.total_batches
+        );
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), summary.total_batches, "每批一次调用");
+        // 任务 4.1：同一运行的全部批次使用**同一冻结模型**。
+        let models: std::collections::BTreeSet<&str> =
+            seen.iter().map(|(model, _)| model.as_str()).collect();
+        assert_eq!(models.len(), 1, "跨批模型必须一致：{models:?}");
+        assert_eq!(models.iter().next().copied(), Some("qwen-plus"));
+        // 凭据来自统一调用点的短期 token，而不是用户自备 Key。
+        for (_, token) in &seen {
+            assert!(
+                token.starts_with("st-lt-v1."),
+                "必须使用短期 token，而不是用户 Key：{token}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_failure_stops_the_run_and_keeps_subtitles_unchanged() {
+        let database = project_with_subtitles(2);
+        let provider = Arc::new(RecordingCorrectionProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+            credential_failures: AtomicUsize::new(usize::MAX / 2),
+        });
+        let workflow = ClipTextCorrectionWorkflow::new(
+            AiRepository::new(database.clone()),
+            provider,
+            test_model_call(&database),
+        );
+        let error = workflow
+            .correct_project(1, 1, CancellationToken::new())
+            .await
+            .unwrap_err();
+        // 任务 4.4：授权原因必须可区分（而不是被描述成 Provider 网络错误）。
+        assert!(
+            matches!(error, ClipTextCorrectionError::Credential),
+            "必须是可区分的授权错误：{error:?}"
+        );
+        let connection = database.connection().unwrap();
+        let unchanged: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ai_clip_subtitles WHERE text = original_text",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, 2, "失败时全部字幕必须保持不变");
+    }
+
+    #[tokio::test]
+    async fn mid_run_credential_failure_refreshes_the_token_and_retries_the_batch() {
+        let database = project_with_subtitles(2);
+        let provider = Arc::new(RecordingCorrectionProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+            credential_failures: AtomicUsize::new(1),
+        });
+        let workflow = ClipTextCorrectionWorkflow::new(
+            AiRepository::new(database.clone()),
+            provider.clone(),
+            rotating_model_call(&database),
+        );
+        let summary = workflow
+            .correct_project(1, 1, CancellationToken::new())
+            .await
+            .expect("重取 token 后必须成功");
+        assert_eq!(summary.total_batches, 1);
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "凭据失败必须重取一次并重试本批");
+        assert_ne!(
+            seen[0].1, seen[1].1,
+            "重试必须使用重取后的新 token：{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_records_never_contain_the_short_term_token() {
+        let database = project_with_subtitles(2);
+        let provider = Arc::new(RecordingCorrectionProvider::default());
+        let workflow = ClipTextCorrectionWorkflow::new(
+            AiRepository::new(database.clone()),
+            provider,
+            rotating_model_call(&database),
+        );
+        workflow
+            .correct_project(1, 1, CancellationToken::new())
+            .await
+            .expect("纠错必须成功");
+        let connection = database.connection().unwrap();
+        let (model_id, prompt_version, status): (String, String, String) = connection
+            .query_row(
+                "SELECT model_id, prompt_version, status FROM ai_clip_text_correction_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        // 任务 4.5：审计只保存实际模型、prompt 版本与状态，绝不含短期 token。
+        assert_eq!(model_id, "qwen-plus");
+        assert!(!prompt_version.is_empty());
+        assert_eq!(status, "completed");
+        for field in [&model_id, &prompt_version, &status] {
+            assert!(!field.contains("st-lt-v1"), "审计字段泄漏了 token：{field}");
+        }
+    }
+
+    /// 未开通/额度耗尽的门禁必须在**任何批次提交前**拦下运行。
+    struct NotActivatedGate;
+
+    impl ClipCorrectionGate for NotActivatedGate {
+        fn activation_ready(&self) -> bool {
+            true
+        }
+        fn service_activated(&self) -> bool {
+            false
+        }
+        fn quota_available(&self) -> bool {
+            true
+        }
+    }
+
+    struct QuotaExhaustedGate;
+
+    impl ClipCorrectionGate for QuotaExhaustedGate {
+        fn activation_ready(&self) -> bool {
+            true
+        }
+        fn service_activated(&self) -> bool {
+            true
+        }
+        fn quota_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_and_quota_gates_stop_the_run_before_any_batch() {
+        for (gate, expected_not_activated) in [
+            (
+                Arc::new(NotActivatedGate) as Arc<dyn ClipCorrectionGate>,
+                true,
+            ),
+            (
+                Arc::new(QuotaExhaustedGate) as Arc<dyn ClipCorrectionGate>,
+                false,
+            ),
+        ] {
+            let database = project_with_subtitles(2);
+            let provider = Arc::new(RecordingCorrectionProvider::default());
+            let workflow = ClipTextCorrectionWorkflow::new(
+                AiRepository::new(database.clone()),
+                provider.clone(),
+                rotating_model_call(&database),
+            )
+            .with_gate(gate);
+            let error = workflow
+                .correct_project(1, 1, CancellationToken::new())
+                .await
+                .unwrap_err();
+            if expected_not_activated {
+                assert!(matches!(error, ClipTextCorrectionError::NotActivated));
+            } else {
+                assert!(matches!(error, ClipTextCorrectionError::QuotaExhausted));
+            }
+            assert!(
+                provider.seen.lock().unwrap().is_empty(),
+                "门禁不通过时不得发起任何付费调用"
+            );
+            let connection = database.connection().unwrap();
+            let unchanged: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM ai_clip_subtitles WHERE text = original_text",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged, 2, "门禁不通过时字幕必须保持不变");
+        }
+    }
+
     #[derive(Default)]
     struct FailSecondBatchProvider {
         calls: AtomicUsize,
@@ -552,7 +943,7 @@ mod tests {
     impl SubtitleCorrectionProvider for FailSecondBatchProvider {
         async fn correct_subtitles(
             &self,
-            _api_key: &str,
+            _call: &crate::ai::ModelCallHandle,
             _request: SubtitleCorrectionRequest,
             _cancellation: CancellationToken,
         ) -> std::result::Result<SubtitleCorrectionOutput, LlmError> {
@@ -682,13 +1073,11 @@ mod tests {
                 .unwrap();
         }
 
-        let credentials = Arc::new(super::super::MemoryCredentialStore::new());
-        credentials.set("sk-test").unwrap();
         let provider = Arc::new(FailSecondBatchProvider::default());
         let workflow = ClipTextCorrectionWorkflow::new(
             AiRepository::new(database.clone()),
             provider.clone(),
-            credentials,
+            test_model_call(&database),
         );
 
         assert!(

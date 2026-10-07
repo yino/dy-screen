@@ -2051,6 +2051,48 @@ pub fn run() {
             );
             let credential_store: Arc<dyn crate::ai::CredentialStore> =
                 Arc::new(SystemCredentialStore::default());
+            // 模型调用点：解析失败**不得**阻断应用启动（录制、浏览、预览与本地 ASR
+            // 都不依赖它）。失败时降级到构建期默认设置，并只记录脱敏分类。
+            let model_call = match ModelCallRuntime::bootstrap(
+                AiRepository::new(database.clone()),
+                Arc::new(ActivationLlmTokenSource::new(activation.clone())),
+                chrono::Utc::now().timestamp_millis(),
+            ) {
+                Ok(runtime) => Arc::new(runtime),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "component": "model_call",
+                            "event": "bootstrap_fallback",
+                            "category": error.category_str(),
+                        })
+                    );
+                    let fallback_repository = AiRepository::new(database.clone());
+                    // 只记录固定分类，不输出任何错误正文（可能含数据内容）。
+                    if fallback_repository
+                        .save_llm_provider_settings(&crate::ai::LlmProviderSettings::default())
+                        .is_err()
+                    {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "component": "model_call",
+                                "event": "bootstrap_fallback_persist_failed",
+                                "category": "repository",
+                            })
+                        );
+                    }
+                    Arc::new(
+                        ModelCallRuntime::bootstrap(
+                            fallback_repository,
+                            Arc::new(ActivationLlmTokenSource::new(activation.clone())),
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .map_err(std::io::Error::other)?,
+                    )
+                }
+            };
             let highlight_workflow = Arc::new(HighlightWorkflow::new(
                 AiRepository::new(database.clone()),
                 Arc::new(RigDeepSeekProvider),
@@ -2079,7 +2121,7 @@ pub fn run() {
             let clip_text_correction = ClipTextCorrectionWorkflow::new(
                 AiRepository::new(database.clone()),
                 Arc::new(RigDeepSeekProvider),
-                credential_store.clone(),
+                model_call.clone(),
             )
             .with_publisher(clip_workflow_publisher)
             .with_gate(Arc::new(crate::ai::ActivationCorrectionGate::new(
@@ -2200,48 +2242,6 @@ pub fn run() {
                 activation.clone(),
                 app.state::<RuntimeResourceState>().inner().clone(),
             );
-            // 模型调用点：解析失败**不得**阻断应用启动（录制、浏览、预览与本地 ASR
-            // 都不依赖它）。失败时降级到构建期默认设置，并只记录脱敏分类。
-            let model_call = match ModelCallRuntime::bootstrap(
-                AiRepository::new(database.clone()),
-                Arc::new(ActivationLlmTokenSource::new(activation.clone())),
-                chrono::Utc::now().timestamp_millis(),
-            ) {
-                Ok(runtime) => Arc::new(runtime),
-                Err(error) => {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "component": "model_call",
-                            "event": "bootstrap_fallback",
-                            "category": error.category_str(),
-                        })
-                    );
-                    let fallback_repository = AiRepository::new(database.clone());
-                    // 只记录固定分类，不输出任何错误正文（可能含数据内容）。
-                    if fallback_repository
-                        .save_llm_provider_settings(&crate::ai::LlmProviderSettings::default())
-                        .is_err()
-                    {
-                        eprintln!(
-                            "{}",
-                            serde_json::json!({
-                                "component": "model_call",
-                                "event": "bootstrap_fallback_persist_failed",
-                                "category": "repository",
-                            })
-                        );
-                    }
-                    Arc::new(
-                        ModelCallRuntime::bootstrap(
-                            fallback_repository,
-                            Arc::new(ActivationLlmTokenSource::new(activation.clone())),
-                            chrono::Utc::now().timestamp_millis(),
-                        )
-                        .map_err(std::io::Error::other)?,
-                    )
-                }
-            };
             spawn_activation_lifecycle(
                 app.handle().clone(),
                 activation.clone(),

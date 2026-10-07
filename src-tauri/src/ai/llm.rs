@@ -516,12 +516,6 @@ pub struct TransitionScoreRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubtitleCorrectionRequest {
     pub prompt: String,
-    /// 本次运行的冻结模型调用。
-    ///
-    /// 由调用方在运行开始前解析一次并传入，使同一运行内的所有批次使用同一模型，
-    /// 而不是每个批次各自现读设置。该字段不参与序列化。
-    #[serde(skip)]
-    pub frozen: FrozenModelCall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1111,7 +1105,34 @@ impl LlmTokenLease {
     }
 }
 
-/// 短期 token 来源。真实实现复用 `AiApi::ai_llm_ak`（与云 ASR 共享同一份缓存）。
+/// 一次模型调用的**身份与凭据**：运行内冻结的快照 + 仍有余量的短期 token。
+///
+/// 业务链路只持有本结构，既不读设置、也不自行获取 token，因此"改一处即改全部模型"
+/// 与"WebView 不接触凭据"两条约束同时成立。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCallHandle {
+    pub frozen: FrozenModelCall,
+    pub token: LlmTokenLease,
+}
+
+impl ModelCallHandle {
+    /// 本次运行实际使用的模型标识（写入运行记录与缓存键）。
+    pub fn model_id(&self) -> &str {
+        self.frozen.model_id()
+    }
+
+    /// 运行指纹输入。
+    pub fn fingerprint_input(&self) -> String {
+        self.frozen.fingerprint_input()
+    }
+
+    /// 只含 provider 与剩余有效期的诊断标签；绝不包含 token 本体。
+    pub fn diagnostic_label(&self, now_unix_seconds: i64) -> String {
+        self.token.diagnostic_label(now_unix_seconds)
+    }
+}
+
+/// 短期 token 来源。真实实现复用 `ApiApi::ai_llm_ak`（与云 ASR 共享同一份缓存）。
 #[async_trait]
 pub trait LlmTokenSource: Send + Sync {
     async fn fetch(&self) -> Result<LlmTokenLease, LlmError>;
@@ -1181,9 +1202,10 @@ pub trait TransitionAgentProvider: Send + Sync {
 
 #[async_trait]
 pub trait SubtitleCorrectionProvider: Send + Sync {
+    /// 迁移后只接受统一调用点给出的句柄：模型来自冻结快照、凭据来自短期 token。
     async fn correct_subtitles(
         &self,
-        api_key: &str,
+        call: &ModelCallHandle,
         request: SubtitleCorrectionRequest,
         cancellation: CancellationToken,
     ) -> Result<SubtitleCorrectionOutput, LlmError>;
@@ -1335,13 +1357,12 @@ impl TransitionAgentProvider for RigDeepSeekProvider {
 impl SubtitleCorrectionProvider for RigDeepSeekProvider {
     async fn correct_subtitles(
         &self,
-        api_key: &str,
+        call: &ModelCallHandle,
         request: SubtitleCorrectionRequest,
         cancellation: CancellationToken,
     ) -> Result<SubtitleCorrectionOutput, LlmError> {
-        self.extract_with_frozen(
-            &request.frozen,
-            api_key,
+        self.extract_with_handle(
+            call,
             &request.prompt,
             "你是受限的中文 ASR 文本纠错 Agent。只修正错别字、同音错词、明显识别错误和标点，保持原意、语气、专名、数字、数组长度与顺序；不润色、不改写、不合并或拆分条目，只输出结构化结果。",
             cancellation,
@@ -1406,6 +1427,33 @@ impl RigDeepSeekProvider {
     /// 按调用方冻结的快照执行抽取。
     ///
     /// 一次运行内的所有阶段 MUST 复用同一冻结值，使运行期间设置变化不影响本次运行。
+    /// 句柄版提取：模型与地址取自冻结快照，凭据取自短期 token。
+    async fn extract_with_handle<T>(
+        &self,
+        call: &ModelCallHandle,
+        prompt: &str,
+        preamble: &str,
+        cancellation: CancellationToken,
+    ) -> Result<T, LlmError>
+    where
+        T: JsonSchema
+            + for<'de> Deserialize<'de>
+            + Serialize
+            + ProviderStructuredOutput
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.extract_with_frozen(
+            &call.frozen,
+            &call.token.token,
+            prompt,
+            preamble,
+            cancellation,
+        )
+        .await
+    }
+
     async fn extract_with_frozen<T>(
         &self,
         frozen: &FrozenModelCall,

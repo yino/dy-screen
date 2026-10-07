@@ -41,11 +41,11 @@
 
 ## 4. 转换文本纠错链路
 
-- [ ] 4.1 把一键文本纠错改为经统一调用点取“短期 token + 冻结模型快照”，验证在相同配置下分批边界、批次顺序与全局字幕映射与转换前一致
-- [ ] 4.2 以既有测试作为等价性断言，验证提示词约束（只修正错别字、同音错词、明显识别错误与标点）与校验规则不变
-- [ ] 4.3 验证原子提交与并发冲突处理不变：任一批次失败或版本冲突时全部工程字幕保持不变
-- [ ] 4.4 新增测试：账号未开通或纠错额度耗尽（依据 heartbeat 响应）时停止运行、保留字幕不变并显示可区分的授权或额度原因
-- [ ] 4.5 验证 WebView 不接触短期 token 与上游原始响应，审计只保存实际模型、prompt 版本、指纹、计数、实际用量（若上游返回）、耗时与脱敏错误分类
+- [x] 4.1 把一键文本纠错改为经统一调用点取“短期 token + 冻结模型快照”，验证在相同配置下分批边界、批次顺序与全局字幕映射与转换前一致（`SubtitleCorrectionProvider` 契约由 `api_key: &str` 改为 `&ModelCallHandle`（冻结快照 + 短期 token）；工作流不再持有 `CredentialStore`，改为注入 `ModelCallRuntime`；测试 `all_batches_share_one_frozen_model_and_the_shared_token_source` 证明跨批同一模型且凭据是 `st-lt-v1.` 短期 token，既有分批边界/顺序测试不变）
+- [x] 4.2 以既有测试作为等价性断言，验证提示词约束（只修正错别字、同音错词、明显识别错误与标点）与校验规则不变（提示词与 preamble 逐字未改；`correction_response_must_be_complete_and_ordered`、`batches_preserve_complete_subtitle_order`、`model_resolution_does_not_change_batch_boundaries_or_order` 全部保持通过）
+- [x] 4.3 验证原子提交与并发冲突处理不变：任一批次失败或版本冲突时全部工程字幕保持不变（`later_batch_failure_keeps_all_subtitles_and_project_version_unchanged` 在迁移后仍通过；新增门禁测试同时断言门禁不通过时字幕逐条不变）
+- [x] 4.4 新增测试：账号未开通或纠错额度耗尽（依据 heartbeat 响应）时停止运行、保留字幕不变并显示可区分的授权或额度原因（工作流级测试 `authorization_and_quota_gates_stop_the_run_before_any_batch`：未开通→`NotActivated`、额度耗尽→`QuotaExhausted`，两者可区分且**不发起任何付费调用**、字幕保持不变；另新增 `credential_failure_stops_the_run_and_keeps_subtitles_unchanged` 覆盖短期 token 授权失败路径）
+- [x] 4.5 验证 WebView 不接触短期 token 与上游原始响应，审计只保存实际模型、prompt 版本、指纹、计数、实际用量（若上游返回）、耗时与脱敏错误分类（token 只在 Rust 侧 `ModelCallHandle` 内流转；审计测试断言运行记录只含实际模型 `qwen-plus`、prompt 版本与状态且**不含 token**；诊断标签只输出 provider 与剩余有效期）
 - [ ] 4.6 实现统一调用点诊断（内存环形缓冲 + 显式开关 + UI 面板默认关闭），验证不含短期 token、完整提示词与 ASR 正文
 
 ## 5. 转换转场匹配链路
