@@ -3,6 +3,7 @@
 //! 本模块只负责项目、输入、可复用产物和转写句段，不直接依赖 Tauri command 或 React。
 //! 这样 repository 与状态机可以在没有 WebView 的环境中完成完整集成测试。
 
+mod bundled_skills;
 mod clip_export;
 mod clip_subtitle;
 mod clip_text_correction;
@@ -27,6 +28,10 @@ mod service;
 mod smart_workflow;
 pub(crate) mod tauri_commands;
 
+pub use bundled_skills::{
+    BundledSkill, SkillLoadError, bundled_skills_directory, load_bundled_skills, skill_snapshot,
+    skills_fingerprint,
+};
 pub use clip_export::{
     ClipExportFailure, ClipExportPlan, ClipOutputDimensions, EffectCaptionOverlay,
     ExportResourceBaseline, ExportResourceSummary, TextLayerRange, TransparentFrameSummary,

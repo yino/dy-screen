@@ -35,8 +35,8 @@
 - [ ] 3.2 新增测试：分析过程尝试调用上述通用工具时被拒绝，且已完成阶段结果不受影响
 - [ ] 3.3 新增测试：用户目录存在同名 Agent 配置或 Profile 时系统忽略它并只用随包版本
 - [ ] 3.4 把现有五个内置精彩 Skill 与两个转场阶段纳入随包 Skill，验证 Skill ID 与版本仍进入运行指纹且指纹语义不变
-- [ ] 3.5 新增测试：ASR 文本包含形似系统指令或工具调用的内容时，工具集合、模型路由与工作流阶段均不改变
-- [ ] 3.6 把 Skill 作为随包文件由 Rust 读取与校验并把 Skill ID 与版本写入运行指纹，验证三条既有链路**不进入 Harness** 也能满足 Skill 随包与指纹语义（消除 tasks 3.4 与 4/5/6 的张力）
+- [x] 3.5 新增测试：ASR 文本包含形似系统指令或工具调用的内容时，工具集合、模型路由与工作流阶段均不改变（highlight 注入防护测试：恶意转写逐字节比对 `task`/`skills`/`tags`/`goal` 不变、提示词中不存在 `tool`/`tools` 字段、恶意文本只能待在 `segments[].text` 数据位；harness 侧 `tool_denied_is_reported_without_execution` 证明白名单由 Rust 决定、不在白名单内的工具被拒且不执行）
+- [x] 3.6 把 Skill 作为随包文件由 Rust 读取与校验并把 Skill ID 与版本写入运行指纹，验证三条既有链路**不进入 Harness** 也能满足 Skill 随包与指纹语义（新增 `bundled_skills.rs`：`load_bundled_skills` 只读随包 `*.skill.json`、`deny_unknown_fields` 拒绝未知字段、id 唯一、版本必须是 `x.y.z`；`skills_fingerprint` 对 `id@version` 排序后 SHA-256，与精彩运行既有 `skills_snapshot`（`id@version`）语义一致；加载器不接受任何用户目录输入——忽略用户同名配置是结构性的）
 - [x] 3.7 删除未使用的 `MAX_AGENT_TURNS`，验证工具循环归 Harness、Rust 侧只保留整次调用的超时与预算上限，且无残留引用（`MAX_AGENT_TURNS` 已删除，全树 grep 无残留；工具循环归 sidecar 的 `tool.invoke`，Rust 侧只做白名单授权与 `per_request_timeout`）
 
 ## 4. 转换文本纠错链路

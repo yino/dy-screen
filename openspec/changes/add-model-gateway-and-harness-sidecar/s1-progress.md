@@ -65,6 +65,8 @@
 ## S2 进度（sidecar 生命周期与 Profile/Skill）
 
 已完成：
+- `ai/bundled_skills.rs`：随包 Skill 加载器（deny_unknown_fields / id 唯一 / 版本 x.y.z）+ `skills_fingerprint`
+  （id@version 排序后 SHA-256，与精彩运行 skills_snapshot 语义一致）；注入防护测试
 - `ai/harness.rs`：`HarnessSidecar`（受限子进程 spawn/request/shutdown）+ stdio JSON-RPC 协议
   （换行分隔、单条 ≤1MiB、请求/响应/错误/取消）+ `HarnessManager`（按需启动 + 空闲回收）
 - Rust 侧工具授权：`ToolAllowlist` + `ToolExecutor`，sidecar 只能 `tool.invoke` 白名单工具，
@@ -74,6 +76,6 @@
 待办（阻塞项）：
 - 任务 2.6（峰值内存/磁盘/启动耗时，8GB 基线）需要真实 Harness 运行时
 - 任务组 1（运行资源清单的 Harness/Profile/Skill 组件类型与发布校验）
-- 任务组 3 的 3.1–3.5（随包 Profile/Skill 资产本体、ASR 文本注入防护）与 3.6
+- 任务组 3 的 3.1–3.4（随包 Profile/Skill 资产本体）——3.5/3.6 已在本机完成
 - 任务组 8（取消/资源上限/迟到结果）部分依赖真实运行时的资源特征
 - 三平台协议与恢复验收（11.x）依赖 Node 22 LTS 三架构资产 + CI 扩展
