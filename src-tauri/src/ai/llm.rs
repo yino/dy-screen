@@ -64,6 +64,15 @@ pub struct LlmProviderSettings {
     pub transition_auto_apply_score: u8,
     pub key_configured: bool,
     pub updated_at: Option<String>,
+    /// 当前取值的解析来源（`ResolutionSource::as_str()`）；由统一调用点写入。
+    #[serde(default)]
+    pub model_source: Option<String>,
+    /// 上次解析时间（RFC 3339）。
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+    /// 下次心跳边界解析时间（RFC 3339），供设置页显示。
+    #[serde(default)]
+    pub next_resolution_at: Option<String>,
 }
 
 impl Default for LlmProviderSettings {
@@ -78,6 +87,9 @@ impl Default for LlmProviderSettings {
             transition_auto_apply_score: DEFAULT_TRANSITION_AUTO_APPLY_SCORE,
             key_configured: false,
             updated_at: None,
+            model_source: None,
+            resolved_at: None,
+            next_resolution_at: None,
         }
     }
 }
@@ -1136,6 +1148,12 @@ impl ModelCallHandle {
 #[async_trait]
 pub trait LlmTokenSource: Send + Sync {
     async fn fetch(&self) -> Result<LlmTokenLease, LlmError>;
+
+    /// 只读缓存状态：**不得发起任何网络请求**，供设置页显示短期 token 状态。
+    /// 默认返回 `None`（来源不暴露缓存）。
+    fn cached(&self, _now_unix_seconds: i64) -> Option<LlmTokenLease> {
+        None
+    }
 }
 
 /// 取一个在 `now` 之后仍有余量的短期 token；余量不足时**重取一次**。
@@ -1536,7 +1554,19 @@ impl CancellationCheck for CancellationToken {
     }
 }
 
-type LlmProviderSettingsRow = (String, String, i64, String, i64, i64, i64, String);
+type LlmProviderSettingsRow = (
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 pub(crate) fn settings_from_row(
     row: Option<LlmProviderSettingsRow>,
@@ -1551,6 +1581,9 @@ pub(crate) fn settings_from_row(
         excellent_score,
         transition_auto_apply_score,
         updated_at,
+        model_source,
+        resolved_at,
+        next_resolution_at,
     )) = row
     else {
         return Ok(LlmProviderSettings {
@@ -1572,6 +1605,9 @@ pub(crate) fn settings_from_row(
             .map_err(|_| LlmError::InvalidConfiguration("转场自动应用阈值无效".to_owned()))?,
         key_configured,
         updated_at: Some(updated_at),
+        model_source,
+        resolved_at,
+        next_resolution_at,
     };
     settings.validate()?;
     Ok(settings)

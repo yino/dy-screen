@@ -643,6 +643,17 @@ impl ApiClient {
             .await
     }
 
+    /// 只读缓存：不发起任何网络请求，供"查看当前模型与可用性"显示短期 token 状态。
+    pub fn cached_ai_llm_ak(
+        &self,
+        device_id: &str,
+        activate_code: &str,
+    ) -> Option<AiLlmAkResponse> {
+        let scope = ai_token_scope(device_id, activate_code);
+        self.ai_llm_ak_cache
+            .get_valid(&scope, chrono::Utc::now().timestamp())
+    }
+
     pub async fn ai_llm_ak(
         &self,
         device_id: &str,

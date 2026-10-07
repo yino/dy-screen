@@ -185,6 +185,26 @@ pub trait AiJobController: Send + Sync {
     }
 }
 
+/// 设置页的"当前模型与可用性"视图（不含任何凭据内容）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelStatusView {
+    /// 当前生效模型标识。
+    pub model_id: String,
+    /// 解析来源：`build_default` / `heartbeat` / `local_override` / `run_override`。
+    pub model_source: Option<String>,
+    /// 上次解析时间（RFC 3339）。
+    pub resolved_at: Option<String>,
+    /// 下次心跳边界解析时间（RFC 3339）。
+    pub next_resolution_at: Option<String>,
+    /// 短期 token 的只读状态（不含 token 本体）。
+    pub token: crate::ai::TokenStatus,
+    /// 旧上游凭据是否仍存在（保留但不再使用；不回显内容）。
+    pub key_configured: bool,
+    /// 调用路径，当前恒为 `cloud_direct`。
+    pub call_path: String,
+}
+
 #[derive(Clone)]
 pub struct AiCommandService {
     project_service: AiProjectService,
@@ -194,6 +214,8 @@ pub struct AiCommandService {
     highlight_workflow: Option<Arc<HighlightWorkflow>>,
     highlight_tasks: Arc<Mutex<HashSet<i64>>>,
     credential_store: Option<Arc<dyn CredentialStore>>,
+    /// 统一调用点：设置页据此显示"当前模型与可用性"（可选，未注入时退化为仅读设置）。
+    model_call: Option<Arc<crate::ai::ModelCallRuntime>>,
 }
 
 impl AiCommandService {
@@ -210,6 +232,7 @@ impl AiCommandService {
             highlight_workflow: None,
             highlight_tasks: Arc::new(Mutex::new(HashSet::new())),
             credential_store: None,
+            model_call: None,
         }
     }
 
@@ -221,6 +244,62 @@ impl AiCommandService {
     pub fn with_credential_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
         self.credential_store = Some(store);
         self
+    }
+
+    /// 注入统一调用点，使设置页能显示当前模型、解析来源与短期 token 状态。
+    pub fn with_model_call(mut self, model_call: Arc<crate::ai::ModelCallRuntime>) -> Self {
+        self.model_call = Some(model_call);
+        self
+    }
+
+    /// 设置页的"当前模型与可用性"视图（任务 9.2）。
+    ///
+    /// MUST NOT 包含短期 token 本体、上游原始响应或旧凭据内容：旧凭据只报告"是否存在"。
+    pub fn model_status(&self) -> Result<AiModelStatusView, AiCommandError> {
+        // 旧凭据是否存在只是展示信息：凭据库不可用时不得让整个状态视图失败。
+        let key_configured = self.llm_key_configured().unwrap_or(false);
+        let settings = self
+            .repository
+            .get_llm_provider_settings(key_configured)
+            .map_err(|error| {
+                AiCommandError::new("ai_repository_error", error.to_string(), false)
+            })?;
+        let now = chrono::Utc::now().timestamp();
+        let (model_id, source, next_resolution_at_ms, token) = match self.model_call.as_ref() {
+            Some(model_call) => {
+                let snapshot = model_call.snapshot().map_err(|error| {
+                    AiCommandError::new("ai_repository_error", error.category_str(), false)
+                })?;
+                (
+                    snapshot.model_id.clone(),
+                    Some(snapshot.source.as_str().to_owned()),
+                    Some(model_call.next_resolution_at_ms().unwrap_or_default()),
+                    model_call.token_status(now),
+                )
+            }
+            None => (
+                settings.model_id.clone(),
+                settings.model_source.clone(),
+                None,
+                crate::ai::TokenStatus {
+                    cached: false,
+                    provider: None,
+                    expires_in_seconds: None,
+                },
+            ),
+        };
+        Ok(AiModelStatusView {
+            model_id,
+            model_source: source,
+            resolved_at: settings.resolved_at.clone(),
+            next_resolution_at: next_resolution_at_ms
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|value| value.to_rfc3339())
+                .or_else(|| settings.next_resolution_at.clone()),
+            token,
+            key_configured,
+            call_path: crate::ai::ModelCallPath::CloudDirect.as_str().to_owned(),
+        })
     }
 
     pub fn list_projects(&self) -> Result<Vec<AiProject>, AiCommandError> {

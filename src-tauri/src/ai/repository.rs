@@ -728,7 +728,7 @@ impl AiRepository {
         let connection = self.database.connection()?;
         let row = connection
             .query_row(
-                "SELECT provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, transition_auto_apply_score, updated_at FROM llm_provider_settings WHERE id = 1",
+                "SELECT provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, transition_auto_apply_score, updated_at, model_source, resolved_at, next_resolution_at FROM llm_provider_settings WHERE id = 1",
                 [],
                 |row| {
                     Ok((
@@ -740,6 +740,9 @@ impl AiRepository {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                     ))
                 },
             )
@@ -757,14 +760,15 @@ impl AiRepository {
             .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
         let now = Utc::now().to_rfc3339();
         self.database.connection()?.execute(
-            r#"INSERT INTO llm_provider_settings(id, provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, transition_auto_apply_score, updated_at)
-               VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            r#"INSERT INTO llm_provider_settings(id, provider, model_id, timeout_ms, prompt_version, qualified_score, excellent_score, transition_auto_apply_score, updated_at, model_source, resolved_at, next_resolution_at)
+               VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, model_id=excluded.model_id,
                    timeout_ms=excluded.timeout_ms, prompt_version=excluded.prompt_version,
                    qualified_score=excluded.qualified_score, excellent_score=excluded.excellent_score,
                    transition_auto_apply_score=excluded.transition_auto_apply_score,
-                   updated_at=excluded.updated_at"#,
-            params![settings.provider, settings.model_id.trim(), settings.timeout_ms as i64, settings.prompt_version, settings.qualified_score, settings.excellent_score, settings.transition_auto_apply_score, now],
+                   updated_at=excluded.updated_at, model_source=excluded.model_source,
+                   resolved_at=excluded.resolved_at, next_resolution_at=excluded.next_resolution_at"#,
+            params![settings.provider, settings.model_id.trim(), settings.timeout_ms as i64, settings.prompt_version, settings.qualified_score, settings.excellent_score, settings.transition_auto_apply_score, now, settings.model_source, settings.resolved_at, settings.next_resolution_at],
         )?;
         self.get_llm_provider_settings(settings.key_configured)
     }
@@ -4756,6 +4760,52 @@ pub(crate) fn migrate_ai_v26(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v28 为模型调用设置补充「解析来源、解析时间与下次解析时间」（步骤 2 任务 9.4）。
+///
+/// 迁移号说明：27 已被步骤 3（特效字幕）占用；本 change 按「实施顺序 = 迁移顺序」取 28，
+/// 步骤 4（生成式动画）顺延为 29，`docs/v2-delivery-order.md` 已同步。
+///
+/// 只增列、不重写旧行：既有阈值取值与 `provider` 字段保持原样（`provider` 退化为
+/// 兼容列，调用路径由统一调用点决定），因此旧库升级后行为与取值都不变。
+pub(crate) fn migrate_ai_v28(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 28",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    for column in ["model_source", "resolved_at", "next_resolution_at"] {
+        let exists: bool = transaction
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM pragma_table_info('llm_provider_settings') WHERE name = '{column}'"
+                ),
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            transaction.execute(
+                &format!("ALTER TABLE llm_provider_settings ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(28, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// v27 增加高光表现形式增强记录与特效字幕渲染缓存（步骤 3 任务 1.2 / 任务组 9）。
 ///
 /// 迁移只建表、只加索引，不重写任何旧行，因此旧工程行为不变。
@@ -7306,6 +7356,81 @@ mod smart_migration_tests {
         assert_ne!(
             changed.id, export_attempt.id,
             "版本变化必须创建新的渲染尝试"
+        );
+    }
+
+    #[test]
+    fn migration_v28_adds_resolution_columns_without_touching_existing_values() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let connection = database.connection().expect("connection");
+        for column in ["model_source", "resolved_at", "next_resolution_at"] {
+            let exists: bool = connection
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM pragma_table_info('llm_provider_settings') WHERE name = '{column}'"
+                    ),
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .expect("pragma")
+                .is_some();
+            assert!(exists, "迁移 28 必须新增列 {column}");
+        }
+        // 只增列：旧库升级后既有阈值与 provider 取值保持不变。
+        // 必须先释放连接再走仓库：内存库连接池同时只允许一个连接，
+        // 持有连接再取连接会死锁。
+        drop(connection);
+        let repository = AiRepository::new(database.clone());
+        let mut settings = repository
+            .get_llm_provider_settings(true)
+            .expect("读取设置");
+        settings.qualified_score = 66;
+        settings.excellent_score = 77;
+        settings.transition_auto_apply_score = 9;
+        repository
+            .save_llm_provider_settings(&settings)
+            .expect("保存设置");
+        let saved = repository
+            .get_llm_provider_settings(true)
+            .expect("再读设置");
+        assert_eq!(saved.qualified_score, 66);
+        assert_eq!(saved.excellent_score, 77);
+        assert_eq!(saved.transition_auto_apply_score, 9);
+        // 新字段默认未设置（不臆造解析信息）。
+        assert!(saved.model_source.is_none());
+        assert!(saved.resolved_at.is_none());
+        assert!(saved.next_resolution_at.is_none());
+    }
+
+    #[test]
+    fn resolution_metadata_round_trips_through_settings() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate");
+        let repository = AiRepository::new(database);
+        let mut settings = repository
+            .get_llm_provider_settings(true)
+            .expect("读取设置");
+        settings.model_id = "qwen-max".to_owned();
+        settings.model_source = Some("heartbeat".to_owned());
+        settings.resolved_at = Some("2026-10-07T00:00:00+00:00".to_owned());
+        settings.next_resolution_at = Some("2026-10-07T00:01:30+00:00".to_owned());
+        repository
+            .save_llm_provider_settings(&settings)
+            .expect("保存设置");
+        let saved = repository
+            .get_llm_provider_settings(true)
+            .expect("再读设置");
+        assert_eq!(saved.model_id, "qwen-max");
+        assert_eq!(saved.model_source.as_deref(), Some("heartbeat"));
+        assert_eq!(
+            saved.resolved_at.as_deref(),
+            Some("2026-10-07T00:00:00+00:00")
+        );
+        assert_eq!(
+            saved.next_resolution_at.as_deref(),
+            Some("2026-10-07T00:01:30+00:00")
         );
     }
 

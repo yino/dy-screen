@@ -476,3 +476,41 @@ fn test_model_call(
         .expect("测试用模型调用点必须可构造"),
     )
 }
+
+/// 任务 9.2 / 9.6：设置页状态视图给出当前模型、解析来源、下次解析时间与短期 token 状态，
+/// 但**绝不包含**任何凭据内容（旧 Key 与短期 token 都不回显）。
+#[tokio::test]
+async fn model_status_reports_current_model_without_leaking_credentials() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let (service, _controller) = command_service(database.clone(), Arc::new(AtomicUsize::new(0)));
+    let repository = AiRepository::new(database);
+    let service = service.with_model_call(test_model_call(&repository));
+
+    let view = service.model_status().expect("状态视图必须可读");
+    assert_eq!(view.model_id, "qwen-plus");
+    assert_eq!(view.call_path, "cloud_direct");
+    assert!(
+        view.resolved_at.is_some(),
+        "冷启动后必须已有解析时间：{view:?}"
+    );
+    assert!(view.next_resolution_at.is_some(), "必须给出下次解析时间");
+    let source = view.model_source.clone().unwrap_or_default();
+    assert!(
+        [
+            "build_default",
+            "heartbeat",
+            "local_override",
+            "run_override"
+        ]
+        .contains(&source.as_str()),
+        "解析来源必须是稳定标识：{source}"
+    );
+    // 序列化后不得出现凭据或 token 本体。
+    let json = serde_json::to_string(&view).unwrap();
+    assert!(
+        !json.contains("st-lt-v1"),
+        "状态视图泄漏了短期 token：{json}"
+    );
+    assert!(!json.contains("sk-"), "状态视图泄漏了旧凭据：{json}");
+}

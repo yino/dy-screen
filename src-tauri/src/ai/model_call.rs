@@ -11,6 +11,7 @@
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::activation::ActivationService;
 use crate::api::ApiError;
@@ -56,8 +57,29 @@ fn map_token_api_error(error: &ApiError) -> LlmError {
     }
 }
 
+impl ActivationLlmTokenSource {
+    /// 只读缓存状态（不发网络请求）。
+    pub fn cached_lease(&self, now_unix_seconds: i64) -> Option<LlmTokenLease> {
+        let (device_id, activate_code) = self.activation.credentials()?;
+        let response = self
+            .activation
+            .api()
+            .cached_ai_llm_ak(&device_id, &activate_code)?;
+        let lease = LlmTokenLease {
+            token: response.ak,
+            expire_at: response.expire_at,
+            provider: response.provider,
+        };
+        lease.usable_at(now_unix_seconds).then_some(lease)
+    }
+}
+
 #[async_trait]
 impl LlmTokenSource for ActivationLlmTokenSource {
+    fn cached(&self, now_unix_seconds: i64) -> Option<LlmTokenLease> {
+        self.cached_lease(now_unix_seconds)
+    }
+
     async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
         let (device_id, activate_code) =
             self.activation.credentials().ok_or(LlmError::Credential)?;
@@ -73,6 +95,15 @@ impl LlmTokenSource for ActivationLlmTokenSource {
             provider: response.provider,
         })
     }
+}
+
+/// 短期 token 的**只读**状态（不含 token 本体）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenStatus {
+    pub cached: bool,
+    pub provider: Option<String>,
+    pub expires_in_seconds: Option<i64>,
 }
 
 /// 运行期持有的模型调用点。
@@ -95,11 +126,52 @@ impl ModelCallRuntime {
         let settings = repository.get_llm_provider_settings(true)?;
         let inputs = ModelResolutionInputs::from_non_production_environment();
         let resolver = ModelCallResolver::bootstrap(&settings, &inputs, now_ms)?;
-        Ok(Self {
+        let runtime = Self {
             repository,
             tokens,
             resolver: RwLock::new(resolver),
-        })
+        };
+        // 冷启动也要把来源与时间落盘：设置页在重启后立刻有值可显示。
+        {
+            let guard = runtime.resolver.read().map_err(|_| LlmError::Temporary)?;
+            runtime.persist_resolution(guard.current(), guard.next_resolution_at_ms())?;
+        }
+        Ok(runtime)
+    }
+
+    /// 把本次解析结果写回设置表，使设置页在重启后仍能显示来源与时间。
+    fn persist_resolution(
+        &self,
+        snapshot: &ModelCallSnapshot,
+        next_resolution_at_ms: i64,
+    ) -> Result<(), LlmError> {
+        let mut settings = self.repository.get_llm_provider_settings(true)?;
+        settings.model_id = snapshot.model_id.clone();
+        settings.model_source = Some(snapshot.source.as_str().to_owned());
+        settings.resolved_at = Some(chrono::Utc::now().to_rfc3339());
+        settings.next_resolution_at = Some(
+            chrono::DateTime::from_timestamp_millis(next_resolution_at_ms)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_default(),
+        );
+        self.repository.save_llm_provider_settings(&settings)?;
+        Ok(())
+    }
+
+    /// 只读的短期 token 状态：不发起任何网络请求，绝不返回 token 本体。
+    pub fn token_status(&self, now_unix_seconds: i64) -> TokenStatus {
+        match self.tokens.cached(now_unix_seconds) {
+            Some(lease) => TokenStatus {
+                cached: true,
+                provider: Some(lease.provider),
+                expires_in_seconds: Some(lease.expire_at - now_unix_seconds),
+            },
+            None => TokenStatus {
+                cached: false,
+                provider: None,
+                expires_in_seconds: None,
+            },
+        }
     }
 
     /// 当前生效快照（设置页展示"当前模型 + 解析来源 + 下次解析时间"用）。
@@ -151,8 +223,17 @@ impl ModelCallRuntime {
     pub fn on_heartbeat(&self, now_ms: i64) -> Result<bool, LlmError> {
         let settings = self.repository.get_llm_provider_settings(true)?;
         let inputs = ModelResolutionInputs::from_non_production_environment();
-        let mut resolver = self.resolver.write().map_err(|_| LlmError::Temporary)?;
-        resolver.apply_heartbeat(&settings, &inputs, now_ms)
+        let (changed, snapshot, next_resolution_at_ms) = {
+            let mut resolver = self.resolver.write().map_err(|_| LlmError::Temporary)?;
+            let changed = resolver.apply_heartbeat(&settings, &inputs, now_ms)?;
+            (
+                changed,
+                resolver.current().clone(),
+                resolver.next_resolution_at_ms(),
+            )
+        };
+        self.persist_resolution(&snapshot, next_resolution_at_ms)?;
+        Ok(changed)
     }
 
     /// 取一个仍有余量的短期 token（余量不足时重取一次）。
@@ -203,6 +284,75 @@ mod tests {
             expire_at,
             provider: "ALI".to_owned(),
         }
+    }
+
+    #[test]
+    fn bootstrap_and_heartbeat_persist_resolution_metadata_for_the_settings_page() {
+        let repository = repository();
+        let runtime = ModelCallRuntime::bootstrap(
+            repository.clone(),
+            Arc::new(ScriptedSource {
+                replies: Vec::new(),
+                calls: AtomicUsize::new(0),
+            }),
+            1_000,
+        )
+        .unwrap();
+        let settings = repository.get_llm_provider_settings(true).unwrap();
+        assert_eq!(settings.model_source.as_deref(), Some("build_default"));
+        assert!(settings.resolved_at.is_some(), "冷启动必须落解析时间");
+        assert!(
+            settings.next_resolution_at.is_some(),
+            "冷启动必须落下一次解析时间"
+        );
+
+        // 用户改设置 → 心跳边界解析后来源变成 local_override 并落盘。
+        let mut changed = settings.clone();
+        changed.model_id = "qwen-max".to_owned();
+        repository.save_llm_provider_settings(&changed).unwrap();
+        assert!(runtime.on_heartbeat(90_000).unwrap());
+        let after = repository.get_llm_provider_settings(true).unwrap();
+        assert_eq!(after.model_id, "qwen-max");
+        assert_eq!(after.model_source.as_deref(), Some("local_override"));
+        assert_ne!(
+            after.resolved_at, settings.resolved_at,
+            "解析时间必须更新，供设置页显示"
+        );
+    }
+
+    #[test]
+    fn token_status_is_read_only_and_never_exposes_the_token_body() {
+        struct CachedSource;
+        #[async_trait]
+        impl LlmTokenSource for CachedSource {
+            async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
+                Err(LlmError::Temporary)
+            }
+            fn cached(&self, _now: i64) -> Option<LlmTokenLease> {
+                Some(lease(1_600))
+            }
+        }
+        let runtime = ModelCallRuntime::bootstrap(repository(), Arc::new(CachedSource), 0).unwrap();
+        let status = runtime.token_status(1_000);
+        assert!(status.cached);
+        assert_eq!(status.provider.as_deref(), Some("ALI"));
+        assert_eq!(status.expires_in_seconds, Some(600));
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("st-lt-v1"), "状态里不得含 token：{json}");
+
+        // 无缓存：只报未缓存，不发起任何网络请求（fetch 会返回 Temporary，不应被触发）。
+        struct EmptySource;
+        #[async_trait]
+        impl LlmTokenSource for EmptySource {
+            async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
+                Err(LlmError::Temporary)
+            }
+        }
+        let runtime = ModelCallRuntime::bootstrap(repository(), Arc::new(EmptySource), 0).unwrap();
+        let status = runtime.token_status(1_000);
+        assert!(!status.cached);
+        assert!(status.provider.is_none());
+        assert!(status.expires_in_seconds.is_none());
     }
 
     #[test]

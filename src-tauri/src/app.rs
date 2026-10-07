@@ -1945,6 +1945,7 @@ pub fn run() {
             ai_export_json,
             ai_diagnose_environment,
             ai_get_llm_settings,
+            ai_get_model_status,
             ai_save_llm_settings,
             ai_clear_llm_key,
             ai_diagnose_llm_provider,
@@ -2104,7 +2105,8 @@ pub fn run() {
                 ai_components.runtime.clone(),
             )
             .with_highlight_workflow(highlight_workflow.clone())
-            .with_credential_store(credential_store.clone());
+            .with_credential_store(credential_store.clone())
+            .with_model_call(model_call.clone());
             app.manage(AiDesktopState::new(ai_commands));
             let clip_workflow_publisher: Arc<dyn ClipWorkflowPublisher> =
                 Arc::new(DesktopClipWorkflowPublisher {

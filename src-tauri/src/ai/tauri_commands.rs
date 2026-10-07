@@ -10,13 +10,13 @@ use super::{
     AiActiveLiveSession, AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate,
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
     AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun,
-    AiImportBatchView, AiProject, AiProjectDetailView, AiProjectSummary, AiReplaySessionCursor,
-    AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerPage, AiSessionImportView,
-    AiSessionOption, AiSmartReplaySessionCursor, AiSmartReplaySessionPage, AiSmartWorkflow,
-    AiSmartWorkflowDetail, AiTranscriptProjection, AiTrustedFileGrant, AuthorizeSmartWorkflowInput,
-    CreateLiveSmartWorkflowInput, CreateLocalSmartWorkflowInput, CreateReplaySmartWorkflowInput,
-    LlmProviderSettings, ProviderDiagnostic, RetrySmartWorkflowStageInput, SmartClippingWorkflow,
-    SmartWorkflowError,
+    AiImportBatchView, AiModelStatusView, AiProject, AiProjectDetailView, AiProjectSummary,
+    AiReplaySessionCursor, AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerPage,
+    AiSessionImportView, AiSessionOption, AiSmartReplaySessionCursor, AiSmartReplaySessionPage,
+    AiSmartWorkflow, AiSmartWorkflowDetail, AiTranscriptProjection, AiTrustedFileGrant,
+    AuthorizeSmartWorkflowInput, CreateLiveSmartWorkflowInput, CreateLocalSmartWorkflowInput,
+    CreateReplaySmartWorkflowInput, LlmProviderSettings, ProviderDiagnostic,
+    RetrySmartWorkflowStageInput, SmartClippingWorkflow, SmartWorkflowError,
 };
 
 pub struct AiDesktopState {
@@ -493,6 +493,13 @@ pub(crate) fn ai_get_llm_settings(
 ) -> Result<LlmProviderSettings, AiCommandError> {
     let key_configured = state.commands.llm_key_configured()?;
     state.commands.get_llm_provider_settings(key_configured)
+}
+
+#[tauri::command]
+pub(crate) fn ai_get_model_status(
+    state: State<'_, AiDesktopState>,
+) -> Result<AiModelStatusView, AiCommandError> {
+    state.commands.model_status()
 }
 
 #[tauri::command]

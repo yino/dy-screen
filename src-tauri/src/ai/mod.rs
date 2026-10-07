@@ -46,9 +46,9 @@ pub use clip_text_correction::{
 };
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
-    AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiProjectDetailView,
-    AiProjectInputView, AiRuntimeComponentDiagnostic, AiRuntimeResourceDiagnostic,
-    AiSessionImportView, AiTrustedFileGrant,
+    AiEnvironmentDiagnostic, AiImportBatchView, AiJobController, AiModelStatusView,
+    AiProjectDetailView, AiProjectInputView, AiRuntimeComponentDiagnostic,
+    AiRuntimeResourceDiagnostic, AiSessionImportView, AiTrustedFileGrant,
 };
 pub use desktop_runtime::{LocalAsrComponents, LocalAsrEnvironment, LocalAsrRuntime};
 pub use domain::{
@@ -129,7 +129,7 @@ pub use llm::{
     TransitionAgentScore, TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token,
     resolve_model_call_with_heartbeat,
 };
-pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime};
+pub use model_call::{ActivationLlmTokenSource, ModelCallRuntime, TokenStatus};
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
 };
@@ -156,5 +156,5 @@ pub use smart_workflow::{
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
     migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23, migrate_ai_v24, migrate_ai_v25,
-    migrate_ai_v26, migrate_ai_v27,
+    migrate_ai_v26, migrate_ai_v27, migrate_ai_v28,
 };
