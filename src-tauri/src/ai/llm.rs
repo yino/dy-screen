@@ -21,10 +21,18 @@ pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
 /// 百炼兼容模式根地址：客户端直连上游时的唯一端点。
 pub const DASHSCOPE_COMPATIBLE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
-/// 默认模型标识（百炼通义）。
-pub const DEFAULT_MODEL_ID: &str = "deepseek-chat";
+/// 构建期默认模型标识（百炼通义兼容模式，`validate-dashscope-direct-capabilities` 已实测）。
+///
+/// 生产构建的默认取值只来自这里；不做自动回退，不可用时报可区分原因，避免静默降质。
+pub const DEFAULT_MODEL_ID: &str = "qwen-plus";
 pub const PROMPT_VERSION: &str = "highlight-v1";
-pub const MAX_AGENT_TURNS: u8 = 3;
+/// 心跳周期边界解析间隔，与 `activation::HEARTBEAT_INTERVAL`（90 秒）对齐。
+pub const MODEL_RESOLUTION_INTERVAL_MS: i64 = 90_000;
+/// 短期 token 的安全提前量：剩余有效期不足该值时视为不可用。
+pub const TOKEN_SAFETY_MARGIN_SECONDS: i64 = 30;
+/// 本机覆盖模型标识的非生产环境变量（仅在 `non-prod-model-config` feature 下编译）。
+#[cfg(feature = "non-prod-model-config")]
+pub const NON_PRODUCTION_MODEL_ENV: &str = "DY_SCREEN_MODEL_ID";
 pub const DEFAULT_QUALIFIED_SCORE: u8 = 70;
 pub const DEFAULT_EXCELLENT_SCORE: u8 = 80;
 pub const DEFAULT_TRANSITION_AUTO_APPLY_SCORE: u8 = 8;
@@ -773,10 +781,24 @@ impl ModelCallPath {
 pub enum ResolutionSource {
     /// 构建期默认值。
     BuildDefault,
-    /// 本机覆盖（开发与验证构建）。
+    /// 心跳周期边界解析出的取值。
+    HeartbeatResolution,
+    /// 本机覆盖（仅在非生产构建中编译）。
     LocalOverride,
-    /// 单次运行覆盖。
+    /// 单次运行覆盖（仅在非生产构建中编译）。
     RunOverride,
+}
+
+impl ResolutionSource {
+    /// 稳定机器标识，供设置页与诊断展示"为什么这次用了这个模型"。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildDefault => "build_default",
+            Self::HeartbeatResolution => "heartbeat",
+            Self::LocalOverride => "local_override",
+            Self::RunOverride => "run_override",
+        }
+    }
 }
 
 /// 一次运行内冻结的模型调用快照。
@@ -819,32 +841,67 @@ pub fn resolve_model_call(
     local_model_override: Option<&str>,
     run_model_override: Option<&str>,
 ) -> Result<ModelCallSnapshot, LlmError> {
+    resolve_model_call_with_heartbeat(settings, None, local_model_override, run_model_override)
+}
+
+/// 按「构建期默认 → 心跳周期解析 → 本机覆盖 → 单次运行覆盖」解析冻结快照。
+///
+/// - 生产构建只有前两层：`local`/`run` 覆盖参数**不参与计算**（调用点本身仍在，
+///   但取值路径在非生产 feature 之外不存在，因此生产包里无法用它们改变模型）。
+/// - 地址恒由构建期默认决定，任何一层都不能改变 Base URL。
+pub fn resolve_model_call_with_heartbeat(
+    settings: &LlmProviderSettings,
+    heartbeat_model: Option<&str>,
+    local_model_override: Option<&str>,
+    run_model_override: Option<&str>,
+) -> Result<ModelCallSnapshot, LlmError> {
     let mut model_id = DEFAULT_MODEL_ID.to_owned();
     let mut source = ResolutionSource::BuildDefault;
-    // 空白覆盖必须视为"未提供"，否则会跳过下层取值、静默回退到硬编码默认模型。
-    let local = local_model_override
+    // 心跳周期解析出的取值优先于构建期默认；空白视为"未提供"。
+    if let Some(value) = heartbeat_model
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let run = run_model_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(value) = local {
+        .filter(|value| !value.is_empty())
+    {
         model_id = value.to_owned();
-        source = ResolutionSource::LocalOverride;
+        source = ResolutionSource::HeartbeatResolution;
     }
-    if let Some(value) = run {
-        model_id = value.to_owned();
-        source = ResolutionSource::RunOverride;
+    // 非生产覆盖只在 `non-prod-model-config` feature 下编译；生产构建里这段代码不存在。
+    #[cfg(feature = "non-prod-model-config")]
+    {
+        // 空白覆盖必须视为"未提供"，否则会跳过下层取值、静默回退到硬编码默认模型。
+        let local = local_model_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let run = run_model_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(value) = local {
+            model_id = value.to_owned();
+            source = ResolutionSource::LocalOverride;
+        }
+        if let Some(value) = run {
+            model_id = value.to_owned();
+            source = ResolutionSource::RunOverride;
+        }
     }
-    // 没有更上层覆盖时，设置页中的模型标识是"本机覆盖"层的显式取值。
-    if local.is_none() && run.is_none() {
-        if settings.model_id.trim().is_empty() {
+    #[cfg(not(feature = "non-prod-model-config"))]
+    {
+        // 生产构建：显式忽略这两个参数，避免"传了就生效"的隐式路径。
+        let _ = (local_model_override, run_model_override);
+    }
+    // 没有更上层取值时，设置表中的模型标识是"当前已解析取值"的持久化载体：
+    // 与构建期默认相同则记 BuildDefault，否则记 LocalOverride（例如升级前的旧取值）。
+    if source == ResolutionSource::BuildDefault {
+        let stored = settings.model_id.trim();
+        if stored.is_empty() {
             return Err(LlmError::InvalidConfiguration(
                 "模型标识不能为空".to_owned(),
             ));
         }
-        model_id = settings.model_id.trim().to_owned();
-        source = ResolutionSource::LocalOverride;
+        if stored != DEFAULT_MODEL_ID {
+            model_id = stored.to_owned();
+            source = ResolutionSource::LocalOverride;
+        }
     }
     if model_id.chars().count() > 128 {
         return Err(LlmError::InvalidConfiguration(
@@ -897,6 +954,11 @@ impl FrozenModelCall {
         })
     }
 
+    /// 由已解析快照冻结（供心跳周期解析器在运行开始时冻结）。
+    pub fn from_snapshot(snapshot: ModelCallSnapshot) -> Self {
+        Self { snapshot }
+    }
+
     /// 只读冻结快照，供调用层取地址、模型与超时。
     pub fn snapshot_ref(&self) -> &ModelCallSnapshot {
         &self.snapshot
@@ -911,6 +973,167 @@ impl FrozenModelCall {
     pub fn model_id(&self) -> &str {
         &self.snapshot.model_id
     }
+}
+
+/// 心跳周期边界解析出的"当前模型配置"。
+///
+/// 语义（design 决策四 / 决策十）：
+/// - **冷启动**：`bootstrap` 立刻用构建期默认，不等第一次心跳；
+/// - **解析时机**：只在心跳响应到达时调用 `apply_heartbeat`，不另起计时器；
+/// - **运行内冻结**：运行开始前 `freeze_for_run`，运行期间不得重新解析；
+/// - `next_resolution_at_ms` 供设置页显示"下次解析时间"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCallResolver {
+    snapshot: ModelCallSnapshot,
+    resolved_at_ms: i64,
+    next_resolution_at_ms: i64,
+}
+
+/// 一次解析的全部输入（显式传入；解析器自身不读环境变量与全局状态）。
+///
+/// 生产装配处用 [`ModelResolutionInputs::from_non_production_environment`] 构造，
+/// 它是唯一读取非生产环境变量的地方；其余调用方显式给出取值，便于测试与并发隔离。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelResolutionInputs {
+    pub heartbeat_model: Option<String>,
+    pub local_model_override: Option<String>,
+    pub run_model_override: Option<String>,
+}
+
+impl ModelResolutionInputs {
+    /// 生产装配入口：心跳取值由调用方随后填入，本机覆盖只来自非生产环境变量。
+    pub fn from_non_production_environment() -> Self {
+        Self {
+            heartbeat_model: None,
+            local_model_override: non_production_model_override(),
+            run_model_override: None,
+        }
+    }
+}
+
+impl ModelCallResolver {
+    /// 冷启动解析：构建期默认立即可用，不等第一次心跳。
+    pub fn bootstrap(
+        settings: &LlmProviderSettings,
+        inputs: &ModelResolutionInputs,
+        now_ms: i64,
+    ) -> Result<Self, LlmError> {
+        let snapshot = resolve_model_call_with_heartbeat(
+            settings,
+            inputs.heartbeat_model.as_deref(),
+            inputs.local_model_override.as_deref(),
+            inputs.run_model_override.as_deref(),
+        )?;
+        Ok(Self {
+            snapshot,
+            resolved_at_ms: now_ms,
+            next_resolution_at_ms: now_ms.saturating_add(MODEL_RESOLUTION_INTERVAL_MS),
+        })
+    }
+
+    /// 心跳响应到达时重新解析；返回**模型或地址是否发生变化**（变化即相关缓存与指纹失效）。
+    pub fn apply_heartbeat(
+        &mut self,
+        settings: &LlmProviderSettings,
+        inputs: &ModelResolutionInputs,
+        now_ms: i64,
+    ) -> Result<bool, LlmError> {
+        let next = resolve_model_call_with_heartbeat(
+            settings,
+            inputs.heartbeat_model.as_deref(),
+            inputs.local_model_override.as_deref(),
+            inputs.run_model_override.as_deref(),
+        )?;
+        let changed =
+            next.model_id != self.snapshot.model_id || next.base_url != self.snapshot.base_url;
+        self.snapshot = next;
+        self.resolved_at_ms = now_ms;
+        self.next_resolution_at_ms = now_ms.saturating_add(MODEL_RESOLUTION_INTERVAL_MS);
+        Ok(changed)
+    }
+
+    /// 当前生效快照。
+    pub fn current(&self) -> &ModelCallSnapshot {
+        &self.snapshot
+    }
+
+    pub fn resolved_at_ms(&self) -> i64 {
+        self.resolved_at_ms
+    }
+
+    pub fn next_resolution_at_ms(&self) -> i64 {
+        self.next_resolution_at_ms
+    }
+
+    /// 运行开始前冻结；进行中的运行不受后续配置切换影响。
+    pub fn freeze_for_run(&self) -> FrozenModelCall {
+        FrozenModelCall::from_snapshot(self.snapshot.clone())
+    }
+}
+
+/// 非生产本机模型覆盖（仅在 `non-prod-model-config` feature 下存在）。
+///
+/// 生产构建里该函数不存在，因此"手输模型/地址"的路径在正式包中根本不可达。
+#[cfg(feature = "non-prod-model-config")]
+pub fn non_production_model_override() -> Option<String> {
+    std::env::var(NON_PRODUCTION_MODEL_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(feature = "non-prod-model-config"))]
+pub fn non_production_model_override() -> Option<String> {
+    None
+}
+
+/// 一次可用的短期 token 租约。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmTokenLease {
+    pub token: String,
+    pub expire_at: i64,
+    pub provider: String,
+}
+
+impl LlmTokenLease {
+    /// 在给定时刻是否仍有足够余量（生产构建统一使用 [`TOKEN_SAFETY_MARGIN_SECONDS`]）。
+    pub fn usable_at(&self, now_unix_seconds: i64) -> bool {
+        self.expire_at > now_unix_seconds.saturating_add(TOKEN_SAFETY_MARGIN_SECONDS)
+    }
+
+    /// 诊断用：只暴露 provider 与剩余有效期，绝不暴露 token 本体。
+    pub fn diagnostic_label(&self, now_unix_seconds: i64) -> String {
+        format!(
+            "provider={} remaining={}s",
+            self.provider,
+            (self.expire_at - now_unix_seconds).max(0)
+        )
+    }
+}
+
+/// 短期 token 来源。真实实现复用 `AiApi::ai_llm_ak`（与云 ASR 共享同一份缓存）。
+#[async_trait]
+pub trait LlmTokenSource: Send + Sync {
+    async fn fetch(&self) -> Result<LlmTokenLease, LlmError>;
+}
+
+/// 取一个在 `now` 之后仍有余量的短期 token；余量不足时**重取一次**。
+///
+/// 长运行中途 token 过期由本函数兜住：第一次取到的 token 即将过期就立刻重取；
+/// 重取后仍不可用则返回可区分的授权失败，由调用方停止该次运行并保留已发布结果。
+pub async fn acquire_llm_token(
+    source: &dyn LlmTokenSource,
+    now_unix_seconds: i64,
+) -> Result<LlmTokenLease, LlmError> {
+    let first = source.fetch().await?;
+    if first.usable_at(now_unix_seconds) {
+        return Ok(first);
+    }
+    let retried = source.fetch().await?;
+    if retried.usable_at(now_unix_seconds) {
+        return Ok(retried);
+    }
+    Err(LlmError::Credential)
 }
 
 #[async_trait]
@@ -1370,12 +1593,19 @@ mod model_call_snapshot_tests {
         }
     }
 
-    /// 解析优先级：本机覆盖覆盖构建期默认，单次运行覆盖覆盖前两者。
+    /// 解析优先级：构建期默认 → 心跳解析 → 本机覆盖 → 单次运行覆盖。
+    ///
+    /// 后两层只在非生产 feature 下存在（本测试因此归属于非生产构建）。
+    #[cfg(feature = "non-prod-model-config")]
     #[test]
     fn resolution_precedence_is_build_then_local_then_run() {
         let base = resolve_model_call(&settings("qwen-plus"), None, None).expect("resolve");
         assert_eq!(base.model_id, "qwen-plus");
-        assert_eq!(base.source, ResolutionSource::LocalOverride);
+        assert_eq!(
+            base.source,
+            ResolutionSource::BuildDefault,
+            "取值与构建期默认相同即记构建期默认"
+        );
 
         let local = resolve_model_call(&settings("qwen-plus"), Some("qwen-max"), None)
             .expect("local override");
@@ -1390,6 +1620,7 @@ mod model_call_snapshot_tests {
         // 空覆盖视为未提供，不得覆盖上一层。
         let blank = resolve_model_call(&settings("qwen-plus"), Some("  "), None).expect("blank");
         assert_eq!(blank.model_id, "qwen-plus");
+        assert_eq!(blank.source, ResolutionSource::BuildDefault);
     }
 
     /// 地址只由构建期默认决定：任何覆盖都不得改变 Base URL。
@@ -1641,5 +1872,269 @@ mod llm_call_diagnostic_tests {
                 "tokenUsage",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod model_call_resolution_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn settings_with_model(model_id: &str) -> LlmProviderSettings {
+        LlmProviderSettings {
+            model_id: model_id.to_owned(),
+            ..LlmProviderSettings::default()
+        }
+    }
+
+    /// 固定回答的 token 来源，用于验证"余量不足则重取一次"。
+    ///
+    /// 剧本用本地枚举承载（`LlmError` 不是 `Clone`），避免为测试给生产错误类型加约束。
+    enum Reply {
+        Lease(LlmTokenLease),
+        Temporary,
+    }
+
+    struct ScriptedTokenSource {
+        script: Vec<Reply>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedTokenSource {
+        fn new(script: Vec<Reply>) -> Self {
+            Self {
+                script,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmTokenSource for ScriptedTokenSource {
+        async fn fetch(&self) -> Result<LlmTokenLease, LlmError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.script.get(index) {
+                Some(Reply::Lease(lease)) => Ok(lease.clone()),
+                Some(Reply::Temporary) | None => Err(LlmError::Temporary),
+            }
+        }
+    }
+
+    fn lease(expire_in_seconds: i64) -> LlmTokenLease {
+        LlmTokenLease {
+            token: "st-lt-v1.test".to_owned(),
+            expire_at: 1_000 + expire_in_seconds,
+            provider: "ALI".to_owned(),
+        }
+    }
+
+    #[test]
+    fn build_default_model_is_qwen_plus_and_fresh_settings_resolve_to_it() {
+        assert_eq!(DEFAULT_MODEL_ID, "qwen-plus");
+        let snapshot = resolve_model_call(&settings_with_model(DEFAULT_MODEL_ID), None, None)
+            .expect("解析必须成功");
+        assert_eq!(snapshot.model_id, "qwen-plus");
+        assert_eq!(snapshot.source, ResolutionSource::BuildDefault);
+        // 地址恒为构建期默认的百炼兼容端点。
+        assert_eq!(snapshot.base_url, DASHSCOPE_COMPATIBLE_BASE_URL);
+        assert_eq!(snapshot.path, ModelCallPath::CloudDirect);
+    }
+
+    #[test]
+    fn settings_model_is_reported_as_local_override() {
+        let snapshot =
+            resolve_model_call(&settings_with_model("qwen-max"), None, None).expect("解析必须成功");
+        assert_eq!(snapshot.model_id, "qwen-max");
+        assert_eq!(snapshot.source, ResolutionSource::LocalOverride);
+    }
+
+    #[test]
+    fn heartbeat_resolution_wins_over_build_default_and_never_changes_base_url() {
+        let snapshot = resolve_model_call_with_heartbeat(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            Some("qwen-turbo"),
+            None,
+            None,
+        )
+        .expect("解析必须成功");
+        assert_eq!(snapshot.model_id, "qwen-turbo");
+        assert_eq!(snapshot.source, ResolutionSource::HeartbeatResolution);
+        assert_eq!(snapshot.base_url, DASHSCOPE_COMPATIBLE_BASE_URL);
+        // 空白心跳取值视为未提供。
+        let blank = resolve_model_call_with_heartbeat(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            Some("   "),
+            None,
+            None,
+        )
+        .expect("解析必须成功");
+        assert_eq!(blank.source, ResolutionSource::BuildDefault);
+    }
+
+    #[test]
+    fn resolver_is_available_before_the_first_heartbeat_and_reports_next_resolution() {
+        let resolver = ModelCallResolver::bootstrap(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            &ModelResolutionInputs::default(),
+            10_000,
+        )
+        .expect("冷启动解析必须成功");
+        assert_eq!(resolver.current().model_id, "qwen-plus");
+        assert_eq!(resolver.current().source, ResolutionSource::BuildDefault);
+        assert_eq!(resolver.resolved_at_ms(), 10_000);
+        assert_eq!(
+            resolver.next_resolution_at_ms(),
+            10_000 + MODEL_RESOLUTION_INTERVAL_MS
+        );
+        assert_eq!(MODEL_RESOLUTION_INTERVAL_MS, 90_000, "必须与 90 秒心跳对齐");
+    }
+
+    #[test]
+    fn heartbeat_refresh_reports_change_and_freezes_do_not_move() {
+        let mut resolver = ModelCallResolver::bootstrap(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            &ModelResolutionInputs::default(),
+            0,
+        )
+        .unwrap();
+        let frozen_before = resolver.freeze_for_run();
+        let unchanged = resolver
+            .apply_heartbeat(
+                &settings_with_model(DEFAULT_MODEL_ID),
+                &ModelResolutionInputs {
+                    heartbeat_model: Some("qwen-plus".to_owned()),
+                    ..ModelResolutionInputs::default()
+                },
+                90_000,
+            )
+            .expect("心跳刷新必须成功");
+        assert!(!unchanged, "同一模型不得报告变化");
+        let changed = resolver
+            .apply_heartbeat(
+                &settings_with_model(DEFAULT_MODEL_ID),
+                &ModelResolutionInputs {
+                    heartbeat_model: Some("qwen-max".to_owned()),
+                    ..ModelResolutionInputs::default()
+                },
+                180_000,
+            )
+            .expect("心跳刷新必须成功");
+        assert!(changed, "模型变化必须报告变化");
+        assert_eq!(resolver.current().model_id, "qwen-max");
+        assert_eq!(resolver.next_resolution_at_ms(), 180_000 + 90_000);
+        // 运行内冻结不受后续切换影响。
+        assert_eq!(frozen_before.model_id(), "qwen-plus");
+        assert_eq!(
+            frozen_before.snapshot_ref().source,
+            ResolutionSource::BuildDefault
+        );
+        assert!(
+            resolver
+                .freeze_for_run()
+                .fingerprint_input()
+                .contains("qwen-max")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_with_enough_margin_is_used_as_is() {
+        let source = ScriptedTokenSource::new(vec![Reply::Lease(lease(600))]);
+        let acquired = acquire_llm_token(&source, 1_000).await.expect("必须成功");
+        assert_eq!(acquired.token, "st-lt-v1.test");
+        assert_eq!(source.calls(), 1, "余量充足时不得重取");
+    }
+
+    #[tokio::test]
+    async fn expiring_token_is_refetched_once_and_then_accepted() {
+        let source =
+            ScriptedTokenSource::new(vec![Reply::Lease(lease(10)), Reply::Lease(lease(600))]);
+        let acquired = acquire_llm_token(&source, 1_000)
+            .await
+            .expect("重取后必须成功");
+        assert!(acquired.usable_at(1_000));
+        assert_eq!(source.calls(), 2, "余量不足必须重取一次");
+    }
+
+    #[tokio::test]
+    async fn always_expiring_token_fails_with_credential_error() {
+        let source = ScriptedTokenSource::new(vec![Reply::Lease(lease(1)), Reply::Lease(lease(1))]);
+        let error = acquire_llm_token(&source, 1_000).await.unwrap_err();
+        assert_eq!(error.category_str(), "credential");
+        assert_eq!(source.calls(), 2, "只重取一次，不得无限重试");
+        // 来源本身报错时直接上抛，不再重取。
+        let failing = ScriptedTokenSource::new(vec![Reply::Temporary]);
+        let error = acquire_llm_token(&failing, 1_000).await.unwrap_err();
+        assert_eq!(error.category_str(), "temporary");
+        assert_eq!(failing.calls(), 1);
+    }
+
+    #[test]
+    fn token_diagnostic_never_contains_the_token_body() {
+        let label = lease(600).diagnostic_label(1_000);
+        assert!(label.contains("provider=ALI"));
+        assert!(
+            !label.contains("st-lt-v1"),
+            "诊断不得含 token 本体：{label}"
+        );
+    }
+
+    /// 生产构建（未启用 feature）必须显式忽略本机/运行覆盖参数。
+    #[cfg(not(feature = "non-prod-model-config"))]
+    #[test]
+    fn production_build_ignores_non_production_overrides() {
+        let snapshot = resolve_model_call(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            Some("qwen-via-local-override"),
+            Some("qwen-via-run-override"),
+        )
+        .expect("解析必须成功");
+        assert_eq!(snapshot.model_id, DEFAULT_MODEL_ID);
+        assert_eq!(snapshot.source, ResolutionSource::BuildDefault);
+    }
+
+    /// 非生产构建（启用 feature）允许本机覆盖，且来源被如实标注。
+    #[cfg(feature = "non-prod-model-config")]
+    #[test]
+    fn non_production_build_applies_local_and_run_overrides() {
+        let local = resolve_model_call(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            Some("qwen-local"),
+            None,
+        )
+        .expect("解析必须成功");
+        assert_eq!(local.model_id, "qwen-local");
+        assert_eq!(local.source, ResolutionSource::LocalOverride);
+        let run = resolve_model_call(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            Some("qwen-local"),
+            Some("qwen-run"),
+        )
+        .expect("解析必须成功");
+        assert_eq!(run.model_id, "qwen-run");
+        assert_eq!(run.source, ResolutionSource::RunOverride);
+    }
+
+    #[cfg(feature = "non-prod-model-config")]
+    #[test]
+    fn non_production_environment_override_is_read_only_under_the_feature() {
+        // SAFETY：测试内串行使用，且只在本 feature 下编译。
+        unsafe { std::env::set_var(NON_PRODUCTION_MODEL_ENV, "qwen-from-env") };
+        assert_eq!(
+            non_production_model_override().as_deref(),
+            Some("qwen-from-env")
+        );
+        let resolver = ModelCallResolver::bootstrap(
+            &settings_with_model(DEFAULT_MODEL_ID),
+            &ModelResolutionInputs::from_non_production_environment(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(resolver.current().model_id, "qwen-from-env");
+        assert_eq!(resolver.current().source, ResolutionSource::LocalOverride);
+        unsafe { std::env::remove_var(NON_PRODUCTION_MODEL_ENV) };
     }
 }

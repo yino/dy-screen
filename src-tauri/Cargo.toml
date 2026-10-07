@@ -17,6 +17,12 @@ path = "src/main.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+# 非生产模型配置：允许通过本机环境变量覆盖模型标识。生产构建不编译这条路径，
+# 因此"手输地址/凭据"的代码在正式包里根本不存在，而不是被一个运行开关挡住。
+non-prod-model-config = []
+
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

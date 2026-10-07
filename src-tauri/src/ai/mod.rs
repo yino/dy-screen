@@ -116,13 +116,17 @@ pub use lifecycle::{AiLifecycle, AiLifecycleError, AiRecoveryReport};
 pub use llm::{
     CandidateAgentOutput, CandidateAgentRequest, CredentialError, CredentialStore,
     DEEPSEEK_BASE_URL, DEFAULT_EXCELLENT_SCORE, DEFAULT_MODEL_ID, DEFAULT_QUALIFIED_SCORE,
-    DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider, HighlightAgentProvider,
-    HighlightCandidateDraft, HighlightCandidateScore, LlmError, LlmProviderSettings,
-    MAX_AGENT_TURNS, MemoryCredentialStore, PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput,
-    RankingAgentRequest, RigDeepSeekProvider, SubtitleCorrectionItem, SubtitleCorrectionOutput,
+    DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider, FrozenModelCall,
+    HighlightAgentProvider, HighlightCandidateDraft, HighlightCandidateScore, LlmError,
+    LlmProviderSettings, LlmTokenLease, LlmTokenSource, MODEL_RESOLUTION_INTERVAL_MS,
+    MemoryCredentialStore, ModelCallResolver, ModelCallSnapshot, ModelResolutionInputs,
+    PROMPT_VERSION, ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest, ResolutionSource,
+    RigDeepSeekProvider, SubtitleCorrectionItem, SubtitleCorrectionOutput,
     SubtitleCorrectionProvider, SubtitleCorrectionRequest, SystemCredentialStore,
-    TransitionAgentCandidate, TransitionAgentMatch, TransitionAgentOutput, TransitionAgentProvider,
-    TransitionAgentRequest, TransitionAgentScore, TransitionScoreOutput, TransitionScoreRequest,
+    TOKEN_SAFETY_MARGIN_SECONDS, TransitionAgentCandidate, TransitionAgentMatch,
+    TransitionAgentOutput, TransitionAgentProvider, TransitionAgentRequest, TransitionAgentScore,
+    TransitionScoreOutput, TransitionScoreRequest, acquire_llm_token,
+    resolve_model_call_with_heartbeat,
 };
 pub use processor::{
     AiInputProcessor, AiJobEvent, AiJobPublisher, AiProcessOutcome, AiProcessorError,
