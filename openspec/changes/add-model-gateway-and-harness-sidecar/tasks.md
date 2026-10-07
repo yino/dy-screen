@@ -21,13 +21,13 @@
 
 ## 2. sidecar 生命周期与 JSON-RPC
 
-- [ ] 2.1 实现 Rust 侧 sidecar 启动、监管与优雅关闭，验证应用退出时不残留子进程
-- [ ] 2.2 实现 stdio 上的 JSON-RPC 请求、响应、错误与取消消息，验证消息不含短期 token 或本地路径
-- [ ] 2.3 验证 sidecar 不接受来自本机其他进程的连接或输入（只由监管进程驱动）
-- [ ] 2.4 实现 sidecar 异常退出与无响应的检测，验证该次调用被判定失败且不影响其他任务
-- [ ] 2.5 实现按需启动与空闲回收，验证空闲态下无 sidecar 常驻进程
+- [x] 2.1 实现 Rust 侧 sidecar 启动、监管与优雅关闭，验证应用退出时不残留子进程（`HarnessSidecar::spawn` 受限环境（最小 PATH/HOME/TMPDIR 落工作区、`kill_on_drop`）+ `shutdown`（先关 stdin 通知 EOF、宽限期内退出、超时强杀）；测试 `graceful_shutdown_terminates_the_child_process` 断言关闭后 `try_wait` 为 Some）
+- [x] 2.2 实现 stdio 上的 JSON-RPC 请求、响应、错误与取消消息，验证消息不含短期 token 或本地路径（`JsonRpcRequest`/`JsonRpcResponse`/`JsonRpcError` 换行分隔、单条 ≤ 1 MiB；请求/响应/错误/取消四类都有对应分支；测试 `protocol_messages_carry_no_tokens_or_local_paths` 断言序列化后不含 token/路径/Authorization）
+- [x] 2.3 验证 sidecar 不接受来自本机其他进程的连接或输入（只由监管进程驱动）（**结构性成立**：stdio 管道、不监听任何端口、`env_clear` 不继承代理；不存在其他进程可连接的接口）
+- [x] 2.4 实现 sidecar 异常退出与无响应的检测，验证该次调用被判定失败且不影响其他任务（`crash_is_reported_as_distinguishable_error` 断言提前退出 → `harness_crashed`；`per_request_timeout` 超时 → `harness_timeout`；单次失败不持久化到管理器状态，后续 `acquire` 仍可启动新实例）
+- [x] 2.5 实现按需启动与空闲回收，验证空闲态下无 sidecar 常驻进程（`HarnessManager::acquire` 惰性启动、`reclaim_idle` 空闲超时回收；测试 `manager_starts_on_demand_and_reclaims_when_idle` 断言启动前无进程、空闲后回收）
 - [ ] 2.6 测量并记录 sidecar 的峰值内存、磁盘占用与启动耗时，验证其在 8 GB 目标设备基线内
-- [ ] 2.7 用最小 Skill 真跑一次工具循环（含一次受控工具调用与结构化结果回收），验证 sidecar 交付可用于承载新分支，而不只证明启动与往返可用
+- [x] 2.7 用最小 Skill 真跑一次工具循环（含一次受控工具调用与结构化结果回收），验证 sidecar 交付可用于承载新分支，而不只证明启动与往返可用（`minimal_skill_tool_loop_round_trips_over_stdio`：真实 Python 子进程跑 `run_skill → tool.invoke(echo) → 返回`，Rust 侧白名单授权并执行工具；另有 `tool_denied_is_reported_without_execution` 断言白名单外工具被拒且执行器不被调用）
 
 ## 3. 应用专用 Profile 与 Skill
 
@@ -37,7 +37,7 @@
 - [ ] 3.4 把现有五个内置精彩 Skill 与两个转场阶段纳入随包 Skill，验证 Skill ID 与版本仍进入运行指纹且指纹语义不变
 - [ ] 3.5 新增测试：ASR 文本包含形似系统指令或工具调用的内容时，工具集合、模型路由与工作流阶段均不改变
 - [ ] 3.6 把 Skill 作为随包文件由 Rust 读取与校验并把 Skill ID 与版本写入运行指纹，验证三条既有链路**不进入 Harness** 也能满足 Skill 随包与指纹语义（消除 tasks 3.4 与 4/5/6 的张力）
-- [ ] 3.7 删除未使用的 `MAX_AGENT_TURNS`，验证工具循环归 Harness、Rust 侧只保留整次调用的超时与预算上限，且无残留引用
+- [x] 3.7 删除未使用的 `MAX_AGENT_TURNS`，验证工具循环归 Harness、Rust 侧只保留整次调用的超时与预算上限，且无残留引用（`MAX_AGENT_TURNS` 已删除，全树 grep 无残留；工具循环归 sidecar 的 `tool.invoke`，Rust 侧只做白名单授权与 `per_request_timeout`）
 
 ## 4. 转换文本纠错链路
 

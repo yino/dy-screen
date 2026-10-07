@@ -15,6 +15,7 @@ mod effect_caption_composition;
 mod effect_caption_orchestration;
 mod effect_caption_render;
 mod effect_caption_spec;
+mod harness;
 mod highlight;
 mod lifecycle;
 mod llm;
@@ -107,6 +108,11 @@ pub use effect_caption_render::{
 pub use effect_caption_spec::{
     CanvasSpec, HighlightRenderWindow, MAX_RENDER_FPS, PREVIEW_FPS_CAP, PREVIEW_SCALE_DIVISOR,
     RenderPurpose, RenderSpec, assert_preview_export_consistent, plan_render_spec,
+};
+pub use harness::{
+    HARNESS_MAX_MESSAGE_BYTES, HARNESS_PROTOCOL_VERSION, HarnessError, HarnessLimits,
+    HarnessManager, HarnessSidecar, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolAllowlist,
+    ToolExecutor,
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,

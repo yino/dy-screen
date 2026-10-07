@@ -60,3 +60,20 @@
 - 数据边界已登记：两个且仅两个上传例外（音频直传 / 最小文本），其余能力结构性禁止上传。
 - `model-call-event` 已发出但设置页尚未消费（任务 9.2）。
 - 设置表尚未新增"模型来源/解析时间戳"字段（9.4 未做，涉及迁移号决策）。
+
+
+## S2 进度（sidecar 生命周期与 Profile/Skill）
+
+已完成：
+- `ai/harness.rs`：`HarnessSidecar`（受限子进程 spawn/request/shutdown）+ stdio JSON-RPC 协议
+  （换行分隔、单条 ≤1MiB、请求/响应/错误/取消）+ `HarnessManager`（按需启动 + 空闲回收）
+- Rust 侧工具授权：`ToolAllowlist` + `ToolExecutor`，sidecar 只能 `tool.invoke` 白名单工具，
+  参数与执行都在 Rust 侧
+- 7 个测试，含**真实子进程最小 Skill 工具循环端到端**、白名单拒绝不执行、崩溃/超时/优雅关闭、消息脱敏
+
+待办（阻塞项）：
+- 任务 2.6（峰值内存/磁盘/启动耗时，8GB 基线）需要真实 Harness 运行时
+- 任务组 1（运行资源清单的 Harness/Profile/Skill 组件类型与发布校验）
+- 任务组 3 的 3.1–3.5（随包 Profile/Skill 资产本体、ASR 文本注入防护）与 3.6
+- 任务组 8（取消/资源上限/迟到结果）部分依赖真实运行时的资源特征
+- 三平台协议与恢复验收（11.x）依赖 Node 22 LTS 三架构资产 + CI 扩展
