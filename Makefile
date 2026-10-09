@@ -291,6 +291,21 @@ test-clip-subtitle:
 	"$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export -- --nocapture
 	"$(NPM)" test -- --run ui/src/AiWorkspace.test.tsx
 
+# 无界面端到端冒烟：真实调用上游，跑「提取精彩 → 合辑 → 纠错 → 转场匹配 → 导出 MP4」。
+#
+# 需要（缺一不可，因此本目标**不进 `make test`**）：
+#   - 有效激活凭据与应用数据库（`DY_SCREEN_DATA_DIR` 可指向副本）
+#   - `DY_SCREEN_API_BASE_URL`
+#   - 会产生真实上游费用
+#
+# 用法： make smoke-smart-clip PROJECT_ID=43 OUT=/tmp/out.mp4
+smoke-smart-clip:
+	@test -n "$(PROJECT_ID)" || { printf '%s\n' '错误：必须通过 PROJECT_ID 指定 AI 工程 id。' >&2; exit 2; }
+	@test -n "$(OUT)" || { printf '%s\n' '错误：必须通过 OUT 指定输出 MP4 路径。' >&2; exit 2; }
+	DY_SCREEN_DATA_DIR="$(DY_SCREEN_DATA_DIR)" DY_SCREEN_API_BASE_URL="$(DY_SCREEN_API_BASE_URL)" \
+		"$(CARGO)" run --offline --manifest-path src-tauri/Cargo.toml \
+		--example headless_highlight -- "$(PROJECT_ID)" "$(OUT)"
+
 test-clip-subtitle-integration: clip-subtitle-doctor
 	DY_SCREEN_FIXTURE_FFMPEG="$(FFMPEG_FIXTURE_GENERATOR)" DY_SCREEN_CLIP_FFMPEG="$(FFMPEG)" DY_SCREEN_CLIP_FFPROBE="$(FFPROBE)" "$(CARGO)" test --offline --manifest-path src-tauri/Cargo.toml --lib ai::clip_export::tests::exports_mixed_source_dimensions_to_a_playable_mp4 -- --exact --nocapture
 

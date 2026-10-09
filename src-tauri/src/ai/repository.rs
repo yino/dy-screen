@@ -16,14 +16,18 @@ use super::domain::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject, AiClipProjectDetail,
     AiClipProjectSource, AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle, AiClipSubtitleUpdate,
     AiClipTimelineUnit, AiClipTimelineUnitKind, AiEffectCaptionRenderAttempt, AiEnhancementKind,
-    AiEnhancementStatus, AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightChunk,
-    AiHighlightEnhancement, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus,
-    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectStatus,
-    AiRenderAttemptStatus, AiSmartClipSourceInput, AiSmartDraft, AiSmartDraftOwnership,
-    AiSmartDraftStatus, AsrArtifact, NewAiEffectCaptionRenderAttempt, NewAiHighlightChunk,
+    AiEnhancementReviewItem, AiEnhancementStatus, AiGeneratedAnimationAsset,
+    AiGeneratedAnimationComposition, AiGeneratedAnimationInsertBinding,
+    AiGeneratedAnimationReplaceRange, AiGeneratedAnimationStatus, AiHighlightCandidate,
+    AiHighlightCandidatePage, AiHighlightChunk, AiHighlightEnhancement, AiHighlightProgress,
+    AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject,
+    AiProjectDetail, AiProjectInput, AiProjectStatus, AiRenderAttemptStatus, AiSmartClipSourceInput,
+    AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AsrArtifact,
+    NewAiEffectCaptionRenderAttempt, NewAiGeneratedAnimationAsset, NewAiHighlightChunk,
     NewAiHighlightEnhancement, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact,
     RecognitionProfile, RecoverySummary, SourceFingerprint, TranscriptSegment,
-    TranscriptSegmentDraft,
+    TranscriptSegmentDraft, GENERATED_ANIMATION_CACHE_DIR, enhancement_review_items,
+    generated_animation_file_name, insert_binding_is_valid,
 };
 
 use super::llm::{HighlightCandidateDraft, HighlightCandidateScore, LlmProviderSettings};
@@ -96,6 +100,42 @@ pub struct ClipExportSource {
     pub source_fingerprint: SourceFingerprint,
     pub subtitles: Vec<AiClipSubtitle>,
     pub bridge_after: Option<ClipExportBridge>,
+    /// `replace` 生成式动画在导出计划中的输入；`None` 表示该片段无画面替换。
+    pub replace: Option<ClipExportReplace>,
+    /// `insert` 生成式动画在导出计划中的输入；`None` 表示该片段后无桥接单元。
+    pub insert_after: Option<ClipExportInsert>,
+}
+
+/// `insert` 合成方式在导出计划中的输入（步骤 4 任务 5.3）。
+///
+/// 该单元增加工程总时长并归属左侧片段；生成音轨一律丢弃，改用 48 kHz 双声道静音
+/// 补齐（决策二）。邻接绑定使用稳定 ID 三元组，任一改变即失效。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipExportInsert {
+    /// 已校验的生成资产文件路径。
+    pub asset_path: String,
+    /// 资产实际时长毫秒。
+    pub duration_ms: u64,
+    /// 归属的左侧片段稳定 ID。
+    pub left_segment_id: i64,
+    /// 右侧片段稳定 ID（必须有效，否则拒绝 `insert`）。
+    pub right_segment_id: i64,
+    /// 边界 ID。
+    pub boundary_id: i64,
+}
+
+/// `replace` 合成方式在导出计划中的输入（步骤 4 任务 4.3）。
+///
+/// 目标范围是**片段内相对时间**（相对该片段的 `source_start_ms`）：由 repository
+/// 依据生成资产的绑定与片段来源区间换算后填入，导出侧不解析模型时间戳。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipExportReplace {
+    /// 已校验的生成资产文件路径。
+    pub asset_path: String,
+    /// 片段内相对起点（毫秒）。
+    pub start_ms: u64,
+    /// 片段内相对终点（毫秒）。
+    pub end_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -204,11 +244,16 @@ fn seed_clip_subtitle_snapshots(
            SELECT s.clip_project_id, s.id, s.input_id, ts.id,
                   MAX(ts.source_start_ms, s.source_start_ms),
                   MIN(ts.source_end_ms, s.source_end_ms),
-                  trim(ts.normalized_text), trim(ts.normalized_text), 0, ?3, ?3
+                  trim(ts.normalized_text),
+                  -- 片段级前置：合辑字幕优先取**句段级纠正文本**（v32）。这样校正
+                  -- 发生在拼合辑之前，且不修改 ASR 原始转写。
+                  COALESCE(NULLIF(trim(c.corrected_text), ''), trim(ts.normalized_text)),
+                  0, ?3, ?3
            FROM ai_clip_segments s
            JOIN ai_project_inputs input ON input.id = s.input_id
            JOIN asr_artifacts artifact ON artifact.id = input.artifact_id
            JOIN transcript_segments ts ON ts.artifact_id = artifact.id
+           LEFT JOIN transcript_segment_corrections c ON c.segment_id = ts.id
            WHERE s.clip_project_id = ?1
              AND (?2 IS NULL OR s.id = ?2)
              AND artifact.status = 'published'
@@ -288,6 +333,56 @@ fn mark_clip_project_edited(
            WHERE clip_project_id = ?2 AND ownership = 'automation'"#,
         params![now, clip_project_id],
     )?;
+    // 任务 5.7：片段结构变化后，邻接绑定已不成立的 `insert` 资产必须失效并重新审阅。
+    invalidate_stale_insert_bindings(transaction, clip_project_id, now)?;
+    Ok(())
+}
+
+/// 失效邻接绑定已不成立的 `insert` 生成资产（任务 5.7 / spec 场景「左右邻接关系改变」）。
+///
+/// 只处理仍在 `validated` 的单元：已失效的保持原状（幂等），已产生费用的记录不删除。
+fn invalidate_stale_insert_bindings(
+    transaction: &rusqlite::Transaction<'_>,
+    clip_project_id: i64,
+    now: &str,
+) -> Result<()> {
+    let segment_ids = transaction
+        .prepare("SELECT id FROM ai_clip_segments WHERE clip_project_id = ?1 ORDER BY position, id")?
+        .query_map([clip_project_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let bindings = transaction
+        .prepare(
+            r#"SELECT asset.id, asset.left_segment_id, asset.right_segment_id, asset.boundary_id
+               FROM ai_generated_animation_assets asset
+               JOIN ai_clip_projects project ON project.highlight_run_id = asset.highlight_run_id
+               WHERE project.id = ?1 AND asset.composition = 'insert' AND asset.status = 'validated'"#,
+        )?
+        .query_map([clip_project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (asset_id, left, right, boundary_id) in bindings {
+        let (Some(left), Some(right), Some(boundary_id)) = (left, right, boundary_id) else {
+            continue;
+        };
+        // 用与审阅/失效判定同一份逻辑，避免两处实现漂移。
+        let binding = AiGeneratedAnimationInsertBinding {
+            left_segment_id: left,
+            right_segment_id: right,
+            boundary_id,
+        };
+        if !insert_binding_is_valid(&binding, &segment_ids) {
+            transaction.execute(
+                "UPDATE ai_generated_animation_assets SET status = 'invalidated', rejection_code = 'adjacency_changed', updated_at = ?2 WHERE id = ?1",
+                params![asset_id, now],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -722,6 +817,14 @@ impl AiRepository {
         }
         self.transition_input(input_id, next, error)?;
         Ok(true)
+    }
+
+    /// 特效字幕渲染缓存的保留天数；**0 表示不清理**。
+    ///
+    /// 此前 `prune_render_cache` 零调用，缓存永不回收；保留期做成设置项后，
+    /// 回收策略由用户决定，默认 3 天。
+    pub fn render_cache_retention_days(&self) -> Result<u32> {
+        Ok(self.database.get_settings()?.render_cache_retention_days)
     }
 
     pub fn get_llm_provider_settings(&self, key_configured: bool) -> Result<LlmProviderSettings> {
@@ -1552,11 +1655,15 @@ impl AiRepository {
         )?;
         let clip_project_id = transaction.last_insert_rowid();
         for (source_order, source) in sources.iter().enumerate() {
+            // 允许 `failed`：**片段级前置**下，批次的文案纠正发生在合辑创建之前，
+            // 批次可能已因纠正失败而标记为 Failed——它仍属于本任务，不能因此让
+            // **其它**批次的合辑创建被整体拒绝（失败批次的候选为空，不产生内容）。
+            // 这与另一处来源校验（见下方 `ai_clip_project_sources` 分支）语义一致。
             let valid = transaction
                 .query_row(
                     r#"SELECT 1 FROM ai_smart_workflow_batches
                        WHERE id = ?1 AND workflow_id = ?2 AND highlight_run_id = ?3
-                         AND status IN ('highlight', 'completed')"#,
+                         AND status IN ('highlight', 'completed', 'failed')"#,
                     params![
                         source.workflow_batch_id,
                         workflow_id,
@@ -2137,6 +2244,70 @@ impl AiRepository {
         })
     }
 
+    /// 写入/更新一批**句段级**文案纠正（v32）。
+    ///
+    /// 供"片段级前置"流程使用：校正发生在拼合辑之前，作用于转写句段，
+    /// 之后生成的合辑字幕会取纠正后的文本。传入空文本表示撤销该句段的纠正。
+    pub fn record_transcript_segment_corrections(
+        &self,
+        run_id: Option<i64>,
+        corrections: &[(String, String, String)],
+    ) -> Result<usize> {
+        if corrections.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.database.connection()?;
+        let transaction = connection.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let mut applied = 0_usize;
+        for (segment_id, original_text, corrected_text) in corrections {
+            let corrected = corrected_text.trim();
+            if corrected.is_empty() {
+                applied += transaction.execute(
+                    "DELETE FROM transcript_segment_corrections WHERE segment_id = ?1",
+                    [segment_id],
+                )?;
+                continue;
+            }
+            applied += transaction.execute(
+                r#"INSERT INTO transcript_segment_corrections(
+                       segment_id, original_text, corrected_text, run_id, created_at, updated_at
+                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?5)
+                   ON CONFLICT(segment_id) DO UPDATE SET
+                       corrected_text = excluded.corrected_text,
+                       run_id = excluded.run_id,
+                       updated_at = excluded.updated_at"#,
+                params![segment_id, original_text, corrected, run_id, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(applied)
+    }
+
+    /// 读取指定句段的纠正文本（未纠正的不出现）。
+    pub fn transcript_segment_corrections(
+        &self,
+        segment_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if segment_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT segment_id, corrected_text FROM transcript_segment_corrections WHERE segment_id = ?1",
+        )?;
+        let mut result = HashMap::new();
+        for segment_id in segment_ids {
+            if let Some(text) = statement
+                .query_row([segment_id], |row| row.get::<_, String>(1))
+                .optional()?
+            {
+                result.insert(segment_id.clone(), text);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn get_clip_project(&self, clip_project_id: i64) -> Result<AiClipProjectDetail> {
         let transition_repository =
             crate::transition_materials::TransitionMaterialRepository::new(self.database.clone());
@@ -2146,12 +2317,22 @@ impl AiRepository {
         let mut bridge_materials = HashMap::new();
         for boundary in boundaries.iter().filter(|item| item.active && !item.stale) {
             if let (Some(key), Some(version)) = (&boundary.asset_key, boundary.asset_version) {
-                let material = transition_repository
-                    .material(key, version)
-                    .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
-                let download = transition_repository
-                    .download(key, version)
-                    .map_err(|error| AiRepositoryError::Integrity(error.to_string()))?;
+                // 素材可能已被目录更新下架（服务端 `is_current` 变化）。**读操作不能因为
+                // 一条失效引用而整体失败**——否则用户连工程都打不开（实测报
+                // `找不到转场素材`）。这里跳过该边界，让工程仍可打开；导出路径会在
+                // `source_for_export` 处严格校验并给出可操作错误。
+                let (Ok(material), Ok(download)) = (
+                    transition_repository.material(key, version),
+                    transition_repository.download(key, version),
+                ) else {
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "[clip-project] 转场素材不可用，已跳过边界 {} 的桥接素材：{key} v{version}",
+                            boundary.id
+                        );
+                    }
+                    continue;
+                };
                 bridge_materials.insert(
                     (boundary.left_stable_id, boundary.right_stable_id),
                     (boundary.id, material, download),
@@ -2192,6 +2373,30 @@ impl AiRepository {
             .query_map([clip_project_id], map_clip_subtitle)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut project_cursor_ms = 0_u64;
+        // 已校验的 `insert` 生成资产：按 (左片段, 右片段) 索引。它占用时间轴并增加工程
+        // 总时长，因此预览与导出必须用同一份时长口径（否则字幕会与画面错位）。
+        let mut insert_assets: HashMap<(i64, i64), AiGeneratedAnimationAsset> = HashMap::new();
+        if let Some(ai_project_id) = connection
+            .query_row(
+                "SELECT project_id FROM ai_highlight_runs WHERE id = ?1",
+                [project.highlight_run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            let mut asset_statement = connection.prepare(&format!(
+                "SELECT {GENERATED_ANIMATION_COLUMNS} FROM ai_generated_animation_assets WHERE project_id = ?1 AND status = 'validated' AND composition = 'insert' ORDER BY id"
+            ))?;
+            let rows = asset_statement
+                .query_map([ai_project_id], map_generated_animation)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for row in rows {
+                let asset = parse_generated_animation(row)?;
+                if let Some(binding) = &asset.insert_binding {
+                    insert_assets.insert((binding.left_segment_id, binding.right_segment_id), asset);
+                }
+            }
+        }
         let mut segment_offsets = HashMap::new();
         let mut timeline_units = Vec::new();
         for (index, segment) in segments.iter().enumerate() {
@@ -2214,26 +2419,57 @@ impl AiRepository {
                 asset_version: None,
                 source_status: None,
                 preview_status: None,
+                generated_asset_id: None,
+                composition: None,
+                asset_status: None,
             });
-            if let Some(right) = segments.get(index + 1)
-                && let Some((boundary_id, material, download)) =
+            if let Some(right) = segments.get(index + 1) {
+                if let Some((boundary_id, material, download)) =
                     bridge_materials.get(&(segment.id, right.id))
-            {
-                let bridge_start = project_cursor_ms;
-                project_cursor_ms = project_cursor_ms.saturating_add(material.duration_ms);
-                timeline_units.push(AiClipTimelineUnit {
-                    key: format!("bridge:{boundary_id}"),
-                    kind: AiClipTimelineUnitKind::Bridge,
-                    project_start_ms: bridge_start,
-                    project_end_ms: project_cursor_ms,
-                    clip_segment_id: None,
-                    boundary_id: Some(*boundary_id),
-                    title: material.title.clone(),
-                    asset_key: Some(material.asset_key.clone()),
-                    asset_version: Some(material.asset_version),
-                    source_status: Some(download.source_status),
-                    preview_status: Some(download.preview_status),
-                });
+                {
+                    let bridge_start = project_cursor_ms;
+                    project_cursor_ms = project_cursor_ms.saturating_add(material.duration_ms);
+                    timeline_units.push(AiClipTimelineUnit {
+                        key: format!("bridge:{boundary_id}"),
+                        kind: AiClipTimelineUnitKind::Bridge,
+                        project_start_ms: bridge_start,
+                        project_end_ms: project_cursor_ms,
+                        clip_segment_id: None,
+                        boundary_id: Some(*boundary_id),
+                        title: material.title.clone(),
+                        asset_key: Some(material.asset_key.clone()),
+                        asset_version: Some(material.asset_version),
+                        source_status: Some(download.source_status),
+                        preview_status: Some(download.preview_status),
+                        generated_asset_id: None,
+                        composition: None,
+                        asset_status: None,
+                    });
+                } else if let Some(asset) = insert_assets.get(&(segment.id, right.id)) {
+                    // 生成式动画单元与桥接互斥地占用同一边界。
+                    let insert_start = project_cursor_ms;
+                    project_cursor_ms =
+                        project_cursor_ms.saturating_add(asset.duration_ms.unwrap_or(0));
+                    timeline_units.push(AiClipTimelineUnit {
+                        key: format!("animation:{}", asset.id),
+                        kind: AiClipTimelineUnitKind::Animation,
+                        project_start_ms: insert_start,
+                        project_end_ms: project_cursor_ms,
+                        clip_segment_id: None,
+                        boundary_id: asset
+                            .insert_binding
+                            .as_ref()
+                            .map(|binding| binding.boundary_id),
+                        title: "生成式动画".to_owned(),
+                        asset_key: None,
+                        asset_version: None,
+                        source_status: None,
+                        preview_status: None,
+                        generated_asset_id: Some(asset.id),
+                        composition: Some(asset.composition),
+                        asset_status: Some(asset.status),
+                    });
+                }
             }
         }
         for subtitle in &mut subtitles {
@@ -2962,13 +3198,85 @@ impl AiRepository {
         Ok(changed as u64)
     }
 
-    pub fn clip_export_sources(&self, clip_project_id: i64) -> Result<Vec<ClipExportSource>> {
+    pub fn clip_export_sources(
+        &self,
+        clip_project_id: i64,
+        generated_animation_root: &std::path::Path,
+    ) -> Result<Vec<ClipExportSource>> {
         let detail = self.get_clip_project(clip_project_id)?;
         let connection = self.database.connection()?;
         if detail.project.export_status == AiClipExportStatus::Exporting {
             return Err(AiRepositoryError::InvalidState(
                 "剪辑工程正在导出".to_owned(),
             ));
+        }
+        // 已校验的生成式动画资产：`replace` 落到片段源内范围，`insert` 绑定左侧片段。
+        // 状态不是 `validated`、或缓存文件缺失的资产必须阻止导出，不得被静默跳过。
+        let mut replace_by_segment: HashMap<i64, ClipExportReplace> = HashMap::new();
+        let mut insert_by_segment: HashMap<i64, ClipExportInsert> = HashMap::new();
+        if let Some(ai_project_id) = connection
+            .query_row(
+                "SELECT project_id FROM ai_highlight_runs WHERE id = ?1",
+                [detail.project.highlight_run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            let mut asset_statement = connection.prepare(&format!(
+                "SELECT {GENERATED_ANIMATION_COLUMNS} FROM ai_generated_animation_assets WHERE project_id = ?1 ORDER BY id"
+            ))?;
+            let asset_rows = asset_statement
+                .query_map([ai_project_id], map_generated_animation)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for row in asset_rows {
+                let asset = parse_generated_animation(row)?;
+                // 路径由约定推导、不入库：清理缓存不影响工程。
+                let path = generated_animation_root
+                    .join(GENERATED_ANIMATION_CACHE_DIR)
+                    .join(generated_animation_file_name(asset.id));
+                if asset.status != AiGeneratedAnimationStatus::Validated || !path.is_file() {
+                    return Err(AiRepositoryError::InvalidState(format!(
+                        "生成式动画资产 {} 缺失或未通过校验，无法导出",
+                        asset.id
+                    )));
+                }
+                let source_path = path.to_string_lossy().into_owned();
+                match asset.composition {
+                    AiGeneratedAnimationComposition::Replace => {
+                        let Some(range) = &asset.replace_range else {
+                            continue;
+                        };
+                        if let Some(segment) = detail.segments.iter().find(|segment| {
+                            range.start_ms >= segment.source_start_ms
+                                && range.end_ms <= segment.source_end_ms
+                        }) {
+                            replace_by_segment.insert(
+                                segment.id,
+                                ClipExportReplace {
+                                    asset_path: source_path,
+                                    start_ms: range.start_ms - segment.source_start_ms,
+                                    end_ms: range.end_ms - segment.source_start_ms,
+                                },
+                            );
+                        }
+                    }
+                    AiGeneratedAnimationComposition::Insert => {
+                        let Some(binding) = &asset.insert_binding else {
+                            continue;
+                        };
+                        insert_by_segment.insert(
+                            binding.left_segment_id,
+                            ClipExportInsert {
+                                asset_path: source_path,
+                                duration_ms: asset.duration_ms.unwrap_or(0),
+                                left_segment_id: binding.left_segment_id,
+                                right_segment_id: binding.right_segment_id,
+                                boundary_id: binding.boundary_id,
+                            },
+                        );
+                    }
+                }
+            }
         }
         let mut statement = connection.prepare(
             r#"SELECT s.id, s.clip_project_id, s.candidate_id, s.input_id, s.position, s.title,
@@ -2998,12 +3306,16 @@ impl AiRepository {
                     .filter(|subtitle| subtitle.clip_segment_id == segment.id)
                     .cloned()
                     .collect();
+                let replace = replace_by_segment.get(&segment.id).cloned();
+                let insert_after = insert_by_segment.get(&segment.id).cloned();
                 Ok(ClipExportSource {
                     segment,
                     source_path,
                     source_fingerprint,
                     subtitles,
                     bridge_after: None,
+                    replace,
+                    insert_after,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -4806,6 +5118,182 @@ pub(crate) fn migrate_ai_v28(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// v29 增加生成式动画资产表（步骤 4 任务 1.2）。
+///
+/// 只建表、只加索引，不重写任何旧行，因此旧工程行为不变。生成资产是单工程单高光的
+/// 产物，MUST NOT 写入目录素材表；`replace` 与 `insert` 的绑定由 CHECK 约束保证互斥且完整。
+pub(crate) fn migrate_ai_v29(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 29",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_generated_animation_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            highlight_run_id INTEGER,
+            generation INTEGER NOT NULL CHECK(generation >= 1),
+            reuse_key TEXT NOT NULL,
+            composition TEXT NOT NULL CHECK(composition IN ('replace', 'insert')),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'validated', 'rejected', 'invalidated')),
+            replace_start_ms INTEGER,
+            replace_end_ms INTEGER,
+            left_segment_id INTEGER,
+            right_segment_id INTEGER,
+            boundary_id INTEGER,
+            upstream_task_id TEXT,
+            sha256 TEXT,
+            width INTEGER,
+            height INTEGER,
+            fps INTEGER,
+            duration_ms INTEGER,
+            rejection_code TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(candidate_id, generation),
+            CHECK (
+                (composition = 'replace'
+                    AND replace_start_ms IS NOT NULL AND replace_end_ms IS NOT NULL
+                    AND replace_end_ms > replace_start_ms
+                    AND left_segment_id IS NULL AND right_segment_id IS NULL AND boundary_id IS NULL)
+                OR
+                (composition = 'insert'
+                    AND left_segment_id IS NOT NULL AND right_segment_id IS NOT NULL
+                    AND boundary_id IS NOT NULL
+                    AND replace_start_ms IS NULL AND replace_end_ms IS NULL)
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_generated_animation_project
+            ON ai_generated_animation_assets(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_ai_generated_animation_candidate
+            ON ai_generated_animation_assets(candidate_id, generation DESC);
+        CREATE INDEX IF NOT EXISTS idx_ai_generated_animation_reuse
+            ON ai_generated_animation_assets(reuse_key, status);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(29, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// v30 为高光增强记录补充「已产生成本」（步骤 4 任务 8.3）。
+///
+/// 只增列、不重写旧行：既有记录的成本视为 0（历史记录不含按次付费的生成分支）。
+/// v32：新增**转写句段级**的文案纠正层，支撑"片段级前置"流程。
+///
+/// 目标流程是「识别 → 提取精彩 → 每片段特效生成 → **校正文案** → 最后拼合辑」，
+/// 即校正发生在**拼合辑之前**。当前实现把校正作用在 `ai_clip_subtitles`（合辑字幕），
+/// 那要求先有合辑，顺序相反。
+///
+/// 因此新增本表承载"句段级纠正"：合辑字幕快照生成时优先取纠正文本
+/// （`COALESCE(纠正, normalized_text)`），从而让校正真正前置，且**不修改
+/// `transcript_segments`**——转写是 ASR 的原始产物，不应被覆盖。
+pub(crate) fn migrate_ai_v32(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 32",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS transcript_segment_corrections (
+            segment_id TEXT PRIMARY KEY
+                REFERENCES transcript_segments(id) ON DELETE CASCADE,
+            original_text TEXT NOT NULL,
+            corrected_text TEXT NOT NULL,
+            run_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_transcript_segment_corrections_run
+            ON transcript_segment_corrections(run_id);
+        "#,
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(32, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// v31：把"旧默认 30 秒"的单次调用超时提升到新默认 90 秒。
+///
+/// 实测一次精彩分析批次（长提示词 + 中文 JSON 输出）需要 6–30 秒以上，30 秒会
+/// 频繁撞线并被归为可重试的 `Temporary`，表现为"部分批次分析失败"。此前 30 秒
+/// 是**默认值**，会被原样持久化进设置表，因此只提升常量不足以让既有用户受益。
+///
+/// 只改仍等于旧默认的行：用户显式设过其它值的不会被覆盖。
+pub(crate) fn migrate_ai_v31(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 31",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "UPDATE llm_provider_settings SET timeout_ms = 90000 WHERE timeout_ms = 30000",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(31, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn migrate_ai_v30(connection: &mut Connection) -> crate::database::Result<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 30",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "ALTER TABLE ai_highlight_enhancements ADD COLUMN cost_minor INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, applied_at) VALUES(30, ?1)",
+        [Utc::now().to_rfc3339()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// v27 增加高光表现形式增强记录与特效字幕渲染缓存（步骤 3 任务 1.2 / 任务组 9）。
 ///
 /// 迁移只建表、只加索引，不重写任何旧行，因此旧工程行为不变。
@@ -4888,6 +5376,208 @@ pub(crate) fn migrate_ai_v27(connection: &mut Connection) -> crate::database::Re
     Ok(())
 }
 
+/// 生成式动画资产（步骤 4 任务 1.1 / 1.2）。
+///
+/// 生成资产是单工程单高光的产物：MUST NOT 写入目录素材表、不产生 `renderMode`、
+/// 不被边界召回作为候选。`replace` 与 `insert` 的绑定必须互斥且完整。
+impl AiRepository {
+    /// 写入（或在未校验时覆盖）一条生成式动画资产。
+    ///
+    /// 已 `validated` 的行不被覆盖：媒体校验通过的资产已有下游引用，必须保持稳定。
+    pub fn record_generated_animation_asset(
+        &self,
+        input: NewAiGeneratedAnimationAsset,
+    ) -> Result<AiGeneratedAnimationAsset> {
+        if input.generation < 1 {
+            return Err(AiRepositoryError::Integrity(
+                "生成动画代次必须从 1 开始".to_owned(),
+            ));
+        }
+        if input.reuse_key.trim().is_empty() {
+            return Err(AiRepositoryError::Integrity(
+                "生成动画复用键不能为空".to_owned(),
+            ));
+        }
+        match (input.composition, input.replace_range, input.insert_binding) {
+            (AiGeneratedAnimationComposition::Replace, Some(range), None) => {
+                if range.end_ms <= range.start_ms {
+                    return Err(AiRepositoryError::Integrity(
+                        "replace 目标范围必须满足 end_ms > start_ms".to_owned(),
+                    ));
+                }
+            }
+            (AiGeneratedAnimationComposition::Insert, None, Some(binding)) => {
+                if binding.left_segment_id <= 0
+                    || binding.right_segment_id <= 0
+                    || binding.boundary_id <= 0
+                {
+                    return Err(AiRepositoryError::Integrity(
+                        "insert 邻接绑定 ID 必须为正".to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(AiRepositoryError::Integrity(
+                    "生成动画绑定与合成方式不匹配".to_owned(),
+                ));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let connection = self.database.connection()?;
+        connection.execute(
+            r#"
+            INSERT INTO ai_generated_animation_assets(
+                project_id, candidate_id, highlight_run_id, generation, reuse_key, composition, status,
+                replace_start_ms, replace_end_ms, left_segment_id, right_segment_id, boundary_id,
+                upstream_task_id, sha256, width, height, fps, duration_ms, rejection_code,
+                created_at, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)
+            ON CONFLICT(candidate_id, generation) DO UPDATE SET
+                reuse_key = excluded.reuse_key,
+                composition = excluded.composition,
+                status = excluded.status,
+                replace_start_ms = excluded.replace_start_ms,
+                replace_end_ms = excluded.replace_end_ms,
+                left_segment_id = excluded.left_segment_id,
+                right_segment_id = excluded.right_segment_id,
+                boundary_id = excluded.boundary_id,
+                upstream_task_id = excluded.upstream_task_id,
+                sha256 = excluded.sha256,
+                width = excluded.width,
+                height = excluded.height,
+                fps = excluded.fps,
+                duration_ms = excluded.duration_ms,
+                rejection_code = excluded.rejection_code,
+                updated_at = excluded.updated_at
+            WHERE ai_generated_animation_assets.status <> 'validated'
+            "#,
+            params![
+                input.project_id,
+                input.candidate_id,
+                input.highlight_run_id,
+                input.generation,
+                input.reuse_key,
+                input.composition.as_str(),
+                input.status.as_str(),
+                input.replace_range.map(|range| range.start_ms as i64),
+                input.replace_range.map(|range| range.end_ms as i64),
+                input.insert_binding.map(|binding| binding.left_segment_id),
+                input
+                    .insert_binding
+                    .map(|binding| binding.right_segment_id),
+                input.insert_binding.map(|binding| binding.boundary_id),
+                input.upstream_task_id,
+                input.sha256,
+                input.width.map(i64::from),
+                input.height.map(i64::from),
+                input.fps.map(i64::from),
+                input.duration_ms.map(|value| value as i64),
+                input.rejection_code,
+                now,
+            ],
+        )?;
+        drop(connection);
+        self.get_generated_animation_asset(input.candidate_id, input.generation)?
+            .ok_or(AiRepositoryError::NotFound("生成动画资产"))
+    }
+
+    /// 按候选与代次读取一条生成式动画资产。
+    pub fn get_generated_animation_asset(
+        &self,
+        candidate_id: i64,
+        generation: i64,
+    ) -> Result<Option<AiGeneratedAnimationAsset>> {
+        let connection = self.database.connection()?;
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {GENERATED_ANIMATION_COLUMNS} FROM ai_generated_animation_assets WHERE candidate_id = ?1 AND generation = ?2"
+                ),
+                params![candidate_id, generation],
+                map_generated_animation,
+            )
+            .optional()?
+            .map(parse_generated_animation)
+            .transpose()
+    }
+
+    /// 按资产 ID 读取生成式动画资产。
+    pub fn get_generated_animation_asset_by_id(
+        &self,
+        asset_id: i64,
+    ) -> Result<Option<AiGeneratedAnimationAsset>> {
+        let connection = self.database.connection()?;
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {GENERATED_ANIMATION_COLUMNS} FROM ai_generated_animation_assets WHERE id = ?1"
+                ),
+                [asset_id],
+                map_generated_animation,
+            )
+            .optional()?
+            .map(parse_generated_animation)
+            .transpose()
+    }
+
+    /// 把生成资产标记为失效（用户移除或邻接变化）：必须重新审阅，MUST NOT 自动重新生成。
+    ///
+    /// 幂等：已失效的资产重复移除不报错。
+    pub fn invalidate_generated_animation_asset(
+        &self,
+        asset_id: i64,
+        reason: &str,
+    ) -> Result<AiGeneratedAnimationAsset> {
+        let asset = self
+            .get_generated_animation_asset_by_id(asset_id)?
+            .ok_or(AiRepositoryError::NotFound("生成式动画资产"))?;
+        if asset.status != AiGeneratedAnimationStatus::Invalidated {
+            let connection = self.database.connection()?;
+            connection.execute(
+                "UPDATE ai_generated_animation_assets SET status = 'invalidated', rejection_code = ?2, updated_at = ?3 WHERE id = ?1",
+                params![asset_id, reason, Utc::now().to_rfc3339()],
+            )?;
+        }
+        self.get_generated_animation_asset_by_id(asset_id)?
+            .ok_or(AiRepositoryError::NotFound("生成式动画资产"))
+    }
+
+    /// 列出工程的全部生成式动画资产。
+    pub fn list_generated_animation_assets(        &self,
+        project_id: i64,
+    ) -> Result<Vec<AiGeneratedAnimationAsset>> {
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {GENERATED_ANIMATION_COLUMNS} FROM ai_generated_animation_assets WHERE project_id = ?1 ORDER BY candidate_id, generation"
+        ))?;
+        let rows = statement.query_map([project_id], map_generated_animation)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(parse_generated_animation)
+            .collect()
+    }
+
+    /// 按复用键查找已通过校验的生成资产；命中即复用，不产生新的上游费用。
+    pub fn find_validated_generated_animation(
+        &self,
+        project_id: i64,
+        reuse_key: &str,
+    ) -> Result<Option<AiGeneratedAnimationAsset>> {
+        let connection = self.database.connection()?;
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {GENERATED_ANIMATION_COLUMNS} FROM ai_generated_animation_assets WHERE project_id = ?1 AND reuse_key = ?2 AND status = 'validated' ORDER BY generation DESC LIMIT 1"
+                ),
+                params![project_id, reuse_key],
+                map_generated_animation,
+            )
+            .optional()?
+            .map(parse_generated_animation)
+            .transpose()
+    }
+}
+
 /// 高光表现形式增强记录（步骤 3 任务 1.5：过期代次只能停在历史建议）。
 impl AiRepository {
     /// 写入一条增强记录。
@@ -4916,6 +5606,26 @@ impl AiRepository {
             ));
         }
         let stale = input.source_fingerprint != current_source_fingerprint;
+        // 决策五：同一高光只保留一种可导出的增强方式，两条分支不得同时进入工程。
+        if !stale && input.status == AiEnhancementStatus::Applied {
+            let conflicting = self
+                .database
+                .connection()?
+                .query_row(
+                    "SELECT 1 FROM ai_highlight_enhancements
+                      WHERE candidate_id = ?1 AND status = 'applied' AND kind <> ?2
+                      LIMIT 1",
+                    params![input.candidate_id, input.kind.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if conflicting {
+                return Err(AiRepositoryError::InvalidState(
+                    "该高光已有另一种可导出的增强方式".to_owned(),
+                ));
+            }
+        }
         let (status, rejection_code, rejection_detail) = if stale {
             (
                 AiEnhancementStatus::Suggested,
@@ -4941,8 +5651,9 @@ impl AiRepository {
                 project_id, candidate_id, highlight_run_id, generation, kind, status,
                 start_ms, end_ms, emphasis_words_json, composition_version,
                 composition_fingerprint, render_cache_key, source_fingerprint,
-                suppression_ranges_json, rejection_code, rejection_detail, created_at, updated_at
-            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)
+                suppression_ranges_json, rejection_code, rejection_detail, cost_minor,
+                created_at, updated_at
+            ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
             ON CONFLICT(candidate_id, generation) DO UPDATE SET
                 status = excluded.status,
                 start_ms = excluded.start_ms,
@@ -4955,6 +5666,7 @@ impl AiRepository {
                 suppression_ranges_json = excluded.suppression_ranges_json,
                 rejection_code = excluded.rejection_code,
                 rejection_detail = excluded.rejection_detail,
+                cost_minor = excluded.cost_minor,
                 updated_at = excluded.updated_at
             WHERE ai_highlight_enhancements.status <> 'applied'
             "#,
@@ -4975,6 +5687,7 @@ impl AiRepository {
                 suppression_ranges_json,
                 rejection_code,
                 rejection_detail,
+                input.cost_minor as i64,
                 now,
             ],
         )?;
@@ -5030,6 +5743,39 @@ impl AiRepository {
             .query_map([project_id], map_enhancement)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter().map(parse_enhancement).collect()
+    }
+
+    /// 列出工程的全部增强记录（含非终态），供审阅栏按高光展示进行中状态（任务 9.2）。
+    pub fn list_enhancements_for_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<AiHighlightEnhancement>> {
+        let connection = self.database.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {ENHANCEMENT_COLUMNS} FROM ai_highlight_enhancements WHERE project_id = ?1 ORDER BY candidate_id, generation DESC, id DESC"
+        ))?;
+        let rows = statement
+            .query_map([project_id], map_enhancement)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().map(parse_enhancement).collect()
+    }
+
+    /// 按高光组装增强审阅项（步骤 4 任务 9.1）。
+    ///
+    /// 组合增强记录与生成资产：已就绪的高光给出最终方式、合成方式、资产校验状态、
+    /// 降级原因与已产生成本；尚无结果的高光以进行中表达，不阻塞整个审阅栏。
+    pub fn enhancement_review_for_project(
+        &self,
+        project_id: i64,
+        candidate_ids: &[i64],
+    ) -> Result<Vec<AiEnhancementReviewItem>> {
+        let enforcements = self.list_enhancements_for_project(project_id)?;
+        let assets = self.list_generated_animation_assets(project_id)?;
+        Ok(enhancement_review_items(
+            candidate_ids,
+            &enforcements,
+            &assets,
+        ))
     }
 
     /// 把同一候选上更早代次的 `applied` 记录标记为 `superseded`（任务 1.5）。
@@ -5369,7 +6115,143 @@ fn parse_render_attempt(row: RenderAttemptRow) -> Result<AiEffectCaptionRenderAt
     })
 }
 
-const ENHANCEMENT_COLUMNS: &str = "id, project_id, candidate_id, highlight_run_id, generation, kind, status, start_ms, end_ms, emphasis_words_json, composition_version, composition_fingerprint, render_cache_key, source_fingerprint, suppression_ranges_json, rejection_code, rejection_detail, created_at, updated_at";
+const GENERATED_ANIMATION_COLUMNS: &str = "id, project_id, candidate_id, highlight_run_id, generation, reuse_key, composition, status, replace_start_ms, replace_end_ms, left_segment_id, right_segment_id, boundary_id, upstream_task_id, sha256, width, height, fps, duration_ms, rejection_code, created_at, updated_at";
+
+type GeneratedAnimationRow = (
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    String,
+    String,
+);
+
+#[allow(clippy::type_complexity)]
+fn map_generated_animation(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneratedAnimationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
+        row.get(21)?,
+    ))
+}
+
+fn parse_generated_animation(row: GeneratedAnimationRow) -> Result<AiGeneratedAnimationAsset> {
+    let (
+        id,
+        project_id,
+        candidate_id,
+        highlight_run_id,
+        generation,
+        reuse_key,
+        composition,
+        status,
+        replace_start_ms,
+        replace_end_ms,
+        left_segment_id,
+        right_segment_id,
+        boundary_id,
+        upstream_task_id,
+        sha256,
+        width,
+        height,
+        fps,
+        duration_ms,
+        rejection_code,
+        created_at,
+        updated_at,
+    ) = row;
+    let composition = AiGeneratedAnimationComposition::parse(&composition)?;
+    let status = AiGeneratedAnimationStatus::parse(&status)?;
+    let replace_range = match (replace_start_ms, replace_end_ms) {
+        (Some(start), Some(end)) => Some(AiGeneratedAnimationReplaceRange {
+            start_ms: u64::try_from(start).map_err(|_| {
+                AiRepositoryError::Integrity("生成动画替换起点无效".to_owned())
+            })?,
+            end_ms: u64::try_from(end)
+                .map_err(|_| AiRepositoryError::Integrity("生成动画替换终点无效".to_owned()))?,
+        }),
+        _ => None,
+    };
+    let insert_binding = match (left_segment_id, right_segment_id, boundary_id) {
+        (Some(left), Some(right), Some(boundary)) => Some(AiGeneratedAnimationInsertBinding {
+            left_segment_id: left,
+            right_segment_id: right,
+            boundary_id: boundary,
+        }),
+        _ => None,
+    };
+    let to_u32 = |value: Option<i64>, field: &'static str| -> Result<Option<u32>> {
+        value
+            .map(|value| {
+                u32::try_from(value)
+                    .map_err(|_| AiRepositoryError::Integrity(format!("生成动画{field}无效")))
+            })
+            .transpose()
+    };
+    Ok(AiGeneratedAnimationAsset {
+        id,
+        project_id,
+        candidate_id,
+        highlight_run_id,
+        generation,
+        reuse_key,
+        composition,
+        status,
+        replace_range,
+        insert_binding,
+        upstream_task_id,
+        sha256,
+        width: to_u32(width, "宽度")?,
+        height: to_u32(height, "高度")?,
+        fps: to_u32(fps, "帧率")?,
+        duration_ms: duration_ms
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| AiRepositoryError::Integrity("生成动画时长无效".to_owned()))
+            })
+            .transpose()?,
+        rejection_code,
+        created_at,
+        updated_at,
+    })
+}
+
+const ENHANCEMENT_COLUMNS: &str = "id, project_id, candidate_id, highlight_run_id, generation, kind, status, start_ms, end_ms, emphasis_words_json, composition_version, composition_fingerprint, render_cache_key, source_fingerprint, suppression_ranges_json, rejection_code, rejection_detail, cost_minor, created_at, updated_at";
 
 type EnhancementRow = (
     i64,
@@ -5389,6 +6271,7 @@ type EnhancementRow = (
     String,
     Option<String>,
     Option<String>,
+    i64,
     String,
     String,
 );
@@ -5414,6 +6297,7 @@ fn map_enhancement(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnhancementRow> 
         row.get(16)?,
         row.get(17)?,
         row.get(18)?,
+        row.get(19)?,
     ))
 }
 
@@ -5436,6 +6320,7 @@ fn parse_enhancement(row: EnhancementRow) -> Result<AiHighlightEnhancement> {
         suppression_ranges_json,
         rejection_code,
         rejection_detail,
+        cost_minor,
         created_at,
         updated_at,
     ) = row;
@@ -5461,6 +6346,8 @@ fn parse_enhancement(row: EnhancementRow) -> Result<AiHighlightEnhancement> {
             .map_err(|_| AiRepositoryError::Integrity("抑制区间快照损坏".to_owned()))?,
         rejection_code,
         rejection_detail,
+        cost_minor: u64::try_from(cost_minor)
+            .map_err(|_| AiRepositoryError::Integrity("增强成本无效".to_owned()))?,
         created_at,
         updated_at,
     })
@@ -6919,7 +7806,521 @@ mod smart_migration_tests {
             }],
             rejection_code: None,
             rejection_detail: None,
+            cost_minor: 0,
         }
+    }
+
+    fn replace_animation(
+        project_id: i64,
+        candidate_id: i64,
+        generation: i64,
+        status: AiGeneratedAnimationStatus,
+        reuse_key: &str,
+    ) -> NewAiGeneratedAnimationAsset {
+        NewAiGeneratedAnimationAsset {
+            project_id,
+            candidate_id,
+            highlight_run_id: None,
+            generation,
+            reuse_key: reuse_key.to_owned(),
+            composition: AiGeneratedAnimationComposition::Replace,
+            status,
+            replace_range: Some(AiGeneratedAnimationReplaceRange {
+                start_ms: 1_000,
+                end_ms: 6_000,
+            }),
+            insert_binding: None,
+            upstream_task_id: Some(format!("task-replace-{generation}")),
+            sha256: Some("a".repeat(64)),
+            width: Some(768),
+            height: Some(512),
+            fps: Some(30),
+            duration_ms: Some(5_000),
+            rejection_code: None,
+        }
+    }
+
+    fn insert_animation(
+        project_id: i64,
+        candidate_id: i64,
+        generation: i64,
+        status: AiGeneratedAnimationStatus,
+        reuse_key: &str,
+    ) -> NewAiGeneratedAnimationAsset {
+        NewAiGeneratedAnimationAsset {
+            project_id,
+            candidate_id,
+            highlight_run_id: None,
+            generation,
+            reuse_key: reuse_key.to_owned(),
+            composition: AiGeneratedAnimationComposition::Insert,
+            status,
+            replace_range: None,
+            insert_binding: Some(AiGeneratedAnimationInsertBinding {
+                left_segment_id: 11,
+                right_segment_id: 12,
+                boundary_id: 21,
+            }),
+            upstream_task_id: Some(format!("task-insert-{generation}")),
+            sha256: Some("b".repeat(64)),
+            width: Some(768),
+            height: Some(512),
+            fps: Some(30),
+            duration_ms: Some(3_000),
+            rejection_code: None,
+        }
+    }
+
+    /// v32：句段级纠正层支撑"片段级前置"——校正发生在拼合辑之前。
+    /// 本测试验证纠正的读写与替换语义（空文本表示撤销）。
+    #[test]
+    fn transcript_segment_corrections_round_trip_and_can_be_revoked() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database.clone());
+        {
+            let connection = database.connection().expect("connection");
+            connection
+                .execute_batch(
+                    r#"
+                    INSERT INTO asr_artifacts(id, source_fingerprint_json, source_fingerprint_hash,
+                        recognition_profile_hash, engine_id, engine_version, model_id, model_version,
+                        status, duration_ms, created_at, published_at, last_used_at)
+                    VALUES(1, '{}', 'fp', 'profile', 'whisper.cpp', '1', 'm', 'v',
+                        'published', 1000, 'now', 'now', 'now');
+                    INSERT INTO transcript_segments(id, artifact_id, ordinal, source_start_ms,
+                        source_end_ms, raw_text, normalized_text)
+                    VALUES('seg_a', 1, 0, 0, 1000, '帐号', '帐号'),
+                          ('seg_b', 1, 1, 1000, 2000, '朱教', '朱教');
+                    "#,
+                )
+                .expect("seed transcript");
+        }
+
+        let applied = repository
+            .record_transcript_segment_corrections(
+                Some(7),
+                &[
+                    ("seg_a".to_owned(), "帐号".to_owned(), "账号".to_owned()),
+                    ("seg_b".to_owned(), "朱教".to_owned(), "助教".to_owned()),
+                ],
+            )
+            .expect("record corrections");
+        assert_eq!(applied, 2);
+
+        let read = repository
+            .transcript_segment_corrections(&["seg_a".to_owned(), "seg_b".to_owned()])
+            .expect("read corrections");
+        assert_eq!(read.get("seg_a").map(String::as_str), Some("账号"));
+        assert_eq!(read.get("seg_b").map(String::as_str), Some("助教"));
+
+        // 空文本 = 撤销该句段的纠正。
+        repository
+            .record_transcript_segment_corrections(
+                Some(7),
+                &[("seg_a".to_owned(), "帐号".to_owned(), String::new())],
+            )
+            .expect("revoke");
+        let read = repository
+            .transcript_segment_corrections(&["seg_a".to_owned(), "seg_b".to_owned()])
+            .expect("read after revoke");
+        assert!(!read.contains_key("seg_a"), "撤销后不应再返回纠正");
+        assert_eq!(read.get("seg_b").map(String::as_str), Some("助教"));
+
+        // 覆盖写入：同一句段再次纠正应替换而非重复。
+        repository
+            .record_transcript_segment_corrections(
+                None,
+                &[("seg_b".to_owned(), "朱教".to_owned(), "助教老师".to_owned())],
+            )
+            .expect("overwrite");
+        let read = repository
+            .transcript_segment_corrections(&["seg_b".to_owned()])
+            .expect("read after overwrite");
+        assert_eq!(read.get("seg_b").map(String::as_str), Some("助教老师"));
+    }
+
+    /// 在受控超时值上重放 v31 迁移，返回迁移后的值。
+    fn migrate_v31_with_timeout(timeout_ms: i64) -> i64 {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let mut connection = database.connection().expect("connection");
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version = 31", [])
+            .expect("reset v31");
+        connection
+            .execute("DELETE FROM llm_provider_settings", [])
+            .expect("clear settings");
+        connection
+            .execute(
+                "INSERT INTO llm_provider_settings(provider, model_id, timeout_ms, prompt_version, updated_at) \
+                 VALUES('deepseek', 'qwen-plus', ?1, 'highlight-v1', '2026-01-01T00:00:00Z')",
+                [timeout_ms],
+            )
+            .expect("insert settings");
+        super::migrate_ai_v31(&mut connection).expect("run v31");
+        connection
+            .query_row("SELECT timeout_ms FROM llm_provider_settings", [], |row| {
+                row.get(0)
+            })
+            .expect("read timeout")
+    }
+
+    /// v31：旧默认 30 秒会被**原样持久化**进设置表（该表受 `CHECK(id = 1)` 限制只有一行），
+    /// 因此只提升 `DEFAULT_LLM_TIMEOUT_MS` 常量不足以让既有用户受益——必须迁移。
+    /// 同时确认**用户显式设置的值不会被覆盖**。
+    #[test]
+    fn migration_v31_raises_only_the_legacy_default_timeout() {
+        assert_eq!(
+            migrate_v31_with_timeout(30_000),
+            90_000,
+            "旧默认 30 秒应被提升到新默认"
+        );
+        assert_eq!(
+            migrate_v31_with_timeout(120_000),
+            120_000,
+            "用户显式设置的最大值必须保留"
+        );
+        assert_eq!(
+            migrate_v31_with_timeout(60_000),
+            60_000,
+            "非旧默认的值不得被改写"
+        );
+    }
+
+    /// 默认值必须足以覆盖实测耗时：真实调用观察到单批 28–43 秒。
+    #[test]
+    fn default_llm_timeout_covers_observed_calls() {
+        assert!(
+            crate::ai::llm::DEFAULT_LLM_TIMEOUT_MS >= 60_000,
+            "默认超时必须显著高于实测 28–43 秒，实际 {}",
+            crate::ai::llm::DEFAULT_LLM_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn migration_v29_is_idempotent_and_creates_generated_animation_table() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        database.migrate().expect("migrate again is idempotent");
+        let connection = database.connection().expect("connection");
+        let exists: bool = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_generated_animation_assets'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("query")
+            .is_some();
+        assert!(exists, "v29 必须建出生成动画资产表");
+        // 生成资产 MUST NOT 产生 renderMode。
+        let has_render_mode: bool = connection
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('ai_generated_animation_assets') WHERE name = 'render_mode'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("query")
+            .is_some();
+        assert!(!has_render_mode, "生成资产 MUST NOT 产生 renderMode");
+    }
+
+    #[test]
+    fn generated_animation_binding_must_match_composition() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("生成动画", &enhancement_test_profile())
+            .expect("create project");
+
+        // replace 带 insert 绑定：拒绝。
+        let mut wrong = replace_animation(
+            project.id,
+            42,
+            1,
+            AiGeneratedAnimationStatus::Pending,
+            "rk-1",
+        );
+        wrong.insert_binding = Some(AiGeneratedAnimationInsertBinding {
+            left_segment_id: 1,
+            right_segment_id: 2,
+            boundary_id: 3,
+        });
+        assert!(matches!(
+            repository.record_generated_animation_asset(wrong),
+            Err(AiRepositoryError::Integrity(_))
+        ));
+
+        // replace 缺目标范围：拒绝。
+        let mut missing =
+            replace_animation(project.id, 42, 1, AiGeneratedAnimationStatus::Pending, "rk-1");
+        missing.replace_range = None;
+        assert!(matches!(
+            repository.record_generated_animation_asset(missing),
+            Err(AiRepositoryError::Integrity(_))
+        ));
+
+        // insert 右片段无效：拒绝。
+        let mut no_right =
+            insert_animation(project.id, 42, 1, AiGeneratedAnimationStatus::Pending, "rk-1");
+        no_right.insert_binding = Some(AiGeneratedAnimationInsertBinding {
+            left_segment_id: 11,
+            right_segment_id: 0,
+            boundary_id: 21,
+        });
+        assert!(matches!(
+            repository.record_generated_animation_asset(no_right),
+            Err(AiRepositoryError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn generated_animation_round_trips_and_reuse_key_only_matches_validated() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("生成动画", &enhancement_test_profile())
+            .expect("create project");
+
+        // pending 的资产不参与复用。
+        let pending = repository
+            .record_generated_animation_asset(replace_animation(
+                project.id,
+                42,
+                1,
+                AiGeneratedAnimationStatus::Pending,
+                "reuse-1",
+            ))
+            .expect("record pending");
+        assert!(
+            repository
+                .find_validated_generated_animation(project.id, "reuse-1")
+                .expect("query")
+                .is_none()
+        );
+
+        // 校验通过后可复用，且媒体属性被完整读回。
+        let validated = repository
+            .record_generated_animation_asset(replace_animation(
+                project.id,
+                42,
+                1,
+                AiGeneratedAnimationStatus::Validated,
+                "reuse-1",
+            ))
+            .expect("record validated");
+        assert_eq!(
+            validated.id, pending.id,
+            "同一 candidate+generation 覆盖而非新增"
+        );
+        assert_eq!(validated.status, AiGeneratedAnimationStatus::Validated);
+        assert_eq!(validated.width, Some(768));
+        assert_eq!(validated.height, Some(512));
+        assert_eq!(validated.fps, Some(30));
+        assert_eq!(validated.duration_ms, Some(5_000));
+        assert_eq!(
+            validated.replace_range,
+            Some(AiGeneratedAnimationReplaceRange {
+                start_ms: 1_000,
+                end_ms: 6_000,
+            })
+        );
+        assert!(validated.insert_binding.is_none());
+        let reused = repository
+            .find_validated_generated_animation(project.id, "reuse-1")
+            .expect("query")
+            .expect("validated 资产必须可复用");
+        assert_eq!(reused.id, pending.id);
+
+        // insert 同样可读回，绑定三元组完整。
+        let insert = repository
+            .record_generated_animation_asset(insert_animation(
+                project.id,
+                43,
+                1,
+                AiGeneratedAnimationStatus::Validated,
+                "reuse-2",
+            ))
+            .expect("record insert");
+        assert_eq!(insert.composition, AiGeneratedAnimationComposition::Insert);
+        assert_eq!(
+            insert.insert_binding,
+            Some(AiGeneratedAnimationInsertBinding {
+                left_segment_id: 11,
+                right_segment_id: 12,
+                boundary_id: 21,
+            })
+        );
+        assert!(insert.replace_range.is_none());
+        assert_eq!(
+            repository
+                .list_generated_animation_assets(project.id)
+                .expect("list")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn validated_generated_animation_is_not_overwritten() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("生成动画", &enhancement_test_profile())
+            .expect("create project");
+        let validated = repository
+            .record_generated_animation_asset(replace_animation(
+                project.id,
+                42,
+                1,
+                AiGeneratedAnimationStatus::Validated,
+                "reuse-1",
+            ))
+            .expect("record validated");
+        // 已校验的行不被覆盖：再次写入 pending 必须保留 validated 状态与媒体属性。
+        let attempted = repository
+            .record_generated_animation_asset(replace_animation(
+                project.id,
+                42,
+                1,
+                AiGeneratedAnimationStatus::Pending,
+                "reuse-1",
+            ))
+            .expect("record attempts");
+        assert_eq!(attempted.id, validated.id);
+        assert_eq!(attempted.status, AiGeneratedAnimationStatus::Validated);
+        assert_eq!(attempted.sha256, validated.sha256);
+    }
+
+    #[test]
+    fn generated_animation_never_pollutes_transition_catalog() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database.clone());
+        let project = repository
+            .create_project("生成动画", &enhancement_test_profile())
+            .expect("create project");
+        repository
+            .record_generated_animation_asset(insert_animation(
+                project.id,
+                43,
+                1,
+                AiGeneratedAnimationStatus::Validated,
+                "reuse-2",
+            ))
+            .expect("record insert");
+        // 生成资产是单工程产物：MUST NOT 写入目录素材表，也不影响边界召回。
+        let connection = database.connection().expect("connection");
+        let catalog_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM transition_materials", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(catalog_rows, 0, "生成资产 MUST NOT 写入目录素材表");
+    }
+
+    #[test]
+    fn enhancement_review_for_project_surfaces_in_progress_and_ready_highlights() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("审阅", &enhancement_test_profile())
+            .expect("create project");
+        // 高光 42 已就绪：insert 动画 applied + 已校验资产 + 成本。
+        let mut applied = enhancement(project.id, 42, 1, AiEnhancementStatus::Applied, "fp");
+        applied.kind = AiEnhancementKind::VideoAnimation;
+        applied.cost_minor = 250;
+        repository
+            .record_enhancement(applied, "fp")
+            .expect("写入动画增强");
+        repository
+            .record_generated_animation_asset(insert_animation(
+                project.id,
+                42,
+                1,
+                AiGeneratedAnimationStatus::Validated,
+                "reuse-1",
+            ))
+            .expect("写入生成资产");
+        // 高光 43 尚无任何结果（进行中）。
+        let items = repository
+            .enhancement_review_for_project(project.id, &[42, 43])
+            .expect("组装审阅项");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, Some(AiEnhancementKind::VideoAnimation));
+        assert_eq!(
+            items[0].composition,
+            Some(AiGeneratedAnimationComposition::Insert)
+        );
+        assert_eq!(
+            items[0].asset_status,
+            Some(AiGeneratedAnimationStatus::Validated)
+        );
+        assert_eq!(items[0].cost_minor, 250);
+        // 进行中的高光不阻塞列表：`kind = None`。
+        assert_eq!(items[1].kind, None);
+        assert_eq!(items[1].cost_minor, 0);
+    }
+
+    #[test]
+    fn migration_v30_adds_cost_column_and_round_trips_cost() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        database.migrate().expect("migrate again is idempotent");
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("成本", &enhancement_test_profile())
+            .expect("create project");
+        let mut input = enhancement(project.id, 42, 1, AiEnhancementStatus::Applied, "fp");
+        input.kind = AiEnhancementKind::VideoAnimation;
+        input.cost_minor = 250;
+        let written = repository
+            .record_enhancement(input, "fp")
+            .expect("写入带成本的增强记录");
+        assert_eq!(written.cost_minor, 250);
+        // 可查询，且记录里不含 Prompt 正文或下载地址。
+        let listed = repository
+            .applied_enhancements_for_project(project.id)
+            .expect("查询");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cost_minor, 250);
+        assert_eq!(listed[0].kind, AiEnhancementKind::VideoAnimation);
+    }
+
+    #[test]
+    fn record_enhancement_rejects_a_second_applied_kind_for_the_same_candidate() {
+        let database = Database::open_in_memory().expect("in-memory database");
+        database.migrate().expect("migrate to latest");
+        let repository = AiRepository::new(database);
+        let project = repository
+            .create_project("互斥", &enhancement_test_profile())
+            .expect("create project");
+        // 先写一条 applied 的特效字幕。
+        repository
+            .record_enhancement(
+                enhancement(project.id, 42, 1, AiEnhancementStatus::Applied, "fp"),
+                "fp",
+            )
+            .expect("首条 applied 必须写入");
+        // 同一候选再来一条 applied 的动画：拒绝（两条分支不得同时进入工程）。
+        let mut animation = enhancement(project.id, 42, 2, AiEnhancementStatus::Applied, "fp");
+        animation.kind = AiEnhancementKind::VideoAnimation;
+        assert!(matches!(
+            repository.record_enhancement(animation, "fp"),
+            Err(AiRepositoryError::InvalidState(_))
+        ));
+        // 同一候选的非终态动画不影响字幕分支。
+        let mut suggested = enhancement(project.id, 42, 3, AiEnhancementStatus::Suggested, "fp");
+        suggested.kind = AiEnhancementKind::VideoAnimation;
+        repository
+            .record_enhancement(suggested, "fp")
+            .expect("非终态必须可写入");
     }
 
     #[test]

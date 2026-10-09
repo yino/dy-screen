@@ -115,6 +115,16 @@ export interface AppSettings {
   ffprobePath?: string;
   notificationsEnabled: boolean;
   autostartEnabled: boolean;
+  /** 生成式转场的图像模型降级链（逗号分隔，按序尝试）。 */
+  generationImageModels: string;
+  /** 生成式转场的视频模型降级链（逗号分隔，按序尝试）。 */
+  generationVideoModels: string;
+  /** 视频分辨率档位：480P / 720P / 1080P。上游默认 1080P，必须显式指定。 */
+  generationVideoResolution: string;
+  /** 视频时长（秒），上游允许 2–30。 */
+  generationVideoSeconds: number;
+  /** 特效字幕渲染缓存保留天数；0 表示不清理。 */
+  renderCacheRetentionDays: number;
 }
 
 export interface EnvironmentStatus {
@@ -467,13 +477,19 @@ export type AiSmartWorkflowStatus =
   | "completed"
   | "cancelled"
   | "failed";
+/**
+ * 必须与后端 `AiSmartStage::ALL` 保持**同序同名**：
+ * 片段级前置下纠错在合辑之前；`enhancement` 位于转场与审阅之间。
+ * `ui/src/llmDefaults.test.ts` 有护栏测试直接比对 Rust 源。
+ */
 export type AiSmartStage =
   | "preflight"
   | "asr"
   | "highlight"
-  | "draft"
   | "correction"
+  | "draft"
   | "transition"
+  | "enhancement"
   | "review";
 export type AiSmartBatchStatus =
   | "pending"
@@ -755,6 +771,51 @@ export interface AiHighlightCandidatePage {
   selectedCandidates: number;
 }
 
+/**
+ * 当前调用端点（百炼兼容模式）支持的默认模型标识。
+ *
+ * 与后端 `DEFAULT_MODEL_ID` 保持同值：客户端只走"直连百炼"这一条路，
+ * 因此 fallback MUST NOT 回落到其他厂商的模型名（例如 `deepseek-chat`），
+ * 否则请求会被上游以 400（模型不存在）拒绝。
+ */
+export const DEFAULT_LLM_MODEL_ID = "qwen-plus";
+
+/** 生成式动画资产（步骤 4 任务组 1）。只含结构化字段：不含下载地址或本地路径。 */
+export interface AiGeneratedAnimationAsset {
+  id: number;
+  projectId: number;
+  candidateId: number;
+  highlightRunId: number | null;
+  generation: number;
+  reuseKey: string;
+  composition: "replace" | "insert";
+  status: "pending" | "validated" | "rejected" | "invalidated";
+  replaceRange: { startMs: number; endMs: number } | null;
+  insertBinding: { leftSegmentId: number; rightSegmentId: number; boundaryId: number } | null;
+  upstreamTaskId: string | null;
+  sha256: string | null;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  durationMs: number | null;
+  rejectionCode: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 单条高光的增强审阅项（步骤 4 任务 9.1）。只含结构化字段：不含 Prompt 正文、资产地址或 Provider 原始响应。 */
+export interface AiEnhancementReviewItem {
+  candidateId: number;
+  /** 最终唯一的增强方式；null 表示尚无结果（进行中）。 */
+  kind: "effect_caption" | "video_animation" | null;
+  status: "suggested" | "applied" | "rejected" | "superseded" | null;
+  composition: "replace" | "insert" | null;
+  assetStatus: "pending" | "validated" | "rejected" | "invalidated" | null;
+  rejectionCode: string | null;
+  /** 已产生成本（分）。 */
+  costMinor: number;
+}
+
 export type AiClipEffect = "none" | "fade_in" | "fade_out" | "fade_in_out" | "flash" | "black";
 export type AiClipExportStatus = "idle" | "exporting" | "completed" | "cancelled" | "failed";
 export type MaterialDownloadStatus = "missing" | "downloading" | "transcoding" | "ready" | "failed";
@@ -849,7 +910,7 @@ export interface ClipTransitionBoundary {
 
 export interface AiClipTimelineUnit {
   key: string;
-  kind: "segment" | "bridge";
+  kind: "segment" | "bridge" | "animation";
   projectStartMs: number;
   projectEndMs: number;
   clipSegmentId: number | null;
@@ -859,6 +920,12 @@ export interface AiClipTimelineUnit {
   assetVersion: number | null;
   sourceStatus: MaterialDownloadStatus | null;
   previewStatus: MaterialDownloadStatus | null;
+  /** 生成资产 ID（仅 animation 单元有值）。 */
+  generatedAssetId: number | null;
+  /** 合成方式（仅 animation 单元有值）。 */
+  composition: "replace" | "insert" | null;
+  /** 资产校验状态（仅 animation 单元有值）。 */
+  assetStatus: "pending" | "validated" | "rejected" | "invalidated" | null;
 }
 
 export interface TransitionMatchSummary {
@@ -1139,6 +1206,10 @@ export interface ClientApi {
   preemptAiWithInput?(inputId: number, confirmed: boolean): Promise<AiProjectDetail>;
   retryAiInput(inputId: number): Promise<AiProjectDetail>;
   queryAiTranscript(projectId: number): Promise<AiTranscriptProjection>;
+  /** 按高光查询增强审阅项（步骤 4 任务 9.1）。入口是剪辑工程。 */
+  queryAiEnhancementReview?(clipProjectId: number): Promise<AiEnhancementReviewItem[]>;
+  /** 移除工程里的生成式动画资产（标记失效、需重新审阅）。 */
+  removeAiGeneratedAnimation?(clipProjectId: number, assetId: number): Promise<AiGeneratedAnimationAsset>;
   copyAiSegmentText(projectId: number, stableSegmentId: string): Promise<string>;
   copyAiInputText(projectId: number, inputId: number): Promise<string>;
   copyAiProjectText(projectId: number): Promise<string>;

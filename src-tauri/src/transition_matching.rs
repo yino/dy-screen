@@ -38,7 +38,7 @@ pub enum TransitionMatchingError {
     NoBoundaries,
     #[error("本地转场素材目录为空，请先同步素材")]
     EmptyCatalog,
-    #[error("DeepSeek Key 尚未配置")]
+    #[error("当前没有可用的模型调用凭据")]
     Credential,
     #[error("Agent 返回了无效的转场匹配结果：{0}")]
     InvalidResponse(String),

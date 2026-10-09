@@ -8,7 +8,8 @@ use tauri_plugin_dialog::DialogExt;
 
 use super::{
     AiActiveLiveSession, AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate,
-    AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentDiagnostic,
+    AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnhancementReviewItem,
+    AiEnvironmentDiagnostic, AiGeneratedAnimationAsset,
     AiHighlightCandidate, AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun,
     AiImportBatchView, AiModelStatusView, AiProject, AiProjectDetailView, AiProjectSummary,
     AiReplaySessionCursor, AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerPage,
@@ -414,6 +415,29 @@ pub(crate) fn ai_query_transcript(
     state: State<'_, AiDesktopState>,
 ) -> Result<AiTranscriptProjection, AiCommandError> {
     state.commands.query_transcript(project_id)
+}
+
+/// 按高光查询增强审阅项（步骤 4 任务 9.1）。
+///
+/// 返回列表只含结构化字段：不含 Prompt 正文、资产下载地址或 Provider 原始响应。
+#[tauri::command]
+pub(crate) fn ai_query_enhancement_review(
+    clip_project_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<Vec<AiEnhancementReviewItem>, AiCommandError> {
+    state.commands.enhancement_review(clip_project_id)
+}
+
+/// 移除工程里的生成式动画资产（标记失效、需重新审阅）。
+#[tauri::command]
+pub(crate) fn ai_remove_generated_animation(
+    clip_project_id: i64,
+    asset_id: i64,
+    state: State<'_, AiDesktopState>,
+) -> Result<AiGeneratedAnimationAsset, AiCommandError> {
+    state
+        .commands
+        .remove_generated_animation(clip_project_id, asset_id)
 }
 
 #[tauri::command]

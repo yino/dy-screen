@@ -192,6 +192,8 @@ pub fn build_export_plan_with_overlays(
     let mut total_duration_ms = 0_u64;
     let mut input_index = 0_usize;
     let mut unit_index = 0_usize;
+    // 上一个片段之后是否有 `insert`：用于给下一个片段首部做短淡入。
+    let mut fade_in_next = false;
     for source in sources {
         let duration_ms = source
             .segment
@@ -209,18 +211,109 @@ pub fn build_export_plan_with_overlays(
         ]);
         let duration_seconds = duration_ms as f64 / 1_000.0;
         let effect_filter = visual_filter(source.segment.effect, duration_seconds);
+        // 有 `replace` 时先落到 base 标签，再由替换叠加层产出最终单元。
+        let video_label = if source.replace.is_some() {
+            format!("base{unit_index}")
+        } else {
+            format!("v{unit_index}")
+        };
         filter_parts.push(format!(
-            "[{input_index}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p{effect_filter}[v{unit_index}]",
+            "[{input_index}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p{effect_filter}[{video_label}]",
             width = output_dimensions.width,
             height = output_dimensions.height,
         ));
+        // 插入单元（`insert`）前后对来源音频做受控短淡出/淡入，避免突然跳入或跳出
+        // 静音；不改变相邻片段自身的音量设置（volume 仍按片段取值）。
+        let boundary_fade = 0.05_f64;
+        let fade_in = if fade_in_next {
+            format!(",afade=t=in:st=0:d={boundary_fade:.3}")
+        } else {
+            String::new()
+        };
+        let fade_out = if source.insert_after.is_some() {
+            let start = (duration_seconds - boundary_fade).max(0.0);
+            format!(",afade=t=out:st={start:.3}:d={boundary_fade:.3}")
+        } else {
+            String::new()
+        };
         filter_parts.push(format!(
-            "[{input_index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,volume={:.2}[a{unit_index}]",
+            "[{input_index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,volume={:.2}{fade_in}{fade_out}[a{unit_index}]",
             source.segment.volume_percent as f64 / 100.0,
         ));
-        concat_inputs.push_str(&format!("[v{unit_index}][a{unit_index}]"));
         input_index += 1;
+        if let Some(replace) = &source.replace {
+            // 目标范围必须完整落在该片段内；越界即拒绝，不修改工程。
+            if replace.start_ms >= replace.end_ms || replace.end_ms > duration_ms {
+                return Err(failure(
+                    "invalid_replace_range",
+                    "生成动画的替换范围无效或超出片段",
+                ));
+            }
+            let asset_input_index = input_index;
+            arguments.extend(["-i".to_owned(), replace.asset_path.clone()]);
+            input_index += 1;
+            // 生成资产平移到目标起点，按时间对齐叠加；范围之外完全不参与合成。
+            // 只接入视频流：`replace` 的音频完全来自原片段，不引入生成音轨。
+            filter_parts.push(format!(
+                "[{asset_input_index}:v]setpts=PTS-STARTPTS+{start}/TB,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[replace{unit_index}]",
+                start = format_seconds(replace.start_ms),
+                width = output_dimensions.width,
+                height = output_dimensions.height,
+            ));
+            filter_parts.push(format!(
+                "[base{unit_index}][replace{unit_index}]overlay=0:0:format=auto:eof_action=pass:enable='between(t,{start}, {end})'[v{unit_index}]",
+                start = format_seconds(replace.start_ms),
+                end = format_seconds(replace.end_ms),
+            ));
+        }
+        concat_inputs.push_str(&format!("[v{unit_index}][a{unit_index}]"));
         unit_index += 1;
+
+        if let Some(insert) = &source.insert_after {
+            // 邻接绑定三元组必须完整有效，否则拒绝该单元（不得追加为末段时间轴单元）。
+            if insert.left_segment_id <= 0
+                || insert.right_segment_id <= 0
+                || insert.boundary_id <= 0
+            {
+                return Err(failure(
+                    "invalid_insert_binding",
+                    "生成动画的插入绑定无效",
+                ));
+            }
+            if insert.duration_ms == 0 {
+                return Err(failure(
+                    "invalid_insert_duration",
+                    "生成动画的插入时长无效",
+                ));
+            }
+            // 插入单元增加工程总时长；右侧片段与其字幕的工程时间随之顺延。
+            total_duration_ms = total_duration_ms.saturating_add(insert.duration_ms);
+            let insert_input_index = input_index;
+            arguments.extend(["-i".to_owned(), insert.asset_path.clone()]);
+            input_index += 1;
+            filter_parts.push(format!(
+                "[{insert_input_index}:v]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p[v{unit_index}]",
+                width = output_dimensions.width,
+                height = output_dimensions.height,
+            ));
+            // 生成音轨一律丢弃：补齐 48 kHz 双声道静音（决策二）。只接视频流，
+            // 因此生成资产自带的音轨不会被混入。
+            let silent_input_index = input_index;
+            arguments.extend([
+                "-f".to_owned(),
+                "lavfi".to_owned(),
+                "-t".to_owned(),
+                format_seconds(insert.duration_ms),
+                "-i".to_owned(),
+                "anullsrc=r=48000:cl=stereo".to_owned(),
+            ]);
+            input_index += 1;
+            filter_parts.push(format!(
+                "[{silent_input_index}:a]asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[a{unit_index}]"
+            ));
+            concat_inputs.push_str(&format!("[v{unit_index}][a{unit_index}]"));
+            unit_index += 1;
+        }
 
         if let Some(bridge) = &source.bridge_after {
             total_duration_ms = total_duration_ms.saturating_add(bridge.duration_ms);
@@ -254,6 +347,7 @@ pub fn build_export_plan_with_overlays(
             concat_inputs.push_str(&format!("[v{unit_index}][a{unit_index}]"));
             unit_index += 1;
         }
+        fade_in_next = source.insert_after.is_some();
     }
     let subtitle_input_index = input_index;
     arguments.extend([
@@ -472,6 +566,19 @@ where
     let stderr = stderr_task.await.unwrap_or_default();
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr);
+        // 排查用：仅在显式开启 `DY_SCREEN_FFMPEG_DEBUG` 且为 debug 构建时输出
+        // FFmpeg 的失败详情。默认关闭，避免把本机路径写入普通日志。
+        if cfg!(debug_assertions) && std::env::var_os("DY_SCREEN_FFMPEG_DEBUG").is_some() {
+            let tail: String = detail
+                .chars()
+                .rev()
+                .take(1200)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            eprintln!("[ffmpeg-debug] exit={:?}\n{tail}", status.code());
+        }
         let message = if detail.contains("No such file") {
             "来源视频不存在，无法导出"
         } else {
@@ -719,6 +826,7 @@ pub fn cleanup_overlay_layers(overlays: &[EffectCaptionOverlay]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{ClipExportInsert, ClipExportReplace};
     use crate::ai::{
         AiClipEffect, AiClipSegment, AiClipSubtitle, ClipExportBridge, build_clip_subtitle_frames,
         render_clip_subtitle_assets,
@@ -748,7 +856,170 @@ mod tests {
             },
             subtitles: Vec::new(),
             bridge_after: None,
+            replace: None,
+            insert_after: None,
         }
+    }
+
+    /// 带 `replace` 生成式动画的片段：片段内 0.5s–1.5s 由生成资产替换（片段共 2s）。
+    fn source_with_replace() -> ClipExportSource {
+        let mut source = source(AiClipEffect::None);
+        source.replace = Some(ClipExportReplace {
+            asset_path: "/safe/animation.mp4".to_owned(),
+            start_ms: 500,
+            end_ms: 1_500,
+        });
+        source
+    }
+
+    #[test]
+    fn replace_plan_swaps_video_range_without_changing_duration_or_order() {
+        let plan = build_export_plan(
+            &[source_with_replace(), source(AiClipEffect::None)],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect("replace 计划必须可构建");
+        let joined = plan.arguments.join(" ");
+        // 生成资产被接成独立输入。
+        assert!(
+            joined.contains("/safe/animation.mp4"),
+            "生成资产必须作为输入"
+        );
+        // 画面替换用 overlay + 时间范围限定，且生成资产时间平移到目标起点。
+        assert!(joined.contains("[base0][replace0]overlay=0:0:format=auto:eof_action=pass:enable='between(t,0.500, 1.500)'"));
+        assert!(joined.contains("[1:v]setpts=PTS-STARTPTS+0.500/TB"));
+        assert!(joined.contains("[0:v]setpts=PTS-STARTPTS"));
+        // 画面替换不删除也不隐藏普通 ASR 字幕：字幕 overlay 仍挂在拼接结果上。
+        assert!(joined.contains("[vjoined][subtitles]overlay"));
+        // 工程总时长与片段顺序不受替换影响：两个 2s 片段仍然是 4s。
+        assert_eq!(plan.total_duration_ms, 4_000);
+    }
+
+    #[test]
+    fn replace_plan_never_introduces_generated_audio() {        let plan = build_export_plan(
+            &[source_with_replace()],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect("replace 计划必须可构建");
+        let joined = plan.arguments.join(" ");
+        // 音频只来自原片段；生成资产不贡献音轨。
+        assert!(joined.contains("[0:a]asetpts=PTS-STARTPTS"));
+        assert!(!joined.contains("[1:a]"), "生成资产 MUST NOT 引入音轨");
+    }
+
+    #[test]
+    fn replace_plan_rejects_range_outside_the_segment() {
+        let mut broken = source_with_replace();
+        broken.replace = Some(ClipExportReplace {
+            asset_path: "/safe/animation.mp4".to_owned(),
+            start_ms: 1_200,
+            end_ms: 5_000,
+        });
+        let rejection = build_export_plan(
+            &[broken],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect_err("越界范围必须被拒绝");
+        assert_eq!(rejection.code, "invalid_replace_range");
+    }
+
+    /// 带 `insert` 生成式动画的片段：片段后插入 1.5s 生成资产桥接。
+    fn source_with_insert() -> ClipExportSource {
+        let mut source = source(AiClipEffect::None);
+        source.insert_after = Some(ClipExportInsert {
+            asset_path: "/safe/bridge-animation.mp4".to_owned(),
+            duration_ms: 1_500,
+            left_segment_id: 1,
+            right_segment_id: 2,
+            boundary_id: 7,
+        });
+        source
+    }
+
+    #[test]
+    fn insert_plan_appends_silent_unit_and_extends_duration() {
+        let plan = build_export_plan(
+            &[source_with_insert(), source(AiClipEffect::None)],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect("insert 计划必须可构建");
+        let joined = plan.arguments.join(" ");
+        // 生成资产接成独立视频输入。
+        assert!(joined.contains("/safe/bridge-animation.mp4"));
+        // 生成音轨一律丢弃：音频用 anullsrc 补齐 48 kHz 双声道静音。
+        assert!(joined.contains("anullsrc=r=48000:cl=stereo"));
+        assert!(joined.contains("aformat=sample_rates=48000:channel_layouts=stereo"));
+        // 工程总时长 = 2s + 1.5s 插入 + 2s，右侧片段与字幕顺延。
+        assert_eq!(plan.total_duration_ms, 5_500);
+    }
+
+    #[test]
+    fn insert_plan_adds_boundary_fades_without_touching_segment_volume() {
+        let plan = build_export_plan(
+            &[source_with_insert(), source(AiClipEffect::None)],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect("insert 计划必须可构建");
+        let joined = plan.arguments.join(" ");
+        // 左片段尾部短淡出、右片段首部短淡入，避免突然跳入/跳出静音。
+        assert!(joined.contains("afade=t=out:st=1.950:d=0.050"));
+        assert!(joined.contains("afade=t=in:st=0:d=0.050"));
+        // 不改变相邻片段自身的音量设置。
+        assert!(joined.contains("volume=1.20"));
+    }
+
+    #[test]
+    fn insert_plan_rejects_missing_right_segment() {
+        let mut broken = source_with_insert();
+        broken.insert_after = Some(ClipExportInsert {
+            asset_path: "/safe/bridge-animation.mp4".to_owned(),
+            duration_ms: 1_500,
+            left_segment_id: 1,
+            right_segment_id: 0,
+            boundary_id: 7,
+        });
+        let rejection = build_export_plan(
+            &[broken],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect_err("缺右侧片段必须拒绝");
+        assert_eq!(rejection.code, "invalid_insert_binding");
     }
 
     #[test]
@@ -1760,5 +2031,41 @@ mod tests {
                 "{seconds}s 处超出 enable 时间窗，不应出现特效字幕层"
             );
         }
+    }
+
+    #[test]
+    fn export_uses_the_project_frozen_bridge_reference_without_touching_the_catalog() {
+        // 任务 10.3：工程里冻结的桥接引用（assetKey/version 已不在当前目录）只要
+        // 通过 `source_path` 读得到文件，导出计划就必须照常构建——历史工程的引用
+        // 不因目录变化而失效，且导出路径根本不接受目录输入。
+        let directory = tempfile::tempdir().unwrap();
+        let bridge = directory.path().join("frozen-bridge.mp4");
+        std::fs::write(&bridge, b"fake bridge").unwrap();
+        let mut first = source(AiClipEffect::None);
+        first.bridge_after = Some(ClipExportBridge {
+            boundary_id: 1,
+            asset_key: "retired_transition".to_owned(),
+            asset_version: 9,
+            source_path: bridge.to_string_lossy().into_owned(),
+            duration_ms: 800,
+            has_audio: false,
+        });
+        let plan = build_export_plan(
+            &[first, source(AiClipEffect::None)],
+            PathBuf::from("/safe/out.part.mp4"),
+            ClipOutputDimensions {
+                width: 1080,
+                height: 1920,
+            },
+            Path::new("/safe/subtitles.ffconcat"),
+            "libx264",
+        )
+        .expect("历史工程的冻结引用必须可导出");
+        // 桥接仍是一个独立时间轴单元：总时长 = 2s + 0.8s + 2s。
+        assert_eq!(plan.total_duration_ms, 4_800);
+        let joined = plan.arguments.join(" ");
+        assert!(joined.contains("frozen-bridge.mp4"));
+        // 无音轨的桥接按既有规则补齐 48 kHz 双声道静音。
+        assert!(joined.contains("anullsrc=r=48000:cl=stereo"));
     }
 }

@@ -45,7 +45,9 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { type CSSProperties, type DragEvent, FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DEFAULT_LLM_MODEL_ID } from "./types";
 import type {
+  AiEnhancementReviewItem,
   AiEnvironmentDiagnostic,
   AiHighlightCandidate,
   AiHighlightCandidatePage,
@@ -156,13 +158,16 @@ const highlightRunStatusLabels: Record<AiHighlightRun["status"], string> = {
   failed: "失败",
 };
 
+// 阶段条的渲染顺序取自本字面量的键顺序（不是后端 `AiSmartStage::ALL`），
+// 因此必须与后端保持一致：**片段级前置**下纠错在合辑之前。
 const smartStageLabels: Record<AiSmartStage, string> = {
   preflight: "输入预检",
   asr: "ASR 识别",
   highlight: "精彩提取",
-  draft: "合辑草稿",
   correction: "文本纠错",
+  draft: "合辑草稿",
   transition: "转场匹配",
+  enhancement: "特效增强",
   review: "等待审阅",
 };
 
@@ -321,7 +326,7 @@ function HighlightAudit({
   const tags = run?.tagsSnapshot ?? project.projectTags ?? [];
   const goal = run?.analysisGoal ?? project.analysisGoal ?? null;
   const promptSnapshot = {
-    model: run?.modelId ?? "deepseek-chat",
+    model: run?.modelId ?? DEFAULT_LLM_MODEL_ID,
     promptVersion: run?.promptVersion ?? "highlight-v1",
     system: highlightSystemPrompt,
     candidateAgent: {
@@ -548,7 +553,11 @@ function SmartClippingHome({
     : mode === "live"
       ? sessionId !== null
       : selectedReplay !== null && selectedReplay.unavailableVideoCount === 0;
-  const gatesReady = Boolean(environment?.ready && llmSettings?.keyConfigured);
+  // 旧上游 Key 已不再参与调用（运行走短期 token），MUST NOT 用它挡流程。
+  // 同时注意：`environment.ready` 只表示**本地** ASR 资源就绪，云端可用性由
+  // `cloudAsrAvailable` 单独表达（后端刻意不把两者混进 ready）。默认路径是百炼
+  // 直连，因此**任一可用**就应允许创建，否则只装了云路径的用户会被挡在门外。
+  const gatesReady = Boolean(environment?.ready || environment?.cloudAsrAvailable);
   const duplicateReady = mode !== "replay"
     || selectedReplay?.existingWorkflowId === null
     || duplicateConfirmed;
@@ -560,7 +569,7 @@ function SmartClippingHome({
         ? "正在直播智能成片"
         : "直播回放智能成片",
     provider: llmSettings?.provider ?? "deepseek",
-    modelId: llmSettings?.modelId ?? "deepseek-chat",
+    modelId: llmSettings?.modelId ?? DEFAULT_LLM_MODEL_ID,
     textScope: "selected_clip_subtitles" as const,
     outputPreference: "reviewable_compilation",
   };
@@ -765,7 +774,7 @@ function SmartClippingHome({
             {mode === "replay" && selectedReplay?.existingWorkflowId != null && <label className="smart-auth-confirm smart-duplicate-confirm"><input type="checkbox" checked={duplicateConfirmed} onChange={(event) => setDuplicateConfirmed(event.target.checked)} />该场回放已有智能任务，我确认重新处理并创建独立任务</label>}
             <div className="smart-gates">
               <span className={environment?.ready ? "ready" : "blocked"}>{environment?.ready ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}ASR 资源</span>
-              <span className={llmSettings?.keyConfigured ? "ready" : "blocked"}>{llmSettings?.keyConfigured ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}Provider</span>
+              <span className={llmSettings ? "ready" : "blocked"}>{llmSettings ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}Provider</span>
               <span className={sourceReady ? "ready" : "blocked"}>{sourceReady ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}受信来源</span>
             </div>
             <button className="primary-button smart-create-button" disabled={!canCreate} onClick={() => void create()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}创建并启动</button>
@@ -1559,11 +1568,9 @@ export function AiWorkspace({
 
   const startHighlightAnalysis = async () => {
     if (!detail || !api.startAiHighlightAnalysis) return;
-    if (!llmSettings?.keyConfigured) {
-      setMessage("请先在设置中配置 DeepSeek API Key");
-      return;
-    }
-    if (!window.confirm("将只发送规范化转写、稳定句段时间和标签到 DeepSeek，确认开始精彩分析？")) return;
+    // 不再用旧上游 Key 做前置门禁：当前调用走短期 token，后端会按激活状态
+    // 与授权确认判定并返回可区分原因。
+    if (!window.confirm("将只发送规范化转写、稳定句段时间和标签到当前模型服务（百炼），确认开始精彩分析？")) return;
     const requestedAt = Date.now();
     setAnalysisBusy(true);
     try {
@@ -1739,7 +1746,8 @@ export function AiWorkspace({
   const running = detail && ["queued", "running"].includes(detail.project.status);
   const canStart = Boolean(
     draft
-      && environment?.ready
+      // 本地资源就绪**或**百炼直连可用：默认路径是云，不能用本地就绪度挡住云用户。
+      && (environment?.ready || environment?.cloudAsrAvailable)
       && detail?.inputs.some((input) => input.status === "pending" && input.audioPresent === true),
   );
   const totalDuration = detail?.inputs.reduce((total, input) => total + (input.durationMs ?? 0), 0) ?? 0;
@@ -1809,13 +1817,13 @@ export function AiWorkspace({
         <span>手动管理 ASR、精彩候选与剪辑工程</span>
       </div>
 
-      <section className={`ai-environment ${environment?.ready ? "ready" : "unavailable"}`}>
-        <div className="ai-environment-icon">{environment?.ready ? <CheckCircle2 size={22} /> : <AlertTriangle size={22} />}</div>
+      <section className={`ai-environment ${environment?.ready || environment?.cloudAsrAvailable ? "ready" : "unavailable"}`}>
+        <div className="ai-environment-icon">{environment?.ready || environment?.cloudAsrAvailable ? <CheckCircle2 size={22} /> : <AlertTriangle size={22} />}</div>
         <div>
-          <strong>{environment?.ready ? "语音识别环境已就绪" : "语音识别环境暂不可用"}</strong>
+          <strong>{environment?.ready || environment?.cloudAsrAvailable ? "语音识别环境已就绪" : "语音识别环境暂不可用"}</strong>
           <p>{environment?.message ?? "正在检测识别能力"}</p>
           {environment && <div className="ai-environment-details"><span>{environment.platform}</span><span>{environment.engineId} {environment.engineVersion}</span><span>{environment.modelId}</span><span className={environment.cloudAsrAvailable ? "ok" : "failed"}>{environment.cloudAsrAvailable ? "百炼直连转写可用（默认路径，会上传标准音频）" : "百炼直连转写不可用，且未显式选择本地识别"}</span>{environment.runtime && <span className={environment.runtime.signatureValid ? "ok" : "failed"}>资源包 {environment.runtime.bundleVersion} · {environment.runtime.signatureValid ? "签名已校验" : "签名待发行配置"}</span>}{environment.checks.map((check) => <span key={check.code} className={check.passed ? "ok" : "failed"} title={check.message}>{check.passed ? "✓" : "!"} {check.message}</span>)}</div>}
-          {!environment?.ready && <small><span>修复方式：完成账号开通与授权，或修复并重新检测本地识别资源</span><span>默认路径为百炼直连；云端不可用时不会自动改用本地识别。</span></small>}
+          {!(environment?.ready || environment?.cloudAsrAvailable) && <small><span>修复方式：完成账号开通与授权，或修复并重新检测本地识别资源</span><span>默认路径为百炼直连；云端不可用时不会自动改用本地识别。</span></small>}
         </div>
         <button className="secondary-button" disabled={busy} onClick={() => void run(refreshEnvironment)}><RefreshCw size={15} />重新检测</button>
       </section>
@@ -1960,8 +1968,8 @@ export function AiWorkspace({
                 <section className="ai-result-workspace">
                   {detail.project.status === "completed" || detail.project.status === "completed_with_errors" ? (
                     <section className="panel ai-highlight-panel">
-                      <header><div><p className="section-kicker">HIGHLIGHT AGENT</p><h3>精彩评分与候选</h3></div><span>{llmSettings?.keyConfigured ? `${llmSettings.modelId} · 仅发送文本` : "未配置 DeepSeek"}</span></header>
-                      <div className="ai-highlight-consent"><div><strong>独立于本地 ASR</strong><p>需要显式授权后，候选 Agent 和评分 Agent 才会读取规范化转写。视频、音频、本地路径和 Key 不会发送。</p></div><button className="primary-button" disabled={analysisWorking || !llmSettings?.keyConfigured || !api.startAiHighlightAnalysis} onClick={() => void startHighlightAnalysis()}><Sparkles size={15} />{analysisWorking ? "分析中…" : analysisCompleted ? "刷新分析结果" : analysisRun?.status === "partial" || analysisRun?.status === "failed" ? "重试未完成批次" : "开始精彩分析"}</button></div>
+                      <header><div><p className="section-kicker">HIGHLIGHT AGENT</p><h3>精彩评分与候选</h3></div><span>{llmSettings ? `${llmSettings.modelId} · 仅发送文本` : "未授权"}</span></header>
+                      <div className="ai-highlight-consent"><div><strong>独立于本地 ASR</strong><p>需要显式授权后，候选 Agent 和评分 Agent 才会读取规范化转写。视频、音频、本地路径和 Key 不会发送。</p></div><button className="primary-button" disabled={analysisWorking || !api.startAiHighlightAnalysis} onClick={() => void startHighlightAnalysis()}><Sparkles size={15} />{analysisWorking ? "分析中…" : analysisCompleted ? "刷新分析结果" : analysisRun?.status === "partial" || analysisRun?.status === "failed" ? "重试未完成批次" : "开始精彩分析"}</button></div>
                       {analysisProgressVisible && <div className="ai-highlight-progress" role="status" aria-live="polite"><div><strong>{analysisRun?.status === "ranking" ? "正在统一评分" : "正在分批生成候选"}</strong><span>已处理 {analysisFinishedBatches} / {analysisTotalBatches} 批 · {analysisProgress?.completedBatches ?? 0} 成功 · {analysisProgress?.failedBatches ?? 0} 失败</span></div><div className="ai-highlight-progress-track" role="progressbar" aria-label="精彩分析进行中" aria-valuemin={0} aria-valuemax={100} aria-valuenow={analysisProgressPercent}><span style={{ width: `${analysisProgressPercent}%` }} /></div><small>{analysisInputCount} 个视频 · {analysisSegmentCount} 个句段 · 已发现 {analysisProgress?.candidateCount ?? 0} 个候选草稿</small></div>}
                       {analysisRun && <div className="ai-highlight-run-meta"><span>状态：{highlightRunStatusLabels[analysisRun.status]}</span><span>范围：{analysisRun.estimatedBatches} 批 · {analysisRun.totalSegments} 句</span><span>阈值：合格 {analysisRun.qualifiedScore} 分 · 优秀 {analysisRun.excellentScore} 分</span><span>模型消耗：{analysisRun.totalTokens} Token</span><span>策略：{analysisRun.skillsSnapshot.join("、") || "通用"}</span></div>}
                       {analysisRun?.lastErrorMessage && <div className="ai-highlight-error"><AlertTriangle size={15} /><span>{analysisRun.lastErrorMessage}</span></div>}
@@ -2051,7 +2059,7 @@ type ClipMaterialFilter = "all" | "video" | "animation" | "transition";
 type ClipPropertyMode = "segment" | "transition" | "subtitle";
 type ClipSubtitleScope = "current" | "all";
 type ClipSubtitleSaveState = "saved" | "unsaved" | "saving" | "failed" | "conflict";
-type WorkflowReviewMode = "agent" | "textCorrection";
+type WorkflowReviewMode = "agent" | "textCorrection" | "enhancement";
 type AgentReviewFilter = "all" | "applied" | "suggestion" | "none";
 type AgentReviewStatus = Exclude<AgentReviewFilter, "all">;
 
@@ -2125,6 +2133,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
   const [textCorrectionReview, setTextCorrectionReview] = useState<TextCorrectionReviewState | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reviewMode, setReviewMode] = useState<WorkflowReviewMode>("agent");
+  const [enhancementReview, setEnhancementReview] = useState<AiEnhancementReviewItem[]>([]);
   const [agentReviewFilter, setAgentReviewFilter] = useState<AgentReviewFilter>("all");
   const [videoMaterials, setVideoMaterials] = useState<AiHighlightCandidate[]>([]);
   const [loadingVideoMaterials, setLoadingVideoMaterials] = useState(false);
@@ -2157,6 +2166,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
     key: `segment:${segment.id}`, kind: "segment" as const, projectStartMs: 0, projectEndMs: 0,
     clipSegmentId: segment.id, boundaryId: null, title: segment.title, assetKey: null,
     assetVersion: null, sourceStatus: null, previewStatus: null,
+    generatedAssetId: null, composition: null, assetStatus: null,
   }));
   let fallbackCursor = 0;
   for (const unit of fallbackTimelineUnits) {
@@ -2173,6 +2183,8 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
   const selectedBoundaryUnit = selectedBoundaryId === null
     ? null
     : timelineUnits.find((unit) => unit.boundaryId === selectedBoundaryId) ?? null;
+  const selectedAnimationUnit = selectedBoundaryUnit?.kind === "animation" ? selectedBoundaryUnit : null;
+  const [animationBusy, setAnimationBusy] = useState(false);
   const selectedTransitionMaterial = selectedBoundary?.assetKey && selectedBoundary.assetVersion
     ? transitionMaterials.find((material) => material.assetKey === selectedBoundary.assetKey && material.assetVersion === selectedBoundary.assetVersion) ?? null
     : null;
@@ -2611,12 +2623,23 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
     else openTextCorrectionReview();
   };
 
+  /** 打开按高光的增强审阅（步骤 4 任务 9.1）。进行中的高光不会阻塞已就绪结果。 */
+  const openEnhancementReview = async () => {
+    setReviewMode("enhancement");
+    setReviewOpen(true);
+    if (api.queryAiEnhancementReview) {
+      try {
+        setEnhancementReview(await api.queryAiEnhancementReview(detail.project.id));
+      } catch {
+        setEnhancementReview([]);
+      }
+    }
+    window.requestAnimationFrame(() => propertiesRef.current?.focus());
+  };
+
   const correctClipText = async () => {
     if (!api.correctAiClipText || versionMutationLocked || correctableSubtitleCount === 0) return;
-    if (!llmSettings?.keyConfigured) {
-      setMessage("请先在设置中配置 DeepSeek API Key");
-      return;
-    }
+    // 旧上游 Key 不参与调用，不再作为门禁；后端按激活状态给出可区分原因。
     setTextCorrecting(true);
     setWorkflowProgress({
       workflow: "textCorrection",
@@ -3074,8 +3097,20 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
     finally { setTransitionBusy(false); }
   };
 
-  const unlockTransition = async (boundaryOverride?: ClipTransitionBoundary) => {
-    const boundary = boundaryOverride ?? selectedBoundary;
+  /** 移除工程里的生成式动画资产：标记失效并需要重新审阅（不自动重新生成）。 */
+  const removeGeneratedAnimation = async () => {
+    const assetId = selectedAnimationUnit?.generatedAssetId ?? null;
+    if (assetId === null || !api.removeAiGeneratedAnimation || !api.getAiClipProject || versionMutationLocked) return;
+    setAnimationBusy(true);
+    try {
+      await api.removeAiGeneratedAnimation(projectId, assetId);
+      setDetail(await api.getAiClipProject(projectId));
+      setMessage("已移除生成式动画，需要重新审阅");
+    } catch (error) { setMessage(safeError(error, "移除生成式动画失败")); }
+    finally { setAnimationBusy(false); }
+  };
+
+  const unlockTransition = async (boundaryOverride?: ClipTransitionBoundary) => {    const boundary = boundaryOverride ?? selectedBoundary;
     if (!boundary || !api.unlockAiClipTransition) return;
     setTransitionBusy(true);
     try {
@@ -3180,9 +3215,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
   ).length ?? Math.max(0, detail.segments.length - 1);
   const transitionAgentUnavailableReason = !api.matchAiClipTransitions
     ? "当前环境不支持一键 Agent"
-    : !llmSettings?.keyConfigured
-      ? "请先在设置中配置 DeepSeek API Key"
-      : detail.segments.length < 2
+    : detail.segments.length < 2
         ? "至少需要两个视频片段"
         : transitionMaterials.length === 0
           ? "本地转场目录为空，请先同步素材"
@@ -3195,9 +3228,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
               : null;
   const textCorrectionUnavailableReason = !api.correctAiClipText
     ? "当前环境不支持一键文本纠错"
-    : !llmSettings?.keyConfigured
-      ? "请先在设置中配置 DeepSeek API Key"
-      : correctableSubtitleCount === 0
+    : correctableSubtitleCount === 0
         ? "没有未隐藏且未经人工修改的字幕"
         : versionMutationLocked
           ? "请先完成导出、字幕保存或其他工作流"
@@ -3379,7 +3410,9 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
                     const effect = clipEffects.find((item) => item.value === segment.effect) ?? clipEffects[0];
                     const right = detail.segments[index + 1];
                     const boundary = right ? detail.boundaries?.find((item) => item.active && item.leftStableId === segment.id && item.rightStableId === right.id) : null;
-                    const bridgeUnit = boundary ? timelineUnits.find((unit) => unit.boundaryId === boundary.id) : null;
+                    const boundaryUnit = boundary ? timelineUnits.find((unit) => unit.boundaryId === boundary.id) : null;
+                    const bridgeUnit = boundaryUnit?.kind === "bridge" ? boundaryUnit : null;
+                    const animationUnit = boundaryUnit?.kind === "animation" ? boundaryUnit : null;
                     const reviewedBoundary = boundary ? agentReviewBoundaries.find((item) => item.id === boundary.id) : null;
                     const reviewedStatus = reviewedBoundary ? agentReviewStatus(reviewedBoundary) : null;
                     const reviewedScore = reviewedBoundary ? agentBoundaryScore(reviewedBoundary) : null;
@@ -3410,6 +3443,13 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
                         aria-label={`转场素材：${bridgeUnit.title}`}
                         onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); reviewedBoundary ? openAgentReview(reviewedBoundary) : selectBoundary(boundary, isPlaying); }}
                       ><Blend size={12} /><strong>{bridgeUnit.title}</strong><small>{formatDuration(bridgeUnit.projectEndMs - bridgeUnit.projectStartMs)}</small>{reviewedBoundary && <em className={`clip-agent-timeline-marker ${reviewedStatus}`}>{reviewedStatus === "none" ? "无" : reviewedScore?.toFixed(1) ?? "--"}</em>}</button>
+                        : animationUnit ? <button
+                          type="button"
+                          className={`clip-animation-unit ${selectedBoundaryId === boundary.id ? "active" : ""} ${animationUnit.assetStatus ?? "pending"}`}
+                          style={{ width: `${Math.max(2, (animationUnit.projectEndMs - animationUnit.projectStartMs) / Math.max(totalDuration, 1) * 100)}%` }}
+                          aria-label={`生成式动画：${animationUnit.title}，${animationUnit.composition === "insert" ? "转场插入" : "画面替换"}，${animationUnit.assetStatus === "validated" ? "资产已校验" : "资产待校验"}`}
+                          onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); reviewedBoundary ? openAgentReview(reviewedBoundary) : selectBoundary(boundary, isPlaying); }}
+                        ><Sparkles size={12} /><strong>{animationUnit.title}</strong><small>{formatDuration(animationUnit.projectEndMs - animationUnit.projectStartMs)}</small>{reviewedBoundary && <em className={`clip-agent-timeline-marker ${reviewedStatus}`}>{reviewedStatus === "none" ? "无" : reviewedScore?.toFixed(1) ?? "--"}</em>}</button>
                         : <button type="button" className={`clip-boundary-slot ${selectedBoundaryId === boundary.id ? "active" : ""} ${boundary.stale ? "stale" : ""} ${reviewedBoundary ? "reviewed" : ""}`} aria-label={`选择 ${segment.title} 与 ${right.title} 之间的转场${reviewedBoundary ? `，Agent ${reviewedStatus === "none" ? "无需转场" : `${reviewedScore?.toFixed(1) ?? "--"} 分`}` : ""}`} title={reviewedBoundary ? "查看 Agent 评分" : boundary.stale ? "需要重新匹配" : "添加转场"} onClick={(event) => { event.stopPropagation(); setPreviewingTransition(null); reviewedBoundary ? openAgentReview(reviewedBoundary) : selectBoundary(boundary); }}>{reviewedBoundary ? <span className={`clip-agent-slot-marker ${reviewedStatus}`}>{reviewedStatus === "none" ? "无" : reviewedScore?.toFixed(1) ?? "--"}</span> : <Plus size={10} />}</button>)}
                     </Fragment>;
                   })}
@@ -3455,6 +3495,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
           <nav className="clip-review-mode-tabs" aria-label="AI 结果类型">
             <button aria-label="Agent 结果" disabled={!agentReview} aria-pressed={reviewMode === "agent"} className={reviewMode === "agent" ? "active" : ""} onClick={() => openAgentReview()}>Agent{agentReview && <span>{agentReviewBoundaries.length}</span>}</button>
             <button aria-label="文本纠错结果" disabled={!textCorrectionReview} aria-pressed={reviewMode === "textCorrection"} className={reviewMode === "textCorrection" ? "active" : ""} onClick={() => openTextCorrectionReview()}>文本纠错{textCorrectionReview && <span>{textCorrectionReview.changes.length}</span>}</button>
+            <button aria-label="增强结果" aria-pressed={reviewMode === "enhancement"} className={reviewMode === "enhancement" ? "active" : ""} onClick={() => void openEnhancementReview()}>增强{enhancementReview.length > 0 && <span>{enhancementReview.length}</span>}</button>
           </nav>
         </> : <>
           <header className="clip-property-header">
@@ -3562,6 +3603,28 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
               })}
               {textCorrectionReview.changes.length === 0 && <p className="clip-review-empty">本次文本纠错没有修改字幕</p>}
             </div>
+          </> : reviewMode === "enhancement" ? <>
+            <div className="clip-review-summary">
+              <div><span>已就绪</span><strong>{enhancementReview.filter((item) => item.kind !== null).length}</strong><small>/ {enhancementReview.length}</small></div>
+              <dl><div><dt>进行中</dt><dd>{enhancementReview.filter((item) => item.kind === null).length}</dd></div><div><dt>已产生成本</dt><dd>{(enhancementReview.reduce((total, item) => total + item.costMinor, 0) / 100).toFixed(2)}</dd></div></dl>
+            </div>
+            <div className="clip-review-list" aria-label="增强审阅列表">
+              {enhancementReview.map((item) => {
+                const kindLabel = item.kind === "video_animation" ? "生成式动画" : item.kind === "effect_caption" ? "特效字幕" : "进行中";
+                const compositionLabel = item.composition === "replace" ? "画面替换" : item.composition === "insert" ? "转场插入" : null;
+                const assetLabel = item.assetStatus === "validated" ? "资产已校验" : item.assetStatus === "pending" ? "资产生成中" : item.assetStatus === "rejected" ? "资产未通过校验" : item.assetStatus === "invalidated" ? "邻接变化已失效" : null;
+                const detailLabel = [compositionLabel, assetLabel, item.rejectionCode ? `原因：${item.rejectionCode}` : null].filter(Boolean).join(" · ");
+                return <article key={item.candidateId} className={`clip-review-row ${item.kind === null ? "pending" : "ready"}`}>
+                  <div className="clip-review-row-main" aria-label={`高光 ${item.candidateId} 的增强结果：${kindLabel}`}>
+                    <span className={`clip-review-status ${item.kind === null ? "suggestion" : "applied"}`}>{item.kind === null ? <LoaderCircle size={13} /> : <Sparkles size={13} />}{kindLabel}</span>
+                    <strong>高光 {item.candidateId}</strong>
+                    <small>{detailLabel || "—"}</small>
+                    <b>{(item.costMinor / 100).toFixed(2)}<em>元</em></b>
+                  </div>
+                </article>;
+              })}
+              {enhancementReview.length === 0 && <p className="clip-review-empty">本次还没有增强结果</p>}
+            </div>
           </> : <p className="clip-review-empty">本次会话还没有可审阅的 AI 结果</p>}
         </div> : propertyMode === "segment" ? <div className="clip-property-panel">
           {selected ? <>
@@ -3602,6 +3665,18 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
               {selectedBoundary.score !== null && <dl className="clip-transition-score-grid"><div><dt>场景</dt><dd>{selectedBoundary.sceneScore?.toFixed(1)}</dd></div><div><dt>衔接</dt><dd>{selectedBoundary.continuityScore?.toFixed(1)}</dd></div><div><dt>节奏</dt><dd>{selectedBoundary.rhythmScore?.toFixed(1)}</dd></div><div><dt>素材</dt><dd>{selectedBoundary.materialScore?.toFixed(1)}</dd></div></dl>}
               {selectedBoundary.reason && <p>{selectedBoundary.reason}</p>}
             </section> : <section className="clip-property-group"><h4>已应用素材</h4><p>当前边界没有转场素材</p></section>}
+            {selectedAnimationUnit && <section className="clip-property-group">
+              <h4>生成式动画</h4>
+              <strong>{selectedAnimationUnit.title}</strong>
+              <dl>
+                <div><dt>资产 ID</dt><dd>#{selectedAnimationUnit.generatedAssetId}</dd></div>
+                <div><dt>合成方式</dt><dd>{selectedAnimationUnit.composition === "insert" ? "转场插入" : "画面替换"}</dd></div>
+                <div><dt>时长</dt><dd>{formatDuration(selectedAnimationUnit.projectEndMs - selectedAnimationUnit.projectStartMs)}</dd></div>
+                <div><dt>生成来源</dt><dd>直连万相</dd></div>
+                <div><dt>校验状态</dt><dd>{selectedAnimationUnit.assetStatus === "validated" ? "已校验" : selectedAnimationUnit.assetStatus === "pending" ? "生成中" : selectedAnimationUnit.assetStatus === "rejected" ? "未通过校验" : "已失效"}</dd></div>
+              </dl>
+              <button className="danger-button" disabled={animationBusy || versionMutationLocked} onClick={() => void removeGeneratedAnimation()}><Trash2 size={13} />移除此动画</button>
+            </section>}
             {(suggestedTransitionMaterial || selectedBoundary.suggestionNone) && <section className="clip-property-group clip-transition-suggestion"><h4>智能建议</h4><strong>{selectedBoundary.suggestionNone ? "建议不使用转场" : suggestedTransitionMaterial?.title}</strong><p>{selectedBoundary.suggestionReason}</p><span>{selectedBoundary.suggestionScore !== null ? `${selectedBoundary.suggestionScore.toFixed(1)} / 10` : selectedBoundary.suggestionConfidence === null ? "" : `${Math.round(selectedBoundary.suggestionConfidence * 100)}%`}</span>{selectedBoundary.suggestionScore !== null && <dl className="clip-transition-score-grid"><div><dt>场景</dt><dd>{selectedBoundary.suggestionSceneScore?.toFixed(1)}</dd></div><div><dt>衔接</dt><dd>{selectedBoundary.suggestionContinuityScore?.toFixed(1)}</dd></div><div><dt>节奏</dt><dd>{selectedBoundary.suggestionRhythmScore?.toFixed(1)}</dd></div><div><dt>素材</dt><dd>{selectedBoundary.suggestionMaterialScore?.toFixed(1)}</dd></div></dl>}{suggestedTransitionMaterial && <button className="secondary-button" disabled={transitionBusy || versionMutationLocked} onClick={() => void applyTransitionMaterial(suggestedTransitionMaterial)}>应用建议</button>}</section>}
             <div className="clip-transition-actions">
               <button className="secondary-button" disabled={transitionBusy || versionMutationLocked || selectedBoundary.manuallyLocked} onClick={() => void matchTransitions(selectedBoundary.id)}><Sparkles size={13} />重新匹配</button>

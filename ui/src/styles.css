@@ -1373,6 +1373,9 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 .clip-track-items > button.clip-bridge-unit { min-width: 46px; border-color: #a77d35; color: #fff7dd; background: #725621; cursor: pointer; }
 .clip-track-items > button.clip-bridge-unit.downloading, .clip-track-items > button.clip-bridge-unit.transcoding { border-style: dashed; background: #594c2d; }
 .clip-track-items > button.clip-bridge-unit.failed { border-color: #b75e55; background: #6a302d; }
+.clip-track-items > button.clip-animation-unit { min-width: 46px; border-color: #6f5aa8; color: #f2ecff; background: #4a3c78; cursor: pointer; }
+.clip-track-items > button.clip-animation-unit.pending { border-style: dashed; background: #3d345c; }
+.clip-track-items > button.clip-animation-unit.rejected, .clip-track-items > button.clip-animation-unit.invalidated { border-color: #b75e55; background: #6a302d; }
 .clip-track-items > button.clip-boundary-slot { min-width: 24px; width: 24px; padding: 0; display: grid; place-items: center; border: 1px dashed #557466; color: #91aa9f; background: #1a3027; cursor: pointer; }
 .clip-track-items > button.clip-boundary-slot.stale { border-color: #b7904e; color: #e4bd73; }
 .clip-track-items > button.clip-boundary-slot.reviewed { border-style: solid; border-color: #e6b44a; overflow: visible; }

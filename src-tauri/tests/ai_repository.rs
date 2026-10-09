@@ -3,10 +3,13 @@ use std::path::PathBuf;
 
 use dy_screen_app_lib::ai::{
     AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipSegment, AiClipSegmentUpdate,
-    AiClipSubtitleUpdate, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProjectStatus,
-    AiRepository, ClipTextCorrectionUpdate, HighlightCandidateDraft, HighlightCandidateScore,
-    NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput, NewAsrArtifact, RecognitionProfile,
-    SourceFingerprint, TranscriptSegment, TranscriptSegmentDraft, project_clip_subtitles,
+    AiClipSubtitleUpdate, AiClipTimelineUnitKind, AiGeneratedAnimationComposition,
+    AiGeneratedAnimationInsertBinding, AiGeneratedAnimationStatus, AiHighlightRunStatus,
+    AiInputSourceKind, AiInputStatus, AiProjectStatus, AiRepository, ClipTextCorrectionUpdate,
+    GENERATED_ANIMATION_CACHE_DIR, HighlightCandidateDraft, HighlightCandidateScore,
+    NewAiGeneratedAnimationAsset, NewAiHighlightChunk, NewAiHighlightRun, NewAiProjectInput,
+    NewAsrArtifact, RecognitionProfile, SourceFingerprint, TranscriptSegment,
+    TranscriptSegmentDraft, generated_animation_file_name, project_clip_subtitles,
 };
 use dy_screen_app_lib::database::Database;
 use dy_screen_app_lib::domain::{NewStreamer, NewVideo};
@@ -1599,4 +1602,269 @@ fn stale_scheduler_events_are_ignored_after_generation_changes() {
         repository.get_input(project_input.id).unwrap().status,
         AiInputStatus::Validating
     );
+}
+
+/// 预览侧（工程详情）与导出侧必须用同一份时长口径：已校验的 `insert` 单元
+/// 既增加 `project_duration_ms`，也出现在时间轴单元里。
+#[test]
+fn clip_project_detail_counts_validated_insert_units_in_duration_and_timeline() {
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("insert-duration.sqlite3");
+    let database = Database::open(&database_path).unwrap();
+    database.migrate().unwrap();
+    let repository = AiRepository::new(database);
+    let project = repository
+        .create_project("插入时长", &profile())
+        .unwrap();
+    let project_input = repository
+        .add_input(project.id, input("/tmp/insert-duration.mp4", 0))
+        .unwrap();
+    let artifact = repository
+        .create_artifact(NewAsrArtifact {
+            source_fingerprint: project_input.source_fingerprint.clone(),
+            recognition_profile_hash: profile().fingerprint().unwrap(),
+            engine_id: "whisper.cpp".to_owned(),
+            engine_version: "v1.9.1".to_owned(),
+            model_id: "whisper-small-multilingual-q5_1".to_owned(),
+            model_version: "small-q5_1@5359861".to_owned(),
+            provider: "local".to_owned(),
+            fallback_reason: None,
+        })
+        .unwrap();
+    repository
+        .publish_artifact(
+            artifact.id,
+            60_000,
+            Some("zh"),
+            &[
+                TranscriptSegmentDraft {
+                    source_start_ms: 1_000,
+                    source_end_ms: 29_000,
+                    raw_text: "第一段".to_owned(),
+                    normalized_text: "第一段。".to_owned(),
+                    confidence: Some(0.9),
+                },
+                TranscriptSegmentDraft {
+                    source_start_ms: 30_000,
+                    source_end_ms: 59_000,
+                    raw_text: "第二段".to_owned(),
+                    normalized_text: "第二段。".to_owned(),
+                    confidence: Some(0.9),
+                },
+            ],
+        )
+        .unwrap();
+    repository
+        .attach_artifact(project_input.id, artifact.id)
+        .unwrap();
+    repository.freeze_project(project.id).unwrap();
+    repository
+        .transition_project(project.id, AiProjectStatus::Running)
+        .unwrap();
+    repository
+        .transition_input(project_input.id, AiInputStatus::Validating, None)
+        .unwrap();
+    repository
+        .transition_input(project_input.id, AiInputStatus::Completed, None)
+        .unwrap();
+    repository.recompute_project_progress(project.id).unwrap();
+    let run = repository
+        .create_highlight_run(NewAiHighlightRun {
+            project_id: project.id,
+            model_id: "qwen-plus".to_owned(),
+            prompt_version: "highlight-v1".to_owned(),
+            tags_snapshot: Vec::new(),
+            skills_snapshot: vec!["generic-hook@1.0.0".to_owned()],
+            analysis_goal: None,
+            analysis_fingerprint: "insert-duration".to_owned(),
+            qualified_score: 70,
+            excellent_score: 80,
+            total_segments: 2,
+            total_chars: 8,
+            estimated_batches: 2,
+            user_authorized: true,
+        })
+        .unwrap();
+    let chunks = repository
+        .add_highlight_chunks(
+            run.id,
+            &[
+                NewAiHighlightChunk {
+                    ordinal: 0,
+                    input_id: project_input.id,
+                    segment_ids: vec!["seg_1".to_owned()],
+                    context_segment_ids: Vec::new(),
+                },
+                NewAiHighlightChunk {
+                    ordinal: 1,
+                    input_id: project_input.id,
+                    segment_ids: vec!["seg_2".to_owned()],
+                    context_segment_ids: Vec::new(),
+                },
+            ],
+        )
+        .unwrap();
+    let draft = |key: &str, segment_id: &str, start_ms: u64| HighlightCandidateDraft {
+        candidate_key: key.to_owned(),
+        title: key.to_owned(),
+        input_id: project_input.id,
+        segment_ids: vec![segment_id.to_owned()],
+        start_ms,
+        end_ms: start_ms + 28_000,
+        hook_score: 82.0,
+        information_score: 78.0,
+        emotion_score: 75.0,
+        tag_relevance_score: 92.0,
+        completeness_score: 80.0,
+        shareability_score: 84.0,
+        reason: "插入时长测试".to_owned(),
+        matched_tags: Vec::new(),
+    };
+    let score = |key: &str| HighlightCandidateScore {
+        candidate_key: key.to_owned(),
+        total_score: 82.0,
+        hook_score: 82.0,
+        information_score: 78.0,
+        emotion_score: 75.0,
+        tag_relevance_score: 92.0,
+        completeness_score: 80.0,
+        shareability_score: 84.0,
+        rank: 1,
+        reason: "插入时长测试".to_owned(),
+    };
+    let mut published = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let key = format!("candidate-{index}");
+        let segment_id = format!("seg_{}", index + 1);
+        let start_ms = (index as u64) * 30_000;
+        repository
+            .mark_highlight_chunk_running(run.id, chunk.id)
+            .unwrap();
+        repository
+            .complete_highlight_chunk(run.id, chunk.id, &[draft(&key, &segment_id, start_ms)], 7)
+            .unwrap();
+        published = repository
+            .publish_highlight_results(
+                run.id,
+                chunk.id,
+                &[draft(&key, &segment_id, start_ms)],
+                &[score(&key)],
+                12,
+            )
+            .unwrap();
+    }
+    assert_eq!(published.len(), 2);
+    repository
+        .select_highlight_candidates(run.id, &[published[0].id, published[1].id])
+        .unwrap();
+    repository
+        .update_highlight_run_status(run.id, AiHighlightRunStatus::Completed, None)
+        .unwrap();
+    let clip = repository.get_or_create_clip_project(run.id).unwrap();
+    assert_eq!(clip.segments.len(), 2);
+    let base_duration = clip.project_duration_ms;
+    // 写入一个已校验的 `insert` 资产，绑定第 0 与第 1 段之间。
+    let asset = repository
+        .record_generated_animation_asset(NewAiGeneratedAnimationAsset {
+            project_id: project.id,
+            candidate_id: published[0].id,
+            highlight_run_id: Some(run.id),
+            generation: 1,
+            reuse_key: "insert-duration".to_owned(),
+            composition: AiGeneratedAnimationComposition::Insert,
+            status: AiGeneratedAnimationStatus::Validated,
+            replace_range: None,
+            insert_binding: Some(AiGeneratedAnimationInsertBinding {
+                left_segment_id: clip.segments[0].id,
+                right_segment_id: clip.segments[1].id,
+                boundary_id: 1,
+            }),
+            upstream_task_id: Some("task-insert-duration".to_owned()),
+            sha256: Some("a".repeat(64)),
+            width: Some(1280),
+            height: Some(720),
+            fps: Some(30),
+            duration_ms: Some(1_500),
+            rejection_code: None,
+        })
+        .unwrap();
+    let after = repository.get_clip_project(clip.project.id).unwrap();
+    // 预览侧工程时长必须与导出侧同口径：计入 `insert` 单元。
+    assert_eq!(after.project_duration_ms, base_duration + 1_500);
+    let insert_unit = after
+        .timeline_units
+        .iter()
+        .find(|unit| unit.kind == AiClipTimelineUnitKind::Animation)
+        .expect("时间轴必须包含生成式动画单元");
+    assert!(insert_unit.generated_asset_id.is_some());
+    assert_eq!(
+        insert_unit.composition,
+        Some(AiGeneratedAnimationComposition::Insert)
+    );
+    assert_eq!(
+        insert_unit.asset_status,
+        Some(AiGeneratedAnimationStatus::Validated)
+    );
+    assert_eq!(
+        insert_unit.project_end_ms - insert_unit.project_start_ms,
+        1_500
+    );
+
+    // 缓存缺失时拒绝导出：不得静默跳过已应用的生成资产。
+    let cache_root = directory.path().join("app-data");
+    assert!(
+        repository
+            .clip_export_sources(clip.project.id, &cache_root)
+            .is_err()
+    );
+    // 补齐缓存文件后，导出源带上 insert 单元（路径由约定推导、不入库）。
+    let cache_dir = cache_root.join(GENERATED_ANIMATION_CACHE_DIR);
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join(generated_animation_file_name(asset.id)),
+        b"fake animation",
+    )
+    .unwrap();
+    let sources = repository
+        .clip_export_sources(clip.project.id, &cache_root)
+        .unwrap();
+    let first_insert = sources[0]
+        .insert_after
+        .as_ref()
+        .expect("第一个片段后必须带上 insert 单元");
+    assert_eq!(first_insert.duration_ms, 1_500);
+    assert_eq!(first_insert.left_segment_id, clip.segments[0].id);
+    assert_eq!(first_insert.right_segment_id, clip.segments[1].id);
+    assert!(sources[1].insert_after.is_none());
+    assert!(sources[0].replace.is_none());
+
+    // 重排片段导致左右邻接关系改变：该动画必须自动失效并需重新审阅。
+    repository
+        .reorder_clip_segments(
+            clip.project.id,
+            &[clip.segments[1].id, clip.segments[0].id],
+        )
+        .unwrap();
+    let after_reorder = repository
+        .get_generated_animation_asset_by_id(asset.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_reorder.status,
+        AiGeneratedAnimationStatus::Invalidated
+    );
+    assert_eq!(
+        after_reorder.rejection_code.as_deref(),
+        Some("adjacency_changed")
+    );
+    // 失效的邻接绑定 MUST NOT 继续被导出。
+    assert!(
+        repository
+            .clip_export_sources(clip.project.id, &cache_root)
+            .is_err()
+    );
+    // 重复移除幂等。
+    repository
+        .invalidate_generated_animation_asset(asset.id, "user_removed")
+        .unwrap();
 }

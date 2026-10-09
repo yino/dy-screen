@@ -33,3 +33,6 @@ docs/review/*.webm
 # Harness 运行时：Node 22 LTS tarball 与解压产物不提交（锁文件 node-lock.json 例外）
 /resources/harness-source/runtime/*
 !/resources/harness-source/runtime/node-lock.json
+
+# 交付产物（体积大，属运行产物而非源码）
+/deliverables/

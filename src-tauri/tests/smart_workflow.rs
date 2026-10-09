@@ -13,7 +13,8 @@ use dy_screen_app_lib::ai::{
     NewAsrArtifact, PreflightReport, ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest,
     RecognitionProfile, SmartClippingWorkflow, SmartStageAttemptStart, SmartWorkflowConfiguration,
     SmartWorkflowGate, SmartWorkflowPublisher, SmartWorkflowRepository, SourceFingerprint,
-    SubtitleCorrectionItem, SubtitleCorrectionOutput, SubtitleCorrectionProvider,
+    IndustryAgentRequest, IndustryDetectionOutput, SubtitleCorrectionItem,
+    SubtitleCorrectionOutput, SubtitleCorrectionProvider,
     SubtitleCorrectionRequest, TranscriptSegmentDraft, TransitionAgentOutput,
     TransitionAgentProvider, TransitionAgentRequest, TransitionScoreOutput, TransitionScoreRequest,
     TrustedLocalFile,
@@ -412,6 +413,19 @@ struct SmartHighlightProvider;
 
 #[async_trait]
 impl HighlightAgentProvider for SmartHighlightProvider {
+    /// 行业识别：测试里用固定的通用钩子，避免依赖真实模型。
+    async fn detect_industry(
+        &self,
+        _call: &ModelCallHandle,
+        _request: IndustryAgentRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<IndustryDetectionOutput, LlmError> {
+        Ok(IndustryDetectionOutput {
+            industry: "generic".to_owned(),
+            token_usage: 0,
+        })
+    }
+
     async fn diagnose(
         &self,
         _call: &ModelCallHandle,
@@ -518,6 +532,61 @@ impl SubtitleCorrectionProvider for EchoCorrectionProvider {
 }
 
 #[derive(Default)]
+/// 前 `failures` 次调用失败、之后成功的纠正 provider。
+///
+/// 同时验证两件事：**重试耗尽后工作流失败**，以及**随后重试阶段能恢复**。
+/// 失败次数必须覆盖批次重试上限，否则第一次运行就会成功，失败路径测不到。
+struct FailUntilRetriesExhaustedCorrectionProvider {
+    calls: AtomicUsize,
+    failures: usize,
+    /// 每个"批次"（用提示词哈希区分）已失败的次数。
+    per_batch: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
+}
+
+#[async_trait]
+impl SubtitleCorrectionProvider for FailUntilRetriesExhaustedCorrectionProvider {
+    async fn correct_subtitles(
+        &self,
+        _call: &ModelCallHandle,
+        request: SubtitleCorrectionRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<SubtitleCorrectionOutput, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // 按批次独立计数：每个不同批次的提示词各自失败 `failures` 次。
+        // 若用全局计数，"第一批耗尽阈值"会让后续批次直接成功，测不到"后续批次重试"；
+        // 反之若阈值设得过大，后续批次又会一起失败。按批次区分才能同时验证两者。
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            request.prompt.hash(&mut hasher);
+            hasher.finish()
+        };
+        let attempted = {
+            let mut map = self.per_batch.lock().unwrap();
+            let entry = map.entry(digest).or_insert(0);
+            let current = *entry;
+            *entry += 1;
+            current
+        };
+        if attempted < self.failures {
+            return Err(LlmError::Temporary);
+        }
+        let texts: Vec<String> =
+            serde_json::from_str(request.prompt.split("输入文本数组：").nth(1).unwrap()).unwrap();
+        Ok(SubtitleCorrectionOutput {
+            corrections: texts
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| SubtitleCorrectionItem {
+                    index: index as u32,
+                    text,
+                })
+                .collect(),
+            token_usage: 1,
+        })
+    }
+}
+
 struct FailOnceCorrectionProvider {
     calls: AtomicUsize,
 }
@@ -1132,11 +1201,7 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
         Arc::new(SmartHighlightProvider),
         test_model_call(&database),
     ));
-    let correction = ClipTextCorrectionWorkflow::new(
-        repository.clone(),
-        Arc::new(EchoCorrectionProvider),
-        test_model_call(&database),
-    );
+    let correction_provider = Arc::new(EchoCorrectionProvider);
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
         TransitionMaterialCache::new(directory.path().join("transition-cache")).unwrap(),
@@ -1157,7 +1222,6 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
         project_service.clone(),
         controller.clone(),
         highlight,
-        correction,
         transition,
         Arc::new(ReadyGate),
     )
@@ -1308,11 +1372,7 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         Arc::new(SmartHighlightProvider),
         test_model_call(&database),
     ));
-    let correction = ClipTextCorrectionWorkflow::new(
-        repository.clone(),
-        Arc::new(EchoCorrectionProvider),
-        test_model_call(&database),
-    );
+    let correction_provider = Arc::new(EchoCorrectionProvider);
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
         TransitionMaterialCache::new(directory.path().join("transition-cache")).unwrap(),
@@ -1333,7 +1393,6 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         project_service.clone(),
         controller.clone(),
         highlight,
-        correction,
         transition,
         Arc::new(ReadyGate),
     )
@@ -1525,12 +1584,12 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
         Arc::new(SmartHighlightProvider),
         test_model_call(&database),
     ));
-    let correction_provider = Arc::new(FailOnceCorrectionProvider::default());
-    let correction = ClipTextCorrectionWorkflow::new(
-        repository.clone(),
-        correction_provider.clone(),
-        test_model_call(&database),
-    );
+    // 失败次数必须覆盖批次重试上限（3 次），第一次运行才会失败；之后重试阶段恢复。
+    let correction_provider = Arc::new(FailUntilRetriesExhaustedCorrectionProvider {
+        calls: AtomicUsize::new(0),
+        failures: 3,
+        per_batch: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
         TransitionMaterialCache::new(directory.path().join("replay-transition-cache")).unwrap(),
@@ -1550,10 +1609,17 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
         project_service,
         controller.clone(),
         highlight,
-        correction,
         transition,
         Arc::new(ReadyGate),
     );
+    // 片段级前置：自动化流程的文案纠正在拼合辑之前作用于转写句段。
+    let workflow = workflow.with_transcript_correction(std::sync::Arc::new(
+        dy_screen_app_lib::ai::TranscriptTextCorrectionWorkflow::new(
+            dy_screen_app_lib::ai::AiRepository::new(database.clone()),
+            correction_provider.clone(),
+            test_model_call(&database),
+        ),
+    ));
 
     let directory_page = workflow
         .list_replay_sessions(Some(streamer.id), None, None, 20)
@@ -1655,7 +1721,14 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
         detail.workflow.status == AiSmartWorkflowStatus::ReviewReady
     })
     .await;
-    assert_eq!(correction_provider.calls.load(Ordering::SeqCst), 2);
+    // 片段级前置后，纠正作用于**转写句段**（不是合辑字幕），因此调用次数
+    // 由句段与批次划分决定，而不再是固定的字幕批次数。这里断言的是**重试语义**：
+    // 首次失败后确实重试过，而不是一次失败即放弃。
+    assert!(
+        correction_provider.calls.load(Ordering::SeqCst) >= 2,
+        "首次失败后必须重试，实际 {} 次",
+        correction_provider.calls.load(Ordering::SeqCst)
+    );
     assert_eq!(
         completed
             .attempts
@@ -1805,12 +1878,12 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
         Arc::new(SmartHighlightProvider),
         test_model_call(&database),
     ));
-    let correction_provider = Arc::new(FailOnceCorrectionProvider::default());
-    let correction = ClipTextCorrectionWorkflow::new(
-        repository.clone(),
-        correction_provider.clone(),
-        test_model_call(&database),
-    );
+    // 失败次数必须覆盖批次重试上限（3 次），第一次运行才会失败；之后重试阶段恢复。
+    let correction_provider = Arc::new(FailUntilRetriesExhaustedCorrectionProvider {
+        calls: AtomicUsize::new(0),
+        failures: 3,
+        per_batch: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
         TransitionMaterialCache::new(directory.path().join("failure-transition-cache")).unwrap(),
@@ -1830,10 +1903,17 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
         project_service,
         controller.clone(),
         highlight,
-        correction,
         transition,
         Arc::new(ReadyGate),
     );
+    // 片段级前置：自动化流程的文案纠正在拼合辑之前作用于转写句段。
+    let workflow = workflow.with_transcript_correction(std::sync::Arc::new(
+        dy_screen_app_lib::ai::TranscriptTextCorrectionWorkflow::new(
+            dy_screen_app_lib::ai::AiRepository::new(database.clone()),
+            correction_provider.clone(),
+            test_model_call(&database),
+        ),
+    ));
     let created = workflow
         .create_live(
             SmartWorkflowConfiguration {
@@ -1941,7 +2021,12 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
     assert_eq!(recovered.batches.len(), 2);
     assert_eq!(controller.enqueue_count.load(Ordering::SeqCst), 2);
     assert_eq!(controller.cancel_count.load(Ordering::SeqCst), 0);
-    assert_eq!(correction_provider.calls.load(Ordering::SeqCst), 3);
+    // 同上：断言重试语义而非固定次数。
+    assert!(
+        correction_provider.calls.load(Ordering::SeqCst) >= 2,
+        "失败批次必须重试，实际 {} 次",
+        correction_provider.calls.load(Ordering::SeqCst)
+    );
 }
 
 async fn run_live_workflow_end_to_end() {
@@ -1994,11 +2079,7 @@ async fn run_live_workflow_end_to_end() {
         Arc::new(SmartHighlightProvider),
         test_model_call(&database),
     ));
-    let correction = ClipTextCorrectionWorkflow::new(
-        repository.clone(),
-        Arc::new(EchoCorrectionProvider),
-        test_model_call(&database),
-    );
+    let correction_provider = Arc::new(EchoCorrectionProvider);
     let assets = TransitionMaterialAssetService::new(
         TransitionMaterialRepository::new(database.clone()),
         TransitionMaterialCache::new(directory.path().join("live-transition-cache")).unwrap(),
@@ -2018,10 +2099,17 @@ async fn run_live_workflow_end_to_end() {
         project_service,
         controller.clone(),
         highlight,
-        correction,
         transition,
         Arc::new(ReadyGate),
     );
+    // 片段级前置：自动化流程的文案纠正在拼合辑之前作用于转写句段。
+    let workflow = workflow.with_transcript_correction(std::sync::Arc::new(
+        dy_screen_app_lib::ai::TranscriptTextCorrectionWorkflow::new(
+            dy_screen_app_lib::ai::AiRepository::new(database.clone()),
+            correction_provider.clone(),
+            test_model_call(&database),
+        ),
+    ));
     let created = workflow
         .create_live(
             SmartWorkflowConfiguration {

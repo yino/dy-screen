@@ -15,12 +15,12 @@ use sha2::{Digest, Sha256};
 use super::{
     AiClipProjectDetail, AiClipSegmentUpdate, AiClipSubtitleUpdate, AiHighlightCandidate,
     AiHighlightCandidatePage, AiHighlightProgress, AiHighlightRun, AiHighlightRunStatus,
-    AiInputSourceKind, AiInputStatus, AiProject, AiProjectDetail, AiProjectInput, AiProjectService,
-    AiProjectStatus, AiProjectSummary, AiReplaySessionCursor, AiReplaySessionPage,
-    AiReplayStreamerCursor, AiReplayStreamerPage, AiRepository, AiSessionOption,
-    AiTranscriptProjection, CredentialStore, HighlightWorkflow, ImportBatchResult, ImportRejection,
-    LlmProviderSettings, ProviderDiagnostic, RecognitionProfile, ServiceError, SessionImportResult,
-    TrustedLocalFile,
+    AiEnhancementReviewItem, AiGeneratedAnimationAsset, AiInputSourceKind, AiInputStatus, AiProject,
+    AiProjectDetail, AiProjectInput, AiProjectService, AiProjectStatus, AiProjectSummary,
+    AiReplaySessionCursor, AiReplaySessionPage, AiReplayStreamerCursor, AiReplayStreamerPage,
+    AiRepository, AiSessionOption, AiTranscriptProjection, CredentialStore, HighlightWorkflow,
+    ImportBatchResult, ImportRejection, LlmProviderSettings, ProviderDiagnostic,
+    RecognitionProfile, ServiceError, SessionImportResult, TrustedLocalFile,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -730,6 +730,74 @@ impl AiCommandService {
     ) -> Result<Option<AiHighlightRun>, AiCommandError> {
         self.repository
             .latest_highlight_run_for_project(project_id)
+            .map_err(repository_error)
+    }
+
+    /// 按高光组装增强审阅项（步骤 4 任务 9.1）。
+    ///
+    /// 入口是**剪辑工程**：由它关联的精彩运行定位父工程，再按选中候选组装。
+    /// 尚无结果的高光以进行中表达，不阻塞其他结果的审阅。
+    pub fn enhancement_review(
+        &self,
+        clip_project_id: i64,
+    ) -> Result<Vec<AiEnhancementReviewItem>, AiCommandError> {
+        let clip = self
+            .repository
+            .get_clip_project(clip_project_id)
+            .map_err(repository_error)?;
+        let run = self
+            .repository
+            .get_highlight_run(clip.project.highlight_run_id)
+            .map_err(repository_error)?;
+        let candidate_ids = self
+            .repository
+            .list_highlight_candidates(run.id)
+            .map_err(repository_error)?
+            .into_iter()
+            .filter(|candidate| candidate.selected)
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        self.repository
+            .enhancement_review_for_project(run.project_id, &candidate_ids)
+            .map_err(repository_error)
+    }
+
+    /// 移除工程里的生成式动画资产：标记失效、需重新审阅，且 MUST NOT 自动重新生成。
+    ///
+    /// 拒绝不属于本工程的资产：不修改工程、不下载文件、不启动 FFmpeg。
+    pub fn remove_generated_animation(
+        &self,
+        clip_project_id: i64,
+        asset_id: i64,
+    ) -> Result<AiGeneratedAnimationAsset, AiCommandError> {
+        let detail = self
+            .repository
+            .get_clip_project(clip_project_id)
+            .map_err(repository_error)?;
+        let run = self
+            .repository
+            .get_highlight_run(detail.project.highlight_run_id)
+            .map_err(repository_error)?;
+        let asset = self
+            .repository
+            .get_generated_animation_asset_by_id(asset_id)
+            .map_err(repository_error)?
+            .ok_or_else(|| {
+                AiCommandError::new(
+                    "generated_animation_not_found",
+                    "生成式动画资产不存在",
+                    false,
+                )
+            })?;
+        if asset.project_id != run.project_id {
+            return Err(AiCommandError::new(
+                "generated_animation_foreign",
+                "生成式动画资产不属于本工程",
+                false,
+            ));
+        }
+        self.repository
+            .invalidate_generated_animation_asset(asset_id, "user_removed")
             .map_err(repository_error)
     }
 

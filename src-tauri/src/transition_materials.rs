@@ -2022,6 +2022,56 @@ mod tests {
             .unwrap();
     }
 
+    /// 素材失效（边界引用的素材在目录中不存在、或下载记录缺失）时，**读工程不得整体
+    /// 失败**。实测此前会报 `找不到转场素材`，导致用户连工程都打不开；读层应跳过该
+    /// 边界，由导出路径（`source_for_export`）给出可操作错误。
+    #[test]
+    fn missing_material_does_not_break_clip_project_read() {
+        let database = Database::open_in_memory().unwrap();
+        database.migrate().unwrap();
+        seed_clip_project(&database);
+        let repository = TransitionMaterialRepository::new(database.clone());
+        // 边界对齐依赖目录状态，必须先应用一次目录。
+        repository
+            .apply_catalog(
+                &TransitionMaterialCatalogResponse {
+                    catalog_version: 1,
+                    changed: true,
+                    cdn_base_url: "https://cdn.example/materials/".to_owned(),
+                    materials: Some(vec![material("tm_test", 1)]),
+                },
+                false,
+            )
+            .unwrap();
+        // 三个片段 → 两个相邻边界。
+        repository.reconcile_boundaries(1).unwrap();
+        let boundaries = repository.list_boundaries(1).unwrap();
+        assert_eq!(boundaries.len(), 2, "三个片段应产生两个边界");
+
+        // 让第一个边界引用**存在但未下载**的素材：`asset_key` 有外键约束，悬空 key
+        // 不可能出现；真实的失效形态是目录里有素材、下载记录却缺失（应用素材时只校验
+        // `is_current`，不校验是否已下载——"已应用但尚未下载"是正常中间状态）。
+        {
+            let connection = database.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE ai_clip_transition_boundaries \
+                     SET asset_key = 'tm_test', asset_version = 1, stale = 0, active = 1 \
+                     WHERE id = ?1",
+                    [boundaries[0].id],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM transition_material_downloads", [])
+                .unwrap();
+        }
+
+        let detail = AiRepository::new(database)
+            .get_clip_project(1)
+            .expect("素材失效不得阻止读取工程");
+        assert_eq!(detail.segments.len(), 3, "工程内容仍应完整可读");
+    }
+
     #[test]
     fn validates_same_origin_and_local_http_rules() {
         let base = validate_base_url("https://cdn.example/materials/", false).unwrap();

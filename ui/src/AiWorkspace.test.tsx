@@ -365,6 +365,23 @@ function createKeyboardClipFixture() {
   api.subscribeClipWorkflow = vi.fn().mockResolvedValue(() => undefined);
   api.cancelAiClipTransitionAgent = vi.fn().mockResolvedValue(undefined);
   api.cancelAiClipTextCorrection = vi.fn().mockResolvedValue(undefined);
+  api.queryAiEnhancementReview = vi.fn().mockResolvedValue([{
+    candidateId: 941,
+    kind: "video_animation",
+    status: "applied",
+    composition: "replace",
+    assetStatus: "validated",
+    rejectionCode: null,
+    costMinor: 250,
+  }, {
+    candidateId: 942,
+    kind: null,
+    status: null,
+    composition: null,
+    assetStatus: null,
+    rejectionCode: null,
+    costMinor: 0,
+  }]);
   return { api, clip };
 }
 
@@ -464,6 +481,85 @@ describe("AiWorkspace", () => {
     expect(await screen.findByText(pendingInput.displayName)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "开始分析" }));
+    await waitFor(() => expect(api.startAiProject).toHaveBeenCalledWith(draftProject.id));
+  });
+
+  it("只装云路径（本地资源未就绪）时仍可创建草稿与开始分析", async () => {
+    const user = userEvent.setup();
+    const draftProject: AiProject = {
+      ...project,
+      id: 204,
+      name: "云路径草稿",
+      status: "draft",
+      inputFrozen: false,
+      progressPercent: 0,
+      createdAt: "2026-07-23T00:00:00Z",
+      updatedAt: "2026-07-23T00:00:00Z",
+    };
+    const pendingInput: AiProjectDetail["inputs"][number] = {
+      ...completedInput,
+      id: 303,
+      projectId: draftProject.id,
+      displayName: "cloud_only.mp4",
+      durationMs: 4_000,
+      status: "pending",
+      progressPercent: 0,
+      artifactId: null,
+    };
+    let projects: AiProject[] = [];
+    let currentDetail: AiProjectDetail = { project: draftProject, inputs: [] };
+    const api = {
+      listAiProjects: vi.fn(async () => projects),
+      getAiProject: vi.fn(async () => currentDetail),
+      queryAiTranscript: vi.fn(async (): Promise<AiTranscriptProjection> => ({
+        project: currentDetail.project,
+        inputs: [],
+      })),
+      // 本地 ASR 资源未就绪，但百炼直连可用：默认路径是云，
+      // 创建与开始分析 MUST NOT 被本地资源就绪度挡住。
+      diagnoseAiEnvironment: vi.fn().mockResolvedValue({
+        ...environment,
+        ready: false,
+        cloudAsrAvailable: true,
+      }),
+      listAiCompletedSessions: vi.fn().mockResolvedValue([]),
+      subscribeAi: vi.fn().mockResolvedValue(() => undefined),
+      subscribePreview: vi.fn().mockResolvedValue(() => undefined),
+      createAiProject: vi.fn(async () => {
+        projects = [draftProject];
+        return draftProject;
+      }),
+      pickAiLocalVideos: vi.fn().mockResolvedValue([{
+        grantId: "cloud-grant",
+        displayName: pendingInput.displayName,
+      }]),
+      importAiLocalGrants: vi.fn(async () => {
+        currentDetail = { project: draftProject, inputs: [pendingInput] };
+        return { added: [pendingInput], rejected: [] };
+      }),
+      startAiProject: vi.fn(async () => {
+        const queued = {
+          ...draftProject,
+          status: "queued" as const,
+          inputFrozen: true,
+        };
+        projects = [queued];
+        currentDetail = { project: queued, inputs: [pendingInput] };
+        return queued;
+      }),
+    } as unknown as ClientApi;
+    render(<AiWorkspace api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "创建项目" }));
+    await user.type(screen.getByLabelText("项目名称"), draftProject.name);
+    const createDraft = screen.getByRole("button", { name: "创建草稿" });
+    expect(createDraft).not.toBeDisabled();
+    await user.click(createDraft);
+    await user.click(await screen.findByRole("button", { name: "添加本地视频" }));
+    expect(await screen.findByText(pendingInput.displayName)).toBeInTheDocument();
+    const startAnalysis = screen.getByRole("button", { name: "开始分析" });
+    expect(startAnalysis).not.toBeDisabled();
+    await user.click(startAnalysis);
     await waitFor(() => expect(api.startAiProject).toHaveBeenCalledWith(draftProject.id));
   });
 
@@ -1435,6 +1531,37 @@ describe("AiWorkspace", () => {
     expect(screen.getByRole("button", { name: "文本纠错结果" })).toHaveAttribute("aria-pressed", "true");
   });
 
+  it("在审阅栏按高光展示增强方式、合成方式、资产状态与已产生成本", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    api.matchAiClipTransitions = vi.fn().mockResolvedValue({
+      runId: 44,
+      threshold: 8,
+      matched: 1,
+      autoApplied: 0,
+      suggestions: 1,
+      noneSuggestions: 0,
+      tokenUsage: 120,
+      boundaries: [],
+    });
+    const { user } = await openKeyboardClipEditor(api);
+
+    // 先让审阅栏出现（Agent 结果），再切到增强结果。
+    await user.click(screen.getByRole("button", { name: "一键 Agent" }));
+    await waitFor(() => expect(api.matchAiClipTransitions).toHaveBeenCalledWith(clip.project.id, null));
+    await user.click(await screen.findByRole("button", { name: "增强结果" }));
+    await waitFor(() => expect(api.queryAiEnhancementReview).toHaveBeenCalledWith(741));
+    expect(screen.getByRole("button", { name: "增强结果" })).toHaveAttribute("aria-pressed", "true");
+    // 已就绪的高光：生成式动画 + 画面替换 + 资产已校验。
+    expect(await screen.findByText("生成式动画")).toBeInTheDocument();
+    expect(screen.getByText(/画面替换/)).toBeInTheDocument();
+    expect(screen.getByText(/资产已校验/)).toBeInTheDocument();
+    // 进行中的高光不阻塞列表。
+    expect(screen.getAllByText("进行中").length).toBeGreaterThan(0);
+    // 展示已产生成本，且不含资产下载地址或 Prompt 正文。
+    expect(screen.getAllByText("2.50").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/https:\/\//)).toBeNull();
+  });
+
   it("从转场素材预览定位纠错字幕后继续推进播放头和逐字字幕", async () => {
     const { api, clip } = createKeyboardClipFixture();
     const correctedText = "快捷键输入已保护。";
@@ -1585,7 +1712,7 @@ describe("AiWorkspace", () => {
     expect(screen.queryByText("Command ai_correct_clip_text not found")).not.toBeInTheDocument();
   });
 
-  it("未配置 Key 时同时禁用两个 LLM 工作流", async () => {
+  it("旧上游 Key 未配置不再阻塞两个 LLM 工作流", async () => {
     const { api } = createKeyboardClipFixture();
     api.getAiLlmSettings = vi.fn().mockResolvedValue({
       provider: "deepseek",
@@ -1605,10 +1732,12 @@ describe("AiWorkspace", () => {
 
     const agent = screen.getByRole("button", { name: "一键 Agent" });
     const correction = screen.getByRole("button", { name: "一键文本纠错" });
-    await waitFor(() => expect(agent).toHaveAttribute("title", "请先在设置中配置 DeepSeek API Key"));
-    expect(agent).toBeDisabled();
-    expect(correction).toBeDisabled();
-    expect(correction).toHaveAttribute("title", "请先在设置中配置 DeepSeek API Key");
+    // 调用走短期 token，旧上游 Key 不参与运行：MUST NOT 再用它做前置门禁，
+    // 否则清过 Key 或新装的用户会被完全挡在门外。
+    await waitFor(() =>
+      expect(agent.getAttribute("title") ?? "").not.toContain("API Key"),
+    );
+    expect(correction.getAttribute("title") ?? "").not.toContain("API Key");
   });
 
   it("素材目录为空时只禁用一键 Agent", async () => {
@@ -1778,6 +1907,86 @@ describe("AiWorkspace", () => {
     expect(await screen.findByText("Agent 已取消")).toBeInTheDocument();
   });
 
+  it("时间轴按生成式动画单元渲染并标注合成方式与校验状态", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    clip.boundaries = [{
+      id: 771,
+      clipProjectId: clip.project.id,
+      leftClipSegmentId: clip.segments[0].id,
+      rightClipSegmentId: clip.segments[1].id,
+      leftStableId: clip.segments[0].id,
+      rightStableId: clip.segments[1].id,
+      assetKey: null,
+      assetVersion: null,
+      selectionSource: "none" as const,
+      confidence: null,
+      score: null,
+      sceneScore: null,
+      continuityScore: null,
+      rhythmScore: null,
+      materialScore: null,
+      reason: null,
+      suggestedAssetKey: null,
+      suggestedAssetVersion: null,
+      suggestionConfidence: null,
+      suggestionScore: null,
+      suggestionSceneScore: null,
+      suggestionContinuityScore: null,
+      suggestionRhythmScore: null,
+      suggestionMaterialScore: null,
+      suggestionReason: null,
+      suggestionNone: false,
+      manuallyLocked: false,
+      stale: false,
+      active: true,
+      updatedAt: "2026-08-03T00:00:00Z",
+    }];
+    clip.projectDurationMs = 5_500;
+    clip.timelineUnits = [{
+      key: `segment:${clip.segments[0].id}`, kind: "segment", projectStartMs: 0,
+      projectEndMs: 2_000, clipSegmentId: clip.segments[0].id, boundaryId: null,
+      title: clip.segments[0].title, assetKey: null, assetVersion: null,
+      sourceStatus: null, previewStatus: null,
+      generatedAssetId: null, composition: null, assetStatus: null,
+    }, {
+      key: "animation:1", kind: "animation", projectStartMs: 2_000,
+      projectEndMs: 3_500, clipSegmentId: null, boundaryId: 771,
+      title: "生成式动画", assetKey: null, assetVersion: null,
+      sourceStatus: null, previewStatus: null,
+      generatedAssetId: 1, composition: "insert", assetStatus: "validated",
+    }, {
+      key: `segment:${clip.segments[1].id}`, kind: "segment", projectStartMs: 3_500,
+      projectEndMs: 5_500, clipSegmentId: clip.segments[1].id, boundaryId: null,
+      title: clip.segments[1].title, assetKey: null, assetVersion: null,
+      sourceStatus: null, previewStatus: null,
+      generatedAssetId: null, composition: null, assetStatus: null,
+    }];
+    api.removeAiGeneratedAnimation = vi.fn().mockResolvedValue({
+      id: 1, projectId: 1, candidateId: 941, highlightRunId: 1, generation: 1,
+      reuseKey: "rk", composition: "insert", status: "invalidated",
+      replaceRange: null, insertBinding: null, upstreamTaskId: null, sha256: null,
+      width: null, height: null, fps: null, durationMs: 1_500, rejectionCode: "user_removed",
+      createdAt: "", updatedAt: "",
+    });
+    const { user } = await openKeyboardClipEditor(api);
+
+    // 边界处渲染生成式动画单元，而不是"添加转场"占位。
+    const unit = await screen.findByRole("button", {
+      name: "生成式动画：生成式动画，转场插入，资产已校验",
+    });
+    expect(unit).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /之间的转场/ })).toBeNull();
+
+    // 属性面板展示生成来源、校验状态与移除操作。
+    await user.click(unit);
+    expect(await screen.findByText("直连万相")).toBeInTheDocument();
+    expect(screen.getByText("已校验")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "移除此动画" }));
+    // 用当前工程的 ID 与动画单元的资产 ID 调用移除命令。
+    await waitFor(() =>
+      expect(api.removeAiGeneratedAnimation).toHaveBeenCalledWith(expect.any(Number), 1),
+    );
+  });
   it("本地搜索转场素材并对明确边界执行人工应用和智能匹配", async () => {
     const { api, clip } = createKeyboardClipFixture();
     const boundary = {
@@ -1819,11 +2028,13 @@ describe("AiWorkspace", () => {
       projectEndMs: 2_000, clipSegmentId: clip.segments[0].id, boundaryId: null,
       title: clip.segments[0].title, assetKey: null, assetVersion: null,
       sourceStatus: null, previewStatus: null,
+      generatedAssetId: null, composition: null, assetStatus: null,
     }, {
       key: `segment:${clip.segments[1].id}`, kind: "segment", projectStartMs: 2_000,
       projectEndMs: 6_000, clipSegmentId: clip.segments[1].id, boundaryId: null,
       title: clip.segments[1].title, assetKey: null, assetVersion: null,
       sourceStatus: null, previewStatus: null,
+      generatedAssetId: null, composition: null, assetStatus: null,
     }];
     const material: TransitionMaterial = {
       assetKey: "reaction_laugh", assetVersion: 2, title: "爆笑反应",

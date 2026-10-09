@@ -1702,7 +1702,12 @@ function sameAppSettings(left: AppSettings, right: AppSettings): boolean {
     && left.ffmpegPath === right.ffmpegPath
     && left.ffprobePath === right.ffprobePath
     && left.notificationsEnabled === right.notificationsEnabled
-    && left.autostartEnabled === right.autostartEnabled;
+    && left.autostartEnabled === right.autostartEnabled
+    && left.generationImageModels === right.generationImageModels
+    && left.generationVideoModels === right.generationVideoModels
+    && left.generationVideoResolution === right.generationVideoResolution
+    && left.generationVideoSeconds === right.generationVideoSeconds
+    && left.renderCacheRetentionDays === right.renderCacheRetentionDays;
 }
 
 /** 解析来源的界面文案：让"为什么这次用了这个模型"一眼可读。 */
@@ -1716,6 +1721,8 @@ function modelSourceLabel(source: string | null): string {
       return "本机设置";
     case "run_override":
       return "单次运行覆盖";
+    case "corrected_unsupported_model":
+      return "你设置的模型不被当前端点支持，已回退到默认模型";
     default:
       return "未知来源";
   }
@@ -2002,6 +2009,36 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
               <small>设备 {activation?.deviceIdHint ?? "正在识别"} · 最近心跳 {formatDate(activation?.lastHeartbeatAt ?? null)}</small>
             </div>
             <div className="access-settings-actions"><button type="button" className="danger-button compact" onClick={onClearActivation}><KeyRound size={15} />重新激活</button></div>
+          </section>
+
+          <section className="panel settings-card generation-settings-card">
+            <div className="panel-header">
+              <div><p className="section-kicker">AI GENERATION</p><h2>生成式转场</h2></div>
+            </div>
+            <label className="settings-field">
+              <span><strong>图像模型（降级链）</strong><small>逗号分隔，按序尝试。新一代与旧一代图像模型走不同路径，程序会自动按序匹配；全部失败才放弃。</small></span>
+              <input aria-label="图像模型降级链" value={form.generationImageModels} onChange={(event) => updateForm({ generationImageModels: event.target.value })} />
+            </label>
+            <label className="settings-field">
+              <span><strong>视频模型（降级链）</strong><small>逗号分隔，按序尝试。付费备选放在免费额度模型之后。</small></span>
+              <input aria-label="视频模型降级链" value={form.generationVideoModels} onChange={(event) => updateForm({ generationVideoModels: event.target.value })} />
+            </label>
+            <label className="settings-field">
+              <span><strong>视频分辨率</strong><small>480P / 720P / 1080P。上游默认是 1080P，不显式指定会按最高档计费。</small></span>
+              <select aria-label="视频分辨率" value={form.generationVideoResolution} onChange={(event) => updateForm({ generationVideoResolution: event.target.value })}>
+                <option value="480P">480P</option>
+                <option value="720P">720P</option>
+                <option value="1080P">1080P</option>
+              </select>
+            </label>
+            <label className="settings-field">
+              <span><strong>视频时长（秒）</strong><small>允许 2–30 秒。转场用 2 秒即可，越长越贵（按秒计费）。</small></span>
+              <input aria-label="视频时长" type="number" min={2} max={30} value={form.generationVideoSeconds} onChange={(event) => updateForm({ generationVideoSeconds: Number(event.target.value) })} />
+            </label>
+            <label className="settings-field">
+              <span><strong>渲染缓存保留天数</strong><small>特效字幕渲染缓存的回收期限。<strong>0 表示不清理</strong>；默认 3 天。</small></span>
+              <input aria-label="渲染缓存保留天数" type="number" min={0} value={form.renderCacheRetentionDays} onChange={(event) => updateForm({ renderCacheRetentionDays: Number(event.target.value) })} />
+            </label>
           </section>
 
           {llm && (

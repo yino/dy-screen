@@ -27,8 +27,8 @@ use crate::ai::{
     HighlightWorkflow, LocalAsrRuntime, RigDeepSeekProvider, SmartClippingWorkflow,
     SmartWorkflowGate, SmartWorkflowPublisher, SmartWorkflowTelemetry, SourceFingerprint,
     SystemCredentialStore, build_export_plan, execute_export, probe_output_dimensions,
-    render_clip_subtitle_assets, select_clip_video_encoder, validate_export_sources,
-    validate_export_subtitles,
+    render_clip_subtitle_assets, select_clip_video_encoder, shift_subtitles_for_inserts,
+    validate_export_sources, validate_export_subtitles,
 };
 use crate::api::ApiClient;
 use crate::app_lifecycle::{
@@ -917,6 +917,18 @@ async fn activate_client(
         )
         .await?;
     }
+    // 激活后**必须恢复** AI 侧被暂停的能力，与 `clear_activation` 的
+    // `pause_for_authorization` 对称。否则在应用内激活（而非重启）后，
+    // ASR 调度器仍然不可用——`resume_after_authorization` 此前**零调用**。
+    // 该函数是幂等的：调度器已就绪时直接返回。
+    // 智能成片队列另有恢复入口（应用启动时的 `recover_and_resume`）；此处只负责
+    // ASR 调度器，避免把用户已有队列重复入队。
+    if state.activation.is_active() {
+        state
+            .ai_runtime
+            .resume_after_authorization()
+            .map_err(|error| error.to_string())?;
+    }
     state._telemetry.track(
         "app_open",
         serde_json::json!({ "platform": std::env::consts::OS })
@@ -1574,8 +1586,13 @@ async fn ai_start_clip_export(
     if !detail.subtitles_complete {
         return Err("剪辑片段缺少 ASR 字幕，请先完成识别或移除该片段".to_owned());
     }
+    // 生成资产路径由约定推导（不入库）：缓存根目录 + 资产 ID。
+    let generated_animation_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let mut sources = repository
-        .clip_export_sources(clip_project_id)
+        .clip_export_sources(clip_project_id, &generated_animation_root)
         .map_err(|error| error.to_string())?;
     for index in 0..sources.len().saturating_sub(1) {
         let left_id = sources[index].segment.id;
@@ -1700,11 +1717,21 @@ async fn ai_start_clip_export(
                         .as_ref()
                         .map_or(0, |bridge| bridge.duration_ms),
                 )
+                .saturating_add(
+                    source
+                        .insert_after
+                        .as_ref()
+                        .map_or(0, |insert| insert.duration_ms),
+                )
         });
-        let subtitles = sources
-            .iter()
-            .flat_map(|source| source.subtitles.iter().cloned())
-            .collect::<Vec<_>>();
+        // 任务 5.4：`insert` 单元会把右侧字幕整体顺延，插入区间内不落任何来源字幕。
+        let subtitles = shift_subtitles_for_inserts(
+            &sources
+                .iter()
+                .flat_map(|source| source.subtitles.iter().cloned())
+                .collect::<Vec<_>>(),
+            &sources,
+        );
         let rendered = tokio::task::spawn_blocking(move || {
             render_clip_subtitle_assets(&subtitles, output_dimensions, total_duration_ms)
         })
@@ -1938,6 +1965,8 @@ pub fn run() {
             ai_preempt_with_input,
             ai_retry_input,
             ai_query_transcript,
+            ai_query_enhancement_review,
+            ai_remove_generated_animation,
             ai_copy_segment_text,
             ai_copy_input_text,
             ai_copy_project_text,
@@ -2132,12 +2161,21 @@ pub fn run() {
             .with_gate(Arc::new(crate::ai::ActivationCorrectionGate::new(
                 activation.clone(),
             )));
+            // 片段级前置：自动化流程的文案纠正走**转写层**（在拼合辑之前），
+            // 合辑字幕创建时自动采用纠正文本。`clip_text_correction` 仍是
+            // 手动「一键文本纠错」入口使用的流程，不再作为本工作流的构造参数。
+            let transcript_correction = Arc::new(
+                crate::ai::TranscriptTextCorrectionWorkflow::new(
+                    AiRepository::new(database.clone()),
+                    Arc::new(RigDeepSeekProvider),
+                    model_call.clone(),
+                ),
+            );
             let smart_clipping = SmartClippingWorkflow::new(
                 database.clone(),
                 ai_project_service,
                 ai_components.runtime.clone(),
                 highlight_workflow,
-                clip_text_correction.clone(),
                 transition_matching.clone(),
                 Arc::new(DesktopSmartWorkflowGate {
                     activation: activation.clone(),
@@ -2145,6 +2183,7 @@ pub fn run() {
                     credentials: credential_store,
                 }),
             )
+            .with_transcript_correction(transcript_correction)
             .with_publisher(Arc::new(DesktopSmartWorkflowPublisher {
                 app: app.handle().clone(),
             }))

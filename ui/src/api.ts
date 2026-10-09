@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { DEFAULT_LLM_MODEL_ID } from "./types";
 import type {
   AiEnvironmentDiagnostic,
   AiModelStatus,
@@ -7,6 +8,8 @@ import type {
   AiClipProjectDetail,
   AiExportResult,
   AiImportBatch,
+  AiEnhancementReviewItem,
+  AiGeneratedAnimationAsset,
   AiHighlightCandidatePage,
   AiHighlightCandidate,
   AiHighlightProgress,
@@ -64,6 +67,11 @@ const defaultSettings: AppSettings = {
   asrDuringRecording: true,
   notificationsEnabled: true,
   autostartEnabled: false,
+  generationImageModels: "qwen-image-3.0,qwen-image-2.1-pro,qwen-image-plus,qwen-image",
+  generationVideoModels: "wan3.0-video-prime,wan3.0-video",
+  generationVideoResolution: "480P",
+  generationVideoSeconds: 2,
+  renderCacheRetentionDays: 3,
 };
 
 function isTauriRuntime(): boolean {
@@ -205,6 +213,10 @@ const tauriApi: ClientApi = {
   retryAiInput: (inputId) => invoke<AiProjectDetail>("ai_retry_input", { inputId }),
   queryAiTranscript: (projectId) =>
     invoke<AiTranscriptProjection>("ai_query_transcript", { projectId }),
+  queryAiEnhancementReview: (clipProjectId: number) =>
+    invoke<AiEnhancementReviewItem[]>("ai_query_enhancement_review", { clipProjectId }),
+  removeAiGeneratedAnimation: (clipProjectId, assetId) =>
+    invoke<AiGeneratedAnimationAsset>("ai_remove_generated_animation", { clipProjectId, assetId }),
   copyAiSegmentText: (projectId, stableSegmentId) =>
     invoke<string>("ai_copy_segment_text", { projectId, stableSegmentId }),
   copyAiInputText: (projectId, inputId) =>
@@ -468,7 +480,7 @@ export function createBrowserApi(): ClientApi {
       sourceSessionId: 88,
       sourceSummary: "受信直播会话 · 已持续录制 01:42:18 · 仅处理完成登记的分片",
       provider: "deepseek",
-      modelId: "deepseek-chat",
+      modelId: DEFAULT_LLM_MODEL_ID,
       textScope: "selected_clip_subtitles",
       authorizationDigest: "browser-qa-authorization",
       authorizedAt: "2026-08-14T09:00:00+08:00",
@@ -1032,7 +1044,7 @@ export function createBrowserApi(): ClientApi {
     }),
     getAiLlmSettings: async (): Promise<LlmProviderSettings> => ({
       provider: "deepseek",
-      modelId: "deepseek-chat",
+      modelId: DEFAULT_LLM_MODEL_ID,
       timeoutMs: 30_000,
       promptVersion: "highlight-v1",
       qualifiedScore: 70,

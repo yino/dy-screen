@@ -22,6 +22,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ClipEditor } from "./AiWorkspace";
 import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
 import { recoverSmartWorkflows, type SmartWorkflowSnapshot } from "./smartWorkflowRecovery";
+import { DEFAULT_LLM_MODEL_ID } from "./types";
 import type {
   AiActiveLiveSession,
   AiClipProjectDetail,
@@ -443,7 +444,9 @@ export function OneClickProductPage({ api }: OneClickProductPageProps) {
     : mode === "live"
       ? liveSessionId !== null
       : selectedReplayStreamer !== null && selectedReplay !== null && selectedReplay.unavailableVideoCount === 0;
-  const gatesReady = Boolean(environment?.ready && llmSettings?.keyConfigured);
+  // 门禁只看"是否有可用的识别路径"：本地资源就绪**或**百炼直连可用。
+  // 旧上游 Key 已不参与调用（运行走短期 token），MUST NOT 用它挡流程。
+  const gatesReady = Boolean(environment?.ready || environment?.cloudAsrAvailable);
   const duplicateReady = mode !== "replay" || selectedReplay?.existingWorkflowId === null || duplicateConfirmed;
   const canCreate = sourceReady && gatesReady && duplicateReady && authorized && !busy;
   const progress = workflowProgress(selectedDetail);
@@ -500,7 +503,7 @@ export function OneClickProductPage({ api }: OneClickProductPageProps) {
     const configuration = {
       name: mode === "local" ? "本地一键成品" : mode === "live" ? "直播首版成品" : "直播回放成品",
       provider: llmSettings?.provider ?? "deepseek",
-      modelId: llmSettings?.modelId ?? "deepseek-chat",
+      modelId: llmSettings?.modelId ?? DEFAULT_LLM_MODEL_ID,
       textScope: "selected_clip_subtitles" as const,
       outputPreference: "reviewable_compilation",
     };
@@ -789,8 +792,8 @@ export function OneClickProductPage({ api }: OneClickProductPageProps) {
 
         <footer className="one-click-authorization">
           <div className="one-click-gates" aria-label="运行条件">
-            <span className={environment?.ready ? "ready" : "blocked"}>{environment?.ready ? <Check size={13} /> : <X size={13} />}ASR</span>
-            <span className={llmSettings?.keyConfigured ? "ready" : "blocked"}>{llmSettings?.keyConfigured ? <Check size={13} /> : <X size={13} />}Agent</span>
+            <span className={environment?.ready || environment?.cloudAsrAvailable ? "ready" : "blocked"}>{environment?.ready || environment?.cloudAsrAvailable ? <Check size={13} /> : <X size={13} />}ASR</span>
+            <span className={llmSettings ? "ready" : "blocked"}>{llmSettings ? <Check size={13} /> : <X size={13} />}Agent</span>
             <span className={sourceReady ? "ready" : "blocked"}>{sourceReady ? <Check size={13} /> : <X size={13} />}来源</span>
           </div>
           <label>

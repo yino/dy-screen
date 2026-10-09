@@ -14,7 +14,10 @@ use fontdue::{Font, FontSettings};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::clip_export::{ClipExportFailure, TextLayerRange, failure};
-use super::{AiClipSubtitle, AiClipSubtitleFrame, ClipOutputDimensions};
+use super::{
+    AiClipSubtitle, AiClipSubtitleFrame, AiTranscriptProjection, ClipExportSource,
+    ClipOutputDimensions,
+};
 
 static SUBTITLE_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -131,6 +134,106 @@ pub fn derive_effect_window(
 
 fn ranges_overlap(left: TextLayerRange, right: TextLayerRange) -> bool {
     left.start_ms < right.end_ms && right.start_ms < left.end_ms
+}
+
+/// 片段级的特效窗口来源：稳定句段 ID 与它在项目时间轴上的区间（片段级前置）。
+///
+/// 与 `PublishedSubtitleRange` 的区别是它来自**项目转写**而不是合辑已发布字幕，
+/// 因而特效窗口可以在建立合辑之前按候选推导。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptEffectWindowSource {
+    pub stable_segment_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// 由项目转写句段构建片段级窗口来源。
+///
+/// 优先使用项目时间轴坐标（`project_*`）；缺失时退回源内坐标，使单片段工程与
+/// 多片段工程的窗口语义一致。
+pub fn transcript_effect_window_sources(    projection: &AiTranscriptProjection,
+) -> Vec<TranscriptEffectWindowSource> {
+    projection
+        .inputs
+        .iter()
+        .flat_map(|input| input.segments.iter())
+        .map(|segment| TranscriptEffectWindowSource {
+            stable_segment_id: segment.stable_segment_id.clone(),
+            start_ms: segment.project_start_ms.unwrap_or(segment.source_start_ms),
+            end_ms: segment.project_end_ms.unwrap_or(segment.source_end_ms),
+        })
+        .collect()
+}
+
+/// 由片段级窗口来源推导特效窗口（与 `derive_effect_window` 同构）。
+///
+/// 不依赖合辑工程：只要候选引用的稳定句段在项目转写中存在即可推导窗口，
+/// 因此增强可以在建立合辑之前运行。
+pub fn derive_effect_window_from_transcript(
+    sources: &[TranscriptEffectWindowSource],
+    segment_ids: &[String],
+) -> Option<TextLayerRange> {
+    let mut matched: Vec<&TranscriptEffectWindowSource> = sources
+        .iter()
+        .filter(|source| segment_ids.iter().any(|id| id == &source.stable_segment_id))
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    matched.sort_by_key(|source| (source.start_ms, source.end_ms));
+    Some(TextLayerRange {
+        start_ms: matched
+            .first()
+            .map(|source| source.start_ms)
+            .unwrap_or_default(),
+        end_ms: matched.last().map(|source| source.end_ms).unwrap_or_default(),
+    })
+}
+
+/// 按 `insert` 单元把工程字幕映射到导出时间轴（步骤 4 任务 5.4）。
+///
+/// 每个 `insert` 在左片段的工程结束时间处插入一个单元；该点及其之后的字幕整体顺延
+/// 插入时长。因此 **插入区间内不会落到任何来源字幕上**（既显示不出、也烧录不进去），
+/// 而插入点之后的右侧字幕按映射后的时间继续显示。
+/// 未被插入影响的前缀字幕保持原样。
+pub fn shift_subtitles_for_inserts(
+    subtitles: &[AiClipSubtitle],
+    sources: &[ClipExportSource],
+) -> Vec<AiClipSubtitle> {
+    let mut insert_points: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = 0_u64;
+    for source in sources {
+        cursor = cursor.saturating_add(
+            source
+                .segment
+                .source_end_ms
+                .saturating_sub(source.segment.source_start_ms),
+        );
+        if let Some(insert) = &source.insert_after {
+            insert_points.push((cursor, insert.duration_ms));
+        }
+    }
+    if insert_points.is_empty() {
+        return subtitles.to_vec();
+    }
+    subtitles
+        .iter()
+        .map(|subtitle| {
+            let shift: u64 = insert_points
+                .iter()
+                .filter(|(point, _)| *point <= subtitle.project_start_ms)
+                .map(|(_, duration)| *duration)
+                .sum();
+            if shift == 0 {
+                return subtitle.clone();
+            }
+            AiClipSubtitle {
+                project_start_ms: subtitle.project_start_ms.saturating_add(shift),
+                project_end_ms: subtitle.project_end_ms.saturating_add(shift),
+                ..subtitle.clone()
+            }
+        })
+        .collect()
 }
 
 /// 规划基础字幕与特效字幕（任务 8.1–8.4）。
@@ -829,7 +932,10 @@ mod tests {
     use std::io::BufReader;
 
     use super::*;
-    use crate::ai::{EffectCaptionOverlay, validate_single_text_layer};
+    use crate::ai::{
+        AiClipEffect, AiClipSegment, ClipExportInsert, EffectCaptionOverlay, SourceFingerprint,
+        validate_single_text_layer,
+    };
 
     fn canvas() -> ClipOutputDimensions {
         ClipOutputDimensions {
@@ -1122,5 +1228,111 @@ mod tests {
             plan_text_layers(&published, &[]).unwrap_err().code,
             "invalid_subtitle_range"
         );
+    }
+
+    #[test]
+    fn transcript_window_covers_referenced_segments_without_clip_project() {
+        let sources = vec![
+            TranscriptEffectWindowSource {
+                stable_segment_id: "a".to_owned(),
+                start_ms: 1_000,
+                end_ms: 3_000,
+            },
+            TranscriptEffectWindowSource {
+                stable_segment_id: "b".to_owned(),
+                start_ms: 3_000,
+                end_ms: 6_000,
+            },
+        ];
+        // 引用 a+b：窗口覆盖两段，无需任何合辑工程。
+        assert_eq!(
+            derive_effect_window_from_transcript(&sources, &["a".to_owned(), "b".to_owned()]),
+            Some(TextLayerRange {
+                start_ms: 1_000,
+                end_ms: 6_000
+            })
+        );
+        // 只引用 b。
+        assert_eq!(
+            derive_effect_window_from_transcript(&sources, &["b".to_owned()]),
+            Some(TextLayerRange {
+                start_ms: 3_000,
+                end_ms: 6_000
+            })
+        );
+        // 引用不存在的句段：不伪造窗口。
+        assert_eq!(
+            derive_effect_window_from_transcript(&sources, &["missing".to_owned()]),
+            None
+        );
+    }
+
+    fn export_source_with_insert(duration_ms: u64, insert_ms: Option<u64>) -> ClipExportSource {
+        ClipExportSource {
+            segment: AiClipSegment {
+                id: 1,
+                clip_project_id: 1,
+                candidate_id: 1,
+                input_id: 1,
+                position: 0,
+                title: "片段".to_owned(),
+                source_start_ms: 0,
+                source_end_ms: duration_ms,
+                volume_percent: 100,
+                effect: AiClipEffect::None,
+            },
+            source_path: "/safe/input.mp4".to_owned(),
+            source_fingerprint: SourceFingerprint {
+                normalized_path: "/safe/input.mp4".to_owned(),
+                size_bytes: 1,
+                modified_at_ms: 1,
+                video_id: None,
+            },
+            subtitles: Vec::new(),
+            bridge_after: None,
+            replace: None,
+            insert_after: insert_ms.map(|duration_ms| ClipExportInsert {
+                asset_path: "/safe/animation.mp4".to_owned(),
+                duration_ms,
+                left_segment_id: 1,
+                right_segment_id: 2,
+                boundary_id: 7,
+            }),
+        }
+    }
+
+    #[test]
+    fn insert_shifts_right_subtitles_and_keeps_the_insert_range_free_of_source_text() {
+        // 左片段 0–2000ms（工程时间）后插入 1500ms，右片段 2000–4000ms。
+        let sources = vec![
+            export_source_with_insert(2_000, Some(1_500)),
+            export_source_with_insert(2_000, None),
+        ];
+        let subtitles = vec![
+            subtitle("left", 0, 800, "左侧字幕"),
+            subtitle("right", 2_100, 2_900, "右侧字幕"),
+        ];
+        let shifted = shift_subtitles_for_inserts(&subtitles, &sources);
+        // 插入点之前的字幕原样保留。
+        assert_eq!(shifted[0].project_start_ms, 0);
+        assert_eq!(shifted[0].project_end_ms, 800);
+        // 插入点之后的右侧字幕整体顺延 1500ms，继续按映射时间显示。
+        assert_eq!(shifted[1].project_start_ms, 3_600);
+        assert_eq!(shifted[1].project_end_ms, 4_400);
+        // 插入区间 [2000, 3500] 内不落任何来源字幕：既显示不出也烧录不进去。
+        assert!(shifted
+            .iter()
+            .all(|item| item.project_end_ms <= 2_000 || item.project_start_ms >= 3_500));
+    }
+
+    #[test]
+    fn subtitles_are_untouched_without_inserts() {
+        let sources = vec![export_source_with_insert(2_000, None)];
+        let subtitles = vec![subtitle("left", 0, 800, "左侧字幕")];
+        let shifted = shift_subtitles_for_inserts(&subtitles, &sources);
+        assert_eq!(shifted.len(), 1);
+        assert_eq!(shifted[0].project_start_ms, 0);
+        assert_eq!(shifted[0].project_end_ms, 800);
+        assert_eq!(shifted[0].text, "左侧字幕");
     }
 }

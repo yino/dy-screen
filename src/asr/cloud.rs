@@ -1040,6 +1040,16 @@ impl DashScopeAsrClient {
                 false,
                 None,
             ));
+            // 阿里云通常在错误响应体里返回 code/message，脱敏输出便于排查。
+            if let Ok(body) = parse_json_response(
+                response,
+                "dashscope_submit_response_invalid",
+                "云端任务响应无效",
+            )
+            .await
+            {
+                log_upstream_body("submit_failed", &body);
+            }
             return Err(mapped);
         }
         let body = parse_json_response(
@@ -1214,10 +1224,19 @@ impl DashScopeAsrClient {
                         return Ok(body);
                     }
                     "FAILED" | "CANCELED" | "CANCELLED" => {
+                        log_upstream_body("task_failed", &body);
+                        let upstream_message = body
+                            .get("message")
+                            .or_else(|| {
+                                body.get("output").and_then(|output| output.get("message"))
+                            })
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|message| !message.is_empty());
                         let failed = AsrError::new(
                             AsrErrorKind::ProcessFailed,
                             "dashscope_task_failed",
-                            "云端转写任务失败，请稍后重试",
+                            upstream_message.unwrap_or("云端转写任务失败，请稍后重试"),
                             false,
                         );
                         self.diagnostics.emit(diagnostic(
@@ -1315,16 +1334,7 @@ impl DashScopeAsrClient {
             Err(error) => return Err(error),
         };
         let output = body.get("output").unwrap_or(&body);
-        let detailed =
-            if let Some(results) = output.get("results").and_then(|value| value.as_array()) {
-                results
-                    .first()
-                    .and_then(|result| result.get("transcription_url"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            } else {
-                None
-            };
+        let detailed = extract_transcription_url(output);
         let result_body = if let Some(url) = detailed {
             let started = std::time::Instant::now();
             let parsed_url = match reqwest::Url::parse(&url) {
@@ -1445,8 +1455,16 @@ impl DashScopeAsrClient {
         } else {
             output.clone()
         };
-        let mut segments = parse_dashscope_segments(&result_body)?
-            .into_iter()
+        let mut segments = match parse_dashscope_segments(&result_body) {
+            Ok(segments) => segments,
+            Err(error) => {
+                // 输出 poll 返回的完整响应体（而非剥离后的 result_body），便于看清
+                // 阿里云在 SUCCEEDED 之外到底还给了什么结构/错误字段。
+                log_upstream_body("parse_segments_failed", &body);
+                return Err(error);
+            }
+        }
+        .into_iter()
             .map(|segment| AsrSegment {
                 start_ms: segment.begin_time,
                 end_ms: segment.end_time,
@@ -1488,6 +1506,27 @@ impl DashScopeAsrClient {
         base.set_path(&joined);
         Ok(base)
     }
+}
+
+/// 从上游任务结果中提取详细转写地址。
+///
+/// 兼容上游两种返回结构：单数 `result.transcription_url`（实际观察到的阿里云
+/// 返回）与复数 `results[].transcription_url`（早期接口形态）。
+fn extract_transcription_url(output: &serde_json::Value) -> Option<String> {
+    output
+        .get("result")
+        .and_then(|result| result.get("transcription_url"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            output
+                .get("results")
+                .and_then(|results| results.as_array())
+                .and_then(|results| results.first())
+                .and_then(|result| result.get("transcription_url"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn bearer_value(token: &str) -> EngineResult<HeaderValue> {
@@ -1791,6 +1830,76 @@ pub fn parse_dashscope_segments(value: &serde_json::Value) -> EngineResult<Vec<D
     Ok(out)
 }
 
+/// 递归脱敏上游响应体：保留完整结构与字段名，仅对签名 URL、token 等明确敏感
+/// 内容做占位替换，便于排查“任务成功但无文本”时看到阿里云真实返回的结构。
+fn redact_upstream_body(body: &serde_json::Value) -> serde_json::Value {
+    redact_value(None, body, 0)
+}
+
+fn redact_value(key: Option<&str>, value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    if depth > 12 {
+        return serde_json::Value::String("[depth-limit]".to_owned());
+    }
+    match value {
+        serde_json::Value::String(s) => {
+            let sensitive_key = key.is_some_and(|key| {
+                matches!(
+                    key,
+                    "transcription_url"
+                        | "file_url"
+                        | "token"
+                        | "authorization"
+                        | "signature"
+                        | "access_key"
+                        | "secret"
+                )
+            });
+            if sensitive_key
+                || s.contains("://")
+                || s.contains("Signature=")
+                || s.contains("Expires=")
+            {
+                serde_json::Value::String("[redacted]".to_owned())
+            } else if s.len() > 256 {
+                serde_json::Value::String(format!("[{} chars truncated]", s.len()))
+            } else {
+                serde_json::Value::String(s.clone())
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), redact_value(Some(k.as_str()), v, depth + 1));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(
+                arr.iter()
+                    .map(|v| redact_value(key, v, depth + 1))
+                    .collect(),
+            )
+        }
+        other => other.clone(),
+    }
+}
+
+/// 把上游响应体的脱敏摘要输出到 stderr，便于失败排查。
+fn log_upstream_body(context: &str, body: &serde_json::Value) {
+    // 排查日志只在 debug 构建输出；发布包无终端可见，且避免无谓序列化开销。
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "component": "ai_asr_cloud",
+                "event": "upstream_body",
+                "context": context,
+                "body": redact_upstream_body(body),
+            })
+        );
+    }
+}
+
 /// 云端优先、本地回退的 ASR engine。
 pub struct CloudFirstAsrEngine {
     local: Arc<dyn AsrEngine>,
@@ -1990,7 +2099,21 @@ pub const CLOUD_ENGINE_VERSION: &str = "1";
 pub fn dashscope_http_error(status: u16) -> AsrError {
     let (code, message, retryable) = match status {
         401 => ("dashscope_unauthorized", "云端转写授权已失效", false),
-        403 => ("dashscope_forbidden", "当前临时密钥无权使用云端转写", false),
+        // 403 同时覆盖"临时密钥无权限"与"所选模型已下线/不可用"两种上游语义：
+        // 百炼对已下线模型返回 403 且文案不含"已下线"，只说"密钥无权"会把用户
+        // 引向检查密钥，而真正的病根是模型。
+        403 => (
+            "dashscope_forbidden",
+            "当前临时密钥无权使用云端转写，或所选转写模型已下线或不可用",
+            false,
+        ),
+        // 400/404/422 是请求本身被拒绝（模型标识不存在、参数不受支持）：
+        // 重试无用，不能含糊成"稍后重试"。
+        400 | 404 | 422 => (
+            "dashscope_request_rejected",
+            "云端转写拒绝了该请求（转写模型或参数不受支持）",
+            false,
+        ),
         429 => (
             "dashscope_rate_limited",
             "云端转写请求过于频繁，请稍后重试",
@@ -2003,7 +2126,7 @@ pub fn dashscope_http_error(status: u16) -> AsrError {
         ),
         _ => (
             "dashscope_request_failed",
-            "云端转写请求失败，请稍后重试",
+            "云端转写请求失败",
             false,
         ),
     };
@@ -3333,6 +3456,9 @@ mod tests {
         for (status, code) in [
             (401, "dashscope_unauthorized"),
             (403, "dashscope_forbidden"),
+            (400, "dashscope_request_rejected"),
+            (404, "dashscope_request_rejected"),
+            (422, "dashscope_request_rejected"),
             (429, "dashscope_rate_limited"),
             (503, "dashscope_service_unavailable"),
         ] {
@@ -3341,6 +3467,75 @@ mod tests {
             assert!(!error.safe_message.contains("Authorization"));
             assert!(!error.safe_message.contains("Bearer"));
         }
+        // 403 的文案必须同时覆盖"密钥无权"与"模型已下线"：百炼对已下线模型
+        // 返回 403 且文案不含"已下线"，只说密钥会把用户引向错误方向。
+        assert!(dashscope_http_error(403).safe_message.contains("模型"));
+        // 可重试语义必须与文案一致：不可重试的错误不得承诺"稍后重试"。
+        for status in [400, 401, 403, 404, 422] {
+            let error = dashscope_http_error(status);
+            assert!(!error.retryable, "{status} 必须不可重试");
+            assert!(
+                !error.safe_message.contains("请稍后重试"),
+                "{status} 的文案不得承诺重试：{}",
+                error.safe_message
+            );
+        }
+        for status in [429, 500, 503] {
+            assert!(
+                dashscope_http_error(status).retryable,
+                "{status} 必须可重试"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_upstream_body_keeps_structure_but_redacts_urls_and_credentials() {
+        let body = serde_json::json!({
+            "code": "InvalidParameter",
+            "message": "The specified parameter is invalid",
+            "request_id": "req-123",
+            "output": {
+                "task_status": "FAILED",
+                "message": "audio decode failed",
+                "results": [{"transcription_url": "https://oss.example.com/x.json?Signature=secret&Expires=1"}],
+                "transcripts": [{"sentences": [{"text": "你好世界"}]}]
+            }
+        });
+        let redacted = redact_upstream_body(&body).to_string();
+        // 保留排查所需的错误字段与结构。
+        assert!(redacted.contains("InvalidParameter"));
+        assert!(redacted.contains("req-123"));
+        assert!(redacted.contains("FAILED"));
+        assert!(redacted.contains("audio decode failed"));
+        // 保留正文（用户自己的音频内容），便于确认阿里云到底返回了什么。
+        assert!(redacted.contains("你好世界"));
+        // 签名 URL 的值必须被脱敏，键名保留以便看清结构。
+        assert!(!redacted.contains("oss.example.com"));
+        assert!(!redacted.contains("Signature=secret"));
+        assert!(!redacted.contains("Expires=1"));
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("transcription_url"));
+        assert!(redacted.contains("transcripts"));
+    }
+
+    #[test]
+    fn extracts_transcription_url_from_singular_and_plural_result_shapes() {
+        let singular = serde_json::json!({
+            "result": {"transcription_url": "http://oss/x.json?Signature=s&Expires=1"}
+        });
+        assert_eq!(
+            extract_transcription_url(&singular).as_deref(),
+            Some("http://oss/x.json?Signature=s&Expires=1")
+        );
+        let plural = serde_json::json!({
+            "results": [{"transcription_url": "http://oss/y.json?Signature=s&Expires=1"}]
+        });
+        assert_eq!(
+            extract_transcription_url(&plural).as_deref(),
+            Some("http://oss/y.json?Signature=s&Expires=1")
+        );
+        let missing = serde_json::json!({"task_status": "SUCCEEDED"});
+        assert_eq!(extract_transcription_url(&missing), None);
     }
 
     #[test]

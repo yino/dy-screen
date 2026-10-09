@@ -1,0 +1,57 @@
+name: tests
+
+# 全量单元与集成测试。
+#
+# 为什么单独一个 workflow：现有两个 workflow 分别是"发布验收"（构建 + 原生脚本）
+# 与"Windows 打包契约"，都不跑通用测试。而**本仓库没有 Cargo workspace**——
+# 根 `Cargo.toml` 是 `dy-screen`，`src-tauri/Cargo.toml` 是 `dy-screen-app`，
+# 从根跑 `cargo test` 不会覆盖 Tauri 应用（应用侧约占全部测试的 3/4）。
+# 因此这里必须**分别**调用两个 manifest。
+#
+# CI 刻意不使用 `--offline`（那是本地沙箱的约束）；改为 `--locked` 保证依赖可复现。
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: Rust 依赖预取
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: dy-screen 单元与集成测试
+        run: cargo test --locked --all-targets
+
+      - name: dy-screen-app 单元与集成测试
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --all-targets
+
+      - name: 前端类型检查
+        run: npm run typecheck
+
+      - name: 前端构建（含 vite 打包校验）
+        # 实测结论：`cargo test` 不依赖 `ui/dist`（build.rs 在缺产物时也能通过），
+        # 但"类型检查通过"不等于"能打包"，所以两者都跑。
+        run: npm run build
+
+      - name: 前端组件测试
+        run: npm test -- --run

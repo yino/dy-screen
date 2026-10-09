@@ -238,21 +238,10 @@ impl ClipTextCorrectionWorkflow {
         .await
     }
 
-    pub async fn correct_smart_project(
-        &self,
-        clip_project_id: i64,
-        expected_project_version: u32,
-        cancellation: CancellationToken,
-    ) -> Result<ClipTextCorrectionSummary> {
-        self.correct_project_with_ownership(
-            clip_project_id,
-            expected_project_version,
-            cancellation,
-            true,
-        )
-        .await
-    }
-
+    /// `automated` 曾由 `correct_smart_project` 传入，用于自动流程纠正自动化字幕。
+    /// **片段级前置**后，自动流程改为在拼合辑之前纠正**转写句段**
+    /// （`TranscriptTextCorrectionWorkflow`），该入口已无调用点并被移除；
+    /// 保留参数是为了不搅动本函数内部的所有权分支，其取值现在恒为 `false`。
     async fn correct_project_with_ownership(
         &self,
         clip_project_id: i64,

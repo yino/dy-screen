@@ -12,7 +12,10 @@
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use super::clip_subtitle::{PublishedSubtitleRange, derive_effect_window};
+use super::clip_subtitle::{
+    PublishedSubtitleRange, TranscriptEffectWindowSource, derive_effect_window_from_transcript,
+    transcript_effect_window_sources,
+};
 use super::domain::{
     AiEnhancementKind, AiEnhancementStatus, AiHighlightCandidate, AiSmartStage,
     NewAiHighlightEnhancement,
@@ -108,17 +111,28 @@ impl EnhancementStageSummary {
     }
 }
 
-/// 由候选与已发布句段构造待增强列表（时间窗只来自已发布句段）。
+/// 由候选与**片段级转写窗口**构造待增强列表。
+///
+/// **片段级前置**：时间窗来自项目转写句段（`TranscriptEffectWindowSource`），
+/// 而不是合辑字幕（`PublishedSubtitleRange`）。这样特效生成**不依赖合辑工程**，
+/// 可以在建立合辑之前运行——这正是此前 `derive_effect_window_from_transcript`
+/// 与 `transcript_effect_window_sources` 写完却**没有任何生产调用点**的原因。
+///
+/// 语义与合辑版一致（优先项目时间轴坐标，缺失时退回源内坐标），因此切换不会
+/// 改变单个高光的窗口。
 pub fn enhancement_highlights(
     candidates: &[AiHighlightCandidate],
-    published: &[PublishedSubtitleRange],
+    transcript_sources: &[TranscriptEffectWindowSource],
     source_fingerprint: &str,
 ) -> Vec<EnhancementHighlight> {
     candidates
         .iter()
         .map(|candidate| {
-            let window = derive_effect_window(published, &candidate.segment_ids)
-                .map(|range| (range.start_ms, range.end_ms));
+            let window = derive_effect_window_from_transcript(
+                transcript_sources,
+                &candidate.segment_ids,
+            )
+            .map(|range| (range.start_ms, range.end_ms));
             EnhancementHighlight {
                 candidate_id: candidate.id,
                 source_fingerprint: source_fingerprint.to_owned(),
@@ -266,6 +280,8 @@ fn base_enhancement_input(
         },
         rejection_code: rejection_code.map(str::to_owned),
         rejection_detail: rejection_code.map(|code| format!("增强未生效：{code}")),
+        // 特效字幕分支不产生按次付费成本。
+        cost_minor: 0,
     }
 }
 
@@ -323,28 +339,49 @@ pub async fn run_enhancement_for_batch(
     let started = std::time::Instant::now();
     let prepared = (|| -> Result<Vec<EnhancementHighlight>, EffectCaptionRuntimeError> {
         let candidates = match request.highlight_run_id {
-            Some(run_id) => repository
-                .list_highlight_candidates(run_id)
-                .map_err(|error| {
-                    EffectCaptionRuntimeError::new(
-                        "enhancement_stage_unavailable",
-                        error.to_string(),
-                    )
-                })?
-                .into_iter()
-                .filter(|candidate| candidate.selected)
-                .collect::<Vec<_>>(),
+            Some(run_id) => {
+                let selected = repository
+                    .list_highlight_candidates(run_id)
+                    .map_err(|error| {
+                        EffectCaptionRuntimeError::new(
+                            "enhancement_stage_unavailable",
+                            error.to_string(),
+                        )
+                    })?
+                    .into_iter()
+                    .filter(|candidate| candidate.selected)
+                    .collect::<Vec<_>>();
+                // 任务 7.1 / 决策五：已分配 `video_animation` 的高光不得再生成特效字幕，
+                // 两种增强方式互斥（普通 ASR 字幕仍按既有规则显示）。
+                let applied = repository
+                    .applied_enhancements_for_project(request.project_id)
+                    .map_err(|error| {
+                        EffectCaptionRuntimeError::new(
+                            "enhancement_stage_unavailable",
+                            error.to_string(),
+                        )
+                    })?;
+                let eligible = super::domain::candidates_eligible_for_effect_caption(
+                    &selected.iter().map(|candidate| candidate.id).collect::<Vec<_>>(),
+                    &applied,
+                );
+                selected
+                    .into_iter()
+                    .filter(|candidate| eligible.contains(&candidate.id))
+                    .collect::<Vec<_>>()
+            }
             None => Vec::new(),
         };
-        let published = repository
-            .get_clip_project(request.project_id)
-            .map(|detail| published_ranges_from_subtitles(&detail.subtitles))
+        // 片段级前置：窗口来源取项目转写，**不读取合辑工程**，因此增强可以在
+        // 建立合辑之前运行（也不因合辑尚未创建而失败）。
+        let projection = crate::ai::AiTranscriptProjection::load(repository, request.project_id)
             .map_err(|error| {
                 EffectCaptionRuntimeError::new("enhancement_stage_unavailable", error.to_string())
             })?;
+        let transcript_sources = transcript_effect_window_sources(&projection);
         Ok(enhancement_highlights(
             &candidates,
-            &published,
+            &transcript_sources,
             &request.source_fingerprint,
         ))
     })();
@@ -415,16 +452,16 @@ mod tests {
         AiRepository::new(database)
     }
 
-    fn published() -> Vec<PublishedSubtitleRange> {
+    /// 片段级窗口来源（**不依赖合辑工程**）。字段与合辑字幕范围同构，因此
+    /// 切换来源不改变窗口取值。
+    fn transcript_sources() -> Vec<TranscriptEffectWindowSource> {
         vec![
-            PublishedSubtitleRange {
-                subtitle_id: 1,
+            TranscriptEffectWindowSource {
                 stable_segment_id: "seg-1".to_owned(),
                 start_ms: 0,
                 end_ms: 1_000,
             },
-            PublishedSubtitleRange {
-                subtitle_id: 2,
+            TranscriptEffectWindowSource {
                 stable_segment_id: "seg-2".to_owned(),
                 start_ms: 1_000,
                 end_ms: 2_000,
@@ -507,7 +544,7 @@ mod tests {
 
     #[test]
     fn highlights_take_their_window_from_published_segments_only() {
-        let highlights = enhancement_highlights(&candidates(), &published(), "fp-1");
+        let highlights = enhancement_highlights(&candidates(), &transcript_sources(), "fp-1");
         assert_eq!(highlights.len(), 2);
         assert_eq!(highlights[0].window, Some((0, 1_000)));
         assert_eq!(highlights[1].window, Some((1_000, 2_000)));
@@ -515,7 +552,7 @@ mod tests {
         // 句段不存在 → 没有时间窗（模型时间不构成输入）。
         let mut orphan = candidates();
         orphan[0].segment_ids = vec!["invented".to_owned()];
-        let highlights = enhancement_highlights(&orphan, &published(), "fp-1");
+        let highlights = enhancement_highlights(&orphan, &transcript_sources(), "fp-1");
         assert_eq!(highlights[0].window, None);
     }
 
@@ -525,7 +562,7 @@ mod tests {
         let project = repository
             .create_project("增强工程", &profile())
             .expect("create project");
-        let highlights = enhancement_highlights(&candidates(), &published(), "fp-1");
+        let highlights = enhancement_highlights(&candidates(), &transcript_sources(), "fp-1");
         let runner = SelectiveRunner {
             failing: vec![11],
             calls: AtomicUsize::new(0),
@@ -580,7 +617,7 @@ mod tests {
         let project = repository
             .create_project("增强工程", &profile())
             .expect("create project");
-        let highlights = enhancement_highlights(&candidates(), &published(), "fp-old");
+        let highlights = enhancement_highlights(&candidates(), &transcript_sources(), "fp-old");
         let runner = SelectiveRunner {
             failing: Vec::new(),
             calls: AtomicUsize::new(0),
@@ -639,7 +676,7 @@ mod tests {
         let mut orphan = candidates();
         orphan.truncate(1);
         orphan[0].segment_ids = vec!["invented".to_owned()];
-        let highlights = enhancement_highlights(&orphan, &published(), "fp-1");
+        let highlights = enhancement_highlights(&orphan, &transcript_sources(), "fp-1");
         let runner = SelectiveRunner {
             failing: Vec::new(),
             calls: AtomicUsize::new(0),
@@ -677,7 +714,7 @@ mod tests {
         let project = repository
             .create_project("增强工程", &profile())
             .expect("create project");
-        let highlights = enhancement_highlights(&candidates(), &published(), "fp-1");
+        let highlights = enhancement_highlights(&candidates(), &transcript_sources(), "fp-1");
         let runner = SelectiveRunner {
             failing: vec![11],
             calls: AtomicUsize::new(0),
@@ -735,7 +772,7 @@ mod tests {
             .expect("create project");
         let mut candidate = candidates();
         candidate.truncate(1);
-        let highlights = enhancement_highlights(&candidate, &published(), "fp-1");
+        let highlights = enhancement_highlights(&candidate, &transcript_sources(), "fp-1");
         let summary = run_enhancement_stage(
             &repository,
             &ValidatingRunner,

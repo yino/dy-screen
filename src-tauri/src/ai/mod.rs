@@ -7,6 +7,8 @@ mod bundled_skills;
 mod clip_export;
 mod clip_subtitle;
 mod clip_text_correction;
+mod transcript_text_correction;
+mod wan_generation;
 mod commands;
 mod desktop_runtime;
 mod domain;
@@ -44,13 +46,23 @@ pub use clip_export::{
 };
 pub use clip_subtitle::{
     ClipSubtitleAssets, EffectCaptionAvailability, EffectCaptionWindow, PublishedSubtitleRange,
-    TextLayerPlan, build_clip_subtitle_frames, build_clip_subtitle_frames_with_suppression,
-    derive_effect_window, plan_text_layers, render_clip_subtitle_assets,
+    TextLayerPlan, TranscriptEffectWindowSource, build_clip_subtitle_frames,
+    build_clip_subtitle_frames_with_suppression, derive_effect_window,
+    derive_effect_window_from_transcript, plan_text_layers, render_clip_subtitle_assets,
+    shift_subtitles_for_inserts, transcript_effect_window_sources,
 };
 pub use clip_text_correction::{
     ActivationCorrectionGate, CLIP_TEXT_CORRECTION_PROMPT_VERSION, ClipCorrectionGate,
     ClipTextCorrectionError, ClipTextCorrectionWorkflow, evaluate_correction_gate,
     map_upstream_business_code,
+};
+pub use transcript_text_correction::{
+    TranscriptCorrectionSummary, TranscriptCorrectionTarget, TranscriptTextCorrectionWorkflow,
+};
+pub use wan_generation::{
+    DASHSCOPE_API_BASE_URL, GeneratedAsset, GenerationClient, GenerationConfig,
+    GenerationFailure, GenerationTransport, ReqwestTransport, multimodal_body, text2image_body,
+    video_body,
 };
 pub use commands::{
     AiCommandError, AiCommandService, AiCreateProjectRequest, AiEnvironmentCheckView,
@@ -63,7 +75,9 @@ pub use domain::{
     AiActiveLiveSession, AiArtifactStatus, AiClipEffect, AiClipExportStatus, AiClipProject,
     AiClipProjectDetail, AiClipProjectSource, AiClipSegment, AiClipSegmentUpdate, AiClipSubtitle,
     AiClipSubtitleFrame, AiClipSubtitleUpdate, AiClipTimelineUnit, AiClipTimelineUnitKind,
-    AiEffectCaptionRenderAttempt, AiEnhancementKind, AiEnhancementStatus, AiHighlightCandidate,
+    AiEffectCaptionRenderAttempt, AiEnhancementKind, AiEnhancementStatus, AiGeneratedAnimationAsset,
+    AiGeneratedAnimationComposition, AiGeneratedAnimationInsertBinding,
+    AiGeneratedAnimationReplaceRange, AiGeneratedAnimationStatus, AiHighlightCandidate,
     AiHighlightCandidatePage, AiHighlightChunk, AiHighlightEnhancement, AiHighlightProgress,
     AiHighlightRun, AiHighlightRunStatus, AiInputSourceKind, AiInputStatus, AiProject,
     AiProjectDetail, AiProjectInput, AiProjectStatus, AiRenderAttemptStatus, AiSmartBatchStatus,
@@ -74,11 +88,19 @@ pub use domain::{
     AiSmartWorkflowMetric, AiSmartWorkflowMode, AiSmartWorkflowStatus, AiSuppressionRange,
     AsrArtifact, AuthorizeSmartWorkflowInput, ClipTextCorrectionSummary,
     CreateLiveSmartWorkflowInput, CreateLocalSmartWorkflowInput, CreateReplaySmartWorkflowInput,
-    NewAiEffectCaptionRenderAttempt, NewAiHighlightChunk, NewAiHighlightEnhancement,
+    NewAiEffectCaptionRenderAttempt, NewAiGeneratedAnimationAsset, NewAiHighlightChunk,
+    NewAiHighlightEnhancement,
     NewAiHighlightRun, NewAiProjectInput, NewAiSmartCandidate, NewAiSmartCandidateSource,
     NewAiSmartWorkflow, NewAiSmartWorkflowBatch, NewAsrArtifact, RecognitionProfile,
     RecoverySummary, RetrySmartWorkflowStageInput, SmartWorkflowConfiguration, SourceFingerprint,
-    TranscriptSegment, TranscriptSegmentDraft,
+    TranscriptSegment, TranscriptSegmentDraft, GENERATED_ANIMATION_CACHE_DIR,
+    GENERATED_ANIMATION_DURATION_TOLERANCE_PERMILLE, GENERATED_ANIMATION_IMAGE_TASK_TYPE,
+    GENERATED_ANIMATION_MAX_SLOWDOWN_PERMILLE, GENERATED_ANIMATION_VIDEO_TASK_TYPE,
+    GeneratedAnimationReuseInput, GeneratedDurationAdaptation, ReplaceSourceRange,
+    ReplaceTargetRange, adapt_generated_duration, candidates_eligible_for_effect_caption,
+    enhancement_review_items, find_enhancement_kind_conflict, generated_animation_file_name,
+    generated_animation_request_id, generated_animation_reuse_key, insert_binding_is_valid,
+    resolve_replace_target_range, AiEnhancementReviewItem,
 };
 pub use effect_caption::{
     BUNDLED_FONT_FAMILIES, CSS_FUNCTION_ALLOWLIST, CSS_PROPERTY_ALLOWLIST, EffectCaptionLimits,
@@ -123,16 +145,18 @@ pub use harness::{
 };
 pub use highlight::{
     AnalysisChunk, AnalysisFingerprintConfig, AnalysisSegment, COMEDY_PAYOFF, ECOMMERCE_CONVERSION,
-    GENERIC_HOOK, HighlightSkill, HighlightWorkflow, KNOWLEDGE_DENSITY, STORY_EMOTION,
-    analysis_fingerprint, chunk_segments, select_skills,
+    FASHION_BEAUTY, FOOD_APPEAL, GAMING_HIGHLIGHT, GENERIC_HOOK, HighlightSkill, HighlightWorkflow,
+    Industry, KNOWLEDGE_DENSITY, MUSIC_PERFORMANCE, STORY_EMOTION, analysis_fingerprint,
+    build_industry_prompt, chunk_segments, parse_industry, select_skills,
 };
 pub use lifecycle::{AiLifecycle, AiLifecycleError, AiRecoveryReport};
 pub use llm::{
     CandidateAgentOutput, CandidateAgentRequest, CredentialError, CredentialStore,
-    DEEPSEEK_BASE_URL, DEFAULT_EXCELLENT_SCORE, DEFAULT_MODEL_ID, DEFAULT_QUALIFIED_SCORE,
+    DEFAULT_EXCELLENT_SCORE, DEFAULT_MODEL_ID, DEFAULT_QUALIFIED_SCORE,
     DEFAULT_TRANSITION_AUTO_APPLY_SCORE, FakeHighlightProvider, FrozenModelCall,
-    HighlightAgentProvider, HighlightCandidateDraft, HighlightCandidateScore,
-    LLM_CALL_DIAGNOSTIC_CAPACITY, LlmCallDiagnostic, LlmError, LlmProviderSettings, LlmTokenLease,
+    HighlightAgentProvider, HighlightCandidateDraft, HighlightCandidateScore, IndustryAgentRequest,
+    IndustryDetectionOutput, LLM_CALL_DIAGNOSTIC_CAPACITY, LlmCallDiagnostic, LlmError,
+    LlmProviderSettings, LlmTokenLease,
     LlmTokenSource, MODEL_RESOLUTION_INTERVAL_MS, MemoryCredentialStore, ModelCallHandle,
     ModelCallPath, ModelCallResolver, ModelCallSnapshot, ModelResolutionInputs, PROMPT_VERSION,
     ProviderDiagnostic, RankingAgentOutput, RankingAgentRequest, ResolutionSource,
@@ -160,7 +184,8 @@ pub use projection::{
     AiTranscriptSegmentProjection,
 };
 pub use repository::{
-    AiRepository, AiRepositoryError, ClipExportBridge, ClipExportSource, ClipTextCorrectionPlan,
+    AiRepository, AiRepositoryError, ClipExportBridge, ClipExportInsert, ClipExportReplace,
+    ClipExportSource, ClipTextCorrectionPlan,
     ClipTextCorrectionTarget, ClipTextCorrectionUpdate, Result, project_clip_subtitles,
 };
 pub use service::{
@@ -178,5 +203,6 @@ pub use smart_workflow::{
 pub(crate) use repository::{
     migrate_ai_v4, migrate_ai_v7, migrate_ai_v9, migrate_ai_v12, migrate_ai_v13, migrate_ai_v14,
     migrate_ai_v16, migrate_ai_v21, migrate_ai_v22, migrate_ai_v23, migrate_ai_v24, migrate_ai_v25,
-    migrate_ai_v26, migrate_ai_v27, migrate_ai_v28,
+    migrate_ai_v26, migrate_ai_v27, migrate_ai_v28, migrate_ai_v29, migrate_ai_v30, migrate_ai_v31,
+    migrate_ai_v32,
 };

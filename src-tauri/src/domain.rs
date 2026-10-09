@@ -306,6 +306,51 @@ pub struct AppSettings {
     pub ffprobe_path: String,
     pub notifications_enabled: bool,
     pub autostart_enabled: bool,
+    /// 生成式转场的**图像模型降级链**（逗号分隔，按序尝试）。
+    ///
+    /// 新一代与旧一代图像模型走**不同路径且模式互斥**（仅同步 / 仅异步），
+    /// 客户端不预判代际，而是对每个模型先后尝试两条路径（见 `ai::wan_generation`）。
+    #[serde(default = "default_generation_image_models")]
+    pub generation_image_models: String,
+    /// **视频模型降级链**（逗号分隔，按序尝试）。
+    #[serde(default = "default_generation_video_models")]
+    pub generation_video_models: String,
+    /// 视频分辨率档位（`480P` / `720P` / `1080P`）。
+    ///
+    /// **必须显式传**：上游默认档位是 1080P，不覆盖会按 1080P 计费。
+    #[serde(default = "default_generation_video_resolution")]
+    pub generation_video_resolution: String,
+    /// 视频时长（秒）。上游允许 `[2, 30]`；转场用下限即可。
+    #[serde(default = "default_generation_video_seconds")]
+    pub generation_video_seconds: u32,
+    /// 特效字幕渲染缓存的保留天数；**0 表示不清理**。
+    #[serde(default = "default_render_cache_retention_days")]
+    pub render_cache_retention_days: u32,
+}
+
+fn default_generation_image_models() -> String {
+    // 单一来源：默认值与生成配置保持一致，避免两处漂移。
+    crate::ai::GenerationConfig::default()
+        .image_models
+        .join(",")
+}
+
+fn default_generation_video_models() -> String {
+    crate::ai::GenerationConfig::default()
+        .video_models
+        .join(",")
+}
+
+fn default_generation_video_resolution() -> String {
+    crate::ai::GenerationConfig::default().video_resolution
+}
+
+fn default_generation_video_seconds() -> u32 {
+    crate::ai::GenerationConfig::default().video_duration_seconds
+}
+
+fn default_render_cache_retention_days() -> u32 {
+    3
 }
 
 fn default_ffmpeg_path() -> String {
@@ -330,6 +375,11 @@ impl AppSettings {
             ffprobe_path: "ffprobe".to_owned(),
             notifications_enabled: true,
             autostart_enabled: false,
+            generation_image_models: default_generation_image_models(),
+            generation_video_models: default_generation_video_models(),
+            generation_video_resolution: default_generation_video_resolution(),
+            generation_video_seconds: default_generation_video_seconds(),
+            render_cache_retention_days: default_render_cache_retention_days(),
         }
     }
 }

@@ -164,6 +164,20 @@ impl AiInputProcessor {
                 );
             }
             self.publish(project_id, input_id, "failed", 100, message);
+            // 把失败真实原因同时打到 stderr（仅 debug 构建），便于开发终端直接定位。
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "component": "ai_asr_input",
+                        "event": "failed",
+                        "project_id": project_id,
+                        "input_id": input_id,
+                        "code": code,
+                        "message": message,
+                    })
+                );
+            }
         }
         let _ = self.repository.recompute_project_progress(project_id);
         result
@@ -456,7 +470,8 @@ pub(crate) fn safe_fallback_reason(code: &str) -> String {
         "ai_token_ai_quota" => "AI 转写额度不可用".to_owned(),
         "ai_token_ai_token_service" => "AI 临时密钥服务暂时不可用".to_owned(),
         "dashscope_unauthorized" => "云端转写授权已失效".to_owned(),
-        "dashscope_forbidden" => "云端转写权限不足".to_owned(),
+        "dashscope_forbidden" => "云端转写权限不足，或所选转写模型已下线".to_owned(),
+        "dashscope_request_rejected" => "云端转写拒绝了该请求（模型或参数不受支持）".to_owned(),
         "dashscope_rate_limited" => "云端转写请求受到限流".to_owned(),
         "dashscope_service_unavailable" => "云端转写服务暂时不可用".to_owned(),
         "dashscope_poll_timeout" => "云端转写等待超时".to_owned(),

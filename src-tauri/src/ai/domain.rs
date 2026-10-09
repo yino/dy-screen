@@ -738,8 +738,13 @@ pub enum AiSmartStage {
     Preflight,
     Asr,
     Highlight,
-    Draft,
+    /// 文案纠正（**片段级前置**）。
+    ///
+    /// 位于 `Draft` **之前**：校正在拼合辑之前作用于转写句段，合辑字幕快照生成时
+    /// 自动采用纠正后的文本（见 `migrate_ai_v32`）。这样用户在看合辑之前就能拿到
+    /// 纠正过的文案，而不是先拼合辑再回头纠正。
     Correction,
+    Draft,
     Transition,
     /// 表现形式增强（特效字幕）：位于转场匹配之后、评审之前，且**不阻塞**基础草稿。
     Enhancement,
@@ -751,8 +756,8 @@ impl AiSmartStage {
         Self::Preflight,
         Self::Asr,
         Self::Highlight,
-        Self::Draft,
         Self::Correction,
+        Self::Draft,
         Self::Transition,
         Self::Enhancement,
         Self::Review,
@@ -1279,6 +1284,8 @@ pub struct AiClipSubtitleFrame {
 pub enum AiClipTimelineUnitKind {
     Segment,
     Bridge,
+    /// 生成式动画单元（`insert` 合成方式）：与桥接同样占用时间轴、增加工程总时长。
+    Animation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1295,6 +1302,12 @@ pub struct AiClipTimelineUnit {
     pub asset_version: Option<i64>,
     pub source_status: Option<crate::transition_materials::MaterialDownloadStatus>,
     pub preview_status: Option<crate::transition_materials::MaterialDownloadStatus>,
+    /// 生成资产 ID（仅 `Animation` 单元有值）。
+    pub generated_asset_id: Option<i64>,
+    /// 合成方式（仅 `Animation` 单元有值）。
+    pub composition: Option<AiGeneratedAnimationComposition>,
+    /// 资产校验状态（仅 `Animation` 单元有值）。
+    pub asset_status: Option<AiGeneratedAnimationStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1470,6 +1483,8 @@ pub struct AiHighlightEnhancement {
     pub suppression_ranges: Vec<AiSuppressionRange>,
     pub rejection_code: Option<String>,
     pub rejection_detail: Option<String>,
+    /// 该高光已产生的上游成本（分）：只有按次付费的生成分支会累加，字幕分支与无增强为 0。
+    pub cost_minor: u64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1494,6 +1509,431 @@ pub struct NewAiHighlightEnhancement {
     pub suppression_ranges: Vec<AiSuppressionRange>,
     pub rejection_code: Option<String>,
     pub rejection_detail: Option<String>,
+    /// 该高光已产生的上游成本（分）。
+    pub cost_minor: u64,
+}
+
+/// 生成式动画的合成方式（步骤 4 任务 1.1）。
+///
+/// `replace` 等长替换高光内的源画面范围，工程总时长不变；`insert` 作为独立时间轴
+/// 单元插入边界，增加工程总时长并让右侧片段与其字幕顺延。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiGeneratedAnimationComposition {
+    Replace,
+    Insert,
+}
+
+impl AiGeneratedAnimationComposition {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Insert => "insert",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "replace" => Ok(Self::Replace),
+            "insert" => Ok(Self::Insert),
+            _ => Err(AiRepositoryError::Integrity("生成动画合成方式无效".to_owned())),
+        }
+    }
+}
+
+/// 生成式动画资产的校验状态（步骤 4 任务 1.1 / 任务组 3）。
+///
+/// 只有 `Validated` 才允许进入合成与导出；`Invalidated` 专指 `insert` 因左右邻接
+/// 关系改变而失效，必须重新审阅且 MUST NOT 自动重新生成。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiGeneratedAnimationStatus {
+    /// 已提交上游，等待生成与下载。
+    Pending,
+    /// 已下载并通过哈希、尺寸、帧率与实际时长校验。
+    Validated,
+    /// 生成失败或媒体校验未通过，转入降级。
+    Rejected,
+    /// 邻接绑定失效（仅 `insert`），需重新审阅。
+    Invalidated,
+}
+
+impl AiGeneratedAnimationStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Validated => "validated",
+            Self::Rejected => "rejected",
+            Self::Invalidated => "invalidated",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "validated" => Ok(Self::Validated),
+            "rejected" => Ok(Self::Rejected),
+            "invalidated" => Ok(Self::Invalidated),
+            _ => Err(AiRepositoryError::Integrity("生成动画状态无效".to_owned())),
+        }
+    }
+}
+
+/// `replace` 的目标源时间范围（高光来源区间内，不得跨来源片段）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiGeneratedAnimationReplaceRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// `insert` 的稳定邻接绑定：左片段、右片段与边界三元组，归属左侧高光。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiGeneratedAnimationInsertBinding {
+    pub left_segment_id: i64,
+    pub right_segment_id: i64,
+    pub boundary_id: i64,
+}
+
+/// 生成式动画资产（步骤 4 任务 1.1）。
+///
+/// 生成资产是单工程单高光的产物：它 MUST NOT 写入目录素材表、不产生 `renderMode`、
+/// 不被边界召回作为候选。媒体属性在下载校验通过后才有值。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiGeneratedAnimationAsset {
+    pub id: i64,
+    pub project_id: i64,
+    pub candidate_id: i64,
+    pub highlight_run_id: Option<i64>,
+    pub generation: i64,
+    /// 复用键：分镜内容 + 提示词 + 目标时长 + 生成规格，全部一致才复用。
+    pub reuse_key: String,
+    pub composition: AiGeneratedAnimationComposition,
+    pub status: AiGeneratedAnimationStatus,
+    /// `replace` 的目标源范围；`insert` 时为 `None`。
+    pub replace_range: Option<AiGeneratedAnimationReplaceRange>,
+    /// `insert` 的邻接绑定；`replace` 时为 `None`。
+    pub insert_binding: Option<AiGeneratedAnimationInsertBinding>,
+    /// 上游业务任务 ID（不透明，非凭据、非下载地址）。
+    pub upstream_task_id: Option<String>,
+    /// 校验通过后写入的媒体属性。
+    pub sha256: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub rejection_code: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 写入生成式动画资产所需的字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAiGeneratedAnimationAsset {
+    pub project_id: i64,
+    pub candidate_id: i64,
+    pub highlight_run_id: Option<i64>,
+    pub generation: i64,
+    pub reuse_key: String,
+    pub composition: AiGeneratedAnimationComposition,
+    pub status: AiGeneratedAnimationStatus,
+    pub replace_range: Option<AiGeneratedAnimationReplaceRange>,
+    pub insert_binding: Option<AiGeneratedAnimationInsertBinding>,
+    pub upstream_task_id: Option<String>,
+    pub sha256: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub rejection_code: Option<String>,
+}
+
+/// 生成资产的上游任务类型（用于本地幂等与记账分类）。
+pub const GENERATED_ANIMATION_IMAGE_TASK_TYPE: &str = "wanx_text2image";
+/// 图生视频任务类型。
+pub const GENERATED_ANIMATION_VIDEO_TASK_TYPE: &str = "wanx_image2video";
+
+/// 生成资产复用键的输入：分镜内容、提示词、目标时长与生成规格。
+///
+/// 全部字段一致才复用；任一变化都视为新任务（可能产生新的上游费用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedAnimationReuseInput<'a> {
+    /// 分镜内容（画面主体、构图、镜头运动等结构化描述）。
+    pub storyboard: &'a str,
+    /// 参考图（文生图）提示词。
+    pub image_prompt: &'a str,
+    /// 图生视频提示词。
+    pub video_prompt: &'a str,
+    /// 目标时长毫秒。
+    pub target_duration_ms: u64,
+    /// 生成规格指纹（模型、尺寸、帧率等冻结取值）。
+    pub spec_fingerprint: &'a str,
+}
+
+/// 计算生成资产复用键：由分镜内容、提示词、目标时长与生成规格共同构成。
+///
+/// 每个字段先写长度前缀再写内容，避免不同字段组合产生相同拼接串。
+pub fn generated_animation_reuse_key(input: &GeneratedAnimationReuseInput<'_>) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        input.storyboard,
+        input.image_prompt,
+        input.video_prompt,
+        input.spec_fingerprint,
+    ] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.update(input.target_duration_ms.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// 由复用键派生稳定请求标识：同一复用键必须得到同一 `requestId`。
+///
+/// 该标识是本地幂等的承担者（上游不具备调用方幂等能力），必须在付费提交前落盘。
+pub fn generated_animation_request_id(reuse_key: &str) -> String {
+    let digest = Sha256::digest(reuse_key.as_bytes());
+    format!("wanx-{}", hex::encode(&digest[..16]))
+}
+
+/// 冻结的生成时长容差：5%（千分比 50）。
+pub const GENERATED_ANIMATION_DURATION_TOLERANCE_PERMILLE: u16 = 50;
+
+/// 生成资产缓存目录名（步骤 4 任务 3.1）。
+///
+/// **本地路径不入库**：由应用数据目录 + 资产 ID 推导文件名，因此清理缓存既不影响
+/// 已发布工程，也不会让数据库留下失效路径（重新导出时按需重新下载）。
+pub const GENERATED_ANIMATION_CACHE_DIR: &str = "generated-animations";
+
+/// 生成资产在缓存目录中的文件名约定。
+pub fn generated_animation_file_name(asset_id: i64) -> String {
+    format!("animation-{asset_id}.mp4")
+}
+
+/// 高光内一个可用来源区间（由工程已发布句段在该来源片段内确定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaceSourceRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// `replace` 目标源范围的计算结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceTargetRange {
+    /// 命中一个来源区间；范围必须完整落在该单区间内。
+    Matched(AiGeneratedAnimationReplaceRange),
+    /// 没有任何单区间能在冻结容差内匹配生成时长，调用方必须转入降级。
+    Unmatched(&'static str),
+}
+
+/// 依据来源区间与生成时长反向确定 `replace` 的目标源范围（决策一）。
+///
+/// 规则：
+/// - 目标范围 MUST 完整落在**单个**来源区间内，不得跨来源片段；
+/// - 优先取等于生成时长的一段；区间略短但差异仍在 5% 容差内时退化为整个区间；
+/// - 差异超过容差即 `Unmatched`（调用方转入降级，MUST NOT 补帧凑时长）；
+/// - MUST NOT 采用模型给出的时间戳。
+pub fn resolve_replace_target_range(
+    ranges: &[ReplaceSourceRange],
+    generated_duration_ms: u64,
+) -> ReplaceTargetRange {
+    if generated_duration_ms == 0 {
+        return ReplaceTargetRange::Unmatched("generated_duration_missing");
+    }
+    let tolerance = u64::from(GENERATED_ANIMATION_DURATION_TOLERANCE_PERMILLE);
+    for range in ranges {
+        if range.end_ms <= range.start_ms {
+            continue;
+        }
+        let available = range.end_ms - range.start_ms;
+        let target_len = generated_duration_ms.min(available);
+        let difference = generated_duration_ms.abs_diff(target_len);
+        // 千分比比较，避免浮点：difference / duration <= tolerance / 1000
+        if difference.saturating_mul(1_000) > generated_duration_ms.saturating_mul(tolerance) {
+            continue;
+        }
+        return ReplaceTargetRange::Matched(AiGeneratedAnimationReplaceRange {
+            start_ms: range.start_ms,
+            end_ms: range.start_ms + target_len,
+        });
+    }
+    ReplaceTargetRange::Unmatched("no_source_range_within_tolerance")
+}
+
+/// 判断 `insert` 的邻接绑定在当前片段顺序下是否仍然成立（步骤 4 任务 5.7）。
+///
+/// 任一重排、移除或追加导致左右邻接变化即失效：该动画必须重新审阅，
+/// MUST NOT 自动重新生成（重新生成会产生新的付费调用）。
+pub fn insert_binding_is_valid(
+    binding: &AiGeneratedAnimationInsertBinding,
+    segment_ids: &[i64],
+) -> bool {
+    segment_ids.windows(2).any(|pair| {
+        pair[0] == binding.left_segment_id && pair[1] == binding.right_segment_id
+    })
+}
+
+/// 冻结的受限放慢上限：最多 1.03x（1030‰）；超出即按超容差处理，
+/// MUST NOT 用大幅变速掩盖时长不匹配。
+pub const GENERATED_ANIMATION_MAX_SLOWDOWN_PERMILLE: u16 = 1_030;
+
+/// 生成时长与目标范围的适配方案（步骤 4 任务组 6 / 决策四）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedDurationAdaptation {
+    /// 生成不短于目标：裁剪多余帧，精确对齐目标。
+    Trim,
+    /// 生成略短于目标：在受限范围内放慢，`slowdown_permille` 为放慢比例千分比。
+    SlowDown { slowdown_permille: u16 },
+    /// 差异超容差或所需变速超受限范围：失败并降级，MUST NOT 补黑帧或长时间冻结画面。
+    Rejected(&'static str),
+}
+
+/// 依据 5% 容差与冻结的受限变速范围适配生成时长（决策四）。
+///
+/// - 生成不短于目标且差异在容差内 → 裁剪多余帧；
+/// - 生成短于目标且放慢比例在受限范围内 → 施加受限变速；
+/// - 其余情况（超容差 / 超受限变速）→ `Rejected`，调用方必须转入降级。
+pub fn adapt_generated_duration(
+    generated_duration_ms: u64,
+    target_duration_ms: u64,
+) -> GeneratedDurationAdaptation {
+    if generated_duration_ms == 0 || target_duration_ms == 0 {
+        return GeneratedDurationAdaptation::Rejected("invalid_duration");
+    }
+    let tolerance = u64::from(GENERATED_ANIMATION_DURATION_TOLERANCE_PERMILLE);
+    let difference = generated_duration_ms.abs_diff(target_duration_ms);
+    if difference.saturating_mul(1_000) > target_duration_ms.saturating_mul(tolerance) {
+        return GeneratedDurationAdaptation::Rejected("over_tolerance");
+    }
+    if generated_duration_ms >= target_duration_ms {
+        return GeneratedDurationAdaptation::Trim;
+    }
+    let slowdown_permille =
+        ((target_duration_ms as f64 / generated_duration_ms as f64) * 1_000.0).round() as u32;
+    if slowdown_permille > u32::from(GENERATED_ANIMATION_MAX_SLOWDOWN_PERMILLE) {
+        return GeneratedDurationAdaptation::Rejected("slowdown_out_of_range");
+    }
+    GeneratedDurationAdaptation::SlowDown {
+        slowdown_permille: u16::try_from(slowdown_permille).unwrap_or(u16::MAX),
+    }
+}
+
+/// 校验同一高光最终只保留一种"可导出"的增强方式（步骤 4 任务组 7 / 决策五）。
+///
+/// 返回第一个同时存在 `effect_caption` 与 `video_animation` 两条 `applied` 记录的候选；
+/// 其他状态（`suggested` / `rejected` / `superseded`）不是终态，不参与冲突判定。
+/// MUST NOT 让两条分支同时产出可导出内容。
+pub fn find_enhancement_kind_conflict(
+    enforcements: &[AiHighlightEnhancement],
+) -> Option<i64> {
+    for (index, left) in enforcements.iter().enumerate() {
+        if left.status != AiEnhancementStatus::Applied {
+            continue;
+        }
+        for right in enforcements.iter().skip(index + 1) {
+            if right.status == AiEnhancementStatus::Applied
+                && right.candidate_id == left.candidate_id
+                && right.kind != left.kind
+            {
+                return Some(left.candidate_id);
+            }
+        }
+    }
+    None
+}
+
+/// 从候选集合中剔除已分配 `video_animation` 的高光（任务 7.1）。
+///
+/// 增强方式互斥：动画高光 MUST NOT 生成或渲染特效字幕，普通 ASR 字幕仍按既有规则显示。
+pub fn candidates_eligible_for_effect_caption(
+    candidate_ids: &[i64],
+    enforcements: &[AiHighlightEnhancement],
+) -> Vec<i64> {
+    candidate_ids
+        .iter()
+        .copied()
+        .filter(|candidate_id| {
+            !enforcements.iter().any(|enhancement| {
+                enhancement.candidate_id == *candidate_id
+                    && enhancement.kind == AiEnhancementKind::VideoAnimation
+            })
+        })
+        .collect()
+}
+
+/// 单条高光的增强审阅摘要（步骤 4 任务 9.1）。
+///
+/// 只含结构化字段：不含 Prompt 正文、资产下载地址或 Provider 原始响应。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiEnhancementReviewItem {
+    pub candidate_id: i64,
+    /// 最终唯一的增强方式；尚无结果时为 `None`（进行中）。
+    pub kind: Option<AiEnhancementKind>,
+    pub status: Option<AiEnhancementStatus>,
+    /// 合成方式（仅 `video_animation` 有值）。
+    pub composition: Option<AiGeneratedAnimationComposition>,
+    /// 生成资产校验状态（仅 `video_animation` 有值）。
+    pub asset_status: Option<AiGeneratedAnimationStatus>,
+    /// 降级原因码。
+    pub rejection_code: Option<String>,
+    /// 已产生成本（分）。
+    pub cost_minor: u64,
+}
+
+/// 组装按高光的增强审阅摘要（步骤 4 任务 9.1 / 9.2 / 9.3）。
+///
+/// 已就绪的高光展示最终增强方式、合成方式、资产校验状态、降级原因与已产生成本；
+/// 尚无结果的高光以 `kind = None` 表示"进行中"，**不阻塞**其他高光的审阅。
+pub fn enhancement_review_items(
+    candidate_ids: &[i64],
+    enforcements: &[AiHighlightEnhancement],
+    assets: &[AiGeneratedAnimationAsset],
+) -> Vec<AiEnhancementReviewItem> {
+    candidate_ids
+        .iter()
+        .map(|candidate_id| {
+            let enforcement = enforcements
+                .iter()
+                .find(|item| {
+                    item.candidate_id == *candidate_id
+                        && item.status == AiEnhancementStatus::Applied
+                })
+                .or_else(|| {
+                    enforcements
+                        .iter()
+                        .find(|item| item.candidate_id == *candidate_id)
+                });
+            match enforcement {
+                None => AiEnhancementReviewItem {
+                    candidate_id: *candidate_id,
+                    kind: None,
+                    status: None,
+                    composition: None,
+                    asset_status: None,
+                    rejection_code: None,
+                    cost_minor: 0,
+                },
+                Some(enforcement) => {
+                    let asset = assets
+                        .iter()
+                        .find(|asset| asset.candidate_id == *candidate_id);
+                    AiEnhancementReviewItem {
+                        candidate_id: *candidate_id,
+                        kind: Some(enforcement.kind),
+                        status: Some(enforcement.status),
+                        composition: asset.map(|asset| asset.composition),
+                        asset_status: asset.map(|asset| asset.status),
+                        rejection_code: enforcement.rejection_code.clone(),
+                        cost_minor: enforcement.cost_minor,
+                    }
+                }
+            }
+        })
+        .collect()
 }
 
 /// 渲染尝试状态（步骤 3 任务组 9）。
@@ -1566,4 +2006,433 @@ pub struct NewAiEffectCaptionRenderAttempt {
     pub height: u32,
     pub fps: u32,
     pub frames_dir: String,
+}
+
+#[cfg(test)]
+mod generated_animation_reuse_tests {
+    use super::*;
+
+    fn reuse_input<'a>(
+        storyboard: &'a str,
+        image_prompt: &'a str,
+        video_prompt: &'a str,
+        duration: u64,
+        spec: &'a str,
+    ) -> GeneratedAnimationReuseInput<'a> {
+        GeneratedAnimationReuseInput {
+            storyboard,
+            image_prompt,
+            video_prompt,
+            target_duration_ms: duration,
+            spec_fingerprint: spec,
+        }
+    }
+
+    #[test]
+    fn reuse_key_is_stable_and_changes_on_any_field() {
+        let base = reuse_input("分镜A", "图像提示", "视频提示", 5_000, "spec-v1");
+        let key = generated_animation_reuse_key(&base);
+        assert_eq!(key, generated_animation_reuse_key(&base), "同输入必须稳定");
+        // 任一字段变化都必须产生不同的键（可能产生新费用）。
+        for changed in [
+            reuse_input("分镜B", "图像提示", "视频提示", 5_000, "spec-v1"),
+            reuse_input("分镜A", "图像提示2", "视频提示", 5_000, "spec-v1"),
+            reuse_input("分镜A", "图像提示", "视频提示2", 5_000, "spec-v1"),
+            reuse_input("分镜A", "图像提示", "视频提示", 6_000, "spec-v1"),
+            reuse_input("分镜A", "图像提示", "视频提示", 5_000, "spec-v2"),
+        ] {
+            assert_ne!(key, generated_animation_reuse_key(&changed));
+        }
+    }
+
+    #[test]
+    fn reuse_key_uses_length_prefixes_to_avoid_concatenation_ambiguity() {
+        // ("ab","c") 与 ("a","bc") 直接拼接会相同，长度前缀必须让它们不同。
+        let left = reuse_input("ab", "c", "x", 1_000, "s");
+        let right = reuse_input("a", "bc", "x", 1_000, "s");
+        assert_ne!(
+            generated_animation_reuse_key(&left),
+            generated_animation_reuse_key(&right)
+        );
+    }
+
+    #[test]
+    fn request_id_is_derived_from_reuse_key_and_stable() {
+        let key = generated_animation_reuse_key(&reuse_input(
+            "分镜A", "图像提示", "视频提示", 5_000, "spec-v1",
+        ));
+        let request_id = generated_animation_request_id(&key);
+        assert_eq!(
+            request_id,
+            generated_animation_request_id(&key),
+            "同一复用键必须得到同一 requestId"
+        );
+        assert!(request_id.starts_with("wanx-"));
+        assert_ne!(
+            request_id,
+            generated_animation_request_id(&format!("{key}-x"))
+        );
+    }
+
+    #[test]
+    fn replace_target_range_prefers_a_single_source_range_never_crossing() {
+        // 区间比生成时长长：取等于生成时长的一段，差异为 0。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[ReplaceSourceRange {
+                    start_ms: 1_000,
+                    end_ms: 20_000,
+                }],
+                5_000,
+            ),
+            ReplaceTargetRange::Matched(AiGeneratedAnimationReplaceRange {
+                start_ms: 1_000,
+                end_ms: 6_000,
+            })
+        );
+        // 区间略短但差异在 5% 容差内：退化为整个区间。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[ReplaceSourceRange {
+                    start_ms: 0,
+                    end_ms: 4_900,
+                }],
+                5_000,
+            ),
+            ReplaceTargetRange::Matched(AiGeneratedAnimationReplaceRange {
+                start_ms: 0,
+                end_ms: 4_900,
+            })
+        );
+        // 两个短区间相加够长，但任一单区间都不够：必须拒绝，不得跨片段拼接。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[
+                    ReplaceSourceRange {
+                        start_ms: 0,
+                        end_ms: 3_000,
+                    },
+                    ReplaceSourceRange {
+                        start_ms: 10_000,
+                        end_ms: 13_000,
+                    },
+                ],
+                5_000,
+            ),
+            ReplaceTargetRange::Unmatched("no_source_range_within_tolerance")
+        );
+    }
+
+    #[test]
+    fn replace_target_range_rejects_over_tolerance_and_missing_duration() {
+        // 区间过短（差异 50%）：拒绝并转入降级。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[ReplaceSourceRange {
+                    start_ms: 0,
+                    end_ms: 2_500,
+                }],
+                5_000,
+            ),
+            ReplaceTargetRange::Unmatched("no_source_range_within_tolerance")
+        );
+        // 生成时长缺失：拒绝。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[ReplaceSourceRange {
+                    start_ms: 0,
+                    end_ms: 9_000,
+                }],
+                0,
+            ),
+            ReplaceTargetRange::Unmatched("generated_duration_missing")
+        );
+        // 空区间：跳过。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[ReplaceSourceRange {
+                    start_ms: 5_000,
+                    end_ms: 5_000,
+                }],
+                5_000,
+            ),
+            ReplaceTargetRange::Unmatched("no_source_range_within_tolerance")
+        );
+    }
+
+    #[test]
+    fn replace_target_range_falls_through_to_a_later_range() {
+        // 第一个区间太短被跳过，第二个命中：证明是"逐个单区间"匹配。
+        assert_eq!(
+            resolve_replace_target_range(
+                &[
+                    ReplaceSourceRange {
+                        start_ms: 0,
+                        end_ms: 1_000,
+                    },
+                    ReplaceSourceRange {
+                        start_ms: 8_000,
+                        end_ms: 20_000,
+                    },
+                ],
+                5_000,
+            ),
+            ReplaceTargetRange::Matched(AiGeneratedAnimationReplaceRange {
+                start_ms: 8_000,
+                end_ms: 13_000,
+            })
+        );
+    }
+
+    #[test]
+    fn insert_binding_invalidates_when_left_right_adjacency_changes() {
+        let binding = AiGeneratedAnimationInsertBinding {
+            left_segment_id: 11,
+            right_segment_id: 12,
+            boundary_id: 7,
+        };
+        // 邻接成立。
+        assert!(insert_binding_is_valid(&binding, &[10, 11, 12, 13]));
+        // 重排后 11 与 12 不再相邻：失效。
+        assert!(!insert_binding_is_valid(&binding, &[10, 11, 13, 12]));
+        // 移除右片段：失效。
+        assert!(!insert_binding_is_valid(&binding, &[10, 11, 13]));
+        // 追加片段改变邻接：失效。
+        assert!(!insert_binding_is_valid(&binding, &[11, 99, 12]));
+        // 单片段工程不可能成立邻接。
+        assert!(!insert_binding_is_valid(&binding, &[11]));
+    }
+
+    #[test]
+    fn duration_adaptation_trims_when_generated_is_not_shorter() {
+        assert_eq!(
+            adapt_generated_duration(5_100, 5_000),
+            GeneratedDurationAdaptation::Trim
+        );
+        assert_eq!(
+            adapt_generated_duration(5_000, 5_000),
+            GeneratedDurationAdaptation::Trim
+        );
+    }
+
+    #[test]
+    fn duration_adaptation_slows_down_within_the_limited_range() {
+        assert_eq!(
+            adapt_generated_duration(4_900, 5_000),
+            GeneratedDurationAdaptation::SlowDown {
+                slowdown_permille: 1_020
+            }
+        );
+    }
+
+    #[test]
+    fn duration_adaptation_rejects_over_tolerance_without_padding_or_freezing() {
+        assert_eq!(
+            adapt_generated_duration(4_500, 5_000),
+            GeneratedDurationAdaptation::Rejected("over_tolerance")
+        );
+        assert_eq!(
+            adapt_generated_duration(5_500, 5_000),
+            GeneratedDurationAdaptation::Rejected("over_tolerance")
+        );
+    }
+
+    #[test]
+    fn duration_adaptation_rejects_slowdown_beyond_the_frozen_range() {
+        assert_eq!(
+            adapt_generated_duration(4_850, 5_000),
+            GeneratedDurationAdaptation::Rejected("slowdown_out_of_range")
+        );
+    }
+
+    #[test]
+    fn duration_adaptation_rejects_missing_duration() {
+        assert_eq!(
+            adapt_generated_duration(0, 5_000),
+            GeneratedDurationAdaptation::Rejected("invalid_duration")
+        );
+        assert_eq!(
+            adapt_generated_duration(5_000, 0),
+            GeneratedDurationAdaptation::Rejected("invalid_duration")
+        );
+    }
+
+    fn enhancement(
+        candidate_id: i64,
+        kind: AiEnhancementKind,
+        status: AiEnhancementStatus,
+    ) -> AiHighlightEnhancement {
+        AiHighlightEnhancement {
+            id: candidate_id,
+            project_id: 1,
+            candidate_id,
+            highlight_run_id: None,
+            generation: 1,
+            kind,
+            status,
+            start_ms: 0,
+            end_ms: 4_000,
+            emphasis_words: Vec::new(),
+            composition_version: None,
+            composition_fingerprint: None,
+            render_cache_key: None,
+            source_fingerprint: "fp".to_owned(),
+            suppression_ranges: Vec::new(),
+            rejection_code: None,
+            rejection_detail: None,
+            cost_minor: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn enhancement_kinds_are_mutually_exclusive_per_candidate() {
+        // 同一候选两条 applied（不同 kind）：冲突，不得同时产出可导出内容。
+        let conflict = vec![
+            enhancement(
+                42,
+                AiEnhancementKind::EffectCaption,
+                AiEnhancementStatus::Applied,
+            ),
+            enhancement(
+                42,
+                AiEnhancementKind::VideoAnimation,
+                AiEnhancementStatus::Applied,
+            ),
+        ];
+        assert_eq!(find_enhancement_kind_conflict(&conflict), Some(42));
+
+        // 非终态不参与判定：suggested 的动画不影响 applied 的字幕分支。
+        let safe = vec![
+            enhancement(
+                42,
+                AiEnhancementKind::EffectCaption,
+                AiEnhancementStatus::Applied,
+            ),
+            enhancement(
+                42,
+                AiEnhancementKind::VideoAnimation,
+                AiEnhancementStatus::Suggested,
+            ),
+        ];
+        assert_eq!(find_enhancement_kind_conflict(&safe), None);
+
+        // 不同候选各自一条：不冲突。
+        let distinct = vec![
+            enhancement(
+                1,
+                AiEnhancementKind::EffectCaption,
+                AiEnhancementStatus::Applied,
+            ),
+            enhancement(
+                2,
+                AiEnhancementKind::VideoAnimation,
+                AiEnhancementStatus::Applied,
+            ),
+        ];
+        assert_eq!(find_enhancement_kind_conflict(&distinct), None);
+    }
+
+    #[test]
+    fn animated_highlights_are_excluded_from_effect_caption() {
+        let enforcements = vec![
+            enhancement(
+                42,
+                AiEnhancementKind::VideoAnimation,
+                AiEnhancementStatus::Applied,
+            ),
+            enhancement(
+                43,
+                AiEnhancementKind::EffectCaption,
+                AiEnhancementStatus::Applied,
+            ),
+        ];
+        // 候选 42 已分配动画：不得再生成特效字幕；43 与 44 允许。
+        assert_eq!(
+            candidates_eligible_for_effect_caption(&[42, 43, 44], &enforcements),
+            vec![43, 44]
+        );
+    }
+
+    fn animation_asset(
+        candidate_id: i64,
+        status: AiGeneratedAnimationStatus,
+    ) -> AiGeneratedAnimationAsset {
+        AiGeneratedAnimationAsset {
+            id: candidate_id,
+            project_id: 1,
+            candidate_id,
+            highlight_run_id: None,
+            generation: 1,
+            reuse_key: "rk".to_owned(),
+            composition: AiGeneratedAnimationComposition::Replace,
+            status,
+            replace_range: Some(AiGeneratedAnimationReplaceRange {
+                start_ms: 0,
+                end_ms: 5_000,
+            }),
+            insert_binding: None,
+            upstream_task_id: Some("task".to_owned()),
+            sha256: Some("a".repeat(64)),
+            width: Some(768),
+            height: Some(512),
+            fps: Some(30),
+            duration_ms: Some(5_000),
+            rejection_code: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn enhancement_review_items_show_final_kind_composition_and_cost() {
+        let enforcements = vec![{
+            let mut item = enhancement(
+                42,
+                AiEnhancementKind::VideoAnimation,
+                AiEnhancementStatus::Applied,
+            );
+            item.cost_minor = 250;
+            item
+        }];
+        let assets = vec![animation_asset(42, AiGeneratedAnimationStatus::Validated)];
+        let items = enhancement_review_items(&[42, 43], &enforcements, &assets);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, Some(AiEnhancementKind::VideoAnimation));
+        assert_eq!(
+            items[0].composition,
+            Some(AiGeneratedAnimationComposition::Replace)
+        );
+        assert_eq!(
+            items[0].asset_status,
+            Some(AiGeneratedAnimationStatus::Validated)
+        );
+        assert_eq!(items[0].cost_minor, 250);
+        // 高光 43 尚无结果：以 kind=None 表示进行中，但不阻塞列表内其他高光。
+        assert_eq!(items[1].kind, None);
+        assert_eq!(items[1].cost_minor, 0);
+    }
+
+    #[test]
+    fn enhancement_review_item_is_redacted_by_construction() {
+        let enforcements = vec![{
+            let mut item = enhancement(
+                42,
+                AiEnhancementKind::VideoAnimation,
+                AiEnhancementStatus::Rejected,
+            );
+            item.rejection_code = Some("over_tolerance".to_owned());
+            item.rejection_detail =
+                Some("原始响应 https://oss.example/x?Signature=secret".to_owned());
+            item
+        }];
+        let items = enhancement_review_items(&[42], &enforcements, &[]);
+        let json = serde_json::to_string(&items).unwrap();
+        // 只暴露原因码，不暴露 rejection_detail 正文或任何地址。
+        assert!(json.contains("over_tolerance"));
+        assert!(!json.contains("Signature"));
+        assert!(!json.contains("https://"));
+        assert!(!json.contains("rejectionDetail"));
+    }
 }

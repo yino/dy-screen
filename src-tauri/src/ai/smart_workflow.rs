@@ -19,13 +19,14 @@ use crate::domain::Video;
 use crate::transition_matching::{TransitionMatchingError, TransitionMatchingWorkflow};
 
 use super::{
-    AiActiveLiveSession, AiInputStatus, AiJobController, AiProjectService, AiProjectStatus,
-    AiRepository, AiRepositoryError, AiSmartBatchStatus, AiSmartCandidate, AiSmartCandidateSource,
+    AiActiveLiveSession, AiHighlightRunStatus, AiInputStatus, AiJobController, AiProjectService,
+    AiProjectStatus, AiRepository, AiRepositoryError, AiSmartBatchStatus, AiSmartCandidate,
+    AiSmartCandidateSource,
     AiSmartDraft, AiSmartDraftOwnership, AiSmartDraftStatus, AiSmartReplaySession,
     AiSmartReplaySessionCursor, AiSmartReplaySessionPage, AiSmartStage, AiSmartStageAttempt,
     AiSmartStageAttemptStatus, AiSmartWorkflow, AiSmartWorkflowBatch, AiSmartWorkflowDetail,
     AiSmartWorkflowEvent, AiSmartWorkflowMetric, AiSmartWorkflowMode, AiSmartWorkflowStatus,
-    AiTranscriptProjection, AnalysisSegment, ClipTextCorrectionError, ClipTextCorrectionWorkflow,
+    AiTranscriptProjection, AnalysisSegment, ClipTextCorrectionError,
     EffectCaptionEnhancementRunner, EnhancementStageRequest, HighlightWorkflow, LlmError,
     NewAiSmartCandidate, NewAiSmartCandidateSource, NewAiSmartWorkflow, NewAiSmartWorkflowBatch,
     Result, SmartWorkflowConfiguration, TrustedLocalFile, run_enhancement_for_batch,
@@ -1812,13 +1813,16 @@ pub struct SmartClippingWorkflow {
     project_service: AiProjectService,
     controller: Arc<dyn AiJobController>,
     highlight: Arc<HighlightWorkflow>,
-    correction: ClipTextCorrectionWorkflow,
     transition: TransitionMatchingWorkflow,
     gate: Arc<dyn SmartWorkflowGate>,
     publisher: Arc<dyn SmartWorkflowPublisher>,
     telemetry: Arc<dyn SmartWorkflowTelemetry>,
     /// 表现形式增强执行者；未注入时增强阶段完全跳过（既有行为不变）。
     enhancement: Option<Arc<dyn EffectCaptionEnhancementRunner>>,
+    /// **片段级前置**的转写层文案纠正；未注入时纠正阶段跳过。
+    ///
+    /// 纠正位于 `Draft` 之前（见 `AiSmartStage`），合辑字幕在创建时自动采用纠正文本。
+    transcript_correction: Option<Arc<super::TranscriptTextCorrectionWorkflow>>,
     tasks: Arc<Mutex<HashMap<i64, SmartWorkflowTask>>>,
 }
 
@@ -1834,7 +1838,6 @@ impl SmartClippingWorkflow {
         project_service: AiProjectService,
         controller: Arc<dyn AiJobController>,
         highlight: Arc<HighlightWorkflow>,
-        correction: ClipTextCorrectionWorkflow,
         transition: TransitionMatchingWorkflow,
         gate: Arc<dyn SmartWorkflowGate>,
     ) -> Self {
@@ -1844,12 +1847,12 @@ impl SmartClippingWorkflow {
             project_service,
             controller,
             highlight,
-            correction,
             transition,
             gate,
             publisher: Arc::new(SilentSmartWorkflowPublisher),
             telemetry: Arc::new(SilentSmartWorkflowTelemetry),
             enhancement: None,
+            transcript_correction: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1861,6 +1864,15 @@ impl SmartClippingWorkflow {
 
     pub fn with_telemetry(mut self, telemetry: Arc<dyn SmartWorkflowTelemetry>) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// 注入**片段级前置**的转写层文案纠正。
+    pub fn with_transcript_correction(
+        mut self,
+        workflow: Arc<super::TranscriptTextCorrectionWorkflow>,
+    ) -> Self {
+        self.transcript_correction = Some(workflow);
         self
     }
 
@@ -2760,15 +2772,23 @@ impl SmartClippingWorkflow {
                         return Err(cancelled_error());
                     }
                     AiProjectStatus::Failed => {
-                        let error = SmartWorkflowError::new(
-                            "smart_asr_failed",
-                            detail
-                                .project
-                                .last_error_message
-                                .as_deref()
-                                .unwrap_or("本地 ASR 失败"),
-                            true,
-                        );
+                        // 转录失败的真实原因写在“输入/视频”级别；项目级 last_error_message
+                        // 在纯转录失败场景下通常为空。这里按项目级 -> 失败输入级 -> 中性兜底
+                        // 的顺序聚合，避免用写死的“本地 ASR 失败”掩盖云端（百炼）等真实错误。
+                        let message = detail
+                            .project
+                            .last_error_message
+                            .clone()
+                            .or_else(|| {
+                                detail
+                                    .inputs
+                                    .iter()
+                                    .filter(|input| input.status == AiInputStatus::Failed)
+                                    .filter_map(|input| input.last_error_message.clone())
+                                    .next()
+                            })
+                            .unwrap_or_else(|| "语音识别失败".to_owned());
+                        let error = SmartWorkflowError::new("smart_asr_failed", message, true);
                         self.finish_failed(
                             &asr_attempt,
                             &error,
@@ -2869,6 +2889,18 @@ impl SmartClippingWorkflow {
                 AiSmartBatchStatus::Highlight,
             )
             .map_err(repository_error)?;
+        if run.status == AiHighlightRunStatus::Failed {
+            // 精彩分析整批失败且无候选时，run 仍以 Ok 返回；这里必须把失败暴露给
+            // 工作流，而不是继续走“无候选 → 等待选择”，否则用户点“确认默认精彩”
+            // 才会发现根本没有候选。
+            return Err(SmartWorkflowError::new(
+                "smart_highlight_failed",
+                run.last_error_message
+                    .as_deref()
+                    .unwrap_or("精彩分析失败，且没有生成可用候选"),
+                true,
+            ));
+        }
         let candidates = self
             .repository
             .list_highlight_candidates(run.id)
@@ -2988,6 +3020,91 @@ impl SmartClippingWorkflow {
             return Ok(());
         }
 
+        // **片段级前置**：文案纠正在拼合辑之前作用于**转写句段**，合辑字幕在创建时
+        // 自动采用纠正后的文本（v32）。未注入转写纠错执行者时本阶段跳过。
+        self.move_to_stage(
+            workflow_id,
+            expected_generation,
+            AiSmartStage::Correction,
+            Some(batch.id),
+        )?;
+        let correction_fingerprint = format!("transcript:{}", batch.id);
+        let correction_attempt = self.start_stage(
+            workflow_id,
+            Some(batch.id),
+            None,
+            AiSmartStage::Correction,
+            &correction_fingerprint,
+        )?;
+        if correction_attempt.status != AiSmartStageAttemptStatus::Completed {
+            let started = Instant::now();
+            match self.transcript_correction.as_ref() {
+                Some(workflow) => {
+                    let project_id = batch.project_id.ok_or_else(|| {
+                        SmartWorkflowError::new(
+                            "smart_project_missing",
+                            "批次缺少 AI 工程引用",
+                            true,
+                        )
+                    })?;
+                    match workflow
+                        .correct_project(project_id, cancellation.child_token())
+                        .await
+                    {
+                        Ok(summary) => {
+                            self.workflows
+                                .finish_attempt(
+                                    correction_attempt.id,
+                                    correction_attempt.attempt_generation,
+                                    AiSmartStageAttemptStatus::Completed,
+                                    Some(("transcript_correction", summary.changed as i64)),
+                                    started.elapsed().as_millis() as u64,
+                                    None,
+                                )
+                                .map_err(repository_error)?;
+                        }
+                        Err(ClipTextCorrectionError::NoEligibleSubtitles) => {
+                            self.workflows
+                                .finish_attempt(
+                                    correction_attempt.id,
+                                    correction_attempt.attempt_generation,
+                                    AiSmartStageAttemptStatus::Completed,
+                                    None,
+                                    started.elapsed().as_millis() as u64,
+                                    Some(("smart_correction_skipped", "没有可纠正的转写句段")),
+                                )
+                                .map_err(repository_error)?;
+                        }
+                        Err(error) => {
+                            let error = SmartWorkflowError::new(
+                                "smart_correction_failed",
+                                error.to_string(),
+                                true,
+                            );
+                            self.finish_failed(
+                                &correction_attempt,
+                                &error,
+                                started.elapsed().as_millis() as u64,
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                None => {
+                    self.workflows
+                        .finish_attempt(
+                            correction_attempt.id,
+                            correction_attempt.attempt_generation,
+                            AiSmartStageAttemptStatus::Completed,
+                            None,
+                            started.elapsed().as_millis() as u64,
+                            Some(("smart_correction_skipped", "未启用转写层文案纠正")),
+                        )
+                        .map_err(repository_error)?;
+                }
+            }
+        }
+
         self.move_to_stage(
             workflow_id,
             expected_generation,
@@ -3099,69 +3216,6 @@ impl SmartClippingWorkflow {
                 .map_err(repository_error)?;
             (clip, draft)
         };
-
-        self.move_to_stage(
-            workflow_id,
-            expected_generation,
-            AiSmartStage::Correction,
-            Some(batch.id),
-        )?;
-        let correction_fingerprint = format!("{}:{}", draft.id, clip.project.version);
-        let correction_attempt = self.start_stage(
-            workflow_id,
-            Some(batch.id),
-            Some(draft.generation),
-            AiSmartStage::Correction,
-            &correction_fingerprint,
-        )?;
-        if correction_attempt.status != AiSmartStageAttemptStatus::Completed {
-            let started = Instant::now();
-            match self
-                .correction
-                .correct_smart_project(
-                    clip.project.id,
-                    clip.project.version,
-                    cancellation.child_token(),
-                )
-                .await
-            {
-                Ok(summary) => {
-                    clip = summary.detail;
-                    self.workflows
-                        .finish_attempt(
-                            correction_attempt.id,
-                            correction_attempt.attempt_generation,
-                            AiSmartStageAttemptStatus::Completed,
-                            Some(("correction_run", summary.run_id)),
-                            started.elapsed().as_millis() as u64,
-                            None,
-                        )
-                        .map_err(repository_error)?;
-                }
-                Err(ClipTextCorrectionError::NoEligibleSubtitles) => {
-                    self.workflows
-                        .finish_attempt(
-                            correction_attempt.id,
-                            correction_attempt.attempt_generation,
-                            AiSmartStageAttemptStatus::Completed,
-                            None,
-                            started.elapsed().as_millis() as u64,
-                            Some(("smart_correction_skipped", "当前草稿没有可纠错字幕")),
-                        )
-                        .map_err(repository_error)?;
-                }
-                Err(error) => {
-                    let error =
-                        SmartWorkflowError::new("smart_correction_failed", error.to_string(), true);
-                    self.finish_failed(
-                        &correction_attempt,
-                        &error,
-                        started.elapsed().as_millis() as u64,
-                    );
-                    return Err(error);
-                }
-            }
-        }
 
         clip = self
             .repository

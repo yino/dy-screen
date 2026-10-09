@@ -262,6 +262,10 @@ impl Database {
         crate::ai::migrate_ai_v26(&mut connection)?;
         crate::ai::migrate_ai_v27(&mut connection)?;
         crate::ai::migrate_ai_v28(&mut connection)?;
+        crate::ai::migrate_ai_v29(&mut connection)?;
+        crate::ai::migrate_ai_v30(&mut connection)?;
+        crate::ai::migrate_ai_v31(&mut connection)?;
+        crate::ai::migrate_ai_v32(&mut connection)?;
 
         let applied = connection
             .query_row(
@@ -572,6 +576,26 @@ impl Database {
                 defaults.notifications_enabled.to_string(),
             ),
             ("autostart_enabled", defaults.autostart_enabled.to_string()),
+            (
+                "generation_image_models",
+                defaults.generation_image_models,
+            ),
+            (
+                "generation_video_models",
+                defaults.generation_video_models,
+            ),
+            (
+                "generation_video_resolution",
+                defaults.generation_video_resolution,
+            ),
+            (
+                "generation_video_seconds",
+                defaults.generation_video_seconds.to_string(),
+            ),
+            (
+                "render_cache_retention_days",
+                defaults.render_cache_retention_days.to_string(),
+            ),
         ];
         let connection = self.connection()?;
         for (key, value) in values {
@@ -1331,6 +1355,31 @@ impl Database {
                 defaults.notifications_enabled,
             ),
             autostart_enabled: parse_or(&values, "autostart_enabled", defaults.autostart_enabled),
+            generation_image_models: value_or(
+                &values,
+                "generation_image_models",
+                defaults.generation_image_models,
+            ),
+            generation_video_models: value_or(
+                &values,
+                "generation_video_models",
+                defaults.generation_video_models,
+            ),
+            generation_video_resolution: value_or(
+                &values,
+                "generation_video_resolution",
+                defaults.generation_video_resolution,
+            ),
+            generation_video_seconds: parse_or(
+                &values,
+                "generation_video_seconds",
+                defaults.generation_video_seconds,
+            ),
+            render_cache_retention_days: parse_or(
+                &values,
+                "render_cache_retention_days",
+                defaults.render_cache_retention_days,
+            ),
         })
     }
 
@@ -1356,6 +1405,26 @@ impl Database {
                 settings.notifications_enabled.to_string(),
             ),
             ("autostart_enabled", settings.autostart_enabled.to_string()),
+            (
+                "generation_image_models",
+                settings.generation_image_models.clone(),
+            ),
+            (
+                "generation_video_models",
+                settings.generation_video_models.clone(),
+            ),
+            (
+                "generation_video_resolution",
+                settings.generation_video_resolution.clone(),
+            ),
+            (
+                "generation_video_seconds",
+                settings.generation_video_seconds.to_string(),
+            ),
+            (
+                "render_cache_retention_days",
+                settings.render_cache_retention_days.to_string(),
+            ),
         ];
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;

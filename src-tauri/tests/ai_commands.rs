@@ -514,3 +514,12 @@ async fn model_status_reports_current_model_without_leaking_credentials() {
     );
     assert!(!json.contains("sk-"), "状态视图泄漏了旧凭据：{json}");
 }
+
+#[tokio::test]
+async fn enhancement_review_rejects_unknown_clip_project() {
+    let database = Database::open_in_memory().unwrap();
+    database.migrate().unwrap();
+    let (commands, _controller) = command_service(database, Arc::new(AtomicUsize::new(0)));
+    // 不存在的剪辑工程：报错而不是返回伪造的空结果。
+    assert!(commands.enhancement_review(9_999).is_err());
+}

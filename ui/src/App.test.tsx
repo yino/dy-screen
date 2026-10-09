@@ -123,6 +123,11 @@ const appSettings: AppSettings = {
   ffprobePath: "ffprobe",
   notificationsEnabled: true,
   autostartEnabled: false,
+  generationImageModels: "qwen-image-3.0,qwen-image-2.1-pro,qwen-image-plus,qwen-image",
+  generationVideoModels: "wan3.0-video-prime,wan3.0-video",
+  generationVideoResolution: "480P",
+  generationVideoSeconds: 2,
+  renderCacheRetentionDays: 3,
 };
 
 const readyRuntimeStatus: RuntimeResourceView = {
@@ -859,6 +864,7 @@ describe("App", () => {
     expect(within(secondaryColumn).getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent)).toEqual([
       "运行环境",
       "客户端授权",
+      "生成式转场",
       "当前模型与可用性",
     ]);
   });
