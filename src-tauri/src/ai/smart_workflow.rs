@@ -3326,27 +3326,41 @@ impl SmartClippingWorkflow {
             .get_clip_project(clip.project.id)
             .map_err(repository_error)?;
 
-        // 生成式转场：在转场匹配之后、评审之前为片段生成真实转场。
+        // 生成式转场：在转场匹配之后、评审之前为**每个片段边界**生成真实转场。
         //
         // **此处故意阻塞**：生成产物会改变成片内容。若异步落地，用户可能在产物
-        // 到达前就点导出，拿到一段"没有转场"的成片，而且**无从察觉**——
-        // 这正是本项目里反复出现的那类静默缺陷。
+        // 到达前就点导出，拿到一段"没有转场"的成片，而且**无从察觉**——这正是本
+        // 项目反复出现的那类静默缺陷。
         //
-        // 费用门禁不在这一层：`GeneratedTransitionRunner` 自己负责"命中复用不调用
+        // **合成方式必须是 `insert`（边界桥接），不是 `replace`**：素材库匹配产出的
+        // 是"两段之间"的桥接；`replace` 只是替换片段内容，两者语义不同。边界由
+        // `reconcile` 为所有相邻片段对建立、**与匹配无关**，因此跳过匹配后仍可用。
+        //
+        // 费用门禁不在这一层：`GeneratedTransitionRunner` 内部负责"命中复用不调用
         // 上游"与"单次运行上限"，因此这里可以放心遍历。
         if let Some(runner) = self.generated_transition.clone() {
             let ai_project_id = batch.project_id.ok_or_else(|| {
                 SmartWorkflowError::new("smart_project_missing", "批次缺少 AI 工程引用", true)
             })?;
             let cancellation = cancellation.child_token();
-            for segment in clip.segments.iter() {
-                let available = segment
-                    .source_end_ms
-                    .saturating_sub(segment.source_start_ms);
-                let span_ms = 2_000_u64.min(available);
-                if span_ms == 0 {
+            let boundaries = self
+                .repository
+                .clip_transition_boundaries(clip.project.id)
+                .unwrap_or_default();
+            for boundary in boundaries.iter().filter(|boundary| boundary.active) {
+                let (Some(left), Some(right)) = (
+                    boundary.left_clip_segment_id,
+                    boundary.right_clip_segment_id,
+                ) else {
                     continue;
-                }
+                };
+                let Some(segment) = clip
+                    .segments
+                    .iter()
+                    .find(|segment| segment.id == left)
+                else {
+                    continue;
+                };
                 // 已知缺口：正式链路应由 `animation-storyboard` Skill 产出画面主体/
                 // 构图/镜头运动提示词；这里退化为片段标题，语义可能与画面不符
                 // （实测过：字幕写"直播 kiss 月入千万"，生成结果真画出一个直播间）。
@@ -3361,17 +3375,19 @@ impl SmartClippingWorkflow {
                         segment.title
                     ),
                     video_prompt: "镜头缓慢推近，温暖的自然光，画面稳定".to_owned(),
-                    duration_ms: span_ms,
-                    reuse_key: format!("smart-{ai_project_id}-{}", segment.candidate_id),
-                    composition: super::AiGeneratedAnimationComposition::Replace,
-                    replace_range: Some(super::AiGeneratedAnimationReplaceRange {
-                        start_ms: segment.source_start_ms,
-                        end_ms: segment.source_start_ms + span_ms,
+                    // 插入单元的长度由生成视频本身决定（runner 按设置里的时长生成）。
+                    duration_ms: 2_000,
+                    reuse_key: format!("smart-{ai_project_id}-boundary-{}", boundary.id),
+                    composition: super::AiGeneratedAnimationComposition::Insert,
+                    replace_range: None,
+                    insert_binding: Some(super::AiGeneratedAnimationInsertBinding {
+                        left_segment_id: left,
+                        right_segment_id: right,
+                        boundary_id: boundary.id,
                     }),
-                    insert_binding: None,
                 };
                 // 结果本身已落库（`ai_generated_animation_assets`），界面直接查表即可。
-                // 单条失败不中断其余片段：转场是增强而非基础内容。
+                // 单条失败不中断其余边界：转场是增强而非基础内容。
                 let _ = runner.generate(&task, &cancellation).await;
             }
         }

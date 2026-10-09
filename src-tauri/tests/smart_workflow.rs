@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use dy_screen::asr::{AsrError, EngineResult, FrozenMediaSource, MediaInspection, MediaInspector};
 use dy_screen_app_lib::ai::{
+    AiGeneratedAnimationComposition, GeneratedTransitionFailure, GeneratedTransitionOutcome, GeneratedTransitionRunner,
+    GeneratedTransitionTask,
     AiCommandError, AiEnvironmentDiagnostic, AiInputSourceKind, AiInputStatus, AiJobController,
     AiPreflight, AiProjectService, AiProjectStatus, AiRepository, AiSmartBatchStatus,
     AiSmartClipSourceInput, AiSmartDraftOwnership, AiSmartStage, AiSmartStageAttemptStatus,
@@ -1325,6 +1327,29 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
 }
 
 /// 测试用增强执行者：记录调用次数并总是成功。
+/// 记录收到的生成任务的假执行者（**不触网、不产生费用**）。
+#[derive(Default)]
+struct RecordingGeneratedTransitionRunner {
+    tasks: std::sync::Mutex<Vec<GeneratedTransitionTask>>,
+}
+
+#[async_trait::async_trait]
+impl GeneratedTransitionRunner for RecordingGeneratedTransitionRunner {
+    async fn generate(
+        &self,
+        task: &GeneratedTransitionTask,
+        _cancellation: &CancellationToken,
+    ) -> Result<GeneratedTransitionOutcome, GeneratedTransitionFailure> {
+        self.tasks.lock().unwrap().push(task.clone());
+        Ok(GeneratedTransitionOutcome {
+            asset_id: 1,
+            model: "recording".to_owned(),
+            duration_ms: task.duration_ms,
+            reused: false,
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingEnhancementRunner {
     calls: AtomicUsize,
@@ -1388,6 +1413,8 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         assets,
     );
     let events = Arc::new(EventCollector::default());
+    // 生成式转场：注入了执行者 → 应**跳过素材库匹配**，并改为按**边界插入**生成。
+    let generated_transition = Arc::new(RecordingGeneratedTransitionRunner::default());
     let workflow = SmartClippingWorkflow::new(
         database.clone(),
         project_service.clone(),
@@ -1396,6 +1423,7 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         transition,
         Arc::new(ReadyGate),
     )
+    .with_generated_transition(generated_transition.clone())
     .with_publisher(events.clone());
 
     let created = workflow
@@ -1442,11 +1470,48 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
     assert_eq!(clip.project.export_status.as_str(), "idle");
     assert_eq!(clip.project.ownership, AiSmartDraftOwnership::Automation);
     assert_eq!(final_detail.drafts[0].status.as_str(), "review_ready");
-    assert!(final_detail.attempts.iter().any(|attempt| {
-        attempt.stage == AiSmartStage::Transition
-            && attempt.status == AiSmartStageAttemptStatus::Completed
-            && attempt.last_error_code.as_deref() == Some("smart_transition_skipped")
-    }));
+    // 注入了生成执行者 → 转场阶段标记为"由 AI 生成、已跳过素材库匹配"。
+    assert!(
+        final_detail.attempts.iter().any(|attempt| {
+            attempt.stage == AiSmartStage::Transition
+                && attempt.status == AiSmartStageAttemptStatus::Completed
+                && attempt.last_error_code.as_deref() == Some("smart_transition_generated")
+        }),
+        "注入生成执行者后应跳过素材库匹配"
+    );
+    // 关键回归：生成任务必须是**边界插入**（两段之间的转场），
+    // 而不是片段内容替换——两者语义不同，此前实现曾用错。
+    {
+        let recorded = generated_transition.tasks.lock().unwrap().clone();
+        let expected = repository
+            .clip_transition_boundaries(clip.project.id)
+            .unwrap()
+            .iter()
+            .filter(|boundary| boundary.active)
+            .count();
+        assert_eq!(
+            recorded.len(),
+            expected,
+            "每个活跃边界都应生成一条转场任务"
+        );
+        for task in &recorded {
+            assert_eq!(
+                task.composition,
+                AiGeneratedAnimationComposition::Insert,
+                "转场必须是 insert（边界桥接），不是 replace（内容替换）"
+            );
+            assert!(task.replace_range.is_none(), "insert 不应携带 replace_range");
+            let binding = task
+                .insert_binding
+                .as_ref()
+                .expect("insert 必须绑定左右片段与边界");
+            assert!(binding.boundary_id > 0, "边界 id 必须有效");
+            assert_ne!(
+                binding.left_segment_id, binding.right_segment_id,
+                "左右片段必须不同"
+            );
+        }
+    }
     {
         let published = events.0.lock().unwrap();
         assert!(

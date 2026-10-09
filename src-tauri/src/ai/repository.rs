@@ -1544,6 +1544,20 @@ impl AiRepository {
         self.get_clip_project(project_id)
     }
 
+    /// 该合辑的**相邻片段边界**（先对账再返回，保证与当前片段一致）。
+    ///
+    /// 转场的合成方式是 `insert`（两段之间的桥接），所以需要 `boundary_id` 与左右
+    /// 片段 id。关键点：边界由 `reconcile_boundaries` 为**所有相邻片段对**建立，
+    /// **与素材库匹配无关**——因此即使跳过匹配（AI 生成替换匹配），边界依然可用。
+    pub fn clip_transition_boundaries(
+        &self,
+        clip_project_id: i64,
+    ) -> Result<Vec<crate::transition_materials::ClipTransitionBoundary>> {
+        crate::transition_materials::TransitionMaterialRepository::new(self.database.clone())
+            .reconcile_boundaries(clip_project_id)
+            .map_err(|error| AiRepositoryError::Integrity(error.to_string()))
+    }
+
     pub fn list_clip_project_sources(
         &self,
         clip_project_id: i64,
