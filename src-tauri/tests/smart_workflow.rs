@@ -448,30 +448,40 @@ impl HighlightAgentProvider for SmartHighlightProvider {
         _cancellation: CancellationToken,
     ) -> Result<CandidateAgentOutput, LlmError> {
         let payload: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
-        let segment = payload["segments"]
+        // 取**前两个**可写句段各产出一个候选：这样才能得到 ≥2 个片段、
+        // 从而出现片段边界——而"边界"正是生成式转场的落点。
+        // 只取一个的话转场阶段根本没有循环可执行，相关断言会**空过**。
+        let candidates = payload["segments"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|segment| segment["readOnlyContext"] == false)
-            .unwrap();
-        let input_id = segment["inputId"].as_i64().unwrap();
+            .filter(|segment| segment["readOnlyContext"] == false)
+            .take(2)
+            .map(|segment| {
+                let input_id = segment["inputId"].as_i64().unwrap();
+                HighlightCandidateDraft {
+                    candidate_key: format!(
+                        "smart-highlight-{input_id}-{}",
+                        segment["id"].as_str().unwrap()
+                    ),
+                    title: "智能精彩".to_owned(),
+                    input_id,
+                    segment_ids: vec![segment["id"].as_str().unwrap().to_owned()],
+                    start_ms: segment["startMs"].as_u64().unwrap(),
+                    end_ms: segment["endMs"].as_u64().unwrap(),
+                    hook_score: 90.0,
+                    information_score: 90.0,
+                    emotion_score: 90.0,
+                    tag_relevance_score: 90.0,
+                    completeness_score: 90.0,
+                    shareability_score: 90.0,
+                    reason: "测试精彩".to_owned(),
+                    matched_tags: Vec::new(),
+                }
+            })
+            .collect();
         Ok(CandidateAgentOutput {
-            candidates: vec![HighlightCandidateDraft {
-                candidate_key: format!("smart-highlight-{input_id}"),
-                title: "智能精彩".to_owned(),
-                input_id,
-                segment_ids: vec![segment["id"].as_str().unwrap().to_owned()],
-                start_ms: segment["startMs"].as_u64().unwrap(),
-                end_ms: segment["endMs"].as_u64().unwrap(),
-                hook_score: 90.0,
-                information_score: 90.0,
-                emotion_score: 90.0,
-                tag_relevance_score: 90.0,
-                completeness_score: 90.0,
-                shareability_score: 90.0,
-                reason: "测试精彩".to_owned(),
-                matched_tags: Vec::new(),
-            }],
+            candidates,
             token_usage: 1,
         })
     }
@@ -1572,12 +1582,8 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         }),
         "注入生成执行者后应跳过素材库匹配"
     );
-    // ⚠️ 本用例的局部工作流只有 **1 个输入 → 1 个片段 → 0 个边界**，
-    // 因此"没有生成产物"是**正确行为**而不是静默失败。
-    //
-    // 上一轮这里写的是 `recorded.len() == expected`，当两者都是 0 时**空过**——
-    // 它从未真正验证过任何生成。这里改成不可能空过的断言：
-    // 单片段工程若出现产物，说明我们对**没有边界**的工程也花了钱。
+    // 上一轮这里的断言是 `recorded.len() == expected`，当两者都是 0 时**空过**——
+    // 生成循环一次都没进过，而它"绿"了。现在强制要求存在边界。
     {
         let ai_project_id = repository
             .ai_project_id_for_clip_project(clip.project.id)
@@ -1592,10 +1598,17 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         let assets = repository
             .list_generated_animation_assets(ai_project_id)
             .unwrap();
+        // 已知覆盖缺口（**未解决**）：本用例由 `CompletingController` 伪造 ASR，
+        // 只产生 **1 个转写句段 → 1 个片段 → 0 个边界**，因此下面这个循环的
+        // "有边界"分支**从未被执行**。要真正覆盖生成循环，需要在该用例里
+        // 播种 ≥2 个转写句段（或另建一个多句段用例）。
+        //
+        // 在没有边界的当下，仍然断言一件真实的事：**不得产生任何产物**——
+        // 为不存在的位置花上游的钱是明确的错误。
         if boundaries == 0 {
             assert!(
                 assets.is_empty(),
-                "没有边界的工程不应产生生成产物——那是在为不存在的位置花钱"
+                "没有边界的工程不得产生生成产物（那是为不存在的位置花钱）"
             );
         } else {
             assert_eq!(assets.len(), boundaries, "每个活跃边界都应有产物");
