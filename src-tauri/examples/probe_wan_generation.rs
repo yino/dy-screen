@@ -20,7 +20,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dy_screen_app_lib::activation::ActivationService;
-use dy_screen_app_lib::ai::{ActivationLlmTokenSource, AiRepository, ModelCallRuntime};
+use dy_screen_app_lib::ai::{
+    ActivationLlmTokenSource, AiRepository, AssetExpectation, FfprobeMediaProbe, GenerationClient,
+    GenerationConfig, ModelCallRuntime, ReqwestTransport, data_uri, download_and_validate,
+};
 use dy_screen_app_lib::api::ApiClient;
 use dy_screen_app_lib::database::Database;
 
@@ -182,6 +185,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "传输失败",
                     error.to_string(),
                 ));
+            }
+        }
+    }
+
+    // ── 第四轮：用**产品自身的客户端**真实走一遍完整链路 ──
+    // 生成参考图 → 下载并校验 → base64 首帧 → 图生视频 → 下载并校验。
+    // 这一步验证的是"新写的下载与校验模块能否对着真实上游工作"。
+    println!("\n\n──────── 第四轮：真实生成 + 下载校验 ────────");
+    let verify_dir = std::env::temp_dir().join("dy-screen-gen-verify");
+    let _ = std::fs::remove_dir_all(&verify_dir);
+    let client = GenerationClient::new(ReqwestTransport::default(), GenerationConfig::default());
+    let probe = FfprobeMediaProbe {
+        ffprobe_path: PathBuf::from("ffprobe"),
+    };
+
+    match client
+        .generate_image(&lease.token, "一只在草地上奔跑的橘猫，写实摄影，自然光")
+        .await
+    {
+        Err((model, failure)) => println!("参考图生成失败：{model} {failure:?}"),
+        Ok(image) => {
+            println!("参考图模型={} task={:?}", image.model, image.task_id);
+            let reference = verify_dir.join("reference.png");
+            match download_and_validate(
+                client.transport_ref(),
+                &probe,
+                &image.url,
+                &reference,
+                AssetExpectation::image(),
+            )
+            .await
+            {
+                Err(rejection) => println!("参考图校验未通过：{} {rejection:?}", rejection.code()),
+                Ok(asset) => {
+                    println!(
+                        "  ✅ 参考图校验通过：{}x{} sha256={}… {} 字节",
+                        asset.media.width, asset.media.height, &asset.sha256[..12], asset.bytes
+                    );
+                    let Ok(bytes) = std::fs::read(&asset.path) else {
+                        println!("  读取参考图失败，跳过视频");
+                        return Ok(());
+                    };
+                    let first_frame = data_uri("image/png", &bytes);
+                    println!("  首帧以 base64 data URI 传递，长度 {} 字符", first_frame.len());
+
+                    match client
+                        .generate_video(&lease.token, "镜头缓慢推近，温暖自然光", &first_frame)
+                        .await
+                    {
+                        Err((model, failure)) => {
+                            println!("视频生成失败：{model} {failure:?}")
+                        }
+                        Ok(video) => {
+                            println!("视频模型={} task={:?}", video.model, video.task_id);
+                            let target = verify_dir.join("transition.mp4");
+                            match download_and_validate(
+                                client.transport_ref(),
+                                &probe,
+                                &video.url,
+                                &target,
+                                AssetExpectation::video(2_000),
+                            )
+                            .await
+                            {
+                                Err(rejection) => println!(
+                                    "  ❌ 视频校验未通过：{} {rejection:?}",
+                                    rejection.code()
+                                ),
+                                Ok(asset) => println!(
+                                    "  ✅ 视频校验通过：{}x{} {}fps {}ms sha256={}… {} 字节",
+                                    asset.media.width,
+                                    asset.media.height,
+                                    asset.media.fps,
+                                    asset.media.duration_ms,
+                                    &asset.sha256[..12],
+                                    asset.bytes
+                                ),
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -194,6 +194,8 @@ pub trait GenerationTransport: Send + Sync {
         body: &Value,
     ) -> Result<(u16, String), String>;
     async fn get(&self, url: &str, token: &str) -> Result<(u16, String), String>;
+    /// 下载生成的资源。上游资源 URL **有效期只有 24 小时**，调用方必须尽快取回。
+    async fn download(&self, url: &str) -> Result<Vec<u8>, String>;
 }
 
 /// reqwest 实现。
@@ -247,6 +249,18 @@ impl GenerationTransport for ReqwestTransport {
         let text = response.text().await.unwrap_or_default();
         Ok((status, text))
     }
+
+    async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        let response = self.client.get(url).send().await.map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 一次成功生成的产物描述（**只给 URL 与用量**，下载与校验由调用方负责）。
@@ -256,6 +270,8 @@ pub struct GeneratedAsset {
     pub model: String,
     /// 上游报告的用量字段（图片为 `image_count`，视频为 `video_count` + 时长）。
     pub usage: String,
+    /// 异步任务 ID；同步路径（多模态图像）没有任务概念，故为 `None`。
+    pub task_id: Option<String>,
 }
 
 /// 生成客户端。
@@ -271,6 +287,11 @@ impl<T: GenerationTransport> GenerationClient<T> {
 
     pub fn config(&self) -> &GenerationConfig {
         &self.config
+    }
+
+    /// 暴露传输层：下载与校验在 `generated_asset` 里做，两者共用同一传输。
+    pub fn transport_ref(&self) -> &T {
+        &self.transport
     }
 
     /// 生成一张参考图。
@@ -314,6 +335,7 @@ impl<T: GenerationTransport> GenerationClient<T> {
                             url,
                             model: model.clone(),
                             usage,
+                            task_id: None,
                         });
                     }
                     // 解析不出图片：不在此处定论，让异步路径再试一次。
@@ -362,6 +384,7 @@ impl<T: GenerationTransport> GenerationClient<T> {
                                 url,
                                 model: model.clone(),
                                 usage: "image_count=1".to_owned(),
+                                task_id: Some(task_id.clone()),
                             });
                         }
                         Err(failure) => last = Some((model.clone(), failure)),
@@ -437,6 +460,7 @@ impl<T: GenerationTransport> GenerationClient<T> {
                                     self.config.video_duration_seconds,
                                     self.config.video_resolution
                                 ),
+                                task_id: Some(task_id.clone()),
                             });
                         }
                         Err(failure) => last = Some((model.clone(), failure)),
@@ -618,6 +642,10 @@ mod tests {
                 return Err("no more canned replies".to_owned());
             }
             Ok(replies.remove(0))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Vec<u8>, String> {
+            Err("下载不在本测试范围内".to_owned())
         }
     }
 

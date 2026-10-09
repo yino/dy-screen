@@ -8,6 +8,8 @@ mod clip_export;
 mod clip_subtitle;
 mod clip_text_correction;
 mod transcript_text_correction;
+mod generated_asset;
+mod generated_transition;
 mod wan_generation;
 mod commands;
 mod desktop_runtime;
@@ -58,6 +60,14 @@ pub use clip_text_correction::{
 };
 pub use transcript_text_correction::{
     TranscriptCorrectionSummary, TranscriptCorrectionTarget, TranscriptTextCorrectionWorkflow,
+};
+pub use generated_transition::{
+    GeneratedTransitionFailure, GeneratedTransitionRequest, base64_encode, data_uri,
+    produce_generated_transition,
+};
+pub use generated_asset::{
+    AssetExpectation, AssetRejection, FfprobeMediaProbe, MediaProbe, ProbedMedia, ValidatedAsset,
+    download_and_validate, sha256_hex,
 };
 pub use wan_generation::{
     DASHSCOPE_API_BASE_URL, GeneratedAsset, GenerationClient, GenerationConfig,
