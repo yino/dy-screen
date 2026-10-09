@@ -62,8 +62,9 @@ pub use transcript_text_correction::{
     TranscriptCorrectionSummary, TranscriptCorrectionTarget, TranscriptTextCorrectionWorkflow,
 };
 pub use generated_transition::{
-    GeneratedTransitionFailure, GeneratedTransitionRequest, base64_encode, data_uri,
-    produce_generated_transition,
+    GeneratedTransitionFailure, GeneratedTransitionOutcome, GeneratedTransitionRequest,
+    GeneratedTransitionRunner, GeneratedTransitionTask, TransitionAction, WanGeneratedTransitionRunner,
+    base64_encode, data_uri, plan_transition_action, produce_generated_transition,
 };
 pub use generated_asset::{
     AssetExpectation, AssetRejection, FfprobeMediaProbe, MediaProbe, ProbedMedia, ValidatedAsset,

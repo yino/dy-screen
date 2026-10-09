@@ -2171,6 +2171,40 @@ pub fn run() {
                     model_call.clone(),
                 ),
             );
+            // ── 生成式转场执行者 ──
+            // 这是"AI 生成转场"进入**产品路径**的唯一入口：在此之前它只能被无界面
+            // 驱动触发，界面上点「一键成品」不会产生任何转场。
+            //
+            // 费用门禁在 runner 内部：命中同键已校验资产则复用（不调用上游），
+            // 单次运行超过上限则跳过。因此这里可以放心注入。
+            let generation_settings = database.get_settings().map_err(|error| {
+                std::io::Error::other(format!("读取生成设置失败：{error}"))
+            })?;
+            let generation_ffprobe = app
+                .state::<RuntimeResourceState>()
+                .media_tools()
+                .map(|(_, ffprobe)| ffprobe)
+                .unwrap_or_else(|_| std::path::PathBuf::from("ffprobe"));
+            let generated_transition = Arc::new(crate::ai::WanGeneratedTransitionRunner::new(
+                AiRepository::new(database.clone()),
+                crate::ai::GenerationClient::new(
+                    crate::ai::ReqwestTransport::default(),
+                    crate::ai::GenerationConfig::from_parts(
+                        &generation_settings.generation_image_models,
+                        &generation_settings.generation_video_models,
+                        &generation_settings.generation_video_resolution,
+                        generation_settings.generation_video_seconds,
+                    ),
+                ),
+                crate::ai::FfprobeMediaProbe {
+                    ffprobe_path: generation_ffprobe,
+                },
+                app_data_dir.clone(),
+                model_call.clone(),
+                // 单次运行最多为 4 个片段生成转场——按秒计费，必须封顶。
+                4,
+            ));
+
             let smart_clipping = SmartClippingWorkflow::new(
                 database.clone(),
                 ai_project_service,
@@ -2184,6 +2218,7 @@ pub fn run() {
                 }),
             )
             .with_transcript_correction(transcript_correction)
+            .with_generated_transition(generated_transition)
             .with_publisher(Arc::new(DesktopSmartWorkflowPublisher {
                 app: app.handle().clone(),
             }))

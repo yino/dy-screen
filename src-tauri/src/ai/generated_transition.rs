@@ -12,6 +12,8 @@
 
 use std::path::Path;
 
+use async_trait::async_trait;
+
 use super::domain::{
     AiGeneratedAnimationAsset, AiGeneratedAnimationComposition, AiGeneratedAnimationInsertBinding,
     AiGeneratedAnimationReplaceRange, AiGeneratedAnimationStatus, GENERATED_ANIMATION_CACHE_DIR,
@@ -71,7 +73,7 @@ pub async fn produce_generated_transition<T: GenerationTransport, P: MediaProbe>
     cache_root: &Path,
     token: &str,
     request: GeneratedTransitionRequest,
-) -> Result<AiGeneratedAnimationAsset, GeneratedTransitionFailure> {
+) -> Result<(AiGeneratedAnimationAsset, String), GeneratedTransitionFailure> {
     let cache_dir = cache_root.join(GENERATED_ANIMATION_CACHE_DIR);
     tokio::fs::create_dir_all(&cache_dir)
         .await
@@ -160,7 +162,211 @@ pub async fn produce_generated_transition<T: GenerationTransport, P: MediaProbe>
         .await
         .map_err(|error| GeneratedTransitionFailure::Io(error.to_string()))?;
 
-    Ok(recorded)
+    // 把"实际用了哪个视频模型"带回去：免费额度与付费备选必须可追溯。
+    Ok((recorded, video.model))
+}
+
+/// 一条待生成的转场任务（由流程阶段构造后交给执行者）。
+///
+/// 提示词必须是**分镜描述**（画面主体/构图/镜头运动），不是字幕原文——
+/// 用字幕原文当提示词会生成语义错位的画面（实测过：字幕写"直播 kiss 月入千万"，
+/// 生成结果真画出一个直播间）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedTransitionTask {
+    /// **AI 工程 id**（不是合辑工程 id；见 `produce_generated_transition` 的易错点）。
+    pub project_id: i64,
+    pub clip_project_id: i64,
+    pub candidate_id: i64,
+    pub highlight_run_id: Option<i64>,
+    pub generation: i64,
+    pub image_prompt: String,
+    pub video_prompt: String,
+    /// 目标时长（毫秒），与 `replace_range`/`insert_binding` 必须一致。
+    pub duration_ms: u64,
+    /// 复用键：命中已校验资产即复用，**不产生新的上游费用**。
+    pub reuse_key: String,
+    /// 合成方式与绑定；与 `AiGeneratedAnimationAsset` 一一对应。
+    pub composition: AiGeneratedAnimationComposition,
+    pub replace_range: Option<AiGeneratedAnimationReplaceRange>,
+    pub insert_binding: Option<AiGeneratedAnimationInsertBinding>,
+}
+
+/// 执行结果（脱敏，可直接入库与展示）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedTransitionOutcome {
+    pub asset_id: i64,
+    pub model: String,
+    pub duration_ms: u64,
+    /// 命中复用：**本次没有产生上游费用**。
+    pub reused: bool,
+}
+
+/// 生成式转场的**阶段执行者**。
+///
+/// 与 `EffectCaptionEnhancementRunner` 同构：流程阶段只依赖这个 trait，
+/// 因此可以用假实现做测试，也不会把网络依赖塞进流程代码。
+#[async_trait]
+pub trait GeneratedTransitionRunner: Send + Sync {
+    async fn generate(
+        &self,
+        task: &GeneratedTransitionTask,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<GeneratedTransitionOutcome, GeneratedTransitionFailure>;
+}
+
+/// 单次运行内是否还要继续生成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionAction {
+    /// 已有通过校验的同键资产：直接复用。
+    Reuse(i64),
+    /// 需要真实调用上游。
+    Generate,
+    /// 达到本次运行上限：停止，**不调用上游**。
+    SkipBudgetExhausted,
+}
+
+/// 是否复用 / 是否生成 / 是否因额度停下。
+///
+/// 抽成纯函数以便单测：这段判断直接决定**要不要花钱**，值得被测试钉住。
+pub fn plan_transition_action(
+    reused_asset_id: Option<i64>,
+    generated_so_far: usize,
+    max_per_run: usize,
+) -> TransitionAction {
+    if let Some(asset_id) = reused_asset_id {
+        return TransitionAction::Reuse(asset_id);
+    }
+    if generated_so_far >= max_per_run {
+        return TransitionAction::SkipBudgetExhausted;
+    }
+    TransitionAction::Generate
+}
+
+/// 真实执行者：包装 `produce_generated_transition`，并加上**复用**与**单次运行上限**门禁。
+///
+/// 两道门禁都直接关系花钱：
+/// - 命中同键已校验资产 → 复用，**不调用上游**
+/// - 达到单次运行上限 → 跳过，**不调用上游**
+pub struct WanGeneratedTransitionRunner<T: GenerationTransport, P: MediaProbe> {
+    repository: AiRepository,
+    client: GenerationClient<T>,
+    probe: P,
+    cache_root: std::path::PathBuf,
+    model_call: std::sync::Arc<super::ModelCallRuntime>,
+    max_per_run: usize,
+    generated: std::sync::Mutex<usize>,
+}
+
+impl<T: GenerationTransport, P: MediaProbe> WanGeneratedTransitionRunner<T, P> {
+    pub fn new(
+        repository: AiRepository,
+        client: GenerationClient<T>,
+        probe: P,
+        cache_root: std::path::PathBuf,
+        model_call: std::sync::Arc<super::ModelCallRuntime>,
+        max_per_run: usize,
+    ) -> Self {
+        Self {
+            repository,
+            client,
+            probe,
+            cache_root,
+            model_call,
+            max_per_run,
+            generated: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// 本次运行已真实生成的条数（用于汇报与诊断）。
+    pub fn generated_count(&self) -> usize {
+        *self
+            .generated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[async_trait]
+impl<T: GenerationTransport, P: MediaProbe> GeneratedTransitionRunner
+    for WanGeneratedTransitionRunner<T, P>
+{
+    async fn generate(
+        &self,
+        task: &GeneratedTransitionTask,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<GeneratedTransitionOutcome, GeneratedTransitionFailure> {
+        let reused = self
+            .repository
+            .find_validated_generated_animation(task.project_id, &task.reuse_key)
+            .ok()
+            .flatten();
+        let generated_so_far = self.generated_count();
+        match plan_transition_action(reused.as_ref().map(|asset| asset.id), generated_so_far, self.max_per_run) {
+            TransitionAction::Reuse(asset_id) => {
+                return Ok(GeneratedTransitionOutcome {
+                    asset_id,
+                    model: "复用已校验资产".to_owned(),
+                    duration_ms: reused
+                        .and_then(|asset| asset.duration_ms)
+                        .unwrap_or(task.duration_ms),
+                    reused: true,
+                });
+            }
+            TransitionAction::SkipBudgetExhausted => {
+                return Err(GeneratedTransitionFailure::Video {
+                    code: "generated_transition_budget_exhausted".to_owned(),
+                    detail: format!("本次运行已达到上限 {generated_so_far}/{}", self.max_per_run),
+                });
+            }
+            TransitionAction::Generate => {}
+        }
+
+        if cancellation.is_cancelled() {
+            return Err(GeneratedTransitionFailure::Io("已取消".to_owned()));
+        }
+
+        let lease = self
+            .model_call
+            .acquire_token(chrono::Utc::now().timestamp())
+            .await
+            .map_err(|error| GeneratedTransitionFailure::Repository(error.category_str().to_owned()))?;
+
+        let (asset, model) = produce_generated_transition(
+            &self.client,
+            &self.probe,
+            &self.repository,
+            &self.cache_root,
+            &lease.token,
+            GeneratedTransitionRequest {
+                project_id: task.project_id,
+                candidate_id: task.candidate_id,
+                highlight_run_id: task.highlight_run_id,
+                generation: task.generation,
+                composition: task.composition,
+                replace_range: task.replace_range,
+                insert_binding: task.insert_binding,
+                reuse_key: task.reuse_key.clone(),
+                image_prompt: task.image_prompt.clone(),
+                video_prompt: task.video_prompt.clone(),
+            },
+        )
+        .await?;
+
+        {
+            let mut counter = self
+                .generated
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *counter += 1;
+        }
+
+        Ok(GeneratedTransitionOutcome {
+            asset_id: asset.id,
+            model,
+            duration_ms: asset.duration_ms.unwrap_or(task.duration_ms),
+            reused: false,
+        })
+    }
 }
 
 /// 标准 base64（含 `=` 填充）。手写以避免在 `--offline` 下新增依赖。
@@ -218,6 +424,29 @@ mod tests {
         assert!(encoded.starts_with("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"));
         assert!(encoded.ends_with("vw==") || encoded.ends_with("v0=") || encoded.len() % 4 == 0);
         assert_eq!(encoded.len() % 4, 0, "长度必须是 4 的倍数");
+    }
+
+    /// 这段判断直接决定"要不要花钱"，必须钉住：
+    /// 命中复用就绝不重复生成；到达上限就绝不再调用上游。
+    #[test]
+    fn action_planning_never_spends_when_it_should_not() {
+        // 命中复用优先于额度判断（额度用尽也能复用已生成的资产）
+        assert_eq!(
+            plan_transition_action(Some(7), 5, 1),
+            TransitionAction::Reuse(7)
+        );
+        // 额度用尽且无复用 → 停下，不调用上游
+        assert_eq!(
+            plan_transition_action(None, 2, 2),
+            TransitionAction::SkipBudgetExhausted
+        );
+        // 还有额度 → 生成
+        assert_eq!(plan_transition_action(None, 1, 2), TransitionAction::Generate);
+        // 上限为 0 时任何新生成都被挡住
+        assert_eq!(
+            plan_transition_action(None, 0, 0),
+            TransitionAction::SkipBudgetExhausted
+        );
     }
 
     #[test]

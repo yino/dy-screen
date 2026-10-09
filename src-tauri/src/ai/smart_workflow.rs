@@ -1823,6 +1823,10 @@ pub struct SmartClippingWorkflow {
     ///
     /// 纠正位于 `Draft` 之前（见 `AiSmartStage`），合辑字幕在创建时自动采用纠正文本。
     transcript_correction: Option<Arc<super::TranscriptTextCorrectionWorkflow>>,
+    /// 生成式转场的阶段执行者；未注入时**完全不产生上游调用**。
+    ///
+    /// 这是"AI 生成转场"进入产品路径的唯一入口：在此之前它只能被无界面驱动触发。
+    generated_transition: Option<Arc<dyn super::GeneratedTransitionRunner>>,
     tasks: Arc<Mutex<HashMap<i64, SmartWorkflowTask>>>,
 }
 
@@ -1853,6 +1857,7 @@ impl SmartClippingWorkflow {
             telemetry: Arc::new(SilentSmartWorkflowTelemetry),
             enhancement: None,
             transcript_correction: None,
+            generated_transition: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1873,6 +1878,17 @@ impl SmartClippingWorkflow {
         workflow: Arc<super::TranscriptTextCorrectionWorkflow>,
     ) -> Self {
         self.transcript_correction = Some(workflow);
+        self
+    }
+
+    /// 注入**生成式转场**执行者。
+    ///
+    /// 未注入时流程不产生任何生成式上游调用，既有行为完全不变。
+    pub fn with_generated_transition(
+        mut self,
+        runner: Arc<dyn super::GeneratedTransitionRunner>,
+    ) -> Self {
+        self.generated_transition = Some(runner);
         self
     }
 
@@ -3288,6 +3304,57 @@ impl SmartClippingWorkflow {
             .repository
             .get_clip_project(clip.project.id)
             .map_err(repository_error)?;
+
+        // 生成式转场：在转场匹配之后、评审之前为片段生成真实转场。
+        //
+        // **此处故意阻塞**：生成产物会改变成片内容。若异步落地，用户可能在产物
+        // 到达前就点导出，拿到一段"没有转场"的成片，而且**无从察觉**——
+        // 这正是本项目里反复出现的那类静默缺陷。
+        //
+        // 费用门禁不在这一层：`GeneratedTransitionRunner` 自己负责"命中复用不调用
+        // 上游"与"单次运行上限"，因此这里可以放心遍历。
+        if let Some(runner) = self.generated_transition.clone() {
+            let ai_project_id = batch.project_id.ok_or_else(|| {
+                SmartWorkflowError::new("smart_project_missing", "批次缺少 AI 工程引用", true)
+            })?;
+            let cancellation = cancellation.child_token();
+            for segment in clip.segments.iter() {
+                let available = segment
+                    .source_end_ms
+                    .saturating_sub(segment.source_start_ms);
+                let span_ms = 2_000_u64.min(available);
+                if span_ms == 0 {
+                    continue;
+                }
+                // 已知缺口：正式链路应由 `animation-storyboard` Skill 产出画面主体/
+                // 构图/镜头运动提示词；这里退化为片段标题，语义可能与画面不符
+                // （实测过：字幕写"直播 kiss 月入千万"，生成结果真画出一个直播间）。
+                let task = super::GeneratedTransitionTask {
+                    project_id: ai_project_id,
+                    clip_project_id: clip.project.id,
+                    candidate_id: segment.candidate_id,
+                    highlight_run_id: batch.highlight_run_id,
+                    generation: 1,
+                    image_prompt: format!(
+                        "{}，写实摄影风格，自然光，电影质感",
+                        segment.title
+                    ),
+                    video_prompt: "镜头缓慢推近，温暖的自然光，画面稳定".to_owned(),
+                    duration_ms: span_ms,
+                    reuse_key: format!("smart-{ai_project_id}-{}", segment.candidate_id),
+                    composition: super::AiGeneratedAnimationComposition::Replace,
+                    replace_range: Some(super::AiGeneratedAnimationReplaceRange {
+                        start_ms: segment.source_start_ms,
+                        end_ms: segment.source_start_ms + span_ms,
+                    }),
+                    insert_binding: None,
+                };
+                // 结果本身已落库（`ai_generated_animation_assets`），界面直接查表即可。
+                // 单条失败不中断其余片段：转场是增强而非基础内容。
+                let _ = runner.generate(&task, &cancellation).await;
+            }
+        }
+
         self.repository
             .mark_smart_draft_review_ready(clip.project.id, clip.project.version)
             .map_err(repository_error)?;

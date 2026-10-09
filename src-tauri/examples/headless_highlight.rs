@@ -310,7 +310,7 @@ async fn generate_transition(
         return Err("第一个片段长度为 0，无法替换".into());
     }
 
-    let asset = produce_generated_transition(
+    let (asset, model) = produce_generated_transition(
         &client,
         &probe,
         repository,
@@ -338,7 +338,7 @@ async fn generate_transition(
     .map_err(|error| format!("{}: {error:?}", error.code()))?;
 
     println!(
-        "      模型产物已校验并落库：{}×{} {}fps {}ms sha256={}…",
+        "      模型产物已校验并落库（模型={model}）：{}×{} {}fps {}ms sha256={}…",
         asset.width.unwrap_or(0),
         asset.height.unwrap_or(0),
         asset.fps.unwrap_or(0),
