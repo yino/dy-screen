@@ -3251,7 +3251,28 @@ impl SmartClippingWorkflow {
             AiSmartStage::Transition,
             &transition_fingerprint,
         )?;
-        if transition_attempt.status != AiSmartStageAttemptStatus::Completed {
+        // **生成式转场替换素材库匹配**：注入了生成执行者时不再做模板匹配。
+        //
+        // 这是有意的取舍：素材库匹配是**免费**的（本地素材），生成是**按秒计费**的。
+        // 保留素材库代码路径（未删除）以便回退：去掉注入即恢复原行为。
+        if transition_attempt.status != AiSmartStageAttemptStatus::Completed
+            && self.generated_transition.is_some()
+        {
+            let started = Instant::now();
+            self.workflows
+                .finish_attempt(
+                    transition_attempt.id,
+                    transition_attempt.attempt_generation,
+                    AiSmartStageAttemptStatus::Completed,
+                    None,
+                    started.elapsed().as_millis() as u64,
+                    Some((
+                        "smart_transition_generated",
+                        "转场由 AI 生成，已跳过素材库匹配",
+                    )),
+                )
+                .map_err(repository_error)?;
+        } else if transition_attempt.status != AiSmartStageAttemptStatus::Completed {
             let started = Instant::now();
             match self
                 .transition
