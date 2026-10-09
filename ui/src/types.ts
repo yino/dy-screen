@@ -1254,6 +1254,8 @@ export interface ClientApi {
   cancelAiClipTransitionAgent?(clipProjectId: number): Promise<void>;
   correctAiClipText?(clipProjectId: number, expectedProjectVersion: number): Promise<ClipTextCorrectionSummary>;
   cancelAiClipTextCorrection?(clipProjectId: number): Promise<void>;
+  /** 生成式转场的审阅视图（可选：测试替身可省略）。 */
+  generatedAnimations?(clipProjectId: number): Promise<GeneratedAnimationView[]>;
   subscribeClipWorkflow?(listener: (progress: ClipWorkflowProgress) => void): Promise<() => void>;
   applyAiClipTransition?(boundaryId: number, assetKey: string | null, assetVersion: number | null, lockEmpty?: boolean): Promise<ClipTransitionBoundary>;
   unlockAiClipTransition?(boundaryId: number): Promise<ClipTransitionBoundary>;
@@ -1275,4 +1277,20 @@ export interface ProviderDiagnostic {
   ok: boolean;
   category: string;
   message: string;
+}
+
+/** 一段 AI 生成转场的审阅视图（后端 `ai_generated_animations`）。 */
+export interface GeneratedAnimationView {
+  id: number;
+  candidateId: number;
+  composition: "replace" | "insert";
+  status: string;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+  durationMs: number | null;
+  sha256Prefix: string | null;
+  rejectionCode: string | null;
+  /** 预览地址；文件缺失时为 null——界面据此显示"缺失"而不是假装有。 */
+  previewUrl: string | null;
 }

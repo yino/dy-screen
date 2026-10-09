@@ -65,7 +65,8 @@ pub struct MaterialAssetRegistry {
 }
 
 impl MaterialAssetRegistry {
-    fn insert(&self, token: String, path: PathBuf) -> Result<(), MaterialAssetFailure> {
+    /// 登记一个「令牌 → 文件」映射。界面拿到令牌后用 `transition-material://<令牌>` 取文件。
+    pub fn insert(&self, token: String, path: PathBuf) -> Result<(), MaterialAssetFailure> {
         self.paths
             .lock()
             .map_err(|_| MaterialAssetFailure::new("state_unavailable", "素材预览状态不可用"))?
@@ -361,6 +362,12 @@ impl TransitionMaterialAssetService {
             cancellation,
             registry,
         }
+    }
+
+    /// 素材文件注册表：生成资产的预览复用同一套令牌与 Range 服务，
+    /// 避免第二份实现出现行为或安全差异。
+    pub fn registry(&self) -> &MaterialAssetRegistry {
+        &self.registry
     }
 
     pub fn cache(&self) -> &TransitionMaterialCache {

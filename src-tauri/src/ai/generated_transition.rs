@@ -369,6 +369,27 @@ impl<T: GenerationTransport, P: MediaProbe> GeneratedTransitionRunner
     }
 }
 
+/// 生成资产文件的**约定路径**：`{cache_root}/generated-animations/animation-{id}.mp4`。
+///
+/// 与 `clip_export_sources` 用的是同一套推导，因此界面预览与导出看到的一定是同一个文件。
+pub fn generated_animation_path(cache_root: &Path, asset_id: i64) -> std::path::PathBuf {
+    cache_root
+        .join(GENERATED_ANIMATION_CACHE_DIR)
+        .join(generated_animation_file_name(asset_id))
+}
+
+/// 从 `generated-animation://<id>` 的请求路径里解析资产 id。
+///
+/// **只接受纯数字正整数**。这是安全边界：路径由约定推导，一旦允许任意片段，
+/// 这个接口就变成了任意文件读取。因此 `../`、绝对路径、带扩展名的输入一律拒绝。
+pub fn parse_generated_animation_request(path: &str) -> Option<i64> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    trimmed.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
 /// 标准 base64（含 `=` 填充）。手写以避免在 `--offline` 下新增依赖。
 pub fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
@@ -447,6 +468,37 @@ mod tests {
             plan_transition_action(None, 0, 0),
             TransitionAction::SkipBudgetExhausted
         );
+    }
+
+    /// 路径解析是**安全边界**：拒绝一切非"纯数字 id"的输入，
+    /// 否则 `generated-animation://` 会退化成任意文件读取。
+    #[test]
+    fn rejects_anything_that_is_not_a_plain_positive_id() {
+        assert_eq!(parse_generated_animation_request("/12"), Some(12));
+        assert_eq!(parse_generated_animation_request("7"), Some(7));
+        // 目录穿越
+        assert_eq!(parse_generated_animation_request("/../etc/passwd"), None);
+        assert_eq!(parse_generated_animation_request("/1/../../x"), None);
+        // 绝对路径与 URL 片段
+        assert_eq!(parse_generated_animation_request("/etc/passwd"), None);
+        assert_eq!(parse_generated_animation_request("/animation-1.mp4"), None);
+        // 空、零、负数、带符号、带空白
+        assert_eq!(parse_generated_animation_request("/"), None);
+        assert_eq!(parse_generated_animation_request("/0"), None);
+        assert_eq!(parse_generated_animation_request("/-1"), None);
+        assert_eq!(parse_generated_animation_request("/+1"), None);
+        assert_eq!(parse_generated_animation_request("/1%20"), None);
+    }
+
+    #[test]
+    fn derives_the_same_path_the_exporter_uses() {
+        let root = Path::new("/tmp/app-data");
+        let path = generated_animation_path(root, 3);
+        assert_eq!(
+            path,
+            Path::new("/tmp/app-data/generated-animations/animation-3.mp4")
+        );
+        assert!(path.to_string_lossy().ends_with(&generated_animation_file_name(3)));
     }
 
     #[test]

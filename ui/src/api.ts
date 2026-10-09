@@ -56,6 +56,7 @@ import type {
   TransitionMatchSummary,
   ClipTransitionBoundary,
   ClipWorkflowProgress,
+  GeneratedAnimationView,
 } from "./types";
 
 const defaultSettings: AppSettings = {
@@ -292,6 +293,9 @@ const tauriApi: ClientApi = {
     invoke("ai_correct_clip_text", { clipProjectId, expectedProjectVersion }),
   cancelAiClipTextCorrection: (clipProjectId) =>
     invoke<void>("ai_cancel_clip_text_correction", { clipProjectId }),
+  /** 生成式转场的审阅视图：让界面能看到"生成了什么"。 */
+  generatedAnimations: (clipProjectId: number) =>
+    invoke<GeneratedAnimationView[]>("ai_generated_animations", { clipProjectId }),
   subscribeClipWorkflow: async (listener) => {
     const unlisten = await listen<ClipWorkflowProgress>("ai-clip-workflow-event", (event) => {
       listener(event.payload);

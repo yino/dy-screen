@@ -651,6 +651,81 @@ fn get_activation_state(state: State<'_, AppState>) -> ActivationStateView {
     state.activation.state()
 }
 
+/// 生成式转场的审阅视图：让界面能看到"**生成了什么**"。
+///
+/// 产物本身早已落库并被导出消费，但此前界面上完全看不到它——这是"功能做了却
+/// 用不起来"的典型。这里把资产元数据与**预览地址**一起给出去。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedAnimationView {
+    id: i64,
+    candidate_id: i64,
+    composition: crate::ai::AiGeneratedAnimationComposition,
+    status: crate::ai::AiGeneratedAnimationStatus,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
+    duration_ms: Option<u64>,
+    /// 只给前 12 位：够核对完整性，不把整串哈希塞进界面。
+    sha256_prefix: Option<String>,
+    rejection_code: Option<String>,
+    /// 供 `<video>` 使用的预览地址；**文件缺失时为 `None`**（不假装有预览）。
+    preview_url: Option<String>,
+}
+
+#[tauri::command]
+async fn ai_generated_animations(
+    clip_project_id: i64,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<GeneratedAnimationView>, String> {
+    let repository = crate::ai::AiRepository::new(state.database.clone());
+    // 生成资产按 **AI 工程** 归属：必须先反查，不能直接拿合辑 id 去查。
+    let Some(ai_project_id) = repository
+        .ai_project_id_for_clip_project(clip_project_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Vec::new());
+    };
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let assets = repository
+        .list_generated_animation_assets(ai_project_id)
+        .map_err(|error| error.to_string())?;
+
+    let registry = state.transition_assets.registry();
+    let mut views = Vec::with_capacity(assets.len());
+    for asset in assets {
+        // 路径由约定推导，与导出取的是同一个文件。
+        let path = crate::ai::generated_animation_path(&app_data_dir, asset.id);
+        let preview_url = if path.is_file() {
+            let token = format!("generated-animation-{}", asset.id);
+            match registry.insert(token.clone(), path) {
+                Ok(()) => Some(format!("transition-material://{token}")),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        views.push(GeneratedAnimationView {
+            id: asset.id,
+            candidate_id: asset.candidate_id,
+            composition: asset.composition,
+            status: asset.status,
+            width: asset.width,
+            height: asset.height,
+            fps: asset.fps,
+            duration_ms: asset.duration_ms,
+            sha256_prefix: asset.sha256.map(|digest| digest.chars().take(12).collect()),
+            rejection_code: asset.rejection_code,
+            preview_url,
+        });
+    }
+    Ok(views)
+}
+
 #[tauri::command]
 fn get_transition_catalog_state(
     state: State<'_, AppState>,
@@ -1878,6 +1953,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_activation_state,
             get_transition_catalog_state,
+            ai_generated_animations,
             retry_transition_catalog_sync,
             list_transition_materials,
             request_transition_material_preview,

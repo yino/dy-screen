@@ -1555,6 +1555,24 @@ impl AiRepository {
         self.get_clip_project(project_id)
     }
 
+    /// 由合辑工程反查 **AI 工程 id**。
+    ///
+    /// 生成资产按 AI 工程归属（`clip_export_sources` 也是这么反查的），
+    /// 所以任何按工程查生成资产的地方都必须先过这一层，不能直接用合辑 id。
+    pub fn ai_project_id_for_clip_project(&self, clip_project_id: i64) -> Result<Option<i64>> {
+        let connection = self.database.connection()?;
+        Ok(connection
+            .query_row(
+                r#"SELECT run.project_id
+                   FROM ai_clip_projects project
+                   JOIN ai_highlight_runs run ON run.id = project.highlight_run_id
+                   WHERE project.id = ?1"#,
+                [clip_project_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
     /// 该合辑的**相邻片段边界**（先对账再返回，保证与当前片段一致）。
     ///
     /// 转场的合成方式是 `insert`（两段之间的桥接），所以需要 `boundary_id` 与左右
