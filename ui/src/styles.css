@@ -1702,3 +1702,13 @@ input[type="checkbox"]:checked::after { transform: translateX(15px); }
 :root[data-theme="dark"] .one-click-track li.blocked { color: #e4c98c; background: #332b1b; }
 :root[data-theme="dark"] .one-click-result { border-color: #34463e; }
 :root[data-theme="dark"] .one-click-result-meta p:not(.section-kicker) { color: #9ba9a2; }
+
+/* 生成转场的预览视频：限宽并保持块级，避免撑破审阅栏 */
+.clip-review-preview {
+  display: block;
+  width: 100%;
+  max-width: 320px;
+  margin-top: 8px;
+  border-radius: 6px;
+  background: #000;
+}

@@ -1562,6 +1562,74 @@ describe("AiWorkspace", () => {
     expect(screen.queryByText(/https:\/\//)).toBeNull();
   });
 
+  it("在审阅栏展示 AI 生成转场：合成方式、规格、校验状态与预览", async () => {
+    const { api, clip } = createKeyboardClipFixture();
+    api.matchAiClipTransitions = vi.fn().mockResolvedValue({
+      runId: 44,
+      threshold: 8,
+      matched: 1,
+      autoApplied: 0,
+      suggestions: 1,
+      noneSuggestions: 0,
+      tokenUsage: 120,
+      boundaries: [],
+    });
+    api.generatedAnimations = vi.fn().mockResolvedValue([
+      {
+        id: 7,
+        candidateId: 413,
+        composition: "insert",
+        status: "validated",
+        width: 640,
+        height: 640,
+        fps: 30,
+        durationMs: 2000,
+        sha256Prefix: "ba9cb65b6381",
+        rejectionCode: null,
+        previewUrl: "transition-material://generated-animation-7",
+      },
+      {
+        id: 8,
+        candidateId: 414,
+        composition: "replace",
+        status: "rejected",
+        width: null,
+        height: null,
+        fps: null,
+        durationMs: null,
+        sha256Prefix: null,
+        rejectionCode: "generated_asset_duration_mismatch",
+        previewUrl: null,
+      },
+    ]);
+    const { user } = await openKeyboardClipEditor(api);
+
+    await user.click(screen.getByRole("button", { name: "一键 Agent" }));
+    await waitFor(() => expect(api.matchAiClipTransitions).toHaveBeenCalledWith(clip.project.id, null));
+    await user.click(await screen.findByRole("button", { name: "生成转场结果" }));
+    // 查的是**合辑工程** id（命令内部再反查 AI 工程）。
+    await waitFor(() => expect(api.generatedAnimations).toHaveBeenCalledWith(741));
+    expect(screen.getByRole("button", { name: "生成转场结果" })).toHaveAttribute("aria-pressed", "true");
+
+    // 边界转场：合成方式、规格与校验状态都可见。
+    expect(await screen.findByText(/边界转场/)).toBeInTheDocument();
+    expect(screen.getByText(/640×640/)).toBeInTheDocument();
+    expect(screen.getByText(/2\.0 秒/)).toBeInTheDocument();
+    expect(screen.getByText("已通过校验")).toBeInTheDocument();
+    expect(screen.getByText(/sha256 ba9cb65b6381/)).toBeInTheDocument();
+    // 可预览的产物给出视频地址（限定在本行内，避免选中界面上其它 <video>）。
+    const previewRow = screen.getByLabelText("生成转场 7：边界转场");
+    expect(previewRow.querySelector("video")?.getAttribute("src"))
+      .toBe("transition-material://generated-animation-7");
+    // 缺失文件的那条不应带 <video>。
+    const missingRow = screen.getByLabelText("生成转场 8：片段替换");
+    expect(missingRow.querySelector("video")).toBeNull();
+
+    // 拒收项显示原因；**文件缺失时明确说无法预览，不假装有**。
+    expect(screen.getByText(/已拒收（generated_asset_duration_mismatch）/)).toBeInTheDocument();
+    expect(screen.getByText("产物文件缺失，无法预览")).toBeInTheDocument();
+  });
+
   it("从转场素材预览定位纠错字幕后继续推进播放头和逐字字幕", async () => {
     const { api, clip } = createKeyboardClipFixture();
     const correctedText = "快捷键输入已保护。";

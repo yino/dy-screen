@@ -85,6 +85,7 @@ import type {
   ClipTextCorrectionSummary,
   ClipWorkflowProgress,
   TransitionMatchSummary,
+  GeneratedAnimationView,
 } from "./types";
 import { SearchableCombobox, type SearchableComboboxOption } from "./SearchableCombobox";
 import { recoverSmartWorkflows, type SmartWorkflowSnapshot } from "./smartWorkflowRecovery";
@@ -2059,7 +2060,7 @@ type ClipMaterialFilter = "all" | "video" | "animation" | "transition";
 type ClipPropertyMode = "segment" | "transition" | "subtitle";
 type ClipSubtitleScope = "current" | "all";
 type ClipSubtitleSaveState = "saved" | "unsaved" | "saving" | "failed" | "conflict";
-type WorkflowReviewMode = "agent" | "textCorrection" | "enhancement";
+type WorkflowReviewMode = "agent" | "textCorrection" | "enhancement" | "generatedTransition";
 type AgentReviewFilter = "all" | "applied" | "suggestion" | "none";
 type AgentReviewStatus = Exclude<AgentReviewFilter, "all">;
 
@@ -2134,6 +2135,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reviewMode, setReviewMode] = useState<WorkflowReviewMode>("agent");
   const [enhancementReview, setEnhancementReview] = useState<AiEnhancementReviewItem[]>([]);
+  const [generatedTransitionReview, setGeneratedTransitionReview] = useState<GeneratedAnimationView[]>([]);
   const [agentReviewFilter, setAgentReviewFilter] = useState<AgentReviewFilter>("all");
   const [videoMaterials, setVideoMaterials] = useState<AiHighlightCandidate[]>([]);
   const [loadingVideoMaterials, setLoadingVideoMaterials] = useState(false);
@@ -2624,6 +2626,20 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
   };
 
   /** 打开按高光的增强审阅（步骤 4 任务 9.1）。进行中的高光不会阻塞已就绪结果。 */
+  /** 打开"生成转场"审阅：让界面能看到 AI 到底生成了什么。 */
+  const openGeneratedTransitionReview = async () => {
+    setReviewMode("generatedTransition");
+    setReviewOpen(true);
+    if (api.generatedAnimations) {
+      try {
+        setGeneratedTransitionReview(await api.generatedAnimations(detail.project.id));
+      } catch {
+        setGeneratedTransitionReview([]);
+      }
+    }
+    window.requestAnimationFrame(() => propertiesRef.current?.focus());
+  };
+
   const openEnhancementReview = async () => {
     setReviewMode("enhancement");
     setReviewOpen(true);
@@ -3496,6 +3512,7 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
             <button aria-label="Agent 结果" disabled={!agentReview} aria-pressed={reviewMode === "agent"} className={reviewMode === "agent" ? "active" : ""} onClick={() => openAgentReview()}>Agent{agentReview && <span>{agentReviewBoundaries.length}</span>}</button>
             <button aria-label="文本纠错结果" disabled={!textCorrectionReview} aria-pressed={reviewMode === "textCorrection"} className={reviewMode === "textCorrection" ? "active" : ""} onClick={() => openTextCorrectionReview()}>文本纠错{textCorrectionReview && <span>{textCorrectionReview.changes.length}</span>}</button>
             <button aria-label="增强结果" aria-pressed={reviewMode === "enhancement"} className={reviewMode === "enhancement" ? "active" : ""} onClick={() => void openEnhancementReview()}>增强{enhancementReview.length > 0 && <span>{enhancementReview.length}</span>}</button>
+            <button aria-label="生成转场结果" aria-pressed={reviewMode === "generatedTransition"} className={reviewMode === "generatedTransition" ? "active" : ""} onClick={() => void openGeneratedTransitionReview()}>生成转场{generatedTransitionReview.length > 0 && <span>{generatedTransitionReview.length}</span>}</button>
           </nav>
         </> : <>
           <header className="clip-property-header">
@@ -3624,6 +3641,31 @@ export function ClipEditor({ api, initial, projectId, llmSettings, onBack, backL
                 </article>;
               })}
               {enhancementReview.length === 0 && <p className="clip-review-empty">本次还没有增强结果</p>}
+            </div>
+          </> : reviewMode === "generatedTransition" ? <>
+            <div className="clip-review-list">
+              {generatedTransitionReview.map((item) => {
+                const compositionLabel = item.composition === "insert" ? "边界转场" : "片段替换";
+                const statusLabel = item.status === "validated"
+                  ? "已通过校验"
+                  : item.rejectionCode
+                    ? `已拒收（${item.rejectionCode}）`
+                    : item.status;
+                const sizeLabel = item.width && item.height ? `${item.width}×${item.height}` : "—";
+                const durationLabel = item.durationMs ? `${(item.durationMs / 1000).toFixed(1)} 秒` : "—";
+                return <article className="clip-review-row" key={item.id} aria-label={`生成转场 ${item.id}：${compositionLabel}`}>
+                  <div className="clip-review-row-main">
+                    <strong>转场 #{item.id}</strong>
+                    <small>{compositionLabel} · {sizeLabel} · {durationLabel} · {item.fps ?? "—"}fps</small>
+                    <b>{statusLabel}</b>
+                  </div>
+                  {item.sha256Prefix && <small>sha256 {item.sha256Prefix}…</small>}
+                  {item.previewUrl
+                    ? <video src={item.previewUrl} controls muted loop playsInline className="clip-review-preview" />
+                    : <p className="clip-review-empty">产物文件缺失，无法预览</p>}
+                </article>;
+              })}
+              {generatedTransitionReview.length === 0 && <p className="clip-review-empty">本次还没有生成转场（可在设置里开启「用 AI 生成转场」）</p>}
             </div>
           </> : <p className="clip-review-empty">本次会话还没有可审阅的 AI 结果</p>}
         </div> : propertyMode === "segment" ? <div className="clip-property-panel">
