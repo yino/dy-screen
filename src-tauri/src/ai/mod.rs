@@ -62,7 +62,7 @@ pub use transcript_text_correction::{
     TranscriptCorrectionSummary, TranscriptCorrectionTarget, TranscriptTextCorrectionWorkflow,
 };
 pub use generated_transition::{
-    GeneratedTransitionFailure, GeneratedTransitionOutcome, GeneratedTransitionRequest,
+    GeneratedTransitionFailure, GenerationPoll, GeneratedTransitionOutcome, GeneratedTransitionRequest,
     GeneratedTransitionRunner, GeneratedTransitionTask, TransitionAction, WanGeneratedTransitionRunner,
     base64_encode, data_uri, generated_animation_path, parse_generated_animation_request,
     plan_transition_action, produce_generated_transition,

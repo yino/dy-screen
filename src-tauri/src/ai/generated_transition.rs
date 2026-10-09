@@ -25,6 +25,25 @@ use super::generated_asset::{
 use super::repository::AiRepository;
 use super::wan_generation::{GenerationClient, GenerationTransport};
 
+/// 异步任务的轮询配置。
+///
+/// 上游建议 15 秒轮询一次；但**测试不能等 15 秒**——把它做成可注入的，
+/// 生产用默认值、测试用毫秒级，否则流程测试会因等待超时而失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationPoll {
+    pub interval: std::time::Duration,
+    pub max_attempts: u32,
+}
+
+impl Default for GenerationPoll {
+    fn default() -> Self {
+        Self {
+            interval: std::time::Duration::from_secs(15),
+            max_attempts: 40,
+        }
+    }
+}
+
 /// 一次生成式转场的输入。
 #[derive(Debug, Clone)]
 pub struct GeneratedTransitionRequest {
@@ -72,6 +91,7 @@ pub async fn produce_generated_transition<T: GenerationTransport, P: MediaProbe>
     repository: &AiRepository,
     cache_root: &Path,
     token: &str,
+    poll: GenerationPoll,
     request: GeneratedTransitionRequest,
 ) -> Result<(AiGeneratedAnimationAsset, String), GeneratedTransitionFailure> {
     let cache_dir = cache_root.join(GENERATED_ANIMATION_CACHE_DIR);
@@ -86,7 +106,7 @@ pub async fn produce_generated_transition<T: GenerationTransport, P: MediaProbe>
 
     // ── ① 参考图 ──
     let image = client
-        .generate_image(token, &request.image_prompt)
+        .generate_image_with_poll(token, &request.image_prompt, poll.interval, poll.max_attempts)
         .await
         .map_err(|(model, failure)| GeneratedTransitionFailure::Image {
             code: "generated_transition_image_upstream".to_owned(),
@@ -115,7 +135,13 @@ pub async fn produce_generated_transition<T: GenerationTransport, P: MediaProbe>
     // ── ② 视频 ──
     let duration_ms = u64::from(client.config().video_duration_seconds) * 1_000;
     let video = client
-        .generate_video(token, &request.video_prompt, &first_frame)
+        .generate_video_with_poll(
+            token,
+            &request.video_prompt,
+            &first_frame,
+            poll.interval,
+            poll.max_attempts,
+        )
         .await
         .map_err(|(model, failure)| GeneratedTransitionFailure::Video {
             code: "generated_transition_video_upstream".to_owned(),
@@ -254,6 +280,7 @@ pub struct WanGeneratedTransitionRunner<T: GenerationTransport, P: MediaProbe> {
     cache_root: std::path::PathBuf,
     model_call: std::sync::Arc<super::ModelCallRuntime>,
     max_per_run: usize,
+    poll: GenerationPoll,
     generated: std::sync::Mutex<usize>,
 }
 
@@ -273,8 +300,15 @@ impl<T: GenerationTransport, P: MediaProbe> WanGeneratedTransitionRunner<T, P> {
             cache_root,
             model_call,
             max_per_run,
+            poll: GenerationPoll::default(),
             generated: std::sync::Mutex::new(0),
         }
+    }
+
+    /// 覆盖轮询配置（**测试用毫秒级**，避免等待生产默认的 15 秒）。
+    pub fn with_poll(mut self, poll: GenerationPoll) -> Self {
+        self.poll = poll;
+        self
     }
 
     /// 本次运行已真实生成的条数（用于汇报与诊断）。
@@ -337,6 +371,7 @@ impl<T: GenerationTransport, P: MediaProbe> GeneratedTransitionRunner
             &self.repository,
             &self.cache_root,
             &lease.token,
+            self.poll,
             GeneratedTransitionRequest {
                 project_id: task.project_id,
                 candidate_id: task.candidate_id,

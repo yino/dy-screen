@@ -322,6 +322,7 @@ async fn generate_transition(
         repository,
         app_data_dir,
         &lease.token,
+        dy_screen_app_lib::ai::GenerationPoll::default(),
         GeneratedTransitionRequest {
             // 必须是 AI 工程 id，不是合辑工程 id（见上方易错点）。
             project_id: ai_project_id,

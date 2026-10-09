@@ -21,6 +21,7 @@ use dy_screen_app_lib::ai::{
     TransitionAgentProvider, TransitionAgentRequest, TransitionScoreOutput, TransitionScoreRequest,
     TrustedLocalFile,
     AiGeneratedAnimationStatus, GENERATED_ANIMATION_CACHE_DIR, GenerationClient, GenerationConfig, GenerationTransport, MediaProbe, ProbedMedia, WanGeneratedTransitionRunner, generated_animation_file_name,
+    GenerationPoll,
 };
 use dy_screen_app_lib::ai::{AiEnvironmentCheckView, AiSmartWorkflowEvent};
 use dy_screen_app_lib::ai::{LlmTokenLease, LlmTokenSource, ModelCallHandle, ModelCallRuntime};
@@ -303,6 +304,11 @@ struct CompletingController {
     repository: AiRepository,
     enqueue_count: AtomicUsize,
     cancel_count: AtomicUsize,
+    /// 每个输入伪造多少个转写句段。
+    ///
+    /// 必须是可配置的：**1 个句段 → 1 个候选 → 1 个片段 → 0 个边界**，
+    /// 而"边界"正是生成式转场的落点。写死 1 会让生成循环永远不被执行。
+    segments_per_input: usize,
 }
 
 #[async_trait]
@@ -334,15 +340,22 @@ impl AiJobController for CompletingController {
             self.repository
                 .publish_artifact(
                     artifact.id,
-                    30_000,
+                    // N=1 时保持原来的 30 秒，避免影响既有断言；多句段时才放大。
+                    (30_000_u64).max(1_000 + self.segments_per_input as u64 * 21_000),
                     Some("zh"),
-                    &[TranscriptSegmentDraft {
-                        source_start_ms: 1_000,
-                        source_end_ms: 21_000,
-                        raw_text: "这是一段足够长的测试精彩字幕".to_owned(),
-                        normalized_text: "这是一段足够长的测试精彩字幕。".to_owned(),
-                        confidence: Some(0.95),
-                    }],
+                    &(0..self.segments_per_input)
+                        .map(|index| {
+                            // **不重叠**：段间留 1 秒间隙，否则会被判为非法句段。
+                            let start = 1_000 + index as u64 * 21_000;
+                            TranscriptSegmentDraft {
+                                source_start_ms: start,
+                                source_end_ms: start + 20_000,
+                                raw_text: "这是一段足够长的测试精彩字幕".to_owned(),
+                                normalized_text: "这是一段足够长的测试精彩字幕。".to_owned(),
+                                confidence: Some(0.95),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                 )
                 .unwrap();
             self.repository
@@ -1201,6 +1214,7 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
         repository: repository.clone(),
         enqueue_count: AtomicUsize::new(0),
         cancel_count: AtomicUsize::new(0),
+        segments_per_input: 1,
     });
     let project_service = AiProjectService::new(
         database.clone(),
@@ -1475,6 +1489,7 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         repository: repository.clone(),
         enqueue_count: AtomicUsize::new(0),
         cancel_count: AtomicUsize::new(0),
+        segments_per_input: 2,
     });
     let project_service = AiProjectService::new(
         database.clone(),
@@ -1517,7 +1532,12 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         generation_cache_root.clone(),
         test_model_call(&database),
         4,
-    ));
+    )
+    // 生产默认 15 秒轮询；测试用毫秒级，否则流程测试会因等待超时失败。
+    .with_poll(GenerationPoll {
+        interval: std::time::Duration::from_millis(1),
+        max_attempts: 3,
+    }));
     let workflow = SmartClippingWorkflow::new(
         database.clone(),
         project_service.clone(),
@@ -1598,19 +1618,14 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         let assets = repository
             .list_generated_animation_assets(ai_project_id)
             .unwrap();
-        // 已知覆盖缺口（**未解决**）：本用例由 `CompletingController` 伪造 ASR，
-        // 只产生 **1 个转写句段 → 1 个片段 → 0 个边界**，因此下面这个循环的
-        // "有边界"分支**从未被执行**。要真正覆盖生成循环，需要在该用例里
-        // 播种 ≥2 个转写句段（或另建一个多句段用例）。
-        //
-        // 在没有边界的当下，仍然断言一件真实的事：**不得产生任何产物**——
-        // 为不存在的位置花上游的钱是明确的错误。
-        if boundaries == 0 {
-            assert!(
-                assets.is_empty(),
-                "没有边界的工程不得产生生成产物（那是为不存在的位置花钱）"
-            );
-        } else {
+        // **必须**有边界：`CompletingController` 现在按 `segments_per_input` 伪造
+        // 多个句段，本用例设为 2 → 2 个候选 → 2 个片段 → 1 个边界。
+        // 没有边界就意味着生成循环根本没被执行，而"没执行"的断言是空的。
+        assert!(
+            boundaries > 0,
+            "本用例必须出现片段边界才能覆盖生成循环；boundaries={boundaries}"
+        );
+        {
             assert_eq!(assets.len(), boundaries, "每个活跃边界都应有产物");
             for asset in &assets {
                 assert_eq!(
@@ -1761,6 +1776,7 @@ async fn replay_directory_and_finite_workflow_freeze_the_complete_session() {
         repository: repository.clone(),
         enqueue_count: AtomicUsize::new(0),
         cancel_count: AtomicUsize::new(0),
+        segments_per_input: 1,
     });
     let project_service = AiProjectService::new(
         database.clone(),
@@ -2055,6 +2071,7 @@ async fn live_batch_failure_does_not_stop_later_batches_and_retry_is_local() {
         repository: repository.clone(),
         enqueue_count: AtomicUsize::new(0),
         cancel_count: AtomicUsize::new(0),
+        segments_per_input: 1,
     });
     let project_service = AiProjectService::new(
         database.clone(),
@@ -2256,6 +2273,7 @@ async fn run_live_workflow_end_to_end() {
         repository: repository.clone(),
         enqueue_count: AtomicUsize::new(0),
         cancel_count: AtomicUsize::new(0),
+        segments_per_input: 1,
     });
     let project_service = AiProjectService::new(
         database.clone(),
