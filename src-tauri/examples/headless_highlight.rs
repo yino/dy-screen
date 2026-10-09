@@ -16,6 +16,8 @@
 //! - `HEADLESS_SKIP_HIGHLIGHT=1`：复用已有的精彩结果，只跑合辑/纠错/导出。
 //! - `HEADLESS_CANCEL_AFTER_MS=N`：N 毫秒后取消，用于验证取消路径。
 //! - `HEADLESS_TRANSCRIPT_CORRECTION=1`：在拼合辑前先做**转写层**文案纠正（片段级前置）。
+//! - `HEADLESS_GENERATE_TRANSITION=1`：导出前为第一个片段**真实生成**一段转场
+//!   （消耗付费额度或免费额度），用于验证生成产物确实进入导出计划。
 //!
 //! 前置：工程必须已完成语音识别（`ai_project_inputs.status = 'completed'`）。
 //! 敏感信息：本程序不打印 token、凭据或上游原始响应正文。
@@ -25,7 +27,11 @@ use std::sync::Arc;
 
 use dy_screen_app_lib::activation::ActivationService;
 use dy_screen_app_lib::ai::{
-    ActivationLlmTokenSource, AiRepository, ClipOutputDimensions, ClipTextCorrectionWorkflow,
+    generated_animation_file_name,
+    ActivationLlmTokenSource, AiGeneratedAnimationComposition, AiGeneratedAnimationReplaceRange,
+    AiRepository, ClipOutputDimensions, ClipTextCorrectionWorkflow, FfprobeMediaProbe,
+    GeneratedTransitionRequest, GenerationClient, GenerationConfig, ReqwestTransport,
+    produce_generated_transition,
     HighlightWorkflow, ModelCallRuntime, RigDeepSeekProvider, build_export_plan, execute_export,
     TranscriptTextCorrectionWorkflow, probe_output_dimensions, render_clip_subtitle_assets,
     select_clip_video_encoder, shift_subtitles_for_inserts,
@@ -242,20 +248,137 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    export_clip(&repository, &app_data_dir, detail.project.id, &destination).await
+    if std::env::var_os("HEADLESS_GENERATE_TRANSITION").is_some() {
+        println!("[5.5/6] 生成真实转场（消耗额度）");
+        match generate_transition(&repository, &app_data_dir, project_id, detail.project.id, &model_call).await {
+            Ok(asset_id) => println!("      生成资产 id={asset_id} 已进入工程"),
+            Err(error) => println!("      ⚠️ 生成转场失败（不阻塞导出）：{error}"),
+        }
+    }
+
+    export_clip(
+        &repository,
+        &app_data_dir,
+        project_id,
+        detail.project.id,
+        &destination,
+    )
+    .await
+}
+
+/// 为第一个片段生成一段真实转场，并按 `replace` 合成落库。
+///
+/// 走的是产品自身的 `produce_generated_transition`：生成→下载→校验→落库→改名到
+/// `generated_animation_file_name(id)`。之后 `clip_export_sources` 会自动消费它，
+/// 因此本函数**不需要**改导出链路。
+///
+/// **易错点**：`AiClipProjectDetail.project` 是**合辑工程**，不是 AI 工程。
+/// 生成资产的 `project_id` 必须是 **AI 工程 id**——`clip_export_sources` 会从
+/// 合辑的 `highlight_run_id` 反查 AI 工程再按它取资产。传错就会"资产落库了、
+/// 却永远匹配不上导出计划"，而且**导出照样成功**，只是没有转场。
+async fn generate_transition(
+    repository: &AiRepository,
+    app_data_dir: &Path,
+    ai_project_id: i64,
+    clip_project_id: i64,
+    model_call: &Arc<ModelCallRuntime>,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let detail = repository.get_clip_project(clip_project_id)?;
+    let segment = detail
+        .segments
+        .first()
+        .ok_or("工程没有片段，无法生成转场")?;
+    let run = repository
+        .latest_highlight_run_for_project(ai_project_id)?
+        .ok_or("找不到精彩分析运行")?;
+
+    let lease = model_call
+        .acquire_token(chrono::Utc::now().timestamp())
+        .await?;
+    let probe = FfprobeMediaProbe {
+        ffprobe_path: PathBuf::from("/opt/homebrew/bin/ffprobe"),
+    };
+    let client = GenerationClient::new(ReqwestTransport::default(), GenerationConfig::default());
+
+    // 时长取"配置的 2 秒"与"片段可用长度"的较小值，避免 replace 区间超出片段。
+    let config_seconds = u64::from(client.config().video_duration_seconds);
+    let available = segment
+        .source_end_ms
+        .saturating_sub(segment.source_start_ms);
+    let span_ms = (config_seconds * 1_000).min(available);
+    if span_ms == 0 {
+        return Err("第一个片段长度为 0，无法替换".into());
+    }
+
+    let asset = produce_generated_transition(
+        &client,
+        &probe,
+        repository,
+        app_data_dir,
+        &lease.token,
+        GeneratedTransitionRequest {
+            // 必须是 AI 工程 id，不是合辑工程 id（见上方易错点）。
+            project_id: ai_project_id,
+            candidate_id: segment.candidate_id,
+            highlight_run_id: Some(run.id),
+            generation: 1,
+            composition: AiGeneratedAnimationComposition::Replace,
+            replace_range: Some(AiGeneratedAnimationReplaceRange {
+                start_ms: segment.source_start_ms,
+                end_ms: segment.source_start_ms + span_ms,
+            }),
+            insert_binding: None,
+            // 稳定复用键：同一高光重复运行只应产生一代资产。
+            reuse_key: format!("headless-transition-{ai_project_id}-{}", segment.candidate_id),
+            image_prompt: format!("{}，写实摄影风格，自然光，电影质感", segment.title),
+            video_prompt: "镜头缓慢推近，温暖的自然光，画面稳定".to_owned(),
+        },
+    )
+    .await
+    .map_err(|error| format!("{}: {error:?}", error.code()))?;
+
+    println!(
+        "      模型产物已校验并落库：{}×{} {}fps {}ms sha256={}…",
+        asset.width.unwrap_or(0),
+        asset.height.unwrap_or(0),
+        asset.fps.unwrap_or(0),
+        asset.duration_ms.unwrap_or(0),
+        asset
+            .sha256
+            .as_deref()
+            .map(|digest| &digest[..12])
+            .unwrap_or("无")
+    );
+    Ok(asset.id)
 }
 
 /// 渲染字幕并导出 MP4，复用产品自身的导出链路。
 async fn export_clip(
     repository: &AiRepository,
     app_data_dir: &Path,
+    ai_project_id: i64,
     clip_project_id: i64,
     destination: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("[6/6] 渲染字幕并导出 MP4");
-    let generated_root = app_data_dir.join("generated-animations");
+    // 注意：`clip_export_sources` **自己**会再拼一层 `GENERATED_ANIMATION_CACHE_DIR`，
+    // 所以这里必须传数据目录本身，传 `.../generated-animations` 会变成双层嵌套、
+    // 导致"资产已落盘但导出找不到文件"。
+    let generated_root = app_data_dir.to_path_buf();
     let sources = repository.clip_export_sources(clip_project_id, &generated_root)?;
     println!("      导出来源 {} 段", sources.len());
+    // 诊断：生成资产必须**真的出现在导出源里**，否则"导出成功"只是普通成片。
+    for (index, source) in sources.iter().enumerate() {
+        if let Some(replace) = source.replace.as_ref() {
+            println!(
+                "      片段[{index}] replace {}-{}ms（生成画面覆盖该区间）",
+                replace.start_ms, replace.end_ms
+            );
+        }
+        if let Some(insert) = source.insert_after.as_ref() {
+            println!("      片段[{index}] insert_after {}ms", insert.duration_ms);
+        }
+    }
     let detail = repository.get_clip_project(clip_project_id)?;
 
     let ffmpeg = PathBuf::from("/opt/homebrew/bin/ffmpeg");
@@ -296,6 +419,29 @@ async fn export_clip(
         assets.manifest_path(),
         encoder,
     )?;
+    let joined = plan.arguments.join(" ");
+    let animations = repository
+        .list_generated_animation_assets(ai_project_id)
+        .unwrap_or_default();
+    println!("      工程内生成资产 {} 条", animations.len());
+    for animation in &animations {
+        let name = generated_animation_file_name(animation.id);
+        println!(
+            "      资产 id={} {}×{} {}ms 是否出现在 FFmpeg 参数：{}",
+            animation.id,
+            animation.width.unwrap_or(0),
+            animation.height.unwrap_or(0),
+            animation.duration_ms.unwrap_or(0),
+            joined.contains(&name)
+        );
+    }
+    if std::env::var_os("HEADLESS_DUMP_PLAN").is_some() {
+        println!("      --- FFmpeg 参数 ---");
+        for (index, argument) in plan.arguments.iter().enumerate() {
+            println!("      [{index}] {argument}");
+        }
+        println!("      --- 结束 ---");
+    }
     let produced = execute_export(&ffmpeg, plan, CancellationToken::new(), |_| {}).await?;
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
