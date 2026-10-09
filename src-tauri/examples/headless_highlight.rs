@@ -28,7 +28,8 @@ use std::sync::Arc;
 use dy_screen_app_lib::activation::ActivationService;
 use dy_screen_app_lib::ai::{
     generated_animation_file_name,
-    ActivationLlmTokenSource, AiGeneratedAnimationComposition, AiGeneratedAnimationReplaceRange,
+    ActivationLlmTokenSource, AiGeneratedAnimationComposition,
+    AiGeneratedAnimationInsertBinding,
     AiRepository, ClipOutputDimensions, ClipTextCorrectionWorkflow, FfprobeMediaProbe,
     GeneratedTransitionRequest, GenerationClient, GenerationConfig, ReqwestTransport,
     produce_generated_transition,
@@ -284,10 +285,25 @@ async fn generate_transition(
     model_call: &Arc<ModelCallRuntime>,
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let detail = repository.get_clip_project(clip_project_id)?;
+    // 与产品路径一致：转场是**边界插入**（两段之间的桥接），不是片段内容替换。
+    let boundaries = repository.clip_transition_boundaries(clip_project_id)?;
+    let boundary = boundaries
+        .iter()
+        .find(|boundary| boundary.active)
+        .ok_or("工程没有相邻片段边界，无法生成转场（需要至少 2 个片段）")?;
+    let (left, right) = (
+        boundary
+            .left_clip_segment_id
+            .ok_or("边界缺少左侧片段")?,
+        boundary
+            .right_clip_segment_id
+            .ok_or("边界缺少右侧片段")?,
+    );
     let segment = detail
         .segments
-        .first()
-        .ok_or("工程没有片段，无法生成转场")?;
+        .iter()
+        .find(|segment| segment.id == left)
+        .ok_or("边界左侧片段不在工程内")?;
     let run = repository
         .latest_highlight_run_for_project(ai_project_id)?
         .ok_or("找不到精彩分析运行")?;
@@ -299,16 +315,6 @@ async fn generate_transition(
         ffprobe_path: PathBuf::from("/opt/homebrew/bin/ffprobe"),
     };
     let client = GenerationClient::new(ReqwestTransport::default(), GenerationConfig::default());
-
-    // 时长取"配置的 2 秒"与"片段可用长度"的较小值，避免 replace 区间超出片段。
-    let config_seconds = u64::from(client.config().video_duration_seconds);
-    let available = segment
-        .source_end_ms
-        .saturating_sub(segment.source_start_ms);
-    let span_ms = (config_seconds * 1_000).min(available);
-    if span_ms == 0 {
-        return Err("第一个片段长度为 0，无法替换".into());
-    }
 
     let (asset, model) = produce_generated_transition(
         &client,
@@ -322,14 +328,15 @@ async fn generate_transition(
             candidate_id: segment.candidate_id,
             highlight_run_id: Some(run.id),
             generation: 1,
-            composition: AiGeneratedAnimationComposition::Replace,
-            replace_range: Some(AiGeneratedAnimationReplaceRange {
-                start_ms: segment.source_start_ms,
-                end_ms: segment.source_start_ms + span_ms,
+            composition: AiGeneratedAnimationComposition::Insert,
+            replace_range: None,
+            insert_binding: Some(AiGeneratedAnimationInsertBinding {
+                left_segment_id: left,
+                right_segment_id: right,
+                boundary_id: boundary.id,
             }),
-            insert_binding: None,
-            // 稳定复用键：同一高光重复运行只应产生一代资产。
-            reuse_key: format!("headless-transition-{ai_project_id}-{}", segment.candidate_id),
+            // 稳定复用键：同一边界重复运行只应产生一代资产（不重复计费）。
+            reuse_key: format!("headless-boundary-{}-{}", ai_project_id, boundary.id),
             image_prompt: format!("{}，写实摄影风格，自然光，电影质感", segment.title),
             video_prompt: "镜头缓慢推近，温暖的自然光，画面稳定".to_owned(),
         },

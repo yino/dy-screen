@@ -20,6 +20,7 @@ use dy_screen_app_lib::ai::{
     SubtitleCorrectionRequest, TranscriptSegmentDraft, TransitionAgentOutput,
     TransitionAgentProvider, TransitionAgentRequest, TransitionScoreOutput, TransitionScoreRequest,
     TrustedLocalFile,
+    AiGeneratedAnimationStatus, GENERATED_ANIMATION_CACHE_DIR, GenerationClient, GenerationConfig, GenerationTransport, MediaProbe, ProbedMedia, WanGeneratedTransitionRunner, generated_animation_file_name,
 };
 use dy_screen_app_lib::ai::{AiEnvironmentCheckView, AiSmartWorkflowEvent};
 use dy_screen_app_lib::ai::{LlmTokenLease, LlmTokenSource, ModelCallHandle, ModelCallRuntime};
@@ -1327,6 +1328,86 @@ async fn enhancement_stage_runs_after_review_ready_without_blocking_the_draft() 
 }
 
 /// 测试用增强执行者：记录调用次数并总是成功。
+/// 假传输：**不触网**，按 URL 返回预设响应；下载返回固定字节。
+///
+/// 用它配**真实执行者**，可以完整走通"生成 → 下载 → 校验 → 落库 → 改名"，
+/// 而不产生任何上游费用。
+struct FakeGenerationTransport;
+
+#[async_trait::async_trait]
+impl GenerationTransport for FakeGenerationTransport {
+    async fn post(
+        &self,
+        url: &str,
+        _token: &str,
+        _asynchronous: bool,
+        _body: &serde_json::Value,
+    ) -> Result<(u16, String), String> {
+        if url.ends_with("multimodal-generation/generation") {
+            // 同步多模态图像路径：直接返回图片地址。
+            return Ok((
+                200,
+                serde_json::json!({
+                    "output": { "choices": [ { "message": { "content": [
+                        { "image": "https://fake/reference.png", "type": "image" }
+                    ] } } ] },
+                    "usage": { "image_count": 1 }
+                })
+                .to_string(),
+            ));
+        }
+        // 异步视频路径：返回 task_id。
+        Ok((
+            200,
+            serde_json::json!({ "output": { "task_id": "task-fake", "task_status": "PENDING" } })
+                .to_string(),
+        ))
+    }
+
+    async fn get(&self, _url: &str, _token: &str) -> Result<(u16, String), String> {
+        Ok((
+            200,
+            serde_json::json!({ "output": {
+                "task_status": "SUCCEEDED",
+                "video_url": "https://fake/transition.mp4"
+            } })
+            .to_string(),
+        ))
+    }
+
+    async fn download(&self, url: &str) -> Result<Vec<u8>, String> {
+        Ok(if url.ends_with(".png") {
+            vec![1, 2, 3, 4]
+        } else {
+            vec![5, 6, 7, 8]
+        })
+    }
+}
+
+/// 假探测：按扩展名区分参考图与转场视频，返回**合法且与请求一致**的规格。
+struct FakeGenerationProbe;
+
+#[async_trait::async_trait]
+impl MediaProbe for FakeGenerationProbe {
+    async fn probe(&self, path: &std::path::Path) -> Result<ProbedMedia, String> {
+        if path.extension().and_then(|value| value.to_str()) == Some("bin") {
+            Ok(ProbedMedia {
+                width: 1024,
+                height: 1024,
+                fps: 0,
+                duration_ms: 0,
+            })
+        } else {
+            Ok(ProbedMedia {
+                width: 640,
+                height: 640,
+                fps: 30,
+                duration_ms: 2_000,
+            })
+        }
+    }
+}
+
 /// 记录收到的生成任务的假执行者（**不触网、不产生费用**）。
 #[derive(Default)]
 struct RecordingGeneratedTransitionRunner {
@@ -1413,8 +1494,20 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         assets,
     );
     let events = Arc::new(EventCollector::default());
-    // 生成式转场：注入了执行者 → 应**跳过素材库匹配**，并改为按**边界插入**生成。
-    let generated_transition = Arc::new(RecordingGeneratedTransitionRunner::default());
+    // 生成式转场：注入**真实执行者**（配假传输，不触网）。
+    // 覆盖"执行者 → 真实落库 → 约定磁盘路径 → 导出源"这条最容易静默丢失的缝。
+    let generation_cache_root = directory.path().join("app-data");
+    let generated_transition = Arc::new(WanGeneratedTransitionRunner::new(
+        repository.clone(),
+        GenerationClient::new(
+            FakeGenerationTransport,
+            GenerationConfig::default(),
+        ),
+        FakeGenerationProbe,
+        generation_cache_root.clone(),
+        test_model_call(&database),
+        4,
+    ));
     let workflow = SmartClippingWorkflow::new(
         database.clone(),
         project_service.clone(),
@@ -1479,36 +1572,55 @@ async fn local_and_live_smart_workflows_run_end_to_end() {
         }),
         "注入生成执行者后应跳过素材库匹配"
     );
-    // 关键回归：生成任务必须是**边界插入**（两段之间的转场），
-    // 而不是片段内容替换——两者语义不同，此前实现曾用错。
+    // ⚠️ 本用例的局部工作流只有 **1 个输入 → 1 个片段 → 0 个边界**，
+    // 因此"没有生成产物"是**正确行为**而不是静默失败。
+    //
+    // 上一轮这里写的是 `recorded.len() == expected`，当两者都是 0 时**空过**——
+    // 它从未真正验证过任何生成。这里改成不可能空过的断言：
+    // 单片段工程若出现产物，说明我们对**没有边界**的工程也花了钱。
     {
-        let recorded = generated_transition.tasks.lock().unwrap().clone();
-        let expected = repository
+        let ai_project_id = repository
+            .ai_project_id_for_clip_project(clip.project.id)
+            .unwrap()
+            .expect("合辑必须能反查到 AI 工程");
+        let boundaries = repository
             .clip_transition_boundaries(clip.project.id)
             .unwrap()
             .iter()
             .filter(|boundary| boundary.active)
             .count();
-        assert_eq!(
-            recorded.len(),
-            expected,
-            "每个活跃边界都应生成一条转场任务"
-        );
-        for task in &recorded {
-            assert_eq!(
-                task.composition,
-                AiGeneratedAnimationComposition::Insert,
-                "转场必须是 insert（边界桥接），不是 replace（内容替换）"
+        let assets = repository
+            .list_generated_animation_assets(ai_project_id)
+            .unwrap();
+        if boundaries == 0 {
+            assert!(
+                assets.is_empty(),
+                "没有边界的工程不应产生生成产物——那是在为不存在的位置花钱"
             );
-            assert!(task.replace_range.is_none(), "insert 不应携带 replace_range");
-            let binding = task
-                .insert_binding
-                .as_ref()
-                .expect("insert 必须绑定左右片段与边界");
-            assert!(binding.boundary_id > 0, "边界 id 必须有效");
-            assert_ne!(
-                binding.left_segment_id, binding.right_segment_id,
-                "左右片段必须不同"
+        } else {
+            assert_eq!(assets.len(), boundaries, "每个活跃边界都应有产物");
+            for asset in &assets {
+                assert_eq!(
+                    asset.composition,
+                    AiGeneratedAnimationComposition::Insert,
+                    "转场必须是 insert（边界桥接），不是 replace（内容替换）"
+                );
+                assert_eq!(asset.status, AiGeneratedAnimationStatus::Validated);
+                // 规格来自**实际探测**，不是上游自述。
+                assert_eq!((asset.width, asset.height, asset.fps), (Some(640), Some(640), Some(30)));
+                assert_eq!(asset.duration_ms, Some(2_000));
+                let path = generation_cache_root
+                    .join(GENERATED_ANIMATION_CACHE_DIR)
+                    .join(generated_animation_file_name(asset.id));
+                assert!(path.is_file(), "产物文件必须落在约定路径：{}", path.display());
+            }
+            // 这一条是此前**静默丢失**的那一环：产物进不了导出源，导出照样成功。
+            let sources = repository
+                .clip_export_sources(clip.project.id, &generation_cache_root)
+                .unwrap();
+            assert!(
+                sources.iter().any(|source| source.insert_after.is_some()),
+                "生成产物必须真的进入导出源的 insert 绑定"
             );
         }
     }
