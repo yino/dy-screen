@@ -1707,6 +1707,7 @@ function sameAppSettings(left: AppSettings, right: AppSettings): boolean {
     && left.generationVideoModels === right.generationVideoModels
     && left.generationVideoResolution === right.generationVideoResolution
     && left.generationVideoSeconds === right.generationVideoSeconds
+    && left.generationTransitionsEnabled === right.generationTransitionsEnabled
     && left.renderCacheRetentionDays === right.renderCacheRetentionDays;
 }
 
@@ -2015,6 +2016,10 @@ export function SettingsPage({ api, settings, maxScreenLimit, environment, brows
             <div className="panel-header">
               <div><p className="section-kicker">AI GENERATION</p><h2>生成式转场</h2></div>
             </div>
+            <label className="switch-row">
+              <div><strong>用 AI 生成转场</strong><small>开启后跳过素材库匹配，按片段边界真实生成转场——<strong>按秒计费</strong>。关闭则回退到免费的素材库匹配，不会既没转场也没匹配。</small></div>
+              <input aria-label="用 AI 生成转场" type="checkbox" checked={form.generationTransitionsEnabled} onChange={(event) => updateForm({ generationTransitionsEnabled: event.target.checked })} />
+            </label>
             <label className="settings-field">
               <span><strong>图像模型（降级链）</strong><small>逗号分隔，按序尝试。新一代与旧一代图像模型走不同路径，程序会自动按序匹配；全部失败才放弃。</small></span>
               <input aria-label="图像模型降级链" value={form.generationImageModels} onChange={(event) => updateForm({ generationImageModels: event.target.value })} />

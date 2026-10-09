@@ -71,6 +71,7 @@ const defaultSettings: AppSettings = {
   generationVideoModels: "wan3.0-video-prime,wan3.0-video",
   generationVideoResolution: "480P",
   generationVideoSeconds: 2,
+  generationTransitionsEnabled: true,
   renderCacheRetentionDays: 3,
 };
 

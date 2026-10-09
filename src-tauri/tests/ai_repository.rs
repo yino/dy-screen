@@ -1868,3 +1868,55 @@ fn clip_project_detail_counts_validated_insert_units_in_duration_and_timeline() 
         .invalidate_generated_animation_asset(asset.id, "user_removed")
         .unwrap();
 }
+
+/// 生成式转场的开关必须**默认开启**、可持久化、并且能被读回。
+///
+/// 这个开关直接决定"要不要花钱"：默认值错了会让用户在没有预期的情况下产生费用；
+/// 读不回来则会让用户关掉之后仍然继续生成。
+#[test]
+fn generation_transition_switch_defaults_on_and_round_trips() {
+    let database = Database::open_in_memory().expect("in-memory database");
+    database.migrate().expect("migrate to latest");
+    let repository = AiRepository::new(database.clone());
+
+    // 默认开启：产品方案是"AI 生成替换素材库匹配"。
+    let defaults = database.get_settings().expect("settings");
+    assert!(defaults.generation_transitions_enabled, "默认应开启生成式转场");
+    assert!(repository.generation_transitions_enabled());
+
+    // 关闭后必须读回 false ——否则用户关不掉花钱路径。
+    let mut settings = defaults.clone();
+    settings.generation_transitions_enabled = false;
+    database.save_settings(&settings).expect("save settings");
+    assert!(!database.get_settings().unwrap().generation_transitions_enabled);
+    assert!(!repository.generation_transitions_enabled());
+
+    // 再打开也要能读回 true（开关是可逆的）。
+    let mut settings = database.get_settings().unwrap();
+    settings.generation_transitions_enabled = true;
+    database.save_settings(&settings).expect("save settings");
+    assert!(repository.generation_transitions_enabled());
+}
+
+/// 渲染缓存保留期的默认值：3 天；且 **0 必须保持 0**（表示不清理），
+/// 不能被解析逻辑悄悄改回默认。
+#[test]
+fn render_cache_retention_defaults_to_three_days_and_zero_is_preserved() {
+    let database = Database::open_in_memory().expect("in-memory database");
+    database.migrate().expect("migrate to latest");
+
+    assert_eq!(
+        database.get_settings().unwrap().render_cache_retention_days,
+        3,
+        "默认保留期应为 3 天"
+    );
+
+    let mut settings = database.get_settings().unwrap();
+    settings.render_cache_retention_days = 0;
+    database.save_settings(&settings).unwrap();
+    assert_eq!(
+        database.get_settings().unwrap().render_cache_retention_days,
+        0,
+        "0 表示不清理，必须原样保留"
+    );
+}

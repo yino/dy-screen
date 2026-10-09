@@ -1830,6 +1830,28 @@ pub struct SmartClippingWorkflow {
     tasks: Arc<Mutex<HashMap<i64, SmartWorkflowTask>>>,
 }
 
+/// 转场阶段产出转场的策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionStrategy {
+    /// 用 AI 生成（**按秒计费**）。
+    Generated,
+    /// 用素材库匹配（**免费**）。
+    Catalog,
+}
+
+/// 决定转场阶段走哪条路。
+///
+/// 这个判断**直接决定要不要花钱**，因此抽成纯函数并单测：
+/// 只有"注入了执行者"**且**"设置里开启"才走生成；任一条件不满足都回退到免费匹配。
+/// 回退而不是什么都不做——否则用户关掉开关会得到"既没转场也没匹配"的更差状态。
+pub fn transition_strategy(runner_present: bool, setting_enabled: bool) -> TransitionStrategy {
+    if runner_present && setting_enabled {
+        TransitionStrategy::Generated
+    } else {
+        TransitionStrategy::Catalog
+    }
+}
+
 struct SmartWorkflowTask {
     cancellation: CancellationToken,
     rerun_requested: bool,
@@ -3255,9 +3277,17 @@ impl SmartClippingWorkflow {
         //
         // 这是有意的取舍：素材库匹配是**免费**的（本地素材），生成是**按秒计费**的。
         // 保留素材库代码路径（未删除）以便回退：去掉注入即恢复原行为。
-        if transition_attempt.status != AiSmartStageAttemptStatus::Completed
-            && self.generated_transition.is_some()
-        {
+        // 生成式转场是否启用。**关闭时回退到免费的素材库匹配**，而不是什么都不做：
+        // 否则用户关掉开关后会"既没转场也没匹配"，那是更差的状态。
+        let generation_enabled = matches!(
+            transition_strategy(
+                self.generated_transition.is_some(),
+                self.repository.generation_transitions_enabled(),
+            ),
+            TransitionStrategy::Generated
+        );
+        if transition_attempt.status != AiSmartStageAttemptStatus::Completed && generation_enabled {
+
             let started = Instant::now();
             self.workflows
                 .finish_attempt(
@@ -3338,7 +3368,11 @@ impl SmartClippingWorkflow {
         //
         // 费用门禁不在这一层：`GeneratedTransitionRunner` 内部负责"命中复用不调用
         // 上游"与"单次运行上限"，因此这里可以放心遍历。
-        if let Some(runner) = self.generated_transition.clone() {
+        if let Some(runner) = self
+            .generated_transition
+            .clone()
+            .filter(|_| generation_enabled)
+        {
             let ai_project_id = batch.project_id.ok_or_else(|| {
                 SmartWorkflowError::new("smart_project_missing", "批次缺少 AI 工程引用", true)
             })?;
@@ -3985,6 +4019,19 @@ fn sanitize_public_message(message: &str) -> String {
 #[cfg(test)]
 mod metric_tests {
     use super::*;
+
+    /// 这段判断直接决定**要不要花钱**，必须把四种组合都钉住。
+    #[test]
+    fn spending_gate_only_generates_when_runner_and_setting_agree() {
+        use TransitionStrategy::{Catalog, Generated};
+        assert_eq!(transition_strategy(true, true), Generated);
+        // 设置里关掉 → 即使注入了执行者也**绝不**走生成（用户的资金开关）
+        assert_eq!(transition_strategy(true, false), Catalog);
+        // 没注入执行者 → 免费匹配
+        assert_eq!(transition_strategy(false, true), Catalog);
+        assert_eq!(transition_strategy(false, false), Catalog);
+    }
+
 
     fn detail(reviewable_at: &str) -> AiSmartWorkflowDetail {
         AiSmartWorkflowDetail {

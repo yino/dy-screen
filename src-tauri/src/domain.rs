@@ -323,6 +323,14 @@ pub struct AppSettings {
     /// 视频时长（秒）。上游允许 `[2, 30]`；转场用下限即可。
     #[serde(default = "default_generation_video_seconds")]
     pub generation_video_seconds: u32,
+    /// 是否用 **AI 生成转场**替换素材库匹配。
+    ///
+    /// - `true`（默认）：跳过素材库匹配，按片段边界真实生成转场（**按秒计费**）
+    /// - `false`：回退到**免费的**素材库匹配（既有行为）
+    ///
+    /// 做成开关的理由很直接：生成要花钱，用户必须能一键关掉。
+    #[serde(default = "default_generation_transitions_enabled")]
+    pub generation_transitions_enabled: bool,
     /// 特效字幕渲染缓存的保留天数；**0 表示不清理**。
     #[serde(default = "default_render_cache_retention_days")]
     pub render_cache_retention_days: u32,
@@ -353,6 +361,10 @@ fn default_render_cache_retention_days() -> u32 {
     3
 }
 
+fn default_generation_transitions_enabled() -> bool {
+    true
+}
+
 fn default_ffmpeg_path() -> String {
     "ffmpeg".to_owned()
 }
@@ -379,6 +391,7 @@ impl AppSettings {
             generation_video_models: default_generation_video_models(),
             generation_video_resolution: default_generation_video_resolution(),
             generation_video_seconds: default_generation_video_seconds(),
+            generation_transitions_enabled: default_generation_transitions_enabled(),
             render_cache_retention_days: default_render_cache_retention_days(),
         }
     }

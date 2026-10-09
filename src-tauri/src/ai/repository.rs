@@ -819,6 +819,17 @@ impl AiRepository {
         Ok(true)
     }
 
+    /// 是否启用 AI 生成转场；关闭时流程回退到**免费的**素材库匹配。
+    ///
+    /// 读设置失败时保守地返回 `true`（与默认值一致）：这里不吞掉生成能力，
+    /// 真正的花费门禁在执行者的"复用/上限"两道检查上。
+    pub fn generation_transitions_enabled(&self) -> bool {
+        self.database
+            .get_settings()
+            .map(|settings| settings.generation_transitions_enabled)
+            .unwrap_or(true)
+    }
+
     /// 特效字幕渲染缓存的保留天数；**0 表示不清理**。
     ///
     /// 此前 `prune_render_cache` 零调用，缓存永不回收；保留期做成设置项后，

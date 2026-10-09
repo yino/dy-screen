@@ -123,6 +123,8 @@ export interface AppSettings {
   generationVideoResolution: string;
   /** 视频时长（秒），上游允许 2–30。 */
   generationVideoSeconds: number;
+  /** 是否用 AI 生成转场替换素材库匹配；关闭时回退到免费的素材库匹配。 */
+  generationTransitionsEnabled: boolean;
   /** 特效字幕渲染缓存保留天数；0 表示不清理。 */
   renderCacheRetentionDays: number;
 }

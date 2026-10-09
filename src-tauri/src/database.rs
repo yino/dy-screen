@@ -596,6 +596,10 @@ impl Database {
                 "render_cache_retention_days",
                 defaults.render_cache_retention_days.to_string(),
             ),
+            (
+                "generation_transitions_enabled",
+                defaults.generation_transitions_enabled.to_string(),
+            ),
         ];
         let connection = self.connection()?;
         for (key, value) in values {
@@ -1380,6 +1384,11 @@ impl Database {
                 "render_cache_retention_days",
                 defaults.render_cache_retention_days,
             ),
+            generation_transitions_enabled: parse_or(
+                &values,
+                "generation_transitions_enabled",
+                defaults.generation_transitions_enabled,
+            ),
         })
     }
 
@@ -1424,6 +1433,10 @@ impl Database {
             (
                 "render_cache_retention_days",
                 settings.render_cache_retention_days.to_string(),
+            ),
+            (
+                "generation_transitions_enabled",
+                settings.generation_transitions_enabled.to_string(),
             ),
         ];
         let mut connection = self.connection()?;
